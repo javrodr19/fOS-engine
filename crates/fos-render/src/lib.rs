@@ -9,6 +9,10 @@
 //! - Layout tree painter
 //! - Text rendering
 //! - Image rendering
+//! - Visual effects (box-shadow, opacity, overflow)
+//! - CSS transforms (rotate, scale, skew, translate)
+//! - CSS animations (transitions, keyframes)
+//! - CSS filters (blur, brightness, contrast, etc.)
 
 mod canvas;
 mod paint;
@@ -18,6 +22,10 @@ mod painter;
 pub mod media;
 pub mod text;
 pub mod image;
+pub mod effects;
+pub mod transform;
+pub mod animation;
+pub mod filters;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};
@@ -25,6 +33,19 @@ pub use background::Background;
 pub use painter::{Painter, BoxStyle, BoxStyles, css_color_to_render};
 pub use text::TextRenderer;
 pub use image::{ImageRenderer, ImageDecoder, DecodedImage, ImageCache, ImageFormat};
+pub use effects::{
+    BoxShadow, Overflow, ClipRect, paint_box_shadow, apply_opacity,
+    Outline, OutlineStyle, ClipPath, paint_outline,
+};
+pub use transform::{
+    Transform2D, TransformOrigin, transform_around_origin,
+    Transform3D, BackfaceVisibility, PerspectiveOrigin,
+};
+pub use animation::{
+    TimingFunction, Transition, Keyframe, KeyframeAnimation, 
+    AnimatedValue, AnimationInstance, AnimationDirection, FillMode
+};
+pub use filters::{FilterFunction, FilterList, BlendMode, apply_filters};
 
 /// Color (RGBA)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

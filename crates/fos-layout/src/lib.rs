@@ -8,12 +8,18 @@
 //! - Block Formatting Context (vertical stacking, margin collapsing)
 //! - Inline Formatting Context (horizontal flow, line wrapping)
 //! - Flexbox layout
+//! - CSS Grid layout
+//! - Multi-column layout
+//! - Table layout
 
 mod box_model;
 mod layout_tree;
 mod block;
 mod inline;
 mod flex;
+mod grid;
+mod multicolumn;
+mod table;
 pub mod lazy;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
@@ -25,6 +31,19 @@ pub use flex::{
     FlexContainerStyle, FlexItemStyle,
     FlexDirection, FlexWrap, FlexBasis,
     JustifyContent, AlignItems, AlignContent,
+};
+pub use grid::{
+    TrackSize, GridTemplate, GridPlacement, GridLine, GridArea,
+    GridLayoutContext, resolve_placement, layout_grid_children,
+};
+pub use multicolumn::{
+    MultiColumnStyle, MultiColumnContext, ColumnRule, ColumnRuleStyle,
+    ColumnFill, ColumnSpan,
+};
+pub use table::{
+    TableLayout, BorderCollapse, CaptionSide, EmptyCells, TableStyle,
+    CellSpan, TableCell, TableStructure, TableLayoutContext,
+    build_table_structure,
 };
 
 use fos_dom::{DomTree, NodeId, Document};

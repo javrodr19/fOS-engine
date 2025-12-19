@@ -2,16 +2,28 @@
 //!
 //! CSS parsing using lightningcss with style cascade implementation.
 //! Designed for memory efficiency with computed style sharing.
+//! Includes CSS Custom Properties (variables), calc(), and math functions.
 
 mod parser;
 mod cascade;
 pub mod properties;
 pub mod computed;
+pub mod variables;
+pub mod selectors;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
 pub use properties::{PropertyId, PropertyValue};
 pub use computed::ComputedStyle;
+pub use variables::{
+    VariableScope, CustomPropertyValue, ResolvedValue,
+    CalcExpression, css_min, css_max, css_clamp,
+};
+pub use selectors::{
+    PseudoElement, PseudoClass, NthExpression, SelectorComponent,
+    AttributeSelector, AttributeMatcher, ElementContext, ElementStates,
+    match_component, match_pseudo_class,
+};
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {

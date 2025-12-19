@@ -19,7 +19,7 @@ impl Page {
     }
     
     /// Render the page to a pixel buffer
-    pub fn render(&self, width: u32, height: u32) -> Canvas {
+    pub fn render(&self, width: u32, height: u32) -> Option<Canvas> {
         tracing::info!("Rendering page {}x{}", width, height);
         
         // TODO: Implement full rendering pipeline

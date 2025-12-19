@@ -23,7 +23,7 @@ repository = "https://github.com/fos/fos-engine"
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 # Parsing
-html5ever = "0.29"
+html5ever = "0.36"
 lightningcss = "1.0.0-alpha.68"
 
 # JavaScript engine (tiny - 2MB)

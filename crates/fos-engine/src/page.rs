@@ -30,7 +30,7 @@ impl Page {
     }
     
     /// Get the page title
-    pub fn title(&self) -> &str {
-        &self.document.title
+    pub fn title(&self) -> String {
+        self.document.title()
     }
 }

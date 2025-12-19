@@ -1,35 +1,19 @@
 //! fOS HTML Parser
 //!
 //! High-performance HTML5 parser built on html5ever.
-//! Designed for minimal memory usage.
+//! Parses HTML and converts to our memory-efficient DOM tree.
 
 mod parser;
-mod tokenizer;
 
 pub use parser::HtmlParser;
+pub use fos_dom::{Document, DomTree, Node, NodeId};
 
-/// Parse an HTML string into a DOM-compatible structure
-pub fn parse(html: &str) -> ParseResult {
+/// Parse an HTML string into a Document
+pub fn parse(html: &str) -> Document {
     HtmlParser::new().parse(html)
 }
 
-/// Result of parsing HTML
-#[derive(Debug)]
-pub struct ParseResult {
-    pub root: NodeId,
-    pub errors: Vec<ParseError>,
-}
-
-/// Unique identifier for a node
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(pub(crate) u32);
-
-/// Parse error
-#[derive(Debug, thiserror::Error)]
-pub enum ParseError {
-    #[error("Unexpected token at line {line}: {message}")]
-    UnexpectedToken { line: u32, message: String },
-    
-    #[error("Unclosed tag: {tag}")]
-    UnclosedTag { tag: String },
+/// Parse an HTML string with a base URL
+pub fn parse_with_url(html: &str, url: &str) -> Document {
+    HtmlParser::new().parse_with_url(html, url)
 }

@@ -8,5 +8,7 @@ description = "HTML5 parser for fOS Engine"
 
 [dependencies]
 html5ever.workspace = true
+markup5ever_rcdom = "0.36"
+fos-dom = { path = "../fos-dom" }
 tracing.workspace = true
 thiserror.workspace = true

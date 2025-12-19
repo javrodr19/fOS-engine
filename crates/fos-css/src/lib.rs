@@ -1,13 +1,17 @@
 //! fOS CSS Parser & Style System
 //!
-//! CSS parsing and cascade implementation.
+//! CSS parsing using lightningcss with style cascade implementation.
+//! Designed for memory efficiency with computed style sharing.
 
 mod parser;
 mod cascade;
 mod properties;
+mod computed;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
+pub use properties::{PropertyId, PropertyValue};
+pub use computed::ComputedStyle;
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {
@@ -20,29 +24,110 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
 }
 
-/// CSS rule
+impl Stylesheet {
+    pub fn new() -> Self {
+        Self { rules: Vec::new() }
+    }
+    
+    /// Number of rules
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+}
+
+/// CSS rule (selector list + declarations)
 #[derive(Debug)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
 }
 
-/// CSS selector
-#[derive(Debug)]
+/// CSS selector with parsed components
+#[derive(Debug, Clone)]
 pub struct Selector {
+    /// Original selector text
     pub text: String,
+    /// Specificity (id, class, type)
     pub specificity: Specificity,
+    /// Parsed selector parts
+    pub parts: Vec<SelectorPart>,
 }
 
-/// Selector specificity (a, b, c)
+/// Part of a compound selector
+#[derive(Debug, Clone)]
+pub enum SelectorPart {
+    /// Type selector (div, span, etc)
+    Type(String),
+    /// Class selector (.class)
+    Class(String),
+    /// ID selector (#id)
+    Id(String),
+    /// Universal selector (*)
+    Universal,
+    /// Attribute selector ([attr=value])
+    Attribute { name: String, op: AttrOp, value: String },
+    /// Pseudo-class (:hover, :first-child)
+    PseudoClass(String),
+    /// Pseudo-element (::before, ::after)
+    PseudoElement(String),
+    /// Combinator
+    Combinator(Combinator),
+}
+
+/// Attribute selector operators
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrOp {
+    Exists,     // [attr]
+    Equals,     // [attr=value]
+    Contains,   // [attr*=value]
+    StartsWith, // [attr^=value]
+    EndsWith,   // [attr$=value]
+    Includes,   // [attr~=value]
+    DashMatch,  // [attr|=value]
+}
+
+/// Selector combinators
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Combinator {
+    /// Descendant (space)
+    Descendant,
+    /// Direct child (>)
+    Child,
+    /// Adjacent sibling (+)
+    NextSibling,
+    /// General sibling (~)
+    SubsequentSibling,
+}
+
+/// Selector specificity (a, b, c) where:
+/// a = ID selectors
+/// b = class, attribute, pseudo-class
+/// c = type, pseudo-element
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Specificity(pub u32, pub u32, pub u32);
 
+impl Specificity {
+    pub fn new(ids: u32, classes: u32, types: u32) -> Self {
+        Self(ids, classes, types)
+    }
+    
+    /// Add another specificity to this one
+    pub fn add(&mut self, other: Specificity) {
+        self.0 += other.0;
+        self.1 += other.1;
+        self.2 += other.2;
+    }
+}
+
 /// CSS declaration (property: value)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Declaration {
-    pub property: String,
-    pub value: String,
+    pub property: PropertyId,
+    pub value: PropertyValue,
     pub important: bool,
 }
 
@@ -51,4 +136,10 @@ pub struct Declaration {
 pub enum CssError {
     #[error("Parse error at line {line}: {message}")]
     ParseError { line: u32, message: String },
+    
+    #[error("Invalid property: {0}")]
+    InvalidProperty(String),
+    
+    #[error("Invalid value for {property}: {value}")]
+    InvalidValue { property: String, value: String },
 }

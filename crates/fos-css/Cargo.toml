@@ -8,5 +8,6 @@ description = "CSS parser and style system for fOS Engine"
 
 [dependencies]
 lightningcss.workspace = true
+fos-dom = { path = "../fos-dom" }
 tracing.workspace = true
 thiserror.workspace = true

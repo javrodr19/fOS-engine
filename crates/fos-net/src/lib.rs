@@ -2,16 +2,13 @@
 //!
 //! HTTP client and resource loading.
 
-mod loader;
+pub mod loader;
+pub mod fetch;
 mod cache;
 
-pub use loader::ResourceLoader;
+pub use loader::{ResourceLoader, Request, Method};
+pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
 pub use url::Url;
-
-/// Fetch a URL
-pub async fn fetch(url: &str) -> Result<Response, NetError> {
-    ResourceLoader::new().fetch(url).await
-}
 
 /// HTTP Response
 #[derive(Debug)]
@@ -19,6 +16,18 @@ pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Response {
+    /// Get body as text
+    pub fn text(&self) -> Option<String> {
+        String::from_utf8(self.body.clone()).ok()
+    }
+    
+    /// Check if response is successful
+    pub fn is_success(&self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
 }
 
 /// Network error
@@ -32,4 +41,26 @@ pub enum NetError {
     
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_response_is_success() {
+        let resp = Response {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(resp.is_success());
+        
+        let resp = Response {
+            status: 404,
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(!resp.is_success());
+    }
 }

@@ -13,6 +13,7 @@ mod paint;
 mod background;
 mod border;
 mod painter;
+pub mod media;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};

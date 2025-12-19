@@ -7,5 +7,7 @@ license.workspace = true
 description = "Layout engine for fOS Engine"
 
 [dependencies]
+fos-dom = { path = "../fos-dom" }
+fos-css = { path = "../fos-css" }
 tracing.workspace = true
 thiserror.workspace = true

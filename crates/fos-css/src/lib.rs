@@ -6,7 +6,7 @@
 mod parser;
 mod cascade;
 pub mod properties;
-mod computed;
+pub mod computed;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;

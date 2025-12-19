@@ -85,9 +85,6 @@ pub enum PropertyId {
     // Transition & Animation
     Transition,
     Animation,
-    
-    // Custom property (--var-name)
-    Custom(u32), // Index into custom property table
 }
 
 impl PropertyId {

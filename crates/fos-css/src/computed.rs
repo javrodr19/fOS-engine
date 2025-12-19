@@ -54,6 +54,82 @@ pub struct ComputedStyle {
     pub right: SizeValue,
     pub bottom: SizeValue,
     pub left: SizeValue,
+    
+    // Property presence bitmask (tracks which properties were explicitly set)
+    pub property_mask: PropertyMask,
+}
+
+/// Bitmask for tracking which properties are explicitly set
+/// 
+/// This allows skipping inherit/default logic for unset properties.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PropertyMask(pub u64);
+
+impl PropertyMask {
+    // Property bit positions
+    pub const DISPLAY: u64 = 1 << 0;
+    pub const POSITION: u64 = 1 << 1;
+    pub const WIDTH: u64 = 1 << 2;
+    pub const HEIGHT: u64 = 1 << 3;
+    pub const MARGIN: u64 = 1 << 4;
+    pub const PADDING: u64 = 1 << 5;
+    pub const COLOR: u64 = 1 << 6;
+    pub const BACKGROUND: u64 = 1 << 7;
+    pub const FONT_SIZE: u64 = 1 << 8;
+    pub const FONT_WEIGHT: u64 = 1 << 9;
+    pub const LINE_HEIGHT: u64 = 1 << 10;
+    pub const FLEX_DIRECTION: u64 = 1 << 11;
+    pub const JUSTIFY_CONTENT: u64 = 1 << 12;
+    pub const ALIGN_ITEMS: u64 = 1 << 13;
+    pub const OPACITY: u64 = 1 << 14;
+    pub const OVERFLOW: u64 = 1 << 15;
+    pub const Z_INDEX: u64 = 1 << 16;
+    pub const TOP: u64 = 1 << 17;
+    pub const RIGHT: u64 = 1 << 18;
+    pub const BOTTOM: u64 = 1 << 19;
+    pub const LEFT: u64 = 1 << 20;
+    pub const VISIBILITY: u64 = 1 << 21;
+    pub const MIN_WIDTH: u64 = 1 << 22;
+    pub const MIN_HEIGHT: u64 = 1 << 23;
+    pub const MAX_WIDTH: u64 = 1 << 24;
+    pub const MAX_HEIGHT: u64 = 1 << 25;
+    pub const BORDER_WIDTH: u64 = 1 << 26;
+    pub const FLEX_WRAP: u64 = 1 << 27;
+    
+    /// Create empty mask
+    pub fn new() -> Self {
+        Self(0)
+    }
+    
+    /// Set a property bit
+    pub fn set(&mut self, bit: u64) {
+        self.0 |= bit;
+    }
+    
+    /// Check if a property is set
+    pub fn is_set(&self, bit: u64) -> bool {
+        (self.0 & bit) != 0
+    }
+    
+    /// Clear a property bit
+    pub fn clear(&mut self, bit: u64) {
+        self.0 &= !bit;
+    }
+    
+    /// Count set properties
+    pub fn count(&self) -> u32 {
+        self.0.count_ones()
+    }
+    
+    /// Check if any property is set
+    pub fn any(&self) -> bool {
+        self.0 != 0
+    }
+    
+    /// Merge with another mask
+    pub fn merge(&mut self, other: PropertyMask) {
+        self.0 |= other.0;
+    }
 }
 
 impl ComputedStyle {

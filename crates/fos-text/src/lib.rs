@@ -5,16 +5,19 @@
 //! - Text shaping (rustybuzz - HarfBuzz port)
 //! - Text layout (line breaking, word wrap)
 //! - Glyph rasterization and caching
+//! - Pre-rendered glyph atlas for ASCII
 
 pub mod font;
 pub mod shaping;
 pub mod layout;
 pub mod render;
+pub mod glyph_atlas;
 
 pub use font::{FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery};
 pub use shaping::{TextShaper, ShapedGlyph, ShapedRun};
 pub use layout::{TextLayout, LineBreaker, ParagraphLayout};
 pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph};
+pub use glyph_atlas::{GlyphAtlasCache, GlyphInfo};
 
 /// Text rendering error types
 #[derive(Debug, thiserror::Error)]

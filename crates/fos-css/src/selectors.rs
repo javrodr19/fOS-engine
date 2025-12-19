@@ -412,6 +412,114 @@ pub fn match_pseudo_class(pseudo: &PseudoClass, element: &ElementContext) -> boo
     }
 }
 
+/// Bloom filter for fast selector rejection
+/// 
+/// Uses a 256-bit (32-byte) bloom filter to quickly reject
+/// selectors that cannot possibly match an element's ancestors.
+#[derive(Clone, Default)]
+pub struct SelectorBloomFilter {
+    bits: [u64; 4],
+}
+
+impl SelectorBloomFilter {
+    /// Create a new empty bloom filter
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Hash a string to filter indices
+    fn hash(s: &str) -> (usize, usize) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut h1 = DefaultHasher::new();
+        s.hash(&mut h1);
+        let hash1 = h1.finish();
+        
+        let mut h2 = DefaultHasher::new();
+        s.len().hash(&mut h2);
+        s.hash(&mut h2);
+        let hash2 = h2.finish();
+        
+        ((hash1 as usize) % 256, (hash2 as usize) % 256)
+    }
+    
+    /// Insert an element identifier (tag, class, or id)
+    pub fn insert(&mut self, s: &str) {
+        let (i1, i2) = Self::hash(s);
+        self.set_bit(i1);
+        self.set_bit(i2);
+    }
+    
+    /// Insert an element's tag name
+    pub fn insert_tag(&mut self, tag: &str) {
+        self.insert(&tag.to_lowercase());
+    }
+    
+    /// Insert an element's id
+    pub fn insert_id(&mut self, id: &str) {
+        self.insert(&format!("#{}", id));
+    }
+    
+    /// Insert an element's class
+    pub fn insert_class(&mut self, class: &str) {
+        self.insert(&format!(".{}", class));
+    }
+    
+    /// Check if a selector might match (may return false positives)
+    pub fn might_match(&self, s: &str) -> bool {
+        let (i1, i2) = Self::hash(s);
+        self.get_bit(i1) && self.get_bit(i2)
+    }
+    
+    /// Check if a tag might be in ancestors
+    pub fn might_have_tag(&self, tag: &str) -> bool {
+        self.might_match(&tag.to_lowercase())
+    }
+    
+    /// Check if an id might be in ancestors
+    pub fn might_have_id(&self, id: &str) -> bool {
+        self.might_match(&format!("#{}", id))
+    }
+    
+    /// Check if a class might be in ancestors
+    pub fn might_have_class(&self, class: &str) -> bool {
+        self.might_match(&format!(".{}", class))
+    }
+    
+    /// Set a bit in the filter
+    fn set_bit(&mut self, index: usize) {
+        let word = index / 64;
+        let bit = index % 64;
+        self.bits[word] |= 1 << bit;
+    }
+    
+    /// Get a bit from the filter
+    fn get_bit(&self, index: usize) -> bool {
+        let word = index / 64;
+        let bit = index % 64;
+        (self.bits[word] & (1 << bit)) != 0
+    }
+    
+    /// Clear the filter
+    pub fn clear(&mut self) {
+        self.bits = [0; 4];
+    }
+    
+    /// Create a copy with additional element
+    pub fn with_element(&self, tag: &str, id: Option<&str>, classes: &[String]) -> Self {
+        let mut filter = self.clone();
+        filter.insert_tag(tag);
+        if let Some(id) = id {
+            filter.insert_id(id);
+        }
+        for class in classes {
+            filter.insert_class(class);
+        }
+        filter
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,11 +10,13 @@ pub mod properties;
 pub mod computed;
 pub mod variables;
 pub mod selectors;
+pub mod style_cache;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
 pub use properties::{PropertyId, PropertyValue};
 pub use computed::ComputedStyle;
+pub use computed::PropertyMask;
 pub use variables::{
     VariableScope, CustomPropertyValue, ResolvedValue,
     CalcExpression, css_min, css_max, css_clamp,
@@ -22,8 +24,9 @@ pub use variables::{
 pub use selectors::{
     PseudoElement, PseudoClass, NthExpression, SelectorComponent,
     AttributeSelector, AttributeMatcher, ElementContext, ElementStates,
-    match_component, match_pseudo_class,
+    match_component, match_pseudo_class, SelectorBloomFilter,
 };
+pub use style_cache::{StyleCache, StyleCacheKey, SharedStyle, CacheStats};
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {

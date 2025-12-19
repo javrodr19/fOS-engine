@@ -1,0 +1,12 @@
+[package]
+name = "fos-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Rendering engine for fOS Engine"
+
+[dependencies]
+tiny-skia.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

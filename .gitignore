@@ -1,0 +1,50 @@
+# Generated files
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+
+# Debug
+*.pdb
+
+# Coverage
+*.gcno
+*.gcda
+lcov.info
+tarpaulin-report.html
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Documentation
+/doc/
+
+# Logs
+*.log
+
+# Editor backups
+*.bak
+*.orig
+
+# Environment
+.env
+.env.local

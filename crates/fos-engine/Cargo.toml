@@ -1,0 +1,22 @@
+[package]
+name = "fos-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "fOS Engine - Lightweight browser engine"
+
+[dependencies]
+# Internal crates
+fos-html = { path = "../fos-html" }
+fos-css = { path = "../fos-css" }
+fos-dom = { path = "../fos-dom" }
+fos-layout = { path = "../fos-layout" }
+fos-render = { path = "../fos-render" }
+fos-js = { path = "../fos-js" }
+fos-net = { path = "../fos-net" }
+
+# Common deps
+tracing.workspace = true
+thiserror.workspace = true
+url.workspace = true

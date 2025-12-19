@@ -1,0 +1,12 @@
+[package]
+name = "fos-css"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CSS parser and style system for fOS Engine"
+
+[dependencies]
+lightningcss.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

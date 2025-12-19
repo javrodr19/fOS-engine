@@ -1,0 +1,11 @@
+[package]
+name = "fos-dom"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DOM tree implementation for fOS Engine"
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true

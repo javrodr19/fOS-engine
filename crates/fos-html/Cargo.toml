@@ -1,0 +1,12 @@
+[package]
+name = "fos-html"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTML5 parser for fOS Engine"
+
+[dependencies]
+html5ever.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

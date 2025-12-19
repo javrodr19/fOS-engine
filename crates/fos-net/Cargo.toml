@@ -1,0 +1,14 @@
+[package]
+name = "fos-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Networking for fOS Engine"
+
+[dependencies]
+reqwest = { workspace = true }
+url.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+smol.workspace = true

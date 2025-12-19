@@ -1,0 +1,50 @@
+# fOS Engine Non-Commercial License
+
+Copyright (c) 2024 fOS Team
+
+## Terms and Conditions
+
+### 1. Permissions
+
+You are free to:
+
+- **Use** — Run and use the software for any personal, educational, or non-commercial purpose
+- **Study** — Read and learn from the source code
+- **Modify** — Adapt, remix, and build upon the software
+- **Share** — Copy and redistribute the software in any medium or format
+
+### 2. Conditions
+
+Under the following conditions:
+
+- **Attribution** — You must give appropriate credit, provide a link to the original repository, and indicate if changes were made
+- **Non-Commercial** — You may not use the software for commercial purposes. This includes:
+  - Selling the software or any derivative works
+  - Using the software as part of a paid product or service
+  - Using the software to generate revenue directly or indirectly
+  - Offering the software as a commercial SaaS or hosted service
+
+### 3. Exceptions
+
+The following are **permitted** even under the non-commercial restriction:
+
+- Using the software internally within a company for non-revenue-generating purposes
+- Including the software in free, open-source projects
+- Educational institutions using the software for teaching
+- Non-profit organizations using the software for their mission
+
+### 4. Commercial Licensing
+
+If you wish to use fOS Engine for commercial purposes, please contact the maintainers to discuss a commercial license agreement.
+
+### 5. Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 6. Termination
+
+This license automatically terminates if you violate any of its terms. Upon termination, you must destroy all copies of the software in your possession.
+
+---
+
+This license is inspired by Creative Commons BY-NC and is designed specifically for software.

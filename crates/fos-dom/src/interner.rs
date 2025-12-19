@@ -15,18 +15,26 @@ impl InternedString {
     pub const EMPTY: InternedString = InternedString(0);
 }
 
+/// String entry storing offset and length
+#[derive(Debug, Clone, Copy)]
+struct StringEntry {
+    offset: u32,
+    len: u32,
+}
+
 /// String interner for deduplicating strings
 /// 
 /// Memory layout:
 /// - All strings stored in a single contiguous buffer
-/// - Each InternedString is just a 4-byte offset
+/// - Each InternedString is just a 4-byte index
+/// - Lengths stored separately (supports null bytes in strings)
 pub struct StringInterner {
-    /// All strings concatenated with null terminators
+    /// All strings concatenated (no delimiters)
     pub buffer: String,
-    /// Map from string content to offset
-    map: HashMap<Box<str>, u32>,
-    /// Offsets into buffer for each interned string
-    pub offsets: Vec<u32>,
+    /// Map from string content to index
+    pub(crate) map: HashMap<Box<str>, u32>,
+    /// Entries storing (offset, length) for each interned string
+    entries: Vec<StringEntry>,
 }
 
 impl StringInterner {
@@ -35,7 +43,7 @@ impl StringInterner {
         let mut interner = Self {
             buffer: String::with_capacity(4096), // Pre-allocate for common strings
             map: HashMap::with_capacity(256),
-            offsets: Vec::with_capacity(256),
+            entries: Vec::with_capacity(256),
         };
         
         // Pre-intern empty string at index 0
@@ -75,46 +83,56 @@ impl StringInterner {
     /// If the string is already interned, returns the existing ID
     pub fn intern(&mut self, s: &str) -> InternedString {
         // Check if already interned
-        if let Some(&offset) = self.map.get(s) {
-            return InternedString(offset);
+        if let Some(&index) = self.map.get(s) {
+            return InternedString(index);
         }
         
         // Add to buffer
-        let offset = self.offsets.len() as u32;
-        let start = self.buffer.len();
+        let index = self.entries.len() as u32;
+        let offset = self.buffer.len() as u32;
+        let len = s.len() as u32;
+        
         self.buffer.push_str(s);
-        self.buffer.push('\0'); // Null terminator for easy C interop
         
-        // Store offset
-        self.offsets.push(start as u32);
-        self.map.insert(s.into(), offset);
+        // Store entry
+        self.entries.push(StringEntry { offset, len });
+        self.map.insert(s.into(), index);
         
-        InternedString(offset)
+        InternedString(index)
     }
     
     /// Get the string for an interned ID
     #[inline]
     pub fn get(&self, id: InternedString) -> &str {
-        let offset = self.offsets.get(id.0 as usize).copied().unwrap_or(0) as usize;
-        let end = self.buffer[offset..].find('\0').unwrap_or(0);
-        &self.buffer[offset..offset + end]
+        if let Some(entry) = self.entries.get(id.0 as usize) {
+            let start = entry.offset as usize;
+            let end = start + entry.len as usize;
+            &self.buffer[start..end]
+        } else {
+            ""
+        }
     }
     
     /// Number of interned strings
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.entries.len()
     }
     
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.entries.is_empty()
     }
     
     /// Total memory used by the interner
     pub fn memory_usage(&self) -> usize {
         self.buffer.capacity() 
             + self.map.capacity() * (std::mem::size_of::<Box<str>>() + std::mem::size_of::<u32>())
-            + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.entries.capacity() * std::mem::size_of::<StringEntry>()
+    }
+    
+    /// Get offsets for backward compatibility (used by document.rs)
+    pub fn offsets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.entries.iter().map(|e| e.offset)
     }
 }
 
@@ -141,5 +159,13 @@ mod tests {
         let mut interner = StringInterner::new();
         let id = interner.intern("world");
         assert_eq!(interner.get(id), "world");
+    }
+    
+    #[test]
+    fn test_null_bytes() {
+        let mut interner = StringInterner::new();
+        let s = "null\0byte\0string";
+        let id = interner.intern(s);
+        assert_eq!(interner.get(id), s, "Null bytes should be preserved");
     }
 }

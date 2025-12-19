@@ -141,14 +141,7 @@ impl Default for Document {
 impl crate::StringInterner {
     /// Look up a string without interning it
     pub fn intern_lookup(&self, s: &str) -> Option<InternedString> {
-        // Linear search through offsets - could optimize with reverse map
-        for (i, &offset) in self.offsets.iter().enumerate() {
-            let start = offset as usize;
-            let end = self.buffer[start..].find('\0').unwrap_or(0);
-            if &self.buffer[start..start + end] == s {
-                return Some(InternedString(i as u32));
-            }
-        }
-        None
+        // Use the map to look up without interning
+        self.map.get(s).map(|&idx| InternedString(idx))
     }
 }

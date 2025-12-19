@@ -1,0 +1,24 @@
+[package]
+name = "fos-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Font database and matching
+fontdb.workspace = true
+
+# Text shaping (HarfBuzz port)
+rustybuzz.workspace = true
+
+# Font file parsing
+ttf-parser.workspace = true
+
+# Rendering (for glyph rasterization)
+tiny-skia.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+[dev-dependencies]

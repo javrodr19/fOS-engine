@@ -7,6 +7,7 @@
 //! - Background painting (solid colors, border-radius)
 //! - Border painting (solid, dashed, dotted)
 //! - Layout tree painter
+//! - Text rendering
 
 mod canvas;
 mod paint;
@@ -14,11 +15,13 @@ mod background;
 mod border;
 mod painter;
 pub mod media;
+pub mod text;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};
 pub use background::Background;
 pub use painter::{Painter, BoxStyle, BoxStyles, css_color_to_render};
+pub use text::TextRenderer;
 
 /// Color (RGBA)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

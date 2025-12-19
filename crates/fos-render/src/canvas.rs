@@ -201,6 +201,25 @@ impl Canvas {
         })
     }
     
+    /// Set pixel at position
+    pub fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
+        if x >= self.width() || y >= self.height() {
+            return;
+        }
+        
+        let idx = (y * self.width() + x) as usize;
+        // Use premultiplied alpha
+        let a = color.a as f32 / 255.0;
+        let pixel = tiny_skia::PremultipliedColorU8::from_rgba(
+            (color.r as f32 * a) as u8,
+            (color.g as f32 * a) as u8,
+            (color.b as f32 * a) as u8,
+            color.a,
+        ).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        
+        self.pixmap.pixels_mut()[idx] = pixel;
+    }
+    
     /// Get raw RGBA bytes
     pub fn as_rgba_bytes(&self) -> Vec<u8> {
         self.pixmap.pixels()

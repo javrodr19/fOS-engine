@@ -6,6 +6,7 @@ members = [
     "crates/fos-dom",
     "crates/fos-layout",
     "crates/fos-render",
+    "crates/fos-text",
     "crates/fos-js",
     "crates/fos-net",
     "crates/fos-engine",
@@ -32,6 +33,11 @@ rquickjs = "0.9"
 # Rendering
 tiny-skia = "0.11"
 # wgpu = "23.0"  # GPU rendering (Phase 3+)
+
+# Text rendering
+fontdb = "0.21"
+rustybuzz = "0.20"
+ttf-parser = "0.24"
 
 # Networking
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

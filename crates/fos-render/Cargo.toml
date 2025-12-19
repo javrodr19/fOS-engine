@@ -9,6 +9,7 @@ description = "Rendering engine for fOS Engine"
 [dependencies]
 fos-layout = { path = "../fos-layout" }
 fos-css = { path = "../fos-css" }
+fos-text = { path = "../fos-text" }
 tiny-skia.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

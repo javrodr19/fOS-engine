@@ -4,7 +4,7 @@
 
 pub mod loader;
 pub mod fetch;
-mod cache;
+pub mod cache;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};

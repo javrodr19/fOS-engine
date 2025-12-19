@@ -11,6 +11,7 @@ mod node;
 mod tree;
 mod document;
 mod interner;
+pub mod pool;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;

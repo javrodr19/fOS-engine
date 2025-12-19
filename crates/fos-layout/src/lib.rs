@@ -14,6 +14,7 @@ mod layout_tree;
 mod block;
 mod inline;
 mod flex;
+pub mod lazy;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};

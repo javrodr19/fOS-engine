@@ -32,6 +32,9 @@ pub mod filters;
 pub mod compositor;
 pub mod layers;
 pub mod gpu;
+pub mod webgl;
+pub mod webgpu;
+pub mod render_opt;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};
@@ -53,6 +56,9 @@ pub use animation::{
 };
 pub use filters::{FilterFunction, FilterList, BlendMode, apply_filters};
 pub use gpu::{GpuRenderer, GpuConfig, GpuState, GpuBackend, RenderFrame, TextureId, GpuError};
+pub use webgl::{WebGLRenderingContext, WebGLVersion, ShaderType, TextureFormat};
+pub use webgpu::{GPUDevice, GPURenderPipeline, GPUComputePipeline, GPUBuffer, GPUTexture};
+pub use render_opt::{DisplayList, TextureAtlas, DirtyRectTracker, OcclusionCuller, RenderTreeDiffer, OffscreenCanvas};
 
 /// Color (RGBA)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

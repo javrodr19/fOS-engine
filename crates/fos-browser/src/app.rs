@@ -11,8 +11,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::loader::Loader;
+use crate::renderer::{PageRenderer, RenderedPage};
 use crate::tab::TabManager;
 use crate::ui::Chrome;
+use crate::ui::tab_bar::TAB_BAR_WIDTH;
+use crate::ui::url_bar::URL_BAR_HEIGHT;
 
 /// Browser application
 pub struct Browser {
@@ -52,6 +56,12 @@ struct BrowserApp {
     tabs: TabManager,
     /// UI chrome
     chrome: Chrome,
+    /// Page loader
+    loader: Loader,
+    /// Page renderer
+    renderer: PageRenderer,
+    /// Current rendered page (cached)
+    rendered_page: Option<RenderedPage>,
     /// Initial URL
     initial_url: String,
     /// Window dimensions
@@ -59,6 +69,8 @@ struct BrowserApp {
     height: u32,
     /// Current modifier state
     modifiers: winit::keyboard::ModifiersState,
+    /// Needs page reload
+    needs_reload: bool,
 }
 
 impl BrowserApp {
@@ -68,16 +80,82 @@ impl BrowserApp {
             surface: None,
             tabs: TabManager::new(),
             chrome: Chrome::new(),
+            loader: Loader::new(),
+            renderer: PageRenderer::new(800, 600),
+            rendered_page: None,
             initial_url,
             width: 1024,
             height: 768,
             modifiers: winit::keyboard::ModifiersState::default(),
+            needs_reload: true,
         }
+    }
+    
+    /// Load the current tab's page
+    fn load_current_page(&mut self) {
+        let url = match self.tabs.active_tab() {
+            Some(tab) => tab.url.clone(),
+            None => return,
+        };
+        
+        log::info!("Loading: {}", url);
+        
+        // Load the page
+        match self.loader.load_sync(&url) {
+            Ok(page) => {
+                // Update tab title
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.title = page.title.clone().unwrap_or_else(|| url.clone());
+                    tab.loading = false;
+                }
+                
+                // Calculate content area size
+                let content_width = self.width.saturating_sub(TAB_BAR_WIDTH);
+                let content_height = self.height.saturating_sub(URL_BAR_HEIGHT);
+                
+                // Update renderer viewport
+                self.renderer.set_viewport(content_width, content_height);
+                
+                // Render the page
+                log::info!("Rendering {} bytes of HTML...", page.html.len());
+                self.rendered_page = self.renderer.render_html(&page.html, &url);
+                
+                if let Some(ref rendered) = self.rendered_page {
+                    log::info!("Rendered: {}x{} pixels", rendered.width, rendered.height);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to load {}: {}", url, e);
+                // Show error page
+                let error_html = format!(r#"
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Error</title></head>
+                    <body style="background: #1a1a1a; color: #ff6b6b; padding: 20px; font-family: sans-serif;">
+                        <h1>Failed to load page</h1>
+                        <p>URL: {}</p>
+                        <p>Error: {}</p>
+                    </body>
+                    </html>
+                "#, url, e);
+                
+                let content_width = self.width.saturating_sub(TAB_BAR_WIDTH);
+                let content_height = self.height.saturating_sub(URL_BAR_HEIGHT);
+                self.renderer.set_viewport(content_width, content_height);
+                self.rendered_page = self.renderer.render_html(&error_html, &url);
+            }
+        }
+        
+        self.needs_reload = false;
     }
     
     /// Render the browser UI and content
     fn render(&mut self) {
-        let Some(surface) = &mut self.surface else { return };
+        // Load page if needed
+        if self.needs_reload {
+            self.load_current_page();
+        }
+        
         let Some(window) = &self.window else { return };
         
         let size = window.inner_size();
@@ -85,8 +163,15 @@ impl BrowserApp {
             return;
         }
         
-        self.width = size.width;
-        self.height = size.height;
+        // Check if viewport changed
+        if size.width != self.width || size.height != self.height {
+            self.width = size.width;
+            self.height = size.height;
+            self.needs_reload = true;
+            self.load_current_page();
+        }
+        
+        let Some(surface) = &mut self.surface else { return };
         
         // Resize surface if needed
         let _ = surface.resize(
@@ -100,15 +185,46 @@ impl BrowserApp {
             Err(_) => return,
         };
         
+        let buffer_width = size.width as usize;
+        let buffer_height = size.height as usize;
+        
         // Clear to background color
-        let bg_color = 0xFF0D0D0D; // Dark gray ARGB
+        let bg_color = 0xFF0D0D0D; // Dark gray ARGB (softbuffer uses 0xAARRGGBB)
         buffer.fill(bg_color);
         
-        // Render UI chrome
+        // Render page content in content area (inline to avoid borrow issues)
+        if let Some(ref rendered) = self.rendered_page {
+            let content_x = TAB_BAR_WIDTH as usize;
+            let content_y = 0usize;
+            let content_height = buffer_height.saturating_sub(URL_BAR_HEIGHT as usize);
+            
+            // Copy rendered pixels to buffer
+            // rendered.pixels is RGBA bytes, buffer is ARGB u32
+            for y in 0..rendered.height.min(content_height as u32) {
+                for x in 0..rendered.width.min((buffer_width - content_x) as u32) {
+                    let src_idx = ((y * rendered.width + x) * 4) as usize;
+                    let dst_x = content_x + x as usize;
+                    let dst_y = content_y + y as usize;
+                    
+                    if src_idx + 3 < rendered.pixels.len() && dst_y < buffer_height && dst_x < buffer_width {
+                        let r = rendered.pixels[src_idx] as u32;
+                        let g = rendered.pixels[src_idx + 1] as u32;
+                        let b = rendered.pixels[src_idx + 2] as u32;
+                        let a = rendered.pixels[src_idx + 3] as u32;
+                        
+                        // Convert RGBA to ARGB (softbuffer format)
+                        let pixel = (a << 24) | (r << 16) | (g << 8) | b;
+                        buffer[dst_y * buffer_width + dst_x] = pixel;
+                    }
+                }
+            }
+        }
+        
+        // Render UI chrome on top
         self.chrome.render(
             &mut buffer,
-            size.width as usize,
-            size.height as usize,
+            buffer_width,
+            buffer_height,
             &self.tabs,
         );
         
@@ -128,11 +244,13 @@ impl BrowserApp {
             PhysicalKey::Code(KeyCode::KeyT) if ctrl => {
                 // Ctrl+T: New tab
                 self.tabs.new_tab("about:blank");
+                self.needs_reload = true;
                 self.request_redraw();
             }
             PhysicalKey::Code(KeyCode::KeyW) if ctrl => {
                 // Ctrl+W: Close tab
                 self.tabs.close_active_tab();
+                self.needs_reload = true;
                 self.request_redraw();
             }
             PhysicalKey::Code(KeyCode::KeyL) if ctrl => {
@@ -142,12 +260,12 @@ impl BrowserApp {
             }
             PhysicalKey::Code(KeyCode::KeyR) if ctrl => {
                 // Ctrl+R: Reload
-                self.tabs.reload_active();
+                self.needs_reload = true;
                 self.request_redraw();
             }
             PhysicalKey::Code(KeyCode::F5) => {
                 // F5: Reload
-                self.tabs.reload_active();
+                self.needs_reload = true;
                 self.request_redraw();
             }
             _ => {}
@@ -188,6 +306,7 @@ impl ApplicationHandler for BrowserApp {
             self.tabs.new_tab("about:blank");
         }
         
+        self.needs_reload = true;
         self.request_redraw();
     }
     
@@ -213,6 +332,7 @@ impl ApplicationHandler for BrowserApp {
                 if state == ElementState::Pressed {
                     // Handle click
                     self.chrome.handle_click(button, &mut self.tabs);
+                    self.needs_reload = true;
                     self.request_redraw();
                 }
             }

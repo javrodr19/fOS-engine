@@ -9,7 +9,9 @@ pub mod tab;
 pub mod navigation;
 pub mod loader;
 pub mod ui;
+pub mod renderer;
 
 pub use app::Browser;
 pub use page::Page;
 pub use tab::Tab;
+pub use renderer::{PageRenderer, RenderedPage};

@@ -4,10 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Minimalist web browser using fOS Engine"
 license = "MIT"
+default-run = "fos-browser"
 
 [dependencies]
-# Core engine
+# Core engine components
 fos-engine = { path = "../fos-engine" }
+fos-html = { path = "../fos-html" }
+fos-dom = { path = "../fos-dom" }
+fos-css = { path = "../fos-css" }
+fos-layout = { path = "../fos-layout" }
+fos-render = { path = "../fos-render" }
 
 # Window management (minimal)
 winit = "0.30"

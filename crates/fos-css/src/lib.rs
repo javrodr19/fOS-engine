@@ -11,6 +11,7 @@ pub mod computed;
 pub mod variables;
 pub mod selectors;
 pub mod style_cache;
+pub mod container;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
@@ -27,6 +28,7 @@ pub use selectors::{
     match_component, match_pseudo_class, SelectorBloomFilter,
 };
 pub use style_cache::{StyleCache, StyleCacheKey, SharedStyle, CacheStats};
+pub use container::{ContainerContext, ContainerQuery, ContainerRegistry};
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {

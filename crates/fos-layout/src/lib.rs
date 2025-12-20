@@ -8,7 +8,7 @@
 //! - Block Formatting Context (vertical stacking, margin collapsing)
 //! - Inline Formatting Context (horizontal flow, line wrapping)
 //! - Flexbox layout
-//! - CSS Grid layout
+//! - CSS Grid layout (with subgrid support)
 //! - Multi-column layout
 //! - Table layout
 
@@ -21,6 +21,7 @@ mod grid;
 mod multicolumn;
 mod table;
 pub mod lazy;
+pub mod subgrid;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};
@@ -45,6 +46,7 @@ pub use table::{
     CellSpan, TableCell, TableStructure, TableLayoutContext,
     build_table_structure,
 };
+pub use subgrid::{Subgrid, SubgridContext};
 
 use fos_dom::{DomTree, NodeId, Document};
 use fos_css::computed::{ComputedStyle, Display};

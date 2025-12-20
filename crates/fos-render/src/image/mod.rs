@@ -7,9 +7,11 @@ mod cache;
 mod renderer;
 pub mod pool;
 pub mod queue;
+pub mod avif;
 
 pub use decoder::{ImageDecoder, DecodedImage, ImageFormat};
 pub use cache::{ImageCache, ImageKey};
 pub use renderer::{ImageRenderer, ScaleMode, ImagePosition};
 pub use pool::{BitmapPool, BitmapBuffer, PoolStats};
 pub use queue::{DecodeQueue, DecodeRequest, DecodePriority, DecodeQueueStats};
+pub use avif::{AvifDecoder, AvifImage, is_avif};

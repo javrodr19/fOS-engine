@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Text rendering and font handling for fOS browser engine"
+
+[features]
+default = ["bundled-fonts"]
+# Use bundled font rendering (rustybuzz + ttf-parser)
+bundled-fonts = []
+# Use system FreeType for font rendering (smaller binary, requires libfreetype)
+system-freetype = []
 
 [dependencies]
 # Font database and matching
 fontdb.workspace = true
 
-# Text shaping (HarfBuzz port)
+# Text shaping (HarfBuzz port) - can use system harfbuzz if desired
 rustybuzz.workspace = true
 
 # Font file parsing

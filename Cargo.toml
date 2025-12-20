@@ -68,6 +68,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 opt-level = "z"  # Optimize for size
+debug = false    # No debug info in release builds
 
 [profile.dev]
 opt-level = 1

@@ -7,6 +7,16 @@
 //! - Fast startup
 //! - Modern web standards support
 //!
+//! # Features
+//! 
+//! The engine supports conditional compilation via feature flags:
+//! - `full` (default): All features enabled
+//! - `minimal`: Core engine only (parsing, layout, rendering)
+//! - `webgl`: Canvas and WebGL support
+//! - `media`: Audio/video media support
+//! - `devtools`: Developer tools
+//! - `accessibility`: Accessibility support
+//!
 //! # Example
 //! ```rust,ignore
 //! use fos_engine::{Engine, Config};
@@ -24,6 +34,8 @@ pub mod arena;
 pub mod intern;
 pub mod cow;
 pub mod compress;
+pub mod cold;
+pub mod plugin;
 
 pub use engine::Engine;
 pub use page::Page;
@@ -33,8 +45,12 @@ pub use arena::{BumpAllocator, Arena, GenArena, GenIndex};
 pub use intern::{StringInterner, InternedString, TagInterner};
 pub use cow::{Cow, CowBuffer, CowString};
 pub use compress::{Lz4Compressor, DeltaEncoder, Varint};
+pub use cold::{cold_path, format_error, cold_panic, cold_unreachable, debug_check};
+pub use cold::{StaticError, DynDispatch, DynWrapper};
+pub use cold::errors as static_errors;
+pub use plugin::{Plugin, PluginInfo, PluginCapabilities, PluginError, PluginLoader};
 
-// Re-export sub-crates for advanced usage
+// Re-export core sub-crates (always included)
 pub use fos_html as html;
 pub use fos_css as css;
 pub use fos_dom as dom;
@@ -42,6 +58,19 @@ pub use fos_layout as layout;
 pub use fos_render as render;
 pub use fos_js as js;
 pub use fos_net as net;
+
+// Re-export optional sub-crates (feature-gated)
+#[cfg(feature = "webgl")]
+pub use fos_canvas as canvas;
+
+#[cfg(feature = "media")]
+pub use fos_media as media;
+
+#[cfg(feature = "devtools")]
+pub use fos_devtools as devtools;
+
+#[cfg(feature = "accessibility")]
+pub use fos_a11y as a11y;
 
 /// Engine version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

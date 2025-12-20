@@ -6,8 +6,22 @@ authors.workspace = true
 license.workspace = true
 description = "fOS Engine - Lightweight browser engine"
 
+[features]
+default = ["full"]
+# Full browser engine with all features
+full = ["webgl", "media", "devtools", "accessibility"]
+# Core engine only (parsing, layout, rendering)
+minimal = []
+# Optional features for conditional compilation
+webgl = ["dep:fos-canvas"]
+media = ["dep:fos-media"]
+devtools = ["dep:fos-devtools"]
+accessibility = ["dep:fos-a11y"]
+# Enable dynamic plugin loading (requires libloading)
+dynamic-plugins = []
+
 [dependencies]
-# Internal crates
+# Core crates (always included)
 fos-html = { path = "../fos-html" }
 fos-css = { path = "../fos-css" }
 fos-dom = { path = "../fos-dom" }
@@ -15,6 +29,12 @@ fos-layout = { path = "../fos-layout" }
 fos-render = { path = "../fos-render" }
 fos-js = { path = "../fos-js" }
 fos-net = { path = "../fos-net" }
+
+# Optional components (feature-gated)
+fos-canvas = { path = "../fos-canvas", optional = true }
+fos-media = { path = "../fos-media", optional = true }
+fos-devtools = { path = "../fos-devtools", optional = true }
+fos-a11y = { path = "../fos-a11y", optional = true }
 
 # Common deps
 tracing.workspace = true

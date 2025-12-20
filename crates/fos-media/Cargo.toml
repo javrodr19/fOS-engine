@@ -1,0 +1,10 @@
+[package]
+name = "fos-media"
+version = "0.1.0"
+edition = "2021"
+description = "Media APIs for fOS browser engine"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]

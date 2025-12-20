@@ -1,0 +1,10 @@
+[package]
+name = "fos-canvas"
+version = "0.1.0"
+edition = "2021"
+description = "Canvas 2D and WebGL APIs for fOS browser engine"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]

@@ -9,6 +9,8 @@ members = [
     "crates/fos-text",
     "crates/fos-js",
     "crates/fos-net",
+    "crates/fos-canvas",
+    "crates/fos-media",
     "crates/fos-engine",
 ]
 

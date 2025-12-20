@@ -381,42 +381,42 @@
 ### Networking
 - [x] WebSocket (full spec)
 - [x] HTTP/2
-- [ ] HTTP/3 / QUIC
+- [x] HTTP/3 / QUIC
 - [x] Server-Sent Events
 - [x] Beacon API
 
 ### Workers
 - [x] Full Web Workers
 - [x] Shared Workers
-- [ ] Service Workers
+- [x] Service Workers
 - [x] Worklets
 
 ### Geolocation & Sensors
 - [x] Geolocation API
-- [ ] DeviceOrientation
-- [ ] Sensor APIs
+- [x] DeviceOrientation
+- [x] Sensor APIs
 
 ### Notifications
 - [x] Notifications API
-- [ ] Push API
-- [ ] Vibration API
+- [x] Push API
+- [x] Vibration API
 
 ### Permissions
 - [x] Permissions API
-- [ ] Permission prompts
+- [x] Permission prompts
 
 ## 14.2 Phase 14 Optimizations
 
 ### Network Optimization
-- [ ] HTTP/3 with QUIC (multiplexed streams)
-- [ ] Request coalescing (batch small requests)
-- [ ] Predictive DNS resolution
-- [ ] Global connection pool
-- [ ] Delta sync protocol
+- [x] HTTP/3 with QUIC (multiplexed streams)
+- [x] Request coalescing (batch small requests)
+- [x] Predictive DNS resolution
+- [x] Global connection pool
+- [x] Delta sync protocol
 
 ### Resource Optimization
-- [ ] Cross-tab immutable resource sharing
-- [ ] Content-addressable caching
+- [x] Cross-tab immutable resource sharing
+- [x] Content-addressable caching
 - [x] Resource deduplication
 
 ---

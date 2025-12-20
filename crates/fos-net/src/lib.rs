@@ -10,6 +10,8 @@ pub mod sse;
 pub mod beacon;
 pub mod http2;
 pub mod xhr;
+pub mod http3;
+pub mod network_opt;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
@@ -19,6 +21,8 @@ pub use sse::{EventSource, EventSourceState, SseEvent};
 pub use beacon::{send_beacon, BeaconData};
 pub use http2::{Http2Connection, Http2Stream, Http2Settings, Http2Frame};
 pub use xhr::{XmlHttpRequest, ReadyState, ResponseType, XhrError, FormData, FormDataValue};
+pub use http3::{QuicConnection, Http3Connection, ConnectionPool, QuicError};
+pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};
 
 /// HTTP Response
 #[derive(Debug)]

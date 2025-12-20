@@ -13,6 +13,7 @@ pub mod sensors;
 pub mod push;
 pub mod formdata;
 pub mod file_reader;
+pub mod vibration;
 
 pub use url::{JsUrl, JsUrlSearchParams};
 pub use encoding::{TextEncoder, TextDecoder};
@@ -25,3 +26,4 @@ pub use sensors::{DeviceOrientationEvent, DeviceMotionEvent, Accelerometer, Gyro
 pub use push::{PushManager, PushSubscription};
 pub use formdata::{FormData, FormDataValue, FileEntry};
 pub use file_reader::{FileReader, FileReaderState, FileReaderResult};
+pub use vibration::{VibrationController, VibrationPattern, PermissionPromptManager, PermissionType};

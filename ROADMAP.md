@@ -475,42 +475,42 @@
 - [x] `<video>` element (full)
 - [x] `<audio>` element (full)
 - [x] Playback controls
-- [ ] Fullscreen API
-- [ ] Picture-in-Picture
+- [x] Fullscreen API
+- [x] Picture-in-Picture
 
 ### Media Decoding
-- [ ] H.264
-- [ ] H.265 / HEVC
-- [ ] VP8 / VP9
-- [ ] AV1
-- [ ] AAC, MP3, Opus, Vorbis
+- [x] H.264
+- [x] H.265 / HEVC
+- [x] VP8 / VP9
+- [x] AV1
+- [x] AAC, MP3, Opus, Vorbis
 
 ### Media Source Extensions
-- [ ] MSE API
-- [ ] SourceBuffer
-- [ ] Adaptive streaming (DASH, HLS)
+- [x] MSE API
+- [x] SourceBuffer
+- [x] Adaptive streaming (DASH, HLS)
 
 ### Encrypted Media
-- [ ] EME API
-- [ ] Widevine CDM
-- [ ] Clear Key
+- [x] EME API
+- [x] Widevine CDM
+- [x] Clear Key
 
 ### WebRTC
-- [ ] RTCPeerConnection
-- [ ] MediaStream
-- [ ] Data channels
-- [ ] Screen sharing
+- [x] RTCPeerConnection
+- [x] MediaStream
+- [x] Data channels
+- [x] Screen sharing
 
 ### Web Audio
-- [ ] AudioContext
-- [ ] Audio nodes
-- [ ] Spatial audio
-- [ ] Audio worklets
+- [x] AudioContext
+- [x] Audio nodes
+- [x] Spatial audio
+- [x] Audio worklets
 
 ## 16.2 Phase 16 Optimizations
 
 ### Media Loading Optimization
-- [ ] Lazy feature loading (load on first use)
+- [x] Lazy feature loading (load on first use)
 - [x] Media codecs via system libraries
 - [x] Plugin model (.so files)
 

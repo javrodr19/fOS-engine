@@ -78,38 +78,38 @@
 - [x] JPEG
 - [x] GIF (animated)
 - [x] WebP
-- [ ] AVIF
-- [ ] SVG (via resvg)
-- [ ] ICO/favicon
+- [x] AVIF
+- [x] SVG (via resvg)
+- [x] ICO/favicon
 
 ### Image Rendering
 - [x] Image scaling (bilinear, bicubic)
 - [x] Aspect ratio handling
 - [x] object-fit, object-position
 - [x] Background images
-- [ ] Image sprites
+- [x] Image sprites
 - [x] Lazy loading (loading="lazy")
 
 ### Image Optimization
-- [ ] Progressive decoding
-- [ ] Memory-mapped loading
+- [x] Progressive decoding
+- [x] Memory-mapped loading
 - [x] Thumbnail caching
-- [ ] Responsive images (srcset)
+- [x] Responsive images (srcset)
 
 ## 9.2 Phase 9 Optimizations
 
 ### Bitmap Memory Optimization
-- [ ] RGB565 for opaque images (2 bytes/pixel vs 4)
-- [ ] Decode images to exact display size
-- [ ] Tile large images, load visible tiles only
-- [ ] Pool bitmap memory across images
-- [ ] Release offscreen bitmaps immediately
+- [x] RGB565 for opaque images (2 bytes/pixel vs 4)
+- [x] Decode images to exact display size
+- [x] Tile large images, load visible tiles only
+- [x] Pool bitmap memory across images
+- [x] Release offscreen bitmaps immediately
 
 ### Image Loading Optimization
-- [ ] Image decode on scroll (viewport-only)
-- [ ] Image decode priority queue (visible first)
-- [ ] Cancel offscreen decodes
-- [ ] Memory-bounded decode queue
+- [x] Image decode on scroll (viewport-only)
+- [x] Image decode priority queue (visible first)
+- [x] Cancel offscreen decodes
+- [x] Memory-bounded decode queue
 - [x] Content-addressable image cache
 
 ---
@@ -123,14 +123,14 @@
 - [x] outline
 - [x] overflow (scroll, hidden, auto)
 - [x] clip-path
-- [ ] mask
+- [x] mask
 
 ### Visual Effects
 - [x] opacity
 - [x] filter (blur, brightness, etc.)
 - [x] backdrop-filter
 - [x] mix-blend-mode
-- [ ] isolation
+- [x] isolation
 
 ### Transforms
 - [x] transform (rotate, scale, skew, translate)
@@ -144,68 +144,68 @@
 - [x] @keyframes
 - [x] animation properties
 - [x] Animation timing functions
-- [ ] Web Animations API
+- [x] Web Animations API
 
 ### Grid Layout
-- [ ] grid-template-columns/rows
-- [ ] grid-gap
-- [ ] grid-area
-- [ ] Implicit grid
-- [ ] Auto-placement
-- [ ] Subgrid
+- [x] grid-template-columns/rows
+- [x] grid-gap
+- [x] grid-area
+- [x] Implicit grid
+- [x] Auto-placement
+- [x] Subgrid
 
 ### Table Layout
-- [ ] table-layout
-- [ ] border-collapse
-- [ ] caption-side
-- [ ] Table cell spanning
+- [x] table-layout
+- [x] border-collapse
+- [x] caption-side
+- [x] Table cell spanning
 
 ### Multi-column
-- [ ] column-count
-- [ ] column-width
-- [ ] column-gap
-- [ ] column-rule
+- [x] column-count
+- [x] column-width
+- [x] column-gap
+- [x] column-rule
 
 ### Advanced Selectors
-- [ ] Attribute selectors ([attr^=], [attr$=])
-- [ ] Pseudo-elements (::before, ::after)
-- [ ] Pseudo-classes (:nth-child, :not, :is, :where)
-- [ ] :has() selector
-- [ ] Container queries
+- [x] Attribute selectors ([attr^=], [attr$=])
+- [x] Pseudo-elements (::before, ::after)
+- [x] Pseudo-classes (:nth-child, :not, :is, :where)
+- [x] :has() selector
+- [x] Container queries
 
 ### CSS Variables
-- [ ] Custom properties (--var)
-- [ ] var() function
-- [ ] calc()
-- [ ] min(), max(), clamp()
+- [x] Custom properties (--var)
+- [x] var() function
+- [x] calc()
+- [x] min(), max(), clamp()
 
 ## 10.2 Phase 10 Optimizations
 
 ### CSS Style Sharing (Servo-inspired)
-- [ ] Computed style cache (hash-based lookup)
-- [ ] Share style structs across identical elements
-- [ ] Inherit-only properties stored once per cascade level
-- [ ] Rule tree (share common selectors)
-- [ ] Bloom filter for selector matching
+- [x] Computed style cache (hash-based lookup)
+- [x] Share style structs across identical elements
+- [x] Inherit-only properties stored once per cascade level
+- [x] Rule tree (share common selectors)
+- [x] Bloom filter for selector matching
 
 ### Selector Optimization
-- [ ] Bloom filter for fast rejection
-- [ ] Hash selectors for O(1) lookup
-- [ ] Right-to-left matching optimization
-- [ ] Hybrid Interpreted/Compiled selectors
+- [x] Bloom filter for fast rejection
+- [x] Hash selectors for O(1) lookup
+- [x] Right-to-left matching optimization
+- [x] Hybrid Interpreted/Compiled selectors
 
 ### CSS Value Optimization
-- [ ] Bit-Packed CSS Values (4 bytes each)
-- [ ] CSS Property Presence Bitmask (64 bytes)
-- [ ] Interned color values (u8 index)
-- [ ] Sentinel values for optional numerics
+- [x] Bit-Packed CSS Values (4 bytes each)
+- [x] CSS Property Presence Bitmask (64 bytes)
+- [x] Interned color values (u8 index)
+- [x] Sentinel values for optional numerics
 
 ### Style Calculation Optimization
-- [ ] Deterministic style cache
-- [ ] On-demand style calculation (hidden elements)
-- [ ] Style inheritance snapshots
-- [ ] CSS Custom Property hoisting
-- [ ] Shared computed style objects
+- [x] Deterministic style cache
+- [x] On-demand style calculation (hidden elements)
+- [x] Style inheritance snapshots
+- [x] CSS Custom Property hoisting
+- [x] Shared computed style objects
 
 ---
 

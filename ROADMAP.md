@@ -750,21 +750,21 @@
 
 ### Delta Encoding
 - [x] Store style differences from parent
-- [ ] Layout deltas between frames
-- [ ] Incremental DOM updates
+- [x] Layout deltas between frames
+- [x] Incremental DOM updates
 
 ### Varint Encoding
 - [x] Variable-length integers for IDs
 - [x] Compact serialization
-- [ ] Smaller hibernation format
+- [x] Smaller hibernation format
 
 ## 21.5 Streaming/Incremental Processing
 
 ### Streaming Processing
-- [ ] Parse-as-you-receive (no buffering full document)
-- [ ] Incremental layout (dirty regions only)
-- [ ] Incremental style calculation
-- [ ] Progressive image rendering
+- [x] Parse-as-you-receive (no buffering full document)
+- [x] Incremental layout (dirty regions only)
+- [x] Incremental style calculation
+- [x] Progressive image rendering
 
 ---
 
@@ -834,8 +834,8 @@
 ### SIMD Acceleration
 - [x] SIMD for layout calculations
 - [x] SIMD for color blending
-- [ ] SIMD HTML tag detection
-- [ ] SIMD CSS tokenization
+- [x] SIMD HTML tag detection
+- [x] SIMD CSS tokenization
 - [x] Platform-specific intrinsics (AVX, NEON)
 
 ## 23.3 Layout Optimizations
@@ -846,8 +846,8 @@
 - [x] 50% memory vs f64
 
 ### Relative Coordinates
-- [ ] Store relative to parent
-- [ ] Only absolute at paint time
+- [x] Store relative to parent
+- [x] Only absolute at paint time
 
 ### Skip Invisible Content
 - [x] visibility: hidden → skip paint

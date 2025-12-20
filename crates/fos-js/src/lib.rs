@@ -9,6 +9,7 @@
 //! - DOM bindings (document.getElementById, createElement)
 //! - Storage APIs (localStorage, sessionStorage)
 //! - Navigation APIs (history, location)
+//! - Input events (keyboard, mouse, focus, clipboard)
 
 mod runtime;
 mod console;
@@ -20,12 +21,18 @@ pub mod location;
 pub mod worker;
 pub mod media;
 pub mod media_bindings;
+pub mod events;
 
 pub use runtime::JsRuntime;
 pub use timers::TimerManager;
 pub use storage::Storage;
 pub use history::HistoryManager;
 pub use location::LocationManager;
+pub use events::{
+    KeyboardEvent, Key, KeyModifiers, MouseEvent, MouseButton,
+    FocusEvent, FocusManager, ClipboardEvent, ClipboardData,
+    TouchEvent, Touch, DragEvent, DataTransfer,
+};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;

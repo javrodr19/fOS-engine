@@ -12,11 +12,40 @@ mod tree;
 mod document;
 mod interner;
 pub mod pool;
+pub mod forms;
+pub mod operations;
+pub mod element;
+pub mod classlist;
+pub mod dataset;
+pub mod geometry;
+pub mod observer;
+pub mod shadow;
+pub mod custom_elements;
+pub mod attributes;
+pub mod dom_events;
+pub mod css_scope;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
 pub use document::Document;
 pub use interner::{StringInterner, InternedString};
+pub use forms::{
+    FormControl, InputElement, InputType, InputValue, 
+    TextareaElement, SelectElement, OptionElement,
+    FormElement, FormData, ValidityState,
+    LabelElement, FieldsetElement, LegendElement,
+};
+pub use operations::{NodeOperations, DocumentFragment, DomError};
+pub use element::{SimpleSelector, NodeList, HTMLCollection};
+pub use classlist::DOMTokenList;
+pub use dataset::DOMStringMap;
+pub use geometry::{DOMRect, DOMRectList, ElementGeometry};
+pub use observer::{MutationObserver, IntersectionObserver, ResizeObserver};
+pub use shadow::{ShadowRoot, ShadowRootMode, Slot};
+pub use custom_elements::{CustomElementRegistry, CustomElementDefinition};
+pub use attributes::{NamedNodeMap, Attr};
+pub use dom_events::{DomEvent, DomEventType};
+pub use css_scope::{ScopedStyleSheet, ScopedRule};
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

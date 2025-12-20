@@ -15,6 +15,7 @@ members = [
     "crates/fos-a11y",
     "crates/fos-devtools",
     "crates/fos-engine",
+    "crates/fos-browser",
 ]
 
 [workspace.package]

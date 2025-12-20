@@ -1,0 +1,36 @@
+[package]
+name = "fos-browser"
+version = "0.1.0"
+edition = "2021"
+description = "Minimalist web browser using fOS Engine"
+license = "MIT"
+
+[dependencies]
+# Core engine
+fos-engine = { path = "../fos-engine" }
+
+# Window management (minimal)
+winit = "0.30"
+
+# CPU framebuffer (lightweight alternative to GPU)
+softbuffer = "0.4"
+
+# URL parsing
+url = "2.5"
+
+# HTTP client (blocking for simplicity)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Async runtime (lightweight)
+smol = "2.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+default = []
+
+[[bin]]
+name = "fos-browser"
+path = "src/main.rs"

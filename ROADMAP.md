@@ -521,24 +521,24 @@
 ## 17.1 Core Features
 
 ### Same-Origin Policy
-- [ ] Cross-origin restrictions
-- [ ] CORS handling
-- [ ] CSP enforcement
+- [x] Cross-origin restrictions
+- [x] CORS handling
+- [x] CSP enforcement
 
 ### Secure Contexts
-- [ ] HTTPS enforcement
-- [ ] Mixed content blocking
-- [ ] Certificate validation
+- [x] HTTPS enforcement
+- [x] Mixed content blocking
+- [x] Certificate validation
 
 ### Sandboxing
-- [ ] Process isolation
-- [ ] JS sandbox
-- [ ] iframe sandbox
+- [x] Process isolation
+- [x] JS sandbox
+- [x] iframe sandbox
 
 ### Privacy
-- [ ] Tracking protection
-- [ ] Cookie policies
-- [ ] Referrer policy
+- [x] Tracking protection
+- [x] Cookie policies
+- [x] Referrer policy
 
 ---
 
@@ -547,19 +547,19 @@
 ## 18.1 Core Features
 
 ### ARIA Support
-- [ ] ARIA roles
-- [ ] ARIA states/properties
-- [ ] Live regions
+- [x] ARIA roles
+- [x] ARIA states/properties
+- [x] Live regions
 
 ### Screen Reader Support
-- [ ] Accessibility tree
-- [ ] Text alternatives
-- [ ] Focus indicators
+- [x] Accessibility tree
+- [x] Text alternatives
+- [x] Focus indicators
 
 ### Keyboard Navigation
-- [ ] Tab order
-- [ ] Focus trapping
-- [ ] Skip links
+- [x] Tab order
+- [x] Focus trapping
+- [x] Skip links
 
 ---
 

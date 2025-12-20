@@ -47,6 +47,9 @@ pub mod visibility;
 // Phase 7: Compatibility Testing
 pub mod compat;
 
+// Phase 21: Advanced Memory Optimization
+pub mod advanced_mem;
+
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;

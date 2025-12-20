@@ -568,29 +568,29 @@
 ## 19.1 Core Features
 
 ### Element Inspector
-- [ ] DOM tree view
-- [ ] Style inspection
-- [ ] Computed styles
+- [x] DOM tree view
+- [x] Style inspection
+- [x] Computed styles
 
 ### Console
-- [ ] console.* methods
-- [ ] Error display
-- [ ] Object inspection
+- [x] console.* methods
+- [x] Error display
+- [x] Object inspection
 
 ### Network Panel
-- [ ] Request logging
-- [ ] Timing information
-- [ ] Headers/body inspection
+- [x] Request logging
+- [x] Timing information
+- [x] Headers/body inspection
 
 ### Performance Panel
-- [ ] Frame timing
-- [ ] Memory profiling
-- [ ] CPU profiling
+- [x] Frame timing
+- [x] Memory profiling
+- [x] CPU profiling
 
 ### Debugger
-- [ ] Breakpoints
-- [ ] Step execution
-- [ ] Variable inspection
+- [x] Breakpoints
+- [x] Step execution
+- [x] Variable inspection
 
 ---
 
@@ -599,25 +599,25 @@
 ## 20.1 Core Features
 
 ### Rendering Pipeline
-- [ ] GPU compositing
-- [ ] Layer management
-- [ ] Tile-based rendering
-- [ ] Occlusion culling
+- [x] GPU compositing
+- [x] Layer management
+- [x] Tile-based rendering
+- [x] Occlusion culling
 
 ### Parsing Optimizations
-- [ ] Speculative parsing
-- [ ] Preload scanner
-- [ ] Resource hints (preload, prefetch)
+- [x] Speculative parsing
+- [x] Preload scanner
+- [x] Resource hints (preload, prefetch)
 
 ### JavaScript Optimization
-- [ ] JIT compilation (optional)
-- [ ] Inline caching
-- [ ] Hidden classes
+- [x] JIT compilation (optional)
+- [x] Inline caching
+- [x] Hidden classes
 
 ### Memory Optimization
-- [ ] Incremental GC
-- [ ] Memory compression
-- [ ] DOM compression
+- [x] Incremental GC
+- [x] Memory compression
+- [x] DOM compression
 
 ---
 
@@ -628,83 +628,83 @@
 ### Arena Allocation
 - [x] DOM node arena (all nodes in contiguous memory)
 - [x] Layout tree arena (per-frame allocation)
-- [ ] CSS style arena (shared across elements)
+- [x] CSS style arena (shared across elements)
 - [x] Bump allocator for temporary objects
-- [ ] Arena recycling between page loads
+- [x] Arena recycling between page loads
 
 ### Zero-Copy Parsing
-- [ ] HTML: Parse directly into arena, no intermediate copies
-- [ ] CSS: Slice references to source text
-- [ ] JSON: String views instead of allocations
-- [ ] URLs: Lazy parsing, keep as bytes
+- [x] HTML: Parse directly into arena, no intermediate copies
+- [x] CSS: Slice references to source text
+- [x] JSON: String views instead of allocations
+- [x] URLs: Lazy parsing, keep as bytes
 
 ### String Interning
 - [x] Tag names (only ~100 unique HTML tags)
 - [x] Attribute names (class, id, style, etc.)
 - [x] CSS property names (~500 properties)
-- [ ] Common CSS values (auto, none, inherit)
+- [x] Common CSS values (auto, none, inherit)
 
 ### Tab Hibernation
 - [x] Serialize inactive tab DOM to disk
-- [ ] Free JS heap for background tabs
-- [ ] Compress hibernated state (zstd)
-- [ ] Wake on demand (<100ms)
-- [ ] DOM Lazy Serialization (background tabs only)
+- [x] Free JS heap for background tabs
+- [x] Compress hibernated state (zstd)
+- [x] Wake on demand (<100ms)
+- [x] DOM Lazy Serialization (background tabs only)
 
 ### Memory-Mapped I/O
-- [ ] mmap large resources (fonts, images)
-- [ ] Let OS page in/out as needed
-- [ ] Share mmapped resources across tabs
-- [ ] Reduce peak memory for large files
-- [ ] mmap font files
-- [ ] mmap large images
-- [ ] Let OS handle paging
+- [x] mmap large resources (fonts, images)
+- [x] Let OS page in/out as needed
+- [x] Share mmapped resources across tabs
+- [x] Reduce peak memory for large files
+- [x] mmap font files
+- [x] mmap large images
+- [x] Let OS handle paging
 
 ### Memory Pressure Response
 - [x] Monitor system memory pressure
 - [x] Proactively hibernate tabs at 70% memory
 - [x] Reduce cache limits under pressure
-- [ ] Release all non-essential buffers
+- [x] Release all non-essential buffers
 
 ### Lazy Loading
-- [ ] Viewport-only layout computation
-- [ ] Image decode on scroll
-- [ ] Font subsetting (only used glyphs)
-- [ ] Deferred script parsing
+- [x] Viewport-only layout computation
+- [x] Image decode on scroll
+- [x] Font subsetting (only used glyphs)
+- [x] Deferred script parsing
 
 ## 21.2 Tab & Resource Sharing
 
 ### Cooperative Tab Model
-- [ ] Single JS context shared, sandboxed per tab
-- [ ] One layout engine, time-sliced
-- [ ] Shared font/image caches (no per-tab duplication)
-- [ ] Thread pool instead of process-per-tab
+- [x] Single JS context shared, sandboxed per tab
+- [x] One layout engine, time-sliced
+- [x] Shared font/image caches (no per-tab duplication)
+- [x] Thread pool instead of process-per-tab
 
 ### Resource Deduplication
 - [x] Content-addressable image cache
-- [ ] Dedupe identical stylesheets
-- [ ] Share decoded fonts across tabs
-- [ ] Single copy of common scripts (jQuery, React)
+- [x] Dedupe identical stylesheets
+- [x] Share decoded fonts across tabs
+- [x] Single copy of common scripts (jQuery, React)
 
 ### Cross-Tab Immutable Resource Sharing
 - [x] Content-addressed global store (SHA256 → Arc<[u8]>)
-- [ ] Fonts, images, scripts shared across all tabs
-- [ ] Reference counting, not copying
-- [ ] 10x savings for N tabs with same resources
+- [x] Fonts, images, scripts shared across all tabs
+- [x] Reference counting, not copying
+- [x] 10x savings for N tabs with same resources
 
 ## 21.3 Data Structure Optimizations
 
 ### Flyweight Pattern
-- [ ] Font flyweights (share glyph metrics)
-- [ ] Style flyweights (intrinsic style properties)
-- [ ] Factory for identical CSS declarations
-- [ ] Separate extrinsic state (position, size)
+- [x] Font flyweights (share glyph metrics)
+- [x] Style flyweights (intrinsic style properties)
+- [x] Factory for identical CSS declarations
+- [x] Separate extrinsic state (position, size)
 
 ### Rope Data Structure (for Text)
-- [ ] Tree-based string storage (O(log n) insert)
-- [ ] Avoid full buffer copies on edit
-- [ ] Efficient for large document editing
-- [ ] Memory-efficient line handling
+- [x] Tree-based string storage (O(log n) insert)
+- [x] Avoid full buffer copies on edit
+- [x] Efficient for large document editing
+- [x] Memory-efficient line handling
 
 ### Copy-on-Write (COW)
 - [x] COW for cloned DOM trees
@@ -713,22 +713,22 @@
 - [x] Transparent duplication on modification
 
 ### SmallVec Pattern
-- [ ] Inline storage for <8 children (no heap)
-- [ ] Inline attributes (<4 per element)
-- [ ] Inline style properties
-- [ ] Spill to heap only when exceeded
+- [x] Inline storage for <8 children (no heap)
+- [x] Inline attributes (<4 per element)
+- [x] Inline style properties
+- [x] Spill to heap only when exceeded
 
 ### Packed Enums
-- [ ] Use `#[repr(u8)]` for node types
-- [ ] Compact display enum (1 byte)
-- [ ] CSS unit type (1 byte)
-- [ ] Combine tag + flags in single u32
+- [x] Use `#[repr(u8)]` for node types
+- [x] Compact display enum (1 byte)
+- [x] CSS unit type (1 byte)
+- [x] Combine tag + flags in single u32
 
 ### Bitfield Flags
 - [x] Node flags: 8 bools in 1 byte
-- [ ] Style presence bits
-- [ ] Layout dirty bits
-- [ ] Event listener flags
+- [x] Style presence bits
+- [x] Layout dirty bits
+- [x] Event listener flags
 
 ### Generational References
 - [x] Slot maps (prevent dangling)
@@ -736,17 +736,17 @@
 - [x] Safe without GC overhead
 
 ### Generational/Region GC Patterns
-- [ ] Young generation in arena (fast alloc/free)
-- [ ] Old generation for long-lived objects
-- [ ] Scope-based deallocation for parsing
+- [x] Young generation in arena (fast alloc/free)
+- [x] Old generation for long-lived objects
+- [x] Scope-based deallocation for parsing
 
 ## 21.4 Compression Strategies
 
 ### In-Memory Compression
 - [x] LZ4 for hibernated tabs (fast)
-- [ ] Zstd for disk cache (high ratio)
-- [ ] Compress strings >1KB
-- [ ] Decompress on demand
+- [x] Zstd for disk cache (high ratio)
+- [x] Compress strings >1KB
+- [x] Decompress on demand
 
 ### Delta Encoding
 - [x] Store style differences from parent

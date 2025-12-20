@@ -20,11 +20,19 @@ mod engine;
 mod page;
 mod config;
 pub mod memory;
+pub mod arena;
+pub mod intern;
+pub mod cow;
+pub mod compress;
 
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;
 pub use memory::{MemoryManager, MemoryStats, PressureLevel};
+pub use arena::{BumpAllocator, Arena, GenArena, GenIndex};
+pub use intern::{StringInterner, InternedString, TagInterner};
+pub use cow::{Cow, CowBuffer, CowString};
+pub use compress::{Lz4Compressor, DeltaEncoder, Varint};
 
 // Re-export sub-crates for advanced usage
 pub use fos_html as html;

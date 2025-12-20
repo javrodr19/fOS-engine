@@ -7,16 +7,19 @@
 //! - Element inspector
 //! - Network panel
 //! - JavaScript debugger
+//! - Performance profiling
 
 pub mod console;
 pub mod inspector;
 pub mod network;
 pub mod debugger;
+pub mod performance;
 
 pub use console::{Console, ConsoleMessage, ConsoleValue, LogLevel};
 pub use inspector::{Inspector, InspectedNode, NodeType};
 pub use network::{NetworkPanel, NetworkRequest, NetworkResponse};
 pub use debugger::{Debugger, Breakpoint, CallFrame, DebuggerState};
+pub use performance::{PerformancePanel, FrameTimingInfo, MemoryInfo};
 
 /// DevTools error
 #[derive(Debug, thiserror::Error)]

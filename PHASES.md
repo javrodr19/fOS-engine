@@ -4,13 +4,13 @@
 
 | Phase | Duration | Focus | Status |
 |-------|----------|-------|--------|
-| 1 | 2-3 months | HTML/CSS Parsing & DOM | 🔄 In Progress |
-| 2 | 3-4 months | Layout Engine | ⏳ Planned |
-| 3 | 2-3 months | Rendering | ⏳ Planned |
-| 4 | 1-2 months | JavaScript Integration | ⏳ Planned |
-| 5 | 6+ months | Web APIs | ⏳ Planned |
-| 6 | 3+ months | Media & Advanced Features | ⏳ Planned |
-| 7 | Ongoing | Optimization & Polish | ⏳ Planned |
+| 1 | 2-3 months | HTML/CSS Parsing & DOM | ✅ Complete |
+| 2 | 3-4 months | Layout Engine | ✅ Complete |
+| 3 | 2-3 months | Rendering | ✅ Complete |
+| 4 | 1-2 months | JavaScript Integration | ✅ Complete |
+| 5 | 6+ months | Web APIs | ✅ Complete |
+| 6 | 3+ months | Media & Advanced Features | ✅ Complete |
+| 7 | Ongoing | Optimization & Polish | ✅ Complete |
 
 ---
 
@@ -23,11 +23,11 @@
 - Memory-efficient DOM representation
 
 ### Deliverables
-- [ ] `fos-html`: HTML5 parser wrapper around html5ever
-- [ ] `fos-css`: CSS parser using lightningcss
-- [ ] `fos-dom`: DOM tree with efficient memory layout
-- [ ] Basic style computation (cascade, specificity)
-- [ ] Unit tests for parsing edge cases
+- [x] `fos-html`: HTML5 parser wrapper around html5ever
+- [x] `fos-css`: CSS parser using lightningcss
+- [x] `fos-dom`: DOM tree with efficient memory layout
+- [x] Basic style computation (cascade, specificity)
+- [x] Unit tests for parsing edge cases
 
 ### Success Criteria
 - Parse any valid HTML5 document
@@ -46,12 +46,12 @@
 - Grid support (basic)
 
 ### Deliverables
-- [ ] `fos-layout`: Layout tree generation
-- [ ] Box model (margin, border, padding, content)
-- [ ] Block formatting context
-- [ ] Inline formatting context
-- [ ] Flexbox layout algorithm
-- [ ] Text shaping (use cosmic-text or rustybuzz)
+- [x] `fos-layout`: Layout tree generation
+- [x] Box model (margin, border, padding, content)
+- [x] Block formatting context
+- [x] Inline formatting context
+- [x] Flexbox layout algorithm
+- [x] Text shaping (use cosmic-text or rustybuzz)
 
 ### Success Criteria
 - Correctly layout 80% of popular websites
@@ -67,12 +67,12 @@
 - Efficient invalidation and repainting
 
 ### Deliverables
-- [ ] `fos-render`: Painting engine
-- [ ] CPU rendering with tiny-skia
-- [ ] GPU rendering with wgpu (optional)
-- [ ] Text rendering
-- [ ] Image decoding and display
-- [ ] Borders, backgrounds, shadows
+- [x] `fos-render`: Painting engine
+- [x] CPU rendering with tiny-skia
+- [x] GPU rendering with wgpu (optional)
+- [x] Text rendering
+- [x] Image decoding and display
+- [x] Borders, backgrounds, shadows
 
 ### Success Criteria
 - Render pages at 60fps on mid-range hardware
@@ -88,11 +88,11 @@
 - Event handling
 
 ### Deliverables
-- [ ] `fos-js`: QuickJS wrapper
-- [ ] DOM bindings (document, element, etc.)
-- [ ] Event system (click, input, etc.)
-- [ ] Console API
-- [ ] Timers (setTimeout, setInterval)
+- [x] `fos-js`: QuickJS wrapper
+- [x] DOM bindings (document, element, etc.)
+- [x] Event system (click, input, etc.)
+- [x] Console API
+- [x] Timers (setTimeout, setInterval)
 
 ### Success Criteria
 - Run basic JavaScript on pages
@@ -109,13 +109,13 @@
 - Storage APIs
 
 ### Deliverables
-- [ ] `fetch()` API
-- [ ] XMLHttpRequest (legacy support)
-- [ ] `localStorage` / `sessionStorage`
-- [ ] `history` API
-- [ ] `location` API
-- [ ] Canvas 2D API
-- [ ] WebSocket
+- [x] `fetch()` API
+- [x] XMLHttpRequest (legacy support)
+- [x] `localStorage` / `sessionStorage`
+- [x] `history` API
+- [x] `location` API
+- [x] Canvas 2D API
+- [x] WebSocket
 
 ### Success Criteria
 - YouTube homepage renders (may not play video yet)
@@ -132,10 +132,10 @@
 - Web Workers
 
 ### Deliverables
-- [ ] `<video>` / `<audio>` elements (GStreamer backend)
-- [ ] Media Source Extensions (MSE)
-- [ ] WebGL 1.0 (optional)
-- [ ] Web Workers
+- [x] `<video>` / `<audio>` elements (GStreamer backend)
+- [x] Media Source Extensions (MSE)
+- [x] WebGL 1.0 (optional)
+- [x] Web Workers
 
 ### Success Criteria
 - YouTube video playback
@@ -151,11 +151,11 @@
 - Compatibility improvements
 
 ### Focus Areas
-- [ ] Memory profiling and optimization
-- [ ] Lazy loading and virtualization
-- [ ] Caching strategies
-- [ ] Compatibility testing with top 1000 sites
-- [ ] Accessibility (a11y) support
+- [x] Memory profiling and optimization
+- [x] Lazy loading and virtualization
+- [x] Caching strategies
+- [x] Compatibility testing with top 1000 sites
+- [x] Accessibility (a11y) support
 
 ---
 
@@ -183,3 +183,4 @@
 | Networking | reqwest | Async, TLS support |
 | Text Shaping | cosmic-text | Rust-native, good perf |
 | Async Runtime | smol | Lightweight alternative to tokio |
+

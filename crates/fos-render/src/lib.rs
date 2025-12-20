@@ -1,6 +1,7 @@
 //! fOS Render - Painting Engine
 //!
 //! CPU rendering of layout trees using tiny-skia.
+//! Optional GPU rendering with wgpu.
 //!
 //! This crate provides:
 //! - Canvas backed by tiny-skia Pixmap
@@ -14,6 +15,7 @@
 //! - CSS animations (transitions, keyframes)
 //! - CSS filters (blur, brightness, contrast, etc.)
 //! - GPU compositing and layer management
+//! - GPU rendering with wgpu (optional)
 
 mod canvas;
 mod paint;
@@ -29,6 +31,7 @@ pub mod animation;
 pub mod filters;
 pub mod compositor;
 pub mod layers;
+pub mod gpu;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};
@@ -49,6 +52,7 @@ pub use animation::{
     AnimatedValue, AnimationInstance, AnimationDirection, FillMode
 };
 pub use filters::{FilterFunction, FilterList, BlendMode, apply_filters};
+pub use gpu::{GpuRenderer, GpuConfig, GpuState, GpuBackend, RenderFrame, TextureId, GpuError};
 
 /// Color (RGBA)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

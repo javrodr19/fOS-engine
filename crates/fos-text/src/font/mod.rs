@@ -3,10 +3,16 @@
 mod database;
 mod face;
 mod matching;
+pub mod variable;
+pub mod emoji;
+pub mod optimization;
 
 pub use database::FontDatabase;
 pub use face::FontFace;
 pub use matching::FontQuery;
+pub use variable::{FontAxis, VariableFont, VariableFontInstance, NamedInstance, axis_tags};
+pub use emoji::{EmojiRenderer, ColorGlyph, ColorFontFormat, is_emoji};
+pub use optimization::{FontSubsetter, GlyphStreamer, SharedFontCache, MmapFont, GlyphMetricsCache};
 
 /// Unique identifier for a loaded font
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

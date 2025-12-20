@@ -2,9 +2,11 @@
 
 mod line;
 mod paragraph;
+pub mod vertical;
 
 pub use line::LineBreaker;
 pub use paragraph::ParagraphLayout;
+pub use vertical::{WritingMode, Direction, TextOrientation, GlyphRotation, VerticalTextContext};
 
 /// Text alignment
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

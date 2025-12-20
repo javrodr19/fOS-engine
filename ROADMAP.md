@@ -37,35 +37,35 @@
 - [x] Unicode BiDi algorithm
 - [x] Script detection
 - [x] Ligatures and kerning
-- [ ] Variable fonts
+- [x] Variable fonts
 
 ### Text Layout
 - [x] Line breaking (UAX #14)
 - [x] Word wrapping
 - [x] Text-align (left, right, center, justify)
-- [ ] Vertical text (writing-mode)
+- [x] Vertical text (writing-mode)
 - [x] Ruby annotations
 
 ### Text Rendering
 - [x] Glyph rasterization
-- [ ] Subpixel antialiasing
-- [ ] Font hinting
-- [ ] Emoji support (color fonts)
-- [ ] Text decorations (underline, strikethrough)
+- [x] Subpixel antialiasing
+- [x] Font hinting
+- [x] Emoji support (color fonts)
+- [x] Text decorations (underline, strikethrough)
 
 ## 8.2 Phase 8 Optimizations
 
 ### Font Memory Optimization
-- [ ] Font subsetting (only used glyphs)
-- [ ] Font glyph streaming (load on demand)
-- [ ] Shared font cache across tabs
-- [ ] mmap font files (OS paging)
+- [x] Font subsetting (only used glyphs)
+- [x] Font glyph streaming (load on demand)
+- [x] Shared font cache across tabs
+- [x] mmap font files (OS paging)
 
 ### Text Rendering Optimization
 - [x] Pre-rendered glyph atlas (common ASCII)
 - [x] Text run caching (same font+text → same glyphs)
-- [ ] Flyweight for glyph metrics
-- [ ] 80% shaping time savings
+- [x] Flyweight for glyph metrics
+- [x] 80% shaping time savings
 
 ---
 

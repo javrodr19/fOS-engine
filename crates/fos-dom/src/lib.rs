@@ -25,6 +25,9 @@ pub mod attributes;
 pub mod dom_events;
 pub mod css_scope;
 pub mod event_opt;
+pub mod compact_node;
+pub mod query_cache;
+pub mod autonomous_elements;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
@@ -50,6 +53,9 @@ pub use attributes::{NamedNodeMap, Attr};
 pub use dom_events::{DomEvent, DomEventType};
 pub use css_scope::{ScopedStyleSheet, ScopedRule};
 pub use event_opt::{CoalescedEventManager, EventType, EventListener, DelegatedHandler, EventThrottler};
+pub use compact_node::{CompactNode, CompactNodeId, NodeFlags, SmallChildren, ElementNameId, DomGeneration};
+pub use query_cache::{QueryCache, DomNormalizer, AttributeDeduplicator, BorrowedStr};
+pub use autonomous_elements::{AutonomousElement, CustomizedBuiltIn, EnhancedCustomElementRegistry, ElementInternals};
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

@@ -254,7 +254,7 @@
 - [x] appendChild, removeChild, insertBefore
 - [x] cloneNode
 - [x] replaceChild
-- [ ] normalize
+- [x] normalize
 - [x] DocumentFragment
 
 ### Element API
@@ -287,34 +287,34 @@
 ### Custom Elements
 - [x] customElements.define
 - [x] Lifecycle callbacks
-- [ ] Autonomous elements
-- [ ] Customized built-in elements
+- [x] Autonomous elements
+- [x] Customized built-in elements
 
 ## 12.2 Phase 12 Optimizations
 
 ### Compact DOM Representation
-- [ ] Node struct: 32 bytes max (vs typical 100+)
-- [ ] Inline small text (<24 bytes in node)
-- [ ] Attribute storage: 2 inline, overflow to arena
-- [ ] Child pointers: single linked list (save 8 bytes)
-- [ ] Element names: u16 ID (not String)
+- [x] Node struct: 32 bytes max (vs typical 100+)
+- [x] Inline small text (<24 bytes in node)
+- [x] Attribute storage: 2 inline, overflow to arena
+- [x] Child pointers: single linked list (save 8 bytes)
+- [x] Element names: u16 ID (not String)
 
 ### DOM Data Structure Optimizations
 - [x] Arena allocation (all nodes contiguous)
-- [ ] ECS-Style data layout
-- [ ] SmallVec for children (<8 inline)
-- [ ] Packed enums (#[repr(u8)])
-- [ ] Bitfield flags (8 bools in 1 byte)
+- [x] ECS-Style data layout
+- [x] SmallVec for children (<8 inline)
+- [x] Packed enums (#[repr(u8)])
+- [x] Bitfield flags (8 bools in 1 byte)
 
 ### DOM Query Optimization
-- [ ] Selector-result memoization
-- [ ] DOM generation IDs (O(1) validation)
-- [ ] Deduplicated attribute storage
+- [x] Selector-result memoization
+- [x] DOM generation IDs (O(1) validation)
+- [x] Deduplicated attribute storage
 
 ### String Optimization
 - [x] String interning (tag names, attributes)
-- [ ] Borrowed DOM strings (zero-alloc parsing)
-- [ ] Zero-copy parsing into arena
+- [x] Borrowed DOM strings (zero-alloc parsing)
+- [x] Zero-copy parsing into arena
 
 ---
 

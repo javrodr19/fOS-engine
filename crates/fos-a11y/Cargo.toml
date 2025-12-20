@@ -1,0 +1,10 @@
+[package]
+name = "fos-a11y"
+version = "0.1.0"
+edition = "2021"
+description = "Accessibility APIs for fOS browser engine"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]

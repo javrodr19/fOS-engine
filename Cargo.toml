@@ -12,6 +12,7 @@ members = [
     "crates/fos-canvas",
     "crates/fos-media",
     "crates/fos-security",
+    "crates/fos-a11y",
     "crates/fos-engine",
 ]
 

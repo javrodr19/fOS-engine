@@ -327,7 +327,7 @@
 - [x] Optional chaining (?.)
 - [x] Nullish coalescing (??)
 - [x] Private class fields
-- [ ] Top-level await
+- [x] Top-level await
 - [x] BigInt
 - [x] WeakRef
 
@@ -337,35 +337,35 @@
 - [x] Symbol
 - [x] Proxy, Reflect
 - [x] SharedArrayBuffer
-- [ ] Atomics
+- [x] Atomics
 
 ### Web APIs in JS
 - [x] URL, URLSearchParams
-- [ ] FormData
+- [x] FormData
 - [x] AbortController
 - [x] TextEncoder/TextDecoder
 - [x] Blob, File
-- [ ] FileReader
+- [x] FileReader
 
 ## 13.2 Phase 13 Optimizations
 
 ### JavaScript Heap Optimization
 - [x] Limit heap per context (configurable, default 64MB)
-- [ ] Compress idle context heap
-- [ ] Share builtins across contexts
-- [ ] Immediate GC on tab hide
+- [x] Compress idle context heap
+- [x] Share builtins across contexts
+- [x] Immediate GC on tab hide
 
 ### JS Execution Optimization
-- [ ] Lazy function compilation
-- [ ] Dead code elimination
-- [ ] Constant folding
-- [ ] Escape analysis (stack-allocate non-escaping)
-- [ ] JIT-less mode (smaller binary)
-- [ ] Bytecode caching
+- [x] Lazy function compilation
+- [x] Dead code elimination
+- [x] Constant folding
+- [x] Escape analysis (stack-allocate non-escaping)
+- [x] JIT-less mode (smaller binary)
+- [x] Bytecode caching
 
 ### JS Binding Optimization
-- [ ] Lazy JavaScript binding (bind on access)
-- [ ] 80% binding memory savings
+- [x] Lazy JavaScript binding (bind on access)
+- [x] 80% binding memory savings
 
 ---
 

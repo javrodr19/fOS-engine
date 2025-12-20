@@ -27,6 +27,7 @@ pub mod events;
 pub mod builtins;
 pub mod webapi;
 pub mod idb;
+pub mod js_optimizations;
 
 pub use runtime::JsRuntime;
 pub use timers::TimerManager;
@@ -38,9 +39,10 @@ pub use events::{
     FocusEvent, FocusManager, ClipboardEvent, ClipboardData,
     TouchEvent, Touch, DragEvent, DataTransfer,
 };
-pub use builtins::{JsPromise, PromiseState, JsMap, JsSet, JsSymbol, JsProxy, JsBigInt, JsWeakRef, SharedArrayBuffer};
-pub use webapi::{JsUrl, JsUrlSearchParams, TextEncoder, TextDecoder, Blob, File, AbortController, Geolocation, Notification, Permissions};
+pub use builtins::{JsPromise, PromiseState, JsMap, JsSet, JsSymbol, JsProxy, JsBigInt, JsWeakRef, SharedArrayBuffer, AsyncModule, TlaModuleGraph};
+pub use webapi::{JsUrl, JsUrlSearchParams, TextEncoder, TextDecoder, Blob, File, AbortController, Geolocation, Notification, Permissions, FormData, FileReader};
 pub use idb::{IDBFactory, IDBDatabase, CacheStorage, CookieStore};
+pub use js_optimizations::{LazyCompiler, ConstantFolder, EscapeAnalyzer, BytecodeCache, HeapCompressor, SharedBuiltins};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;

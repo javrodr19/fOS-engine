@@ -227,22 +227,22 @@
 - [x] Mouse events
 - [x] Touch events
 - [x] Focus management
-- [ ] Selection API
+- [x] Selection API
 - [x] Clipboard API
 - [x] Drag and drop
 
 ### Form Validation
 - [x] HTML5 validation attributes
 - [x] Constraint Validation API
-- [ ] Custom validity
-- [ ] :valid, :invalid pseudo-classes
+- [x] Custom validity
+- [x] :valid, :invalid pseudo-classes
 
 ## 11.2 Phase 11 Optimizations
 
 ### Event Optimization
-- [ ] Event listener coalescing (1 handler per type)
-- [ ] Event handler deduplication
-- [ ] Lazy event binding
+- [x] Event listener coalescing (1 handler per type)
+- [x] Event handler deduplication
+- [x] Lazy event binding
 
 ---
 

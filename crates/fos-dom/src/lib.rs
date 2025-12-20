@@ -24,6 +24,7 @@ pub mod custom_elements;
 pub mod attributes;
 pub mod dom_events;
 pub mod css_scope;
+pub mod event_opt;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
@@ -34,6 +35,8 @@ pub use forms::{
     TextareaElement, SelectElement, OptionElement,
     FormElement, FormData, ValidityState,
     LabelElement, FieldsetElement, LegendElement,
+    Selection, Range, InputSelection, SelectionDirection,
+    ValidatedFormControl, ValidationConstraints, ValidationPseudoClass,
 };
 pub use operations::{NodeOperations, DocumentFragment, DomError};
 pub use element::{SimpleSelector, NodeList, HTMLCollection};
@@ -46,6 +49,7 @@ pub use custom_elements::{CustomElementRegistry, CustomElementDefinition};
 pub use attributes::{NamedNodeMap, Attr};
 pub use dom_events::{DomEvent, DomEventType};
 pub use css_scope::{ScopedStyleSheet, ScopedRule};
+pub use event_opt::{CoalescedEventManager, EventType, EventListener, DelegatedHandler, EventThrottler};
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

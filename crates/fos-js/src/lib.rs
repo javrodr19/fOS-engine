@@ -10,6 +10,8 @@
 //! - Storage APIs (localStorage, sessionStorage)
 //! - Navigation APIs (history, location)
 //! - Input events (keyboard, mouse, focus, clipboard)
+//! - Built-in objects (Promise, Map, Set, Symbol, Proxy)
+//! - Web APIs (URL, Blob, TextEncoder, AbortController)
 
 mod runtime;
 mod console;
@@ -22,6 +24,8 @@ pub mod worker;
 pub mod media;
 pub mod media_bindings;
 pub mod events;
+pub mod builtins;
+pub mod webapi;
 
 pub use runtime::JsRuntime;
 pub use timers::TimerManager;
@@ -33,6 +37,8 @@ pub use events::{
     FocusEvent, FocusManager, ClipboardEvent, ClipboardData,
     TouchEvent, Touch, DragEvent, DataTransfer,
 };
+pub use builtins::{JsPromise, PromiseState, JsMap, JsSet, JsSymbol, JsProxy, JsBigInt, JsWeakRef, SharedArrayBuffer};
+pub use webapi::{JsUrl, JsUrlSearchParams, TextEncoder, TextDecoder, Blob, File, AbortController};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;

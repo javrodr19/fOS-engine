@@ -19,10 +19,12 @@
 mod engine;
 mod page;
 mod config;
+pub mod memory;
 
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;
+pub use memory::{MemoryManager, MemoryStats, PressureLevel};
 
 // Re-export sub-crates for advanced usage
 pub use fos_html as html;

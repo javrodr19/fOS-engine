@@ -13,6 +13,7 @@
 //! - CSS transforms (rotate, scale, skew, translate)
 //! - CSS animations (transitions, keyframes)
 //! - CSS filters (blur, brightness, contrast, etc.)
+//! - GPU compositing and layer management
 
 mod canvas;
 mod paint;
@@ -26,6 +27,8 @@ pub mod effects;
 pub mod transform;
 pub mod animation;
 pub mod filters;
+pub mod compositor;
+pub mod layers;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};

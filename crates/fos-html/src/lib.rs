@@ -4,6 +4,7 @@
 //! Parses HTML and converts to our memory-efficient DOM tree.
 
 mod parser;
+pub mod preload;
 
 pub use parser::HtmlParser;
 pub use fos_dom::{Document, DomTree, Node, NodeId};

@@ -37,6 +37,13 @@ pub mod compress;
 pub mod cold;
 pub mod plugin;
 
+// Phase 23: Low-Level Optimizations
+pub mod packed;
+pub mod alloc;
+pub mod simd;
+pub mod fixed_point;
+pub mod visibility;
+
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;
@@ -49,6 +56,14 @@ pub use cold::{cold_path, format_error, cold_panic, cold_unreachable, debug_chec
 pub use cold::{StaticError, DynDispatch, DynWrapper};
 pub use cold::errors as static_errors;
 pub use plugin::{Plugin, PluginInfo, PluginCapabilities, PluginError, PluginLoader};
+
+// Phase 23 exports
+pub use packed::{CacheAligned, Packed, CompactPair, CACHE_LINE_SIZE};
+pub use packed::sentinel;
+pub use alloc::{SlabAllocator, PoolAllocator, TypedPool, AllocStats};
+pub use simd::{SimdLevel, Color4, Bounds, blend_color, lerp_f32, lerp_f32x4};
+pub use fixed_point::{Fixed16, Fixed8, FixedRect};
+pub use visibility::{VisibilityState, Viewport, ElementVisibility, CullingContext};
 
 // Re-export core sub-crates (always included)
 pub use fos_html as html;

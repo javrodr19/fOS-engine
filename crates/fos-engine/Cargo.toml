@@ -19,6 +19,9 @@ devtools = ["dep:fos-devtools"]
 accessibility = ["dep:fos-a11y"]
 # Enable dynamic plugin loading (requires libloading)
 dynamic-plugins = []
+# Phase 23: Low-Level Optimizations
+mimalloc = ["dep:mimalloc"]
+simd = []
 
 [dependencies]
 # Core crates (always included)
@@ -35,6 +38,9 @@ fos-canvas = { path = "../fos-canvas", optional = true }
 fos-media = { path = "../fos-media", optional = true }
 fos-devtools = { path = "../fos-devtools", optional = true }
 fos-a11y = { path = "../fos-a11y", optional = true }
+
+# Phase 23: Optional allocator
+mimalloc = { version = "0.1", optional = true }
 
 # Common deps
 tracing.workspace = true

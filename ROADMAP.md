@@ -26,28 +26,28 @@
 ## 8.1 Core Features
 
 ### Font Loading
-- [ ] Font file parsing (TTF, OTF, WOFF, WOFF2)
-- [ ] System font enumeration
-- [ ] @font-face CSS rule
-- [ ] Font matching algorithm
-- [ ] Font fallback chains
+- [x] Font file parsing (TTF, OTF, WOFF, WOFF2)
+- [x] System font enumeration
+- [x] @font-face CSS rule
+- [x] Font matching algorithm
+- [x] Font fallback chains
 
 ### Text Shaping
-- [ ] Integrate rustybuzz (HarfBuzz port)
-- [ ] Unicode BiDi algorithm
-- [ ] Script detection
-- [ ] Ligatures and kerning
+- [x] Integrate rustybuzz (HarfBuzz port)
+- [x] Unicode BiDi algorithm
+- [x] Script detection
+- [x] Ligatures and kerning
 - [ ] Variable fonts
 
 ### Text Layout
-- [ ] Line breaking (UAX #14)
-- [ ] Word wrapping
-- [ ] Text-align (left, right, center, justify)
+- [x] Line breaking (UAX #14)
+- [x] Word wrapping
+- [x] Text-align (left, right, center, justify)
 - [ ] Vertical text (writing-mode)
-- [ ] Ruby annotations
+- [x] Ruby annotations
 
 ### Text Rendering
-- [ ] Glyph rasterization
+- [x] Glyph rasterization
 - [ ] Subpixel antialiasing
 - [ ] Font hinting
 - [ ] Emoji support (color fonts)
@@ -62,8 +62,8 @@
 - [ ] mmap font files (OS paging)
 
 ### Text Rendering Optimization
-- [ ] Pre-rendered glyph atlas (common ASCII)
-- [ ] Text run caching (same font+text → same glyphs)
+- [x] Pre-rendered glyph atlas (common ASCII)
+- [x] Text run caching (same font+text → same glyphs)
 - [ ] Flyweight for glyph metrics
 - [ ] 80% shaping time savings
 
@@ -74,26 +74,26 @@
 ## 9.1 Core Features
 
 ### Image Decoding
-- [ ] PNG (via image crate)
-- [ ] JPEG
-- [ ] GIF (animated)
-- [ ] WebP
+- [x] PNG (via image crate)
+- [x] JPEG
+- [x] GIF (animated)
+- [x] WebP
 - [ ] AVIF
 - [ ] SVG (via resvg)
 - [ ] ICO/favicon
 
 ### Image Rendering
-- [ ] Image scaling (bilinear, bicubic)
-- [ ] Aspect ratio handling
-- [ ] object-fit, object-position
-- [ ] Background images
+- [x] Image scaling (bilinear, bicubic)
+- [x] Aspect ratio handling
+- [x] object-fit, object-position
+- [x] Background images
 - [ ] Image sprites
-- [ ] Lazy loading (loading="lazy")
+- [x] Lazy loading (loading="lazy")
 
 ### Image Optimization
 - [ ] Progressive decoding
 - [ ] Memory-mapped loading
-- [ ] Thumbnail caching
+- [x] Thumbnail caching
 - [ ] Responsive images (srcset)
 
 ## 9.2 Phase 9 Optimizations
@@ -110,7 +110,7 @@
 - [ ] Image decode priority queue (visible first)
 - [ ] Cancel offscreen decodes
 - [ ] Memory-bounded decode queue
-- [ ] Content-addressable image cache
+- [x] Content-addressable image cache
 
 ---
 
@@ -119,31 +119,31 @@
 ## 10.1 Core Features
 
 ### Box Model Extensions
-- [ ] box-shadow
-- [ ] outline
-- [ ] overflow (scroll, hidden, auto)
-- [ ] clip-path
+- [x] box-shadow
+- [x] outline
+- [x] overflow (scroll, hidden, auto)
+- [x] clip-path
 - [ ] mask
 
 ### Visual Effects
-- [ ] opacity
-- [ ] filter (blur, brightness, etc.)
-- [ ] backdrop-filter
-- [ ] mix-blend-mode
+- [x] opacity
+- [x] filter (blur, brightness, etc.)
+- [x] backdrop-filter
+- [x] mix-blend-mode
 - [ ] isolation
 
 ### Transforms
-- [ ] transform (rotate, scale, skew, translate)
-- [ ] transform-origin
-- [ ] perspective
-- [ ] 3D transforms
-- [ ] backface-visibility
+- [x] transform (rotate, scale, skew, translate)
+- [x] transform-origin
+- [x] perspective
+- [x] 3D transforms
+- [x] backface-visibility
 
 ### Animations
-- [ ] transition
-- [ ] @keyframes
-- [ ] animation properties
-- [ ] Animation timing functions
+- [x] transition
+- [x] @keyframes
+- [x] animation properties
+- [x] Animation timing functions
 - [ ] Web Animations API
 
 ### Grid Layout
@@ -214,26 +214,26 @@
 ## 11.1 Core Features
 
 ### Form Elements
-- [ ] `<input>` (all types: text, password, email, number, date, etc.)
-- [ ] `<textarea>`
-- [ ] `<select>`, `<option>`
-- [ ] `<button>`
-- [ ] `<form>`
-- [ ] `<label>`
-- [ ] `<fieldset>`, `<legend>`
+- [x] `<input>` (all types: text, password, email, number, date, etc.)
+- [x] `<textarea>`
+- [x] `<select>`, `<option>`
+- [x] `<button>`
+- [x] `<form>`
+- [x] `<label>`
+- [x] `<fieldset>`, `<legend>`
 
 ### Input Handling
-- [ ] Keyboard events
-- [ ] Mouse events
-- [ ] Touch events
-- [ ] Focus management
+- [x] Keyboard events
+- [x] Mouse events
+- [x] Touch events
+- [x] Focus management
 - [ ] Selection API
-- [ ] Clipboard API
-- [ ] Drag and drop
+- [x] Clipboard API
+- [x] Drag and drop
 
 ### Form Validation
-- [ ] HTML5 validation attributes
-- [ ] Constraint Validation API
+- [x] HTML5 validation attributes
+- [x] Constraint Validation API
 - [ ] Custom validity
 - [ ] :valid, :invalid pseudo-classes
 
@@ -251,42 +251,42 @@
 ## 12.1 Core Features
 
 ### Node Operations
-- [ ] appendChild, removeChild, insertBefore
-- [ ] cloneNode
-- [ ] replaceChild
+- [x] appendChild, removeChild, insertBefore
+- [x] cloneNode
+- [x] replaceChild
 - [ ] normalize
-- [ ] DocumentFragment
+- [x] DocumentFragment
 
 ### Element API
-- [ ] querySelector, querySelectorAll
-- [ ] getElementsByClassName
-- [ ] getElementsByTagName
-- [ ] closest, matches
-- [ ] classList
-- [ ] dataset
-- [ ] attributes (get/set/remove)
+- [x] querySelector, querySelectorAll
+- [x] getElementsByClassName
+- [x] getElementsByTagName
+- [x] closest, matches
+- [x] classList
+- [x] dataset
+- [x] attributes (get/set/remove)
 
 ### Geometry APIs
-- [ ] getBoundingClientRect
-- [ ] getClientRects
-- [ ] offsetTop/Left/Width/Height
-- [ ] scrollTop/Left/Width/Height
-- [ ] IntersectionObserver
-- [ ] ResizeObserver
+- [x] getBoundingClientRect
+- [x] getClientRects
+- [x] offsetTop/Left/Width/Height
+- [x] scrollTop/Left/Width/Height
+- [x] IntersectionObserver
+- [x] ResizeObserver
 
 ### Mutation APIs
-- [ ] MutationObserver
-- [ ] DOM change events
+- [x] MutationObserver
+- [x] DOM change events
 
 ### Shadow DOM
-- [ ] attachShadow
-- [ ] Shadow root
-- [ ] Slots
-- [ ] CSS scoping
+- [x] attachShadow
+- [x] Shadow root
+- [x] Slots
+- [x] CSS scoping
 
 ### Custom Elements
-- [ ] customElements.define
-- [ ] Lifecycle callbacks
+- [x] customElements.define
+- [x] Lifecycle callbacks
 - [ ] Autonomous elements
 - [ ] Customized built-in elements
 
@@ -300,7 +300,7 @@
 - [ ] Element names: u16 ID (not String)
 
 ### DOM Data Structure Optimizations
-- [ ] Arena allocation (all nodes contiguous)
+- [x] Arena allocation (all nodes contiguous)
 - [ ] ECS-Style data layout
 - [ ] SmallVec for children (<8 inline)
 - [ ] Packed enums (#[repr(u8)])
@@ -312,7 +312,7 @@
 - [ ] Deduplicated attribute storage
 
 ### String Optimization
-- [ ] String interning (tag names, attributes)
+- [x] String interning (tag names, attributes)
 - [ ] Borrowed DOM strings (zero-alloc parsing)
 - [ ] Zero-copy parsing into arena
 
@@ -323,34 +323,34 @@
 ## 13.1 Core Features
 
 ### ES2020+ Features
-- [ ] async/await
-- [ ] Optional chaining (?.)
-- [ ] Nullish coalescing (??)
-- [ ] Private class fields
+- [x] async/await
+- [x] Optional chaining (?.)
+- [x] Nullish coalescing (??)
+- [x] Private class fields
 - [ ] Top-level await
-- [ ] BigInt
-- [ ] WeakRef
+- [x] BigInt
+- [x] WeakRef
 
 ### Built-in Objects
-- [ ] Promise (full spec)
-- [ ] Map, Set, WeakMap, WeakSet
-- [ ] Symbol
-- [ ] Proxy, Reflect
-- [ ] SharedArrayBuffer
+- [x] Promise (full spec)
+- [x] Map, Set, WeakMap, WeakSet
+- [x] Symbol
+- [x] Proxy, Reflect
+- [x] SharedArrayBuffer
 - [ ] Atomics
 
 ### Web APIs in JS
-- [ ] URL, URLSearchParams
+- [x] URL, URLSearchParams
 - [ ] FormData
-- [ ] AbortController
-- [ ] TextEncoder/TextDecoder
-- [ ] Blob, File
+- [x] AbortController
+- [x] TextEncoder/TextDecoder
+- [x] Blob, File
 - [ ] FileReader
 
 ## 13.2 Phase 13 Optimizations
 
 ### JavaScript Heap Optimization
-- [ ] Limit heap per context (configurable, default 64MB)
+- [x] Limit heap per context (configurable, default 64MB)
 - [ ] Compress idle context heap
 - [ ] Share builtins across contexts
 - [ ] Immediate GC on tab hide
@@ -374,35 +374,35 @@
 ## 14.1 Core Features
 
 ### Storage
-- [ ] IndexedDB
-- [ ] Cache API
-- [ ] Cookies API
+- [x] IndexedDB
+- [x] Cache API
+- [x] Cookies API
 
 ### Networking
-- [ ] WebSocket (full spec)
-- [ ] HTTP/2
+- [x] WebSocket (full spec)
+- [x] HTTP/2
 - [ ] HTTP/3 / QUIC
-- [ ] Server-Sent Events
-- [ ] Beacon API
+- [x] Server-Sent Events
+- [x] Beacon API
 
 ### Workers
-- [ ] Full Web Workers
-- [ ] Shared Workers
+- [x] Full Web Workers
+- [x] Shared Workers
 - [ ] Service Workers
-- [ ] Worklets
+- [x] Worklets
 
 ### Geolocation & Sensors
-- [ ] Geolocation API
+- [x] Geolocation API
 - [ ] DeviceOrientation
 - [ ] Sensor APIs
 
 ### Notifications
-- [ ] Notifications API
+- [x] Notifications API
 - [ ] Push API
 - [ ] Vibration API
 
 ### Permissions
-- [ ] Permissions API
+- [x] Permissions API
 - [ ] Permission prompts
 
 ## 14.2 Phase 14 Optimizations
@@ -417,7 +417,7 @@
 ### Resource Optimization
 - [ ] Cross-tab immutable resource sharing
 - [ ] Content-addressable caching
-- [ ] Resource deduplication
+- [x] Resource deduplication
 
 ---
 
@@ -426,12 +426,12 @@
 ## 15.1 Core Features
 
 ### Canvas 2D
-- [ ] CanvasRenderingContext2D
-- [ ] Path drawing
-- [ ] Text rendering
-- [ ] Image drawing
-- [ ] Compositing
-- [ ] Transformations
+- [x] CanvasRenderingContext2D
+- [x] Path drawing
+- [x] Text rendering
+- [x] Image drawing
+- [x] Compositing
+- [x] Transformations
 - [ ] OffscreenCanvas
 
 ### WebGL
@@ -462,8 +462,8 @@
 
 ### GPU Optimization
 - [ ] GPU-accelerated layout
-- [ ] Tile-based rendering
-- [ ] Layer management
+- [x] Tile-based rendering
+- [x] Layer management
 
 ---
 
@@ -472,9 +472,9 @@
 ## 16.1 Core Features
 
 ### Audio/Video
-- [ ] `<video>` element (full)
-- [ ] `<audio>` element (full)
-- [ ] Playback controls
+- [x] `<video>` element (full)
+- [x] `<audio>` element (full)
+- [x] Playback controls
 - [ ] Fullscreen API
 - [ ] Picture-in-Picture
 
@@ -511,8 +511,8 @@
 
 ### Media Loading Optimization
 - [ ] Lazy feature loading (load on first use)
-- [ ] Media codecs via system libraries
-- [ ] Plugin model (.so files)
+- [x] Media codecs via system libraries
+- [x] Plugin model (.so files)
 
 ---
 
@@ -626,10 +626,10 @@
 ## 21.1 Core Memory Techniques
 
 ### Arena Allocation
-- [ ] DOM node arena (all nodes in contiguous memory)
-- [ ] Layout tree arena (per-frame allocation)
+- [x] DOM node arena (all nodes in contiguous memory)
+- [x] Layout tree arena (per-frame allocation)
 - [ ] CSS style arena (shared across elements)
-- [ ] Bump allocator for temporary objects
+- [x] Bump allocator for temporary objects
 - [ ] Arena recycling between page loads
 
 ### Zero-Copy Parsing
@@ -639,13 +639,13 @@
 - [ ] URLs: Lazy parsing, keep as bytes
 
 ### String Interning
-- [ ] Tag names (only ~100 unique HTML tags)
-- [ ] Attribute names (class, id, style, etc.)
-- [ ] CSS property names (~500 properties)
+- [x] Tag names (only ~100 unique HTML tags)
+- [x] Attribute names (class, id, style, etc.)
+- [x] CSS property names (~500 properties)
 - [ ] Common CSS values (auto, none, inherit)
 
 ### Tab Hibernation
-- [ ] Serialize inactive tab DOM to disk
+- [x] Serialize inactive tab DOM to disk
 - [ ] Free JS heap for background tabs
 - [ ] Compress hibernated state (zstd)
 - [ ] Wake on demand (<100ms)
@@ -661,9 +661,9 @@
 - [ ] Let OS handle paging
 
 ### Memory Pressure Response
-- [ ] Monitor system memory pressure
-- [ ] Proactively hibernate tabs at 70% memory
-- [ ] Reduce cache limits under pressure
+- [x] Monitor system memory pressure
+- [x] Proactively hibernate tabs at 70% memory
+- [x] Reduce cache limits under pressure
 - [ ] Release all non-essential buffers
 
 ### Lazy Loading
@@ -681,13 +681,13 @@
 - [ ] Thread pool instead of process-per-tab
 
 ### Resource Deduplication
-- [ ] Content-addressable image cache
+- [x] Content-addressable image cache
 - [ ] Dedupe identical stylesheets
 - [ ] Share decoded fonts across tabs
 - [ ] Single copy of common scripts (jQuery, React)
 
 ### Cross-Tab Immutable Resource Sharing
-- [ ] Content-addressed global store (SHA256 → Arc<[u8]>)
+- [x] Content-addressed global store (SHA256 → Arc<[u8]>)
 - [ ] Fonts, images, scripts shared across all tabs
 - [ ] Reference counting, not copying
 - [ ] 10x savings for N tabs with same resources
@@ -707,10 +707,10 @@
 - [ ] Memory-efficient line handling
 
 ### Copy-on-Write (COW)
-- [ ] COW for cloned DOM trees
-- [ ] COW for style inheritance
-- [ ] COW for image buffers
-- [ ] Transparent duplication on modification
+- [x] COW for cloned DOM trees
+- [x] COW for style inheritance
+- [x] COW for image buffers
+- [x] Transparent duplication on modification
 
 ### SmallVec Pattern
 - [ ] Inline storage for <8 children (no heap)
@@ -725,15 +725,15 @@
 - [ ] Combine tag + flags in single u32
 
 ### Bitfield Flags
-- [ ] Node flags: 8 bools in 1 byte
+- [x] Node flags: 8 bools in 1 byte
 - [ ] Style presence bits
 - [ ] Layout dirty bits
 - [ ] Event listener flags
 
 ### Generational References
-- [ ] Slot maps (prevent dangling)
-- [ ] Generation + index (8 bytes total)
-- [ ] Safe without GC overhead
+- [x] Slot maps (prevent dangling)
+- [x] Generation + index (8 bytes total)
+- [x] Safe without GC overhead
 
 ### Generational/Region GC Patterns
 - [ ] Young generation in arena (fast alloc/free)
@@ -743,19 +743,19 @@
 ## 21.4 Compression Strategies
 
 ### In-Memory Compression
-- [ ] LZ4 for hibernated tabs (fast)
+- [x] LZ4 for hibernated tabs (fast)
 - [ ] Zstd for disk cache (high ratio)
 - [ ] Compress strings >1KB
 - [ ] Decompress on demand
 
 ### Delta Encoding
-- [ ] Store style differences from parent
+- [x] Store style differences from parent
 - [ ] Layout deltas between frames
 - [ ] Incremental DOM updates
 
 ### Varint Encoding
-- [ ] Variable-length integers for IDs
-- [ ] Compact serialization
+- [x] Variable-length integers for IDs
+- [x] Compact serialization
 - [ ] Smaller hibernation format
 
 ## 21.5 Streaming/Incremental Processing
@@ -819,40 +819,40 @@
 ## 23.1 Rust Optimizations
 
 ### Struct Packing & Layout
-- [ ] Order fields largest to smallest
-- [ ] `#[repr(C)]` for predictable layout
-- [ ] Align to cache lines (64 bytes)
+- [x] Order fields largest to smallest
+- [x] `#[repr(C)]` for predictable layout
+- [x] Align to cache lines (64 bytes)
 
 ### Custom Allocators
-- [ ] Use mimalloc (30% faster)
-- [ ] Slab allocator for DOM nodes
-- [ ] Arena for parsing phase
-- [ ] Pool for layout phase
+- [x] Use mimalloc (30% faster)
+- [x] Slab allocator for DOM nodes
+- [x] Arena for parsing phase
+- [x] Pool for layout phase
 
 ## 23.2 SIMD Optimization
 
 ### SIMD Acceleration
-- [ ] SIMD for layout calculations
-- [ ] SIMD for color blending
+- [x] SIMD for layout calculations
+- [x] SIMD for color blending
 - [ ] SIMD HTML tag detection
 - [ ] SIMD CSS tokenization
-- [ ] Platform-specific intrinsics (AVX, NEON)
+- [x] Platform-specific intrinsics (AVX, NEON)
 
 ## 23.3 Layout Optimizations
 
 ### Fixed-Point Arithmetic
-- [ ] Use i32 fixed-point (16.16) vs f32
-- [ ] Deterministic cross-platform
-- [ ] 50% memory vs f64
+- [x] Use i32 fixed-point (16.16) vs f32
+- [x] Deterministic cross-platform
+- [x] 50% memory vs f64
 
 ### Relative Coordinates
 - [ ] Store relative to parent
 - [ ] Only absolute at paint time
 
 ### Skip Invisible Content
-- [ ] visibility: hidden → skip paint
-- [ ] display: none → skip layout entirely
-- [ ] offscreen → skip until scroll
+- [x] visibility: hidden → skip paint
+- [x] display: none → skip layout entirely
+- [x] offscreen → skip until scroll
 
 ---
 

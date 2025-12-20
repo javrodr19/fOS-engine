@@ -14,6 +14,9 @@ pub mod style_cache;
 pub mod container;
 pub mod mask;
 pub mod web_animations;
+pub mod rule_tree;
+pub mod inheritance;
+pub mod selector_opt;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
@@ -33,6 +36,9 @@ pub use style_cache::{StyleCache, StyleCacheKey, SharedStyle, CacheStats};
 pub use container::{ContainerContext, ContainerQuery, ContainerRegistry};
 pub use mask::{Mask, MaskLayer, MaskImage, Isolation, MaskComposite, MaskMode};
 pub use web_animations::{Animation, AnimationEffect, Keyframe, PlayState, DocumentAnimations};
+pub use rule_tree::{RuleTree, RuleNode, PackedValue, ColorInterner, RuleSpecificity, CascadeLevel};
+pub use inheritance::{InheritanceSnapshot, InheritedProperties, CustomPropertyResolver, OnDemandStyler};
+pub use selector_opt::{SelectorIndex, RtlMatcher, HybridSelector, CompiledSelector};
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {

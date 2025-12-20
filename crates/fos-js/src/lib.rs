@@ -7,11 +7,11 @@
 //! - Console API (log, warn, error)
 //! - Timers (setTimeout, setInterval)
 //! - DOM bindings (document.getElementById, createElement)
-//! - Storage APIs (localStorage, sessionStorage)
+//! - Storage APIs (localStorage, sessionStorage, IndexedDB)
 //! - Navigation APIs (history, location)
 //! - Input events (keyboard, mouse, focus, clipboard)
 //! - Built-in objects (Promise, Map, Set, Symbol, Proxy)
-//! - Web APIs (URL, Blob, TextEncoder, AbortController)
+//! - Web APIs (URL, Blob, TextEncoder, AbortController, Geolocation)
 
 mod runtime;
 mod console;
@@ -26,6 +26,7 @@ pub mod media_bindings;
 pub mod events;
 pub mod builtins;
 pub mod webapi;
+pub mod idb;
 
 pub use runtime::JsRuntime;
 pub use timers::TimerManager;
@@ -38,7 +39,8 @@ pub use events::{
     TouchEvent, Touch, DragEvent, DataTransfer,
 };
 pub use builtins::{JsPromise, PromiseState, JsMap, JsSet, JsSymbol, JsProxy, JsBigInt, JsWeakRef, SharedArrayBuffer};
-pub use webapi::{JsUrl, JsUrlSearchParams, TextEncoder, TextDecoder, Blob, File, AbortController};
+pub use webapi::{JsUrl, JsUrlSearchParams, TextEncoder, TextDecoder, Blob, File, AbortController, Geolocation, Notification, Permissions};
+pub use idb::{IDBFactory, IDBDatabase, CacheStorage, CookieStore};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;

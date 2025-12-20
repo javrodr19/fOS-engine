@@ -1,14 +1,20 @@
 //! fOS Networking
 //!
-//! HTTP client and resource loading.
+//! HTTP client, WebSocket, SSE, and resource loading.
 
 pub mod loader;
 pub mod fetch;
 pub mod cache;
+pub mod websocket;
+pub mod sse;
+pub mod beacon;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
 pub use url::Url;
+pub use websocket::{WebSocket, WebSocketState, WebSocketError, MessageData};
+pub use sse::{EventSource, EventSourceState, SseEvent};
+pub use beacon::{send_beacon, BeaconData};
 
 /// HTTP Response
 #[derive(Debug)]

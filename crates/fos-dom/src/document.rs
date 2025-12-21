@@ -50,6 +50,34 @@ impl Document {
         }
     }
     
+    /// Finalize the document after parsing - finds html, head, body elements
+    pub fn finalize(&mut self) {
+        // Find <html> element (first child of root that is an element)
+        for (id, node) in self.tree.children(self.tree.root()) {
+            if let Some(elem) = node.as_element() {
+                let tag = self.tree.resolve(elem.name.local);
+                if tag.eq_ignore_ascii_case("html") {
+                    self.html_element = id;
+                    break;
+                }
+            }
+        }
+        
+        // Find <head> and <body> within <html>
+        if self.html_element.is_valid() {
+            for (id, node) in self.tree.children(self.html_element) {
+                if let Some(elem) = node.as_element() {
+                    let tag = self.tree.resolve(elem.name.local);
+                    if tag.eq_ignore_ascii_case("head") {
+                        self.head_element = id;
+                    } else if tag.eq_ignore_ascii_case("body") {
+                        self.body_element = id;
+                    }
+                }
+            }
+        }
+    }
+    
     /// Get document URL
     pub fn url(&self) -> &str {
         &self.url

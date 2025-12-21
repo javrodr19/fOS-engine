@@ -36,6 +36,9 @@ impl HtmlParser {
         let mut document = Document::empty(url);
         self.convert_node(&dom.document, document.tree_mut(), NodeId::ROOT);
         
+        // Find html, head, body elements
+        document.finalize();
+        
         tracing::debug!("Parsed {} nodes", document.tree().len());
         document
     }

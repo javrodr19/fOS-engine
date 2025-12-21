@@ -184,21 +184,7 @@ impl TabBar {
         c: char,
         color: u32,
     ) {
-        // Simple 8x8 bitmap font placeholder
-        // In production, would use proper font rendering
-        let pattern = get_char_pattern(c);
-        
-        for (row, &bits) in pattern.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    let px = (x + col) as usize;
-                    let py = (y + row as i32) as usize;
-                    if px < buffer_width && py < buffer_height {
-                        buffer[py * buffer_width + px] = color;
-                    }
-                }
-            }
-        }
+        super::font::draw_char(buffer, buffer_width, buffer_height, x, y, c, color);
     }
     
     /// Handle mouse move
@@ -264,53 +250,3 @@ pub enum TabBarAction {
     NewTab,
 }
 
-/// Get 8x8 bitmap pattern for a character
-fn get_char_pattern(c: char) -> [u8; 8] {
-    // Minimal bitmap font for common characters
-    match c {
-        '+' => [
-            0b00000000,
-            0b00010000,
-            0b00010000,
-            0b01111100,
-            0b00010000,
-            0b00010000,
-            0b00000000,
-            0b00000000,
-        ],
-        'A'..='Z' | 'a'..='z' => {
-            // Simple letter representation
-            let idx = c.to_ascii_uppercase() as u8 - b'A';
-            [
-                0b01111100,
-                0b10000010,
-                0b10000010,
-                0b11111110,
-                0b10000010,
-                0b10000010,
-                0b10000010,
-                0b00000000,
-            ]
-        }
-        '0'..='9' => [
-            0b01111100,
-            0b10000110,
-            0b10001010,
-            0b10010010,
-            0b10100010,
-            0b11000010,
-            0b01111100,
-            0b00000000,
-        ],
-        _ => [
-            0b01111110,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01111110,
-            0b00000000,
-        ],
-    }
-}

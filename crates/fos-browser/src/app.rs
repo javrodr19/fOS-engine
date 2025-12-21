@@ -193,10 +193,21 @@ impl BrowserApp {
         buffer.fill(bg_color);
         
         // Render page content in content area (inline to avoid borrow issues)
+        let content_x = TAB_BAR_WIDTH as usize;
+        let content_height = buffer_height.saturating_sub(URL_BAR_HEIGHT as usize);
+        
         if let Some(ref rendered) = self.rendered_page {
-            let content_x = TAB_BAR_WIDTH as usize;
-            let content_y = 0usize;
-            let content_height = buffer_height.saturating_sub(URL_BAR_HEIGHT as usize);
+            // Log first time we render
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
+                LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::info!("Copying {}x{} pixels to buffer at x={}", rendered.width, rendered.height, content_x);
+                // Check first few pixels
+                if rendered.pixels.len() >= 4 {
+                    log::info!("First pixel RGBA: {},{},{},{}", 
+                        rendered.pixels[0], rendered.pixels[1], rendered.pixels[2], rendered.pixels[3]);
+                }
+            }
             
             // Copy rendered pixels to buffer
             // rendered.pixels is RGBA bytes, buffer is ARGB u32
@@ -204,7 +215,7 @@ impl BrowserApp {
                 for x in 0..rendered.width.min((buffer_width - content_x) as u32) {
                     let src_idx = ((y * rendered.width + x) * 4) as usize;
                     let dst_x = content_x + x as usize;
-                    let dst_y = content_y + y as usize;
+                    let dst_y = y as usize;
                     
                     if src_idx + 3 < rendered.pixels.len() && dst_y < buffer_height && dst_x < buffer_width {
                         let r = rendered.pixels[src_idx] as u32;
@@ -212,9 +223,19 @@ impl BrowserApp {
                         let b = rendered.pixels[src_idx + 2] as u32;
                         let a = rendered.pixels[src_idx + 3] as u32;
                         
-                        // Convert RGBA to ARGB (softbuffer format)
+                        // Convert RGBA to ARGB (softbuffer format: 0xAARRGGBB)
                         let pixel = (a << 24) | (r << 16) | (g << 8) | b;
                         buffer[dst_y * buffer_width + dst_x] = pixel;
+                    }
+                }
+            }
+        } else {
+            // No rendered page - draw a placeholder rectangle
+            let placeholder_color = 0xFF1A3A5A; // Dark blue
+            for y in 50..150.min(content_height) {
+                for x in content_x..content_x + 200 {
+                    if x < buffer_width && y < buffer_height {
+                        buffer[y * buffer_width + x] = placeholder_color;
                     }
                 }
             }
@@ -240,6 +261,67 @@ impl BrowserApp {
         
         let ctrl = modifiers.control_key();
         
+        // If URL bar is focused, handle text input
+        if self.chrome.is_url_bar_focused() {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::Enter) => {
+                    if let Some(url) = self.chrome.handle_enter() {
+                        self.navigate_to(&url);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Escape) => {
+                    self.chrome.handle_escape();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Backspace) => {
+                    self.chrome.handle_backspace();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Delete) => {
+                    self.chrome.handle_delete();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                    self.chrome.handle_left();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::ArrowRight) => {
+                    self.chrome.handle_right();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::Home) => {
+                    self.chrome.handle_home();
+                    self.request_redraw();
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::End) => {
+                    self.chrome.handle_end();
+                    self.request_redraw();
+                    return;
+                }
+                _ => {
+                    // Handle text input
+                    if let Some(text) = &event.text {
+                        for c in text.chars() {
+                            if c.is_ascii_graphic() || c == ' ' {
+                                self.chrome.handle_char(c);
+                            }
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
+        }
+        
+        // Global shortcuts
         match event.physical_key {
             PhysicalKey::Code(KeyCode::KeyT) if ctrl => {
                 // Ctrl+T: New tab
@@ -270,6 +352,28 @@ impl BrowserApp {
             }
             _ => {}
         }
+    }
+    
+    /// Navigate to a URL
+    fn navigate_to(&mut self, url: &str) {
+        // Normalize URL
+        let normalized = if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("about:") {
+            url.to_string()
+        } else if url.contains('.') {
+            format!("https://{}", url)
+        } else {
+            // Treat as search query (could be made configurable)
+            format!("https://duckduckgo.com/?q={}", url.replace(' ', "+"))
+        };
+        
+        // Update active tab URL
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.url = normalized;
+            tab.loading = true;
+        }
+        
+        self.needs_reload = true;
+        self.request_redraw();
     }
     
     fn request_redraw(&self) {
@@ -331,8 +435,9 @@ impl ApplicationHandler for BrowserApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
                     // Handle click
-                    self.chrome.handle_click(button, &mut self.tabs);
-                    self.needs_reload = true;
+                    if let Some(url) = self.chrome.handle_click(button, &mut self.tabs) {
+                        self.navigate_to(&url);
+                    }
                     self.request_redraw();
                 }
             }

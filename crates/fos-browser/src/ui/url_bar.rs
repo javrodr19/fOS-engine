@@ -26,6 +26,8 @@ pub struct UrlBar {
     pub input: String,
     /// Is focused
     pub focused: bool,
+    /// Cursor position
+    pub cursor: usize,
     /// Hovered button
     hovered_button: Option<UrlBarButton>,
     /// Can go back
@@ -51,6 +53,7 @@ impl UrlBar {
         Self {
             input: String::new(),
             focused: false,
+            cursor: 0,
             hovered_button: None,
             can_back: false,
             can_forward: false,
@@ -61,7 +64,78 @@ impl UrlBar {
     
     /// Set URL
     pub fn set_url(&mut self, url: &str) {
-        self.input = url.to_string();
+        if !self.focused {
+            self.input = url.to_string();
+            self.cursor = self.input.len();
+        }
+    }
+    
+    /// Handle character input
+    pub fn handle_char(&mut self, c: char) {
+        if self.focused {
+            self.input.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+    }
+    
+    /// Handle backspace
+    pub fn handle_backspace(&mut self) {
+        if self.focused && self.cursor > 0 {
+            self.cursor -= 1;
+            self.input.remove(self.cursor);
+        }
+    }
+    
+    /// Handle delete
+    pub fn handle_delete(&mut self) {
+        if self.focused && self.cursor < self.input.len() {
+            self.input.remove(self.cursor);
+        }
+    }
+    
+    /// Move cursor left
+    pub fn cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    
+    /// Move cursor right
+    pub fn cursor_right(&mut self) {
+        if self.cursor < self.input.len() {
+            self.cursor += 1;
+        }
+    }
+    
+    /// Move cursor to start
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+    
+    /// Move cursor to end
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.len();
+    }
+    
+    /// Submit the URL (returns URL to navigate to)
+    pub fn submit(&mut self) -> Option<String> {
+        if self.focused && !self.input.is_empty() {
+            self.focused = false;
+            Some(self.input.clone())
+        } else {
+            None
+        }
+    }
+    
+    /// Start editing with current URL
+    pub fn focus(&mut self) {
+        self.focused = true;
+        self.cursor = self.input.len();
+    }
+    
+    /// Cancel editing
+    pub fn unfocus(&mut self) {
+        self.focused = false;
     }
     
     /// Render the URL bar
@@ -154,12 +228,24 @@ impl UrlBar {
             self.input.clone()
         };
         
+        let text_color = if self.focused { colors::TEXT } else { colors::TEXT_DIM };
         self.draw_text(
             buffer, buffer_width, buffer_height,
             input_x + 8, y_start + 10,
             &display_url,
-            colors::TEXT,
+            text_color,
         );
+        
+        // Draw cursor if focused
+        if self.focused {
+            let cursor_x = input_x + 8 + (self.cursor.min(80) * 7);
+            for dy in 4..height - 4 {
+                let py = y_start + dy;
+                if cursor_x < buffer_width && py < buffer_height {
+                    buffer[py * buffer_width + cursor_x] = colors::TEXT;
+                }
+            }
+        }
         
         // Menu button
         let menu_x = buffer_width - BUTTON_SIZE as usize - 4;
@@ -223,20 +309,7 @@ impl UrlBar {
         c: char,
         color: u32,
     ) {
-        // Simple representation - in production use proper font
-        let pattern = get_char_pattern(c);
-        
-        for (row, &bits) in pattern.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    let px = (x + col) as usize;
-                    let py = (y + row as i32) as usize;
-                    if px < buffer_width && py < buffer_height {
-                        buffer[py * buffer_width + px] = color;
-                    }
-                }
-            }
-        }
+        super::font::draw_char(buffer, buffer_width, buffer_height, x, y, c, color);
     }
     
     /// Draw text
@@ -282,27 +355,44 @@ impl UrlBar {
     }
     
     /// Handle click, return action
-    pub fn handle_click(&self, x: i32, y: i32, url_bar_y: i32, tab_bar_width: i32) -> Option<UrlBarAction> {
+    pub fn handle_click(&mut self, x: i32, y: i32, url_bar_y: i32, tab_bar_width: i32, total_width: i32) -> Option<UrlBarAction> {
         if y < url_bar_y || y >= url_bar_y + URL_BAR_HEIGHT as i32 {
+            self.focused = false;
             return None;
         }
         
         let local_x = x - tab_bar_width;
         
+        // Calculate input field bounds
+        let input_start = 4 + 3 * (BUTTON_SIZE as i32 + 2) + 4;
+        let input_end = total_width - tab_bar_width - BUTTON_SIZE as i32 - 12;
+        
         if local_x >= 4 && local_x < 4 + BUTTON_SIZE as i32 {
+            self.focused = false;
             if self.can_back {
                 return Some(UrlBarAction::Back);
             }
         } else if local_x >= 4 + BUTTON_SIZE as i32 + 2 && local_x < 4 + 2 * BUTTON_SIZE as i32 + 2 {
+            self.focused = false;
             if self.can_forward {
                 return Some(UrlBarAction::Forward);
             }
         } else if local_x >= 4 + 2 * (BUTTON_SIZE as i32 + 2) && local_x < 4 + 3 * BUTTON_SIZE as i32 + 4 {
+            self.focused = false;
             if self.loading {
                 return Some(UrlBarAction::Stop);
             } else {
                 return Some(UrlBarAction::Reload);
             }
+        } else if local_x >= input_start && local_x < input_end {
+            // Clicked in input field
+            self.focus();
+            // Approximate cursor position from click
+            let char_offset = ((local_x - input_start - 8) / 7).max(0) as usize;
+            self.cursor = char_offset.min(self.input.len());
+            return Some(UrlBarAction::Focus);
+        } else {
+            self.focused = false;
         }
         
         None
@@ -322,133 +412,8 @@ pub enum UrlBarAction {
     Forward,
     Reload,
     Stop,
-    Navigate(/* url would be passed separately */),
+    Navigate,
+    Focus,
     Menu,
 }
 
-/// Get 8x8 bitmap pattern for a character
-fn get_char_pattern(c: char) -> [u8; 8] {
-    match c {
-        '←' => [
-            0b00000000,
-            0b00010000,
-            0b00110000,
-            0b01111111,
-            0b00110000,
-            0b00010000,
-            0b00000000,
-            0b00000000,
-        ],
-        '→' => [
-            0b00000000,
-            0b00001000,
-            0b00001100,
-            0b11111110,
-            0b00001100,
-            0b00001000,
-            0b00000000,
-            0b00000000,
-        ],
-        '↻' => [
-            0b00111100,
-            0b01000010,
-            0b00000010,
-            0b00011110,
-            0b00000010,
-            0b01000010,
-            0b00111100,
-            0b00000000,
-        ],
-        '×' => [
-            0b00000000,
-            0b01000010,
-            0b00100100,
-            0b00011000,
-            0b00100100,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-        ],
-        '≡' => [
-            0b00000000,
-            0b01111110,
-            0b00000000,
-            0b01111110,
-            0b00000000,
-            0b01111110,
-            0b00000000,
-            0b00000000,
-        ],
-        '/' => [
-            0b00000010,
-            0b00000100,
-            0b00001000,
-            0b00010000,
-            0b00100000,
-            0b01000000,
-            0b10000000,
-            0b00000000,
-        ],
-        ':' => [
-            0b00000000,
-            0b00011000,
-            0b00011000,
-            0b00000000,
-            0b00011000,
-            0b00011000,
-            0b00000000,
-            0b00000000,
-        ],
-        '.' => [
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00011000,
-            0b00011000,
-            0b00000000,
-        ],
-        '-' => [
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01111110,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-        ],
-        '_' => [
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01111110,
-            0b00000000,
-        ],
-        'a'..='z' | 'A'..='Z' => [
-            0b00111100,
-            0b01000010,
-            0b01000010,
-            0b01111110,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b00000000,
-        ],
-        '0'..='9' => [
-            0b00111100,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b00111100,
-            0b00000000,
-        ],
-        _ => [0; 8],
-    }
-}

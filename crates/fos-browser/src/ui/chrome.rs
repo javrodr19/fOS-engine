@@ -84,7 +84,7 @@ impl Chrome {
         );
     }
     
-    /// Render content area
+    /// Render content area placeholder (only when loading)
     fn render_content(
         &self,
         buffer: &mut [u32],
@@ -96,20 +96,21 @@ impl Chrome {
         height: usize,
         tabs: &TabManager,
     ) {
-        // Fill with background
-        for dy in 0..height {
-            for dx in 0..width {
-                let px = x + dx;
-                let py = y + dy;
-                if px < buffer_width && py < buffer_height {
-                    buffer[py * buffer_width + px] = CONTENT_BG;
-                }
-            }
-        }
-        
-        // Show placeholder text if no content
+        // Only show loading placeholder if actively loading
+        // The actual page content is rendered by the app, not the chrome
         if let Some(tab) = tabs.active_tab() {
-            if tab.page.is_none() {
+            if tab.loading {
+                // Fill with background only when loading
+                for dy in 0..height {
+                    for dx in 0..width {
+                        let px = x + dx;
+                        let py = y + dy;
+                        if px < buffer_width && py < buffer_height {
+                            buffer[py * buffer_width + px] = CONTENT_BG;
+                        }
+                    }
+                }
+                
                 self.draw_centered_text(
                     buffer,
                     buffer_width,
@@ -120,7 +121,6 @@ impl Chrome {
                     0xFF808080,
                 );
             }
-            // TODO: Render actual page content here
         }
     }
     
@@ -157,19 +157,7 @@ impl Chrome {
         c: char,
         color: u32,
     ) {
-        let pattern = get_basic_char(c);
-        
-        for (row, &bits) in pattern.iter().enumerate() {
-            for col in 0..8 {
-                if (bits >> (7 - col)) & 1 == 1 {
-                    let px = (x + col) as usize;
-                    let py = (y + row as i32) as usize;
-                    if px < buffer_width && py < buffer_height {
-                        buffer[py * buffer_width + px] = color;
-                    }
-                }
-            }
-        }
+        super::font::draw_char(buffer, buffer_width, buffer_height, x, y, c, color);
     }
     
     /// Handle mouse move
@@ -181,10 +169,10 @@ impl Chrome {
         // Would need tabs reference - for now just track position
     }
     
-    /// Handle click
-    pub fn handle_click(&mut self, button: MouseButton, tabs: &mut TabManager) {
+    /// Handle click - returns URL to navigate to if any
+    pub fn handle_click(&mut self, button: MouseButton, tabs: &mut TabManager) -> Option<String> {
         if button != MouseButton::Left {
-            return;
+            return None;
         }
         
         let x = self.mouse_x;
@@ -207,11 +195,11 @@ impl Chrome {
                     }
                 }
             }
-            return;
+            return None;
         }
         
         // Check URL bar
-        if let Some(action) = self.url_bar.handle_click(x, y, url_bar_y, TAB_BAR_WIDTH as i32) {
+        if let Some(action) = self.url_bar.handle_click(x, y, url_bar_y, TAB_BAR_WIDTH as i32, self.width as i32) {
             match action {
                 UrlBarAction::Back => {
                     // TODO: Implement navigation
@@ -220,14 +208,68 @@ impl Chrome {
                     // TODO: Implement navigation
                 }
                 UrlBarAction::Reload => {
-                    tabs.reload_active();
+                    if let Some(tab) = tabs.active_tab() {
+                        return Some(tab.url.clone());
+                    }
                 }
                 UrlBarAction::Stop => {
                     // TODO: Stop loading
                 }
+                UrlBarAction::Focus => {
+                    // URL bar is now focused, no navigation
+                }
                 _ => {}
             }
         }
+        
+        None
+    }
+    
+    /// Check if URL bar is focused
+    pub fn is_url_bar_focused(&self) -> bool {
+        self.url_bar.focused
+    }
+    
+    /// Handle character input to URL bar
+    pub fn handle_char(&mut self, c: char) {
+        self.url_bar.handle_char(c);
+    }
+    
+    /// Handle backspace in URL bar
+    pub fn handle_backspace(&mut self) {
+        self.url_bar.handle_backspace();
+    }
+    
+    /// Handle delete in URL bar
+    pub fn handle_delete(&mut self) {
+        self.url_bar.handle_delete();
+    }
+    
+    /// Handle arrow keys in URL bar
+    pub fn handle_left(&mut self) {
+        self.url_bar.cursor_left();
+    }
+    
+    pub fn handle_right(&mut self) {
+        self.url_bar.cursor_right();
+    }
+    
+    pub fn handle_home(&mut self) {
+        self.url_bar.cursor_home();
+    }
+    
+    pub fn handle_end(&mut self) {
+        self.url_bar.cursor_end();
+    }
+    
+    /// Handle Enter key - returns URL to navigate to
+    pub fn handle_enter(&mut self) -> Option<String> {
+        self.url_bar.submit()
+    }
+    
+    /// Handle Escape key
+    pub fn handle_escape(&mut self) {
+        self.url_bar.unfocus();
     }
     
     /// Focus URL bar for text input
@@ -242,17 +284,3 @@ impl Default for Chrome {
     }
 }
 
-/// Get basic character pattern
-fn get_basic_char(c: char) -> [u8; 8] {
-    match c {
-        'L' => [0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01111110, 0b00000000],
-        'o' => [0b00000000, 0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000, 0b00000000],
-        'a' => [0b00000000, 0b00111100, 0b00000010, 0b00111110, 0b01000010, 0b00111110, 0b00000000, 0b00000000],
-        'd' => [0b00000010, 0b00000010, 0b00111110, 0b01000010, 0b01000010, 0b00111110, 0b00000000, 0b00000000],
-        'i' => [0b00010000, 0b00000000, 0b00110000, 0b00010000, 0b00010000, 0b00111000, 0b00000000, 0b00000000],
-        'n' => [0b00000000, 0b01011100, 0b01100010, 0b01000010, 0b01000010, 0b01000010, 0b00000000, 0b00000000],
-        'g' => [0b00000000, 0b00111110, 0b01000010, 0b01000010, 0b00111110, 0b00000010, 0b00111100, 0b00000000],
-        '.' => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00011000, 0b00011000, 0b00000000],
-        _ => [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-    }
-}

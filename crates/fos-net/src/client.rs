@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::tcp::{TcpConnection, TcpConfig};
 use crate::tls::{TlsStream, TlsConfig, TlsState};
 use crate::http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
+use crate::http2::{Http2Connection, Frame, Http2Event, Http2Error};
 use crate::cookies::{CookieJar, Cookie};
 use crate::connection_pool::{ConnectionPool, HostKey, PoolConfig, AcquireResult, ConnId};
 use crate::{Response, NetError};
@@ -262,7 +263,12 @@ impl HttpClient {
             let tls = TlsStream::connect(stream, &url.host, TlsConfig::default())
                 .map_err(|e| NetError::Network(format!("TLS failed: {}", e)))?;
             
-            self.send_and_receive_tls(tls, req)
+            // Check ALPN for HTTP/2
+            if tls.is_h2() {
+                self.send_and_receive_h2(tls, &url, req)
+            } else {
+                self.send_and_receive_tls(tls, req)
+            }
         } else {
             self.send_and_receive_tcp(stream, req)
         }
@@ -299,6 +305,97 @@ impl HttpClient {
             status: resp.status,
             headers: resp.headers,
             body: resp.body,
+        })
+    }
+    
+    /// Send request using HTTP/2
+    fn send_and_receive_h2(&self, mut stream: TlsStream, url: &UrlParts, req: Http1Request) -> Result<Response, NetError> {
+        // Create HTTP/2 connection
+        let mut h2 = Http2Connection::new_client();
+        
+        // Send connection preface
+        h2.send_preface(&mut stream)
+            .map_err(|e| NetError::Network(format!("H2 preface failed: {}", e)))?;
+        
+        // Send request
+        let headers: Vec<(String, String)> = req.headers.iter()
+            .filter(|(n, _)| !n.starts_with(':'))
+            .cloned()
+            .collect();
+        
+        let stream_id = h2.send_request(
+            &mut stream,
+            &req.method,
+            &url.path_and_query(),
+            &url.host_with_port(),
+            &headers,
+            req.body.is_none(),
+        ).map_err(|e| NetError::Network(format!("H2 request failed: {}", e)))?;
+        
+        // Send body if present
+        if let Some(body) = &req.body {
+            h2.send_data(&mut stream, stream_id, body, true)
+                .map_err(|e| NetError::Network(format!("H2 data failed: {}", e)))?;
+        }
+        
+        // Read response frames
+        let mut response_headers = Vec::new();
+        let mut response_body = Vec::new();
+        let mut response_status = 200u16;
+        let max_frame_size = h2.remote_settings.max_frame_size;
+        
+        loop {
+            let frame = Frame::read_from(&mut stream, max_frame_size)
+                .map_err(|e| NetError::Network(format!("H2 frame read failed: {}", e)))?;
+            
+            match h2.process_frame(frame)
+                .map_err(|e| NetError::Network(format!("H2 process failed: {}", e)))? 
+            {
+                Some(Http2Event::SettingsReceived) => {
+                    // Send SETTINGS ACK
+                    h2.send_settings_ack(&mut stream)
+                        .map_err(|e| NetError::Network(format!("H2 settings ack failed: {}", e)))?;
+                }
+                Some(Http2Event::Headers { stream_id: sid, headers, end_stream }) if sid == stream_id => {
+                    // Parse status from pseudo-header
+                    for (name, value) in &headers {
+                        if name == ":status" {
+                            response_status = value.parse().unwrap_or(200);
+                        } else if !name.starts_with(':') {
+                            response_headers.push((name.clone(), value.clone()));
+                        }
+                    }
+                    if end_stream {
+                        break;
+                    }
+                }
+                Some(Http2Event::Data { stream_id: sid, data, end_stream }) if sid == stream_id => {
+                    response_body.extend(data);
+                    if end_stream {
+                        break;
+                    }
+                }
+                Some(Http2Event::Ping { ack: false, data }) => {
+                    h2.send_ping_ack(&mut stream, data)
+                        .map_err(|e| NetError::Network(format!("H2 ping ack failed: {}", e)))?;
+                }
+                Some(Http2Event::WindowUpdate { .. }) => {
+                    // Flow control update - continue
+                }
+                Some(Http2Event::GoAway { error_code, .. }) => {
+                    return Err(NetError::Network(format!("H2 GOAWAY: error {}", error_code)));
+                }
+                Some(Http2Event::RstStream { error_code, .. }) => {
+                    return Err(NetError::Network(format!("H2 RST_STREAM: error {}", error_code)));
+                }
+                _ => {}
+            }
+        }
+        
+        Ok(Response {
+            status: response_status,
+            headers: response_headers,
+            body: response_body,
         })
     }
     

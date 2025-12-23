@@ -26,7 +26,7 @@ pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
 pub use websocket::{WebSocket, WebSocketState, WebSocketError, MessageData};
 pub use sse::{EventSource, EventSourceState, SseEvent};
 pub use beacon::{send_beacon, BeaconData};
-pub use http2::{Http2Connection, Http2Stream, Http2Settings, Http2Frame};
+pub use http2::{Http2Connection, Stream as Http2Stream, Settings as Http2Settings, Frame as Http2Frame, Http2Error, Http2Event, HpackEncoder, HpackDecoder};
 pub use xhr::{XmlHttpRequest, ReadyState, ResponseType, XhrError, FormData, FormDataValue};
 pub use http3::{QuicConnection, Http3Connection, QuicError};
 pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};

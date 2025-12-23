@@ -1,12 +1,16 @@
 //! Enhanced Networking Layer
 //!
-//! Integrates fos-net for HTTP caching and security.
+//! Integrates fos-net for HTTP caching, HTTP/2, and security.
 
 use std::time::Duration;
+use std::collections::HashMap;
 use fos_net::cache::HttpCache;
+use fos_net::http2::Http2Connection;
+use fos_net::network_opt::{PredictiveDns, RequestCoalescer};
 use fos_security::https::{SecureContext, MixedContentChecker, MixedContentResult};
 
 /// Network manager for the browser
+/// Integrates HTTP caching, HTTP/2 multiplexing, predictive DNS, and security
 pub struct NetworkManager {
     /// HTTP response cache
     cache: HttpCache,
@@ -14,10 +18,16 @@ pub struct NetworkManager {
     mixed_content: MixedContentChecker,
     /// User agent string
     user_agent: String,
+    /// HTTP/2 connection pool by origin
+    http2_pool: HashMap<String, Http2Connection>,
+    /// Predictive DNS resolver
+    predictive_dns: PredictiveDns,
+    /// Request coalescer for batching
+    coalescer: RequestCoalescer,
 }
 
 impl NetworkManager {
-    /// Create a new network manager
+    /// Create a new network manager with all fos-net features
     pub fn new() -> Self {
         Self {
             // 500 entries, 25MB cache
@@ -26,8 +36,51 @@ impl NetworkManager {
             user_agent: format!(
                 "fOS-Browser/0.1 (compatible; fOS Engine; +https://github.com/fosproject)"
             ),
+            http2_pool: HashMap::new(),
+            predictive_dns: PredictiveDns::new(),
+            coalescer: RequestCoalescer::new(5, 50), // Batch 5 requests or 50ms
         }
     }
+    
+    // === HTTP/2 Connection Pool ===
+    
+    /// Get or create HTTP/2 connection for a host
+    pub fn get_http2_connection(&mut self, host: &str) -> Option<&mut Http2Connection> {
+        if !self.http2_pool.contains_key(host) {
+            // Create new HTTP/2 connection
+            self.http2_pool.insert(host.to_string(), Http2Connection::new());
+        }
+        self.http2_pool.get_mut(host)
+    }
+    
+    /// Check if HTTP/2 is available for host
+    pub fn has_http2(&self, host: &str) -> bool {
+        self.http2_pool.contains_key(host)
+    }
+    
+    // === Predictive DNS ===
+    
+    /// Prefetch DNS for a host (call for visible links)
+    pub fn prefetch_dns(&mut self, host: &str) {
+        self.predictive_dns.prefetch(host);
+    }
+    
+    /// Record navigation for pattern learning
+    pub fn record_navigation(&mut self, from_page: &str, to_host: &str) {
+        self.predictive_dns.record_access(from_page, to_host);
+    }
+    
+    /// Predict and prefetch DNS based on current page
+    pub fn predict_dns(&mut self, current_path: &str) {
+        self.predictive_dns.predict_and_prefetch(current_path);
+    }
+    
+    /// Process pending DNS prefetch
+    pub fn process_dns_prefetch(&mut self) -> Option<String> {
+        self.predictive_dns.pop_prefetch()
+    }
+    
+    // === Fetch with caching ===
     
     /// Fetch a URL with caching
     pub fn fetch(&mut self, url: &str, page_url: Option<&str>) -> Result<FetchResult, NetworkError> {
@@ -68,6 +121,13 @@ impl NetworkManager {
                     }
                     MixedContentResult::Allow => {}
                 }
+            }
+        }
+        
+        // Prefetch DNS for this host (learns patterns)
+        if let Ok(parsed) = url::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                self.predictive_dns.prefetch(host);
             }
         }
         
@@ -154,12 +214,29 @@ impl NetworkManager {
     pub fn cleanup(&mut self) {
         self.cache.cleanup();
     }
+    
+    /// Get network statistics
+    pub fn stats(&self) -> NetworkStats {
+        NetworkStats {
+            cache_entries: self.cache.stats().entry_count,
+            cache_size_bytes: self.cache.stats().total_size,
+            http2_connections: self.http2_pool.len(),
+        }
+    }
 }
 
 impl Default for NetworkManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Network statistics
+#[derive(Debug, Clone)]
+pub struct NetworkStats {
+    pub cache_entries: usize,
+    pub cache_size_bytes: usize,
+    pub http2_connections: usize,
 }
 
 /// Result of a fetch operation
@@ -222,5 +299,13 @@ mod tests {
     fn test_network_manager_creation() {
         let manager = NetworkManager::new();
         assert!(!manager.is_cached("https://example.com"));
+    }
+    
+    #[test]
+    fn test_network_stats() {
+        let manager = NetworkManager::new();
+        let stats = manager.stats();
+        assert_eq!(stats.cache_entries, 0);
+        assert_eq!(stats.http2_connections, 0);
     }
 }

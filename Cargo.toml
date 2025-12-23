@@ -45,9 +45,6 @@ fontdb = "0.21"
 rustybuzz = "0.20"
 ttf-parser = "0.24"
 
-# Networking
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-
 # Async runtime (lightweight)
 smol = "2.0"
 

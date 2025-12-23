@@ -134,42 +134,33 @@ impl NetworkManager {
         // Fetch from network
         log::debug!("Fetching from network: {}", url);
         
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(&self.user_agent)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| NetworkError::RequestFailed(e.to_string()))?;
+        let mut client = fos_net::client::blocking::Client::new();
         
-        let response = client.get(url).send()
-            .map_err(|e| NetworkError::RequestFailed(e.to_string()))?;
+        let response = client.get(url)
+            .map_err(|e| NetworkError::RequestFailed(format!("{}", e)))?;
         
-        let status = response.status().as_u16();
+        let status = response.status;
         
-        if !response.status().is_success() {
+        if !response.is_success() {
             return Err(NetworkError::HttpError(status));
         }
         
-        // Parse cache headers - clone the values to avoid borrow issues
-        let cache_control = response.headers()
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        // Parse cache headers
+        let cache_control = response.headers.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
         
-        let etag = response.headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let etag = response.headers.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("etag"))
+            .map(|(_, v)| v.clone());
         
-        let content_type = response.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
+        let content_type = response.headers.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
         
-        let body = response.bytes()
-            .map_err(|e| NetworkError::RequestFailed(e.to_string()))?
-            .to_vec();
+        let body = response.body;
         
         // Determine cache TTL
         let max_age = parse_max_age(&cache_control).unwrap_or(Duration::from_secs(300));

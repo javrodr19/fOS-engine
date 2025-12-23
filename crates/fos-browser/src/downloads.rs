@@ -165,22 +165,22 @@ impl DownloadManager {
             }
         }
         
-        // Perform download (blocking)
-        let result = reqwest::blocking::Client::new()
-            .get(url)
-            .send();
+        // Perform download using custom client (blocking)
+        let mut client = fos_net::client::blocking::Client::new();
+        let result = client.get(url);
         
         match result {
             Ok(response) => {
-                // Get content length
-                let total = response.content_length();
+                // Get content length from headers
+                let total = response.headers.iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.parse().ok());
                 
                 // Get content type
-                let mime = response.headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
+                let mime = response.headers.iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
                 
                 {
                     let mut dl = downloads.lock().unwrap();
@@ -198,17 +198,7 @@ impl DownloadManager {
                 // Write to file
                 match File::create(&save_path) {
                     Ok(mut file) => {
-                        let bytes = match response.bytes() {
-                            Ok(b) => b,
-                            Err(e) => {
-                                let mut dl = downloads.lock().unwrap();
-                                if let Some(d) = dl.get_mut(&id) {
-                                    d.state = DownloadState::Failed;
-                                    d.error = Some(e.to_string());
-                                }
-                                return;
-                            }
-                        };
+                        let bytes = response.body;
                         
                         if let Err(e) = file.write_all(&bytes) {
                             let mut dl = downloads.lock().unwrap();
@@ -239,7 +229,7 @@ impl DownloadManager {
                 let mut dl = downloads.lock().unwrap();
                 if let Some(d) = dl.get_mut(&id) {
                     d.state = DownloadState::Failed;
-                    d.error = Some(e.to_string());
+                    d.error = Some(format!("{}", e));
                 }
             }
         }

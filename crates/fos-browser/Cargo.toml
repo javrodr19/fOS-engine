@@ -43,9 +43,6 @@ winit = "0.30"
 # CPU framebuffer (lightweight alternative to GPU)
 softbuffer = "0.4"
 
-# HTTP client (blocking for simplicity)
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-
 # Async runtime (lightweight)
 smol = "2.0"
 

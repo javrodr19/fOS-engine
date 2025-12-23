@@ -40,7 +40,7 @@ pub async fn fetch(url: &str) -> Result<FetchResponse, NetError> {
 
 /// Fetch with options
 pub async fn fetch_with_options(url: &str, options: FetchOptions) -> Result<FetchResponse, NetError> {
-    let loader = ResourceLoader::new();
+    let mut loader = ResourceLoader::new();
     
     let method = match options.method.to_uppercase().as_str() {
         "POST" => Method::Post,

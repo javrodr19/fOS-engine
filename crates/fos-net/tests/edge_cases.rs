@@ -235,37 +235,39 @@ fn test_net_error_display() {
 // ============================================================================
 // URL PARSING TESTS
 // ============================================================================
+// NOTE: URL parsing is now handled by fos-dom::url, not fos-net
+// These tests are commented out as the Url type was removed with reqwest
 
-#[test]
-fn test_url_parsing() {
-    let url = Url::parse("https://example.com/path?query=1#hash").unwrap();
-    assert_eq!(url.scheme(), "https");
-    assert_eq!(url.host_str().unwrap(), "example.com");
-    assert_eq!(url.path(), "/path");
-    assert_eq!(url.query(), Some("query=1"));
-    assert_eq!(url.fragment(), Some("hash"));
-}
+// #[test]
+// fn test_url_parsing() {
+//     let url = Url::parse("https://example.com/path?query=1#hash").unwrap();
+//     assert_eq!(url.scheme(), "https");
+//     assert_eq!(url.host_str().unwrap(), "example.com");
+//     assert_eq!(url.path(), "/path");
+//     assert_eq!(url.query(), Some("query=1"));
+//     assert_eq!(url.fragment(), Some("hash"));
+// }
 
-#[test]
-fn test_url_with_port() {
-    let url = Url::parse("http://localhost:8080/api").unwrap();
-    assert_eq!(url.port(), Some(8080));
-    assert_eq!(url.host_str().unwrap(), "localhost");
-}
+// #[test]
+// fn test_url_with_port() {
+//     let url = Url::parse("http://localhost:8080/api").unwrap();
+//     assert_eq!(url.port(), Some(8080));
+//     assert_eq!(url.host_str().unwrap(), "localhost");
+// }
 
-#[test]
-fn test_url_with_auth() {
-    let url = Url::parse("https://user:pass@example.com/").unwrap();
-    assert_eq!(url.username(), "user");
-    assert_eq!(url.password(), Some("pass"));
-}
+// #[test]
+// fn test_url_with_auth() {
+//     let url = Url::parse("https://user:pass@example.com/").unwrap();
+//     assert_eq!(url.username(), "user");
+//     assert_eq!(url.password(), Some("pass"));
+// }
 
-#[test]
-fn test_url_file_scheme() {
-    let url = Url::parse("file:///path/to/file.txt").unwrap();
-    assert_eq!(url.scheme(), "file");
-    assert_eq!(url.path(), "/path/to/file.txt");
-}
+// #[test]
+// fn test_url_file_scheme() {
+//     let url = Url::parse("file:///path/to/file.txt").unwrap();
+//     assert_eq!(url.scheme(), "file");
+//     assert_eq!(url.path(), "/path/to/file.txt");
+// }
 
 // ============================================================================
 // RESOURCE LOADER TESTS

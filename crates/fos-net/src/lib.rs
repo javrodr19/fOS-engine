@@ -12,17 +12,30 @@ pub mod http2;
 pub mod xhr;
 pub mod http3;
 pub mod network_opt;
+pub mod connection_pool;
+pub mod tcp;
+pub mod tls;
+pub mod http1;
+pub mod cookies;
+pub mod client;
+pub mod coalescing;
+pub mod prefetch;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
-// Re-export URL from fos-engine (custom RFC 3986 parser)
 pub use websocket::{WebSocket, WebSocketState, WebSocketError, MessageData};
 pub use sse::{EventSource, EventSourceState, SseEvent};
 pub use beacon::{send_beacon, BeaconData};
 pub use http2::{Http2Connection, Http2Stream, Http2Settings, Http2Frame};
 pub use xhr::{XmlHttpRequest, ReadyState, ResponseType, XhrError, FormData, FormDataValue};
-pub use http3::{QuicConnection, Http3Connection, ConnectionPool, QuicError};
+pub use http3::{QuicConnection, Http3Connection, QuicError};
 pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};
+pub use connection_pool::{ConnectionPool, PooledConnection, PoolConfig, HostKey, AcquireResult};
+pub use client::{HttpClient, HttpClientBuilder, ClientConfig};
+pub use cookies::{Cookie, CookieJar, SameSite};
+pub use tcp::{TcpConnection, TcpConfig, BufferedTcpConnection};
+pub use tls::{TlsStream, TlsConfig, TlsState};
+pub use http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
 
 /// HTTP Response
 #[derive(Debug)]

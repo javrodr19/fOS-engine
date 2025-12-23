@@ -1,11 +1,10 @@
 //! Resource Loader
 //!
-//! HTTP client using reqwest for network requests.
+//! HTTP client for network requests using custom HTTP client.
 
 use crate::{Response, NetError};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use crate::client::{HttpClient, HttpClientBuilder};
 use std::collections::HashMap;
-use std::str::FromStr;
 
 /// HTTP method
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +21,20 @@ pub enum Method {
 impl Default for Method {
     fn default() -> Self {
         Method::Get
+    }
+}
+
+impl Method {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Head => "HEAD",
+            Method::Options => "OPTIONS",
+            Method::Patch => "PATCH",
+        }
     }
 }
 
@@ -67,83 +80,37 @@ impl Request {
     }
 }
 
-/// Load resources from network
+/// Load resources from network  
 pub struct ResourceLoader {
-    client: reqwest::Client,
+    client: HttpClient,
 }
 
 impl ResourceLoader {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = HttpClient::builder()
             .user_agent("fOS-Engine/0.1")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .build();
         
         Self { client }
     }
     
     /// Fetch a URL with GET
-    pub async fn fetch(&self, url: &str) -> Result<Response, NetError> {
+    pub async fn fetch(&mut self, url: &str) -> Result<Response, NetError> {
         self.request(Request::get(url)).await
     }
     
     /// Make an HTTP request
-    pub async fn request(&self, req: Request) -> Result<Response, NetError> {
+    pub async fn request(&mut self, req: Request) -> Result<Response, NetError> {
         tracing::info!("HTTP {:?} {}", req.method, req.url);
         
-        let method = match req.method {
-            Method::Get => reqwest::Method::GET,
-            Method::Post => reqwest::Method::POST,
-            Method::Put => reqwest::Method::PUT,
-            Method::Delete => reqwest::Method::DELETE,
-            Method::Head => reqwest::Method::HEAD,
-            Method::Options => reqwest::Method::OPTIONS,
-            Method::Patch => reqwest::Method::PATCH,
-        };
+        let headers: Vec<(String, String)> = req.headers.into_iter().collect();
         
-        let mut builder = self.client.request(method, &req.url);
-        
-        // Add headers
-        for (key, value) in &req.headers {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_str(key),
-                HeaderValue::from_str(value),
-            ) {
-                builder = builder.header(name, val);
-            }
-        }
-        
-        // Add body
-        if let Some(body) = req.body {
-            builder = builder.body(body);
-        }
-        
-        // Execute request
-        let response = builder.send().await.map_err(|e| {
-            NetError::Network(e.to_string())
-        })?;
-        
-        let status = response.status().as_u16();
-        
-        // Convert headers
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
-            })
-            .collect();
-        
-        // Get body
-        let body = response.bytes().await.map_err(|e| {
-            NetError::Network(e.to_string())
-        })?.to_vec();
-        
-        Ok(Response {
-            status,
-            headers,
-            body,
-        })
+        self.client.request(
+            req.method.as_str(),
+            &req.url,
+            Some(headers),
+            req.body,
+        )
     }
 }
 
@@ -174,5 +141,12 @@ mod tests {
         assert_eq!(req.method, Method::Post);
         assert!(req.body.is_some());
         assert_eq!(req.headers.get("Content-Type").unwrap(), "application/json");
+    }
+    
+    #[test]
+    fn test_method_as_str() {
+        assert_eq!(Method::Get.as_str(), "GET");
+        assert_eq!(Method::Post.as_str(), "POST");
+        assert_eq!(Method::Delete.as_str(), "DELETE");
     }
 }

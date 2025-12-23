@@ -156,77 +156,62 @@ impl XmlHttpRequest {
         
         self.send_flag = true;
         
-        // Build request
-        let client = reqwest::Client::new();
-        let mut request = match self.method.as_str() {
-            "GET" => client.get(&self.url),
-            "POST" => client.post(&self.url),
-            "PUT" => client.put(&self.url),
-            "DELETE" => client.delete(&self.url),
-            "HEAD" => client.head(&self.url),
-            "PATCH" => client.patch(&self.url),
-            _ => return Err(XhrError::UnsupportedMethod(self.method.clone())),
-        };
+        // Build request using custom client
+        let mut client = crate::client::HttpClient::new();
         
-        // Add headers
-        for (name, value) in &self.request_headers {
-            if !name.starts_with('_') {
-                request = request.header(name.as_str(), value.as_str());
-            }
-        }
-        
-        // Add body
-        if let Some(b) = body {
-            request = request.body(b);
-        }
-        
-        // Set timeout
-        if self.timeout > 0 {
-            request = request.timeout(std::time::Duration::from_millis(self.timeout as u64));
-        }
+        // Convert headers to expected format
+        let headers: Vec<(String, String)> = self.request_headers.iter()
+            .filter(|(name, _)| !name.starts_with('_'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         
         self.ready_state = ReadyState::HeadersReceived;
         
-        // Send request
-        match request.send().await {
+        // Send request using custom client
+        let result = client.request(
+            &self.method,
+            &self.url,
+            Some(headers),
+            body.map(|b| b.into_bytes()),
+        );
+        
+        match result {
             Ok(response) => {
-                self.status = response.status().as_u16();
-                self.status_text = response.status().canonical_reason()
-                    .unwrap_or("Unknown")
-                    .to_string();
+                self.status = response.status;
+                self.status_text = match response.status {
+                    200 => "OK",
+                    201 => "Created",
+                    204 => "No Content",
+                    301 => "Moved Permanently",
+                    302 => "Found",
+                    304 => "Not Modified",
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    503 => "Service Unavailable",
+                    _ => "Unknown",
+                }.to_string();
                 
                 // Copy headers
-                for (name, value) in response.headers() {
-                    if let Ok(v) = value.to_str() {
-                        self.response_headers.insert(name.to_string(), v.to_string());
-                    }
+                for (name, value) in &response.headers {
+                    self.response_headers.insert(name.clone(), value.clone());
                 }
                 
                 self.ready_state = ReadyState::Loading;
                 
-                // Get body
-                match response.text().await {
-                    Ok(text) => {
-                        self.response_text = text;
-                        self.ready_state = ReadyState::Done;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        self.error_flag = true;
-                        self.ready_state = ReadyState::Done;
-                        Err(XhrError::Network(e.to_string()))
-                    }
-                }
+                // Get body as text
+                self.response_text = String::from_utf8(response.body)
+                    .unwrap_or_default();
+                self.ready_state = ReadyState::Done;
+                Ok(())
             }
             Err(e) => {
                 self.error_flag = true;
                 self.ready_state = ReadyState::Done;
-                
-                if e.is_timeout() {
-                    Err(XhrError::Timeout)
-                } else {
-                    Err(XhrError::Network(e.to_string()))
-                }
+                Err(XhrError::Network(format!("{}", e)))
             }
         }
     }

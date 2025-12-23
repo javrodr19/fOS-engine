@@ -39,20 +39,16 @@ impl Loader {
     
     /// Fetch HTML content
     fn fetch_html(&self, url: &str) -> Result<String, Box<dyn Error>> {
-        // Use blocking reqwest for simplicity
-        // In production, would use async
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(&self.user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        // Use custom blocking client from fos-net
+        let mut client = fos_net::client::blocking::Client::new();
         
-        let response = client.get(url).send()?;
+        let response = client.get(url)?;
         
-        if !response.status().is_success() {
-            return Err(format!("HTTP error: {}", response.status()).into());
+        if !response.is_success() {
+            return Err(format!("HTTP error: {}", response.status).into());
         }
         
-        let html = response.text()?;
+        let html = response.text().unwrap_or_default();
         Ok(html)
     }
     

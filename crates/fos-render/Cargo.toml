@@ -14,8 +14,7 @@ tiny-skia.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
-# Image decoding (minimal features for size)
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Custom image decoders - no external dependencies needed
 
 [dev-dependencies]
 png = "0.17"

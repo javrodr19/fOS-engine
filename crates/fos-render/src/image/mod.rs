@@ -5,6 +5,7 @@
 mod decoder;
 mod cache;
 mod renderer;
+pub mod decoders;
 pub mod pool;
 pub mod queue;
 pub mod avif;

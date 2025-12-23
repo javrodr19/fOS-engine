@@ -1,9 +1,8 @@
 //! Image decoder for various formats
 //!
-//! Supports PNG, JPEG, GIF, WebP via the image crate.
+//! Supports PNG, JPEG, GIF, WebP via custom from-scratch decoders.
 
-use image::{DynamicImage, ImageFormat as ImgFormat, GenericImageView};
-use std::io::Cursor;
+use super::decoders::{self, DecodeError};
 
 /// Supported image formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,17 +52,6 @@ impl ImageFormat {
             "gif" => Self::Gif,
             "webp" => Self::WebP,
             _ => Self::Unknown,
-        }
-    }
-    
-    /// Convert to image crate format
-    fn to_image_format(self) -> Option<ImgFormat> {
-        match self {
-            Self::Png => Some(ImgFormat::Png),
-            Self::Jpeg => Some(ImgFormat::Jpeg),
-            Self::Gif => Some(ImgFormat::Gif),
-            Self::WebP => Some(ImgFormat::WebP),
-            Self::Unknown => None,
         }
     }
 }
@@ -120,21 +108,14 @@ impl DecodedImage {
 pub struct ImageDecoder;
 
 impl ImageDecoder {
-    /// Decode image from bytes
+    /// Decode image from bytes using custom decoders
     pub fn decode(data: &[u8]) -> Result<DecodedImage, ImageError> {
-        let format = ImageFormat::from_bytes(data);
-        Self::decode_with_format(data, format)
+        decoders::decode(data).map_err(|e| ImageError::DecodeFailed(e.to_string()))
     }
     
     /// Decode with known format
     pub fn decode_with_format(data: &[u8], format: ImageFormat) -> Result<DecodedImage, ImageError> {
-        let img_format = format.to_image_format()
-            .ok_or(ImageError::UnsupportedFormat)?;
-        
-        let img = image::load(Cursor::new(data), img_format)
-            .map_err(|e| ImageError::DecodeFailed(e.to_string()))?;
-        
-        Ok(Self::image_to_decoded(img, format))
+        decoders::decode_format(data, format).map_err(|e| ImageError::DecodeFailed(e.to_string()))
     }
     
     /// Decode and resize to target dimensions
@@ -143,35 +124,48 @@ impl ImageDecoder {
         target_width: u32,
         target_height: u32,
     ) -> Result<DecodedImage, ImageError> {
-        let format = ImageFormat::from_bytes(data);
-        let img_format = format.to_image_format()
-            .ok_or(ImageError::UnsupportedFormat)?;
+        let mut img = Self::decode(data)?;
         
-        let img = image::load(Cursor::new(data), img_format)
-            .map_err(|e| ImageError::DecodeFailed(e.to_string()))?;
+        // Simple nearest-neighbor resize
+        if img.width != target_width || img.height != target_height {
+            let new_pixels = resize_nearest(&img.pixels, img.width, img.height, target_width, target_height);
+            img.pixels = new_pixels;
+            img.width = target_width;
+            img.height = target_height;
+        }
         
-        // Resize using fast algorithm
-        let resized = img.resize_exact(
-            target_width,
-            target_height,
-            image::imageops::FilterType::Triangle,
-        );
-        
-        Ok(Self::image_to_decoded(resized, format))
+        Ok(img)
     }
+}
+
+/// Nearest-neighbor resize
+fn resize_nearest(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 4) as usize];
     
-    /// Convert DynamicImage to DecodedImage
-    fn image_to_decoded(img: DynamicImage, format: ImageFormat) -> DecodedImage {
-        let (width, height) = img.dimensions();
-        let rgba = img.into_rgba8();
-        
-        DecodedImage {
-            pixels: rgba.into_raw(),
-            width,
-            height,
-            format,
+    let x_ratio = src_width as f32 / dst_width as f32;
+    let y_ratio = src_height as f32 / dst_height as f32;
+    
+    for y in 0..dst_height {
+        for x in 0..dst_width {
+            let src_x = ((x as f32 + 0.5) * x_ratio) as u32;
+            let src_y = ((y as f32 + 0.5) * y_ratio) as u32;
+            
+            let src_idx = ((src_y * src_width + src_x) * 4) as usize;
+            let dst_idx = ((y * dst_width + x) * 4) as usize;
+            
+            if src_idx + 4 <= src.len() && dst_idx + 4 <= dst.len() {
+                dst[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+            }
         }
     }
+    
+    dst
 }
 
 /// Image decoding errors
@@ -191,6 +185,12 @@ impl std::fmt::Display for ImageError {
 }
 
 impl std::error::Error for ImageError {}
+
+impl From<DecodeError> for ImageError {
+    fn from(e: DecodeError) -> Self {
+        ImageError::DecodeFailed(e.to_string())
+    }
+}
 
 #[cfg(test)]
 mod tests {

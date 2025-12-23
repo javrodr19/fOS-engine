@@ -60,7 +60,20 @@ env_logger = "0.11"
 thiserror = "1.0"
 
 [features]
+# Default: Core browser only
 default = []
+
+# Enable all optional modules
+full = ["predictive-net", "device-apis", "extensions"]
+
+# HTTP/3 and predictive networking
+predictive-net = []
+
+# Device APIs (battery, gamepad, sensors, geolocation)
+device-apis = []
+
+# Extension and plugin support
+extensions = []
 
 [[bin]]
 name = "fos-browser"

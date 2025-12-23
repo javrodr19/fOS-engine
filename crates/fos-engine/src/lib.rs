@@ -35,6 +35,7 @@ pub mod intern;
 pub mod cow;
 pub mod compress;
 pub mod cold;
+pub mod url;
 pub mod plugin;
 
 // Phase 23: Low-Level Optimizations
@@ -62,6 +63,9 @@ pub use cold::{cold_path, format_error, cold_panic, cold_unreachable, debug_chec
 pub use cold::{StaticError, DynDispatch, DynWrapper};
 pub use cold::errors as static_errors;
 pub use plugin::{Plugin, PluginInfo, PluginCapabilities, PluginError, PluginLoader};
+pub use url::{Url, ParseError as UrlParseError, Host, Query, UserInfo};
+pub use url::{percent_encode, percent_decode, punycode_encode, punycode_decode};
+pub use url::{idn_to_ascii, idn_to_unicode, UrlInterner};
 
 // Phase 23 exports
 pub use packed::{CacheAligned, Packed, CompactPair, CACHE_LINE_SIZE};

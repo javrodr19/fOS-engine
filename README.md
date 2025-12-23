@@ -1,40 +1,53 @@
-# fOS Engine
+# fOS Engine Documentation
 
-A lightweight browser engine written in Rust, designed for minimal RAM usage while maintaining compatibility with modern web standards.
+This directory contains the development roadmaps and phase documentation for the fOS browser engine.
 
-## Goals
+## Documents
 
-- **Minimal RAM**: Target ~20-30MB per tab for simple pages
-- **Fast Startup**: Sub-second cold start
-- **Modern Standards**: Full HTML5, CSS3, ES2024 support
-- **Embeddable**: Use as a library in any Rust application
+| File | Description |
+|------|-------------|
+| [PHASES.md](./PHASES.md) | Original development phases (1-7) - All complete |
+| [ROADMAP.md](./ROADMAP.md) | Detailed feature roadmap (Phases 1-24) |
+| [FUNCTIONAL_ROADMAP.md](./FUNCTIONAL_ROADMAP.md) | Progressive browser implementation plan |
+
+## Status
+
+### Engine Development (Complete)
+- ✅ Phase 1-7: Core engine implementation
+- ✅ Phase 8-19: Advanced features
+- ✅ Phase 20-24: Optimizations
+
+### Functional Browser (In Progress)
+- 🔄 Level 1: Text-based sites (Wikipedia)
+- ⏳ Level 2: Interactive sites (GitHub)
+- ⏳ Level 3: Media sites (YouTube)
+- ⏳ Level 4: Web apps (Gmail)
+- ⏳ Level 5: Complex SPAs (Twitter)
 
 ## Architecture
 
 ```
-fos-engine/
-├── crates/
-│   ├── fos-html/     # HTML5 parser (html5ever wrapper)
-│   ├── fos-css/      # CSS parser & cascade (lightningcss)
-│   ├── fos-dom/      # DOM tree & APIs
-│   ├── fos-layout/   # Layout engine (box model, flexbox, grid)
-│   ├── fos-render/   # GPU/CPU rendering (tiny-skia/wgpu)
-│   ├── fos-js/       # JavaScript runtime (QuickJS)
-│   ├── fos-net/      # Networking & resource loading
-│   └── fos-engine/   # Main API that ties everything together
-└── examples/         # Demo applications
+fOS Engine
+├── fos-html       # HTML5 parsing
+├── fos-css        # CSS parsing & styling
+├── fos-dom        # DOM tree
+├── fos-layout     # Layout engine
+├── fos-render     # Rendering (CPU/GPU)
+├── fos-js         # JavaScript (QuickJS)
+├── fos-net        # Networking
+├── fos-canvas     # Canvas 2D
+├── fos-media      # Video/Audio
+├── fos-security   # Security policies
+├── fos-devtools   # Developer tools
+└── fos-engine     # Core integration
 ```
 
-## Building
+## RAM Targets
 
-```bash
-cargo build --release
-```
-
-## Development Phases
-
-See [PHASES.md](PHASES.md) for the complete development roadmap.
-
-## License
-
-GPL-3.0
+| Scenario | Target |
+|----------|--------|
+| Engine idle | 15 MB |
+| Simple page | 30 MB |
+| Complex page | 80 MB |
+| 5 tabs | 200 MB |
+| 10 tabs | 350 MB |

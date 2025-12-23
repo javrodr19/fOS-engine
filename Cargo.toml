@@ -47,7 +47,6 @@ ttf-parser = "0.24"
 
 # Networking
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-url = "2.5"
 
 # Async runtime (lightweight)
 smol = "2.0"

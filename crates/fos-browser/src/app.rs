@@ -854,14 +854,14 @@ impl ApplicationHandler for BrowserApp {
                                             href
                                         } else if href.starts_with("/") {
                                             // Absolute path - prepend origin
-                                            if let Ok(base) = url::Url::parse(&self.current_url) {
+                                            if let Ok(base) = fos_engine::url::Url::parse(&self.current_url) {
                                                 format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), href)
                                             } else {
                                                 href
                                             }
                                         } else {
                                             // Relative path
-                                            if let Ok(base) = url::Url::parse(&self.current_url) {
+                                            if let Ok(base) = fos_engine::url::Url::parse(&self.current_url) {
                                                 if let Ok(joined) = base.join(&href) {
                                                     joined.to_string()
                                                 } else {

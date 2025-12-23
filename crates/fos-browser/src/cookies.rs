@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use fos_engine::url::Url;
 
 /// A browser cookie
 #[derive(Debug, Clone)]
@@ -58,7 +59,7 @@ impl Cookie {
     }
     
     /// Check if cookie matches a URL
-    pub fn matches(&self, url: &url::Url) -> bool {
+    pub fn matches(&self, url: &Url) -> bool {
         // Check domain
         let host = url.host_str().unwrap_or("");
         if !self.domain_matches(host) {
@@ -138,7 +139,7 @@ impl Cookie {
         Some(cookie)
     }
     
-    fn parse_http_date(s: &str) -> Result<u64, ()> {
+    fn parse_http_date(_s: &str) -> Result<u64, ()> {
         // Very simplified HTTP date parsing
         // Real implementation would handle multiple formats
         // For now, just use current time + 1 year as fallback
@@ -201,7 +202,7 @@ impl CookieJar {
     }
     
     /// Get cookies for a URL
-    pub fn get_for_url(&self, url: &url::Url) -> Vec<&Cookie> {
+    pub fn get_for_url(&self, url: &Url) -> Vec<&Cookie> {
         let mut matching = Vec::new();
         
         for domain_cookies in self.cookies.values() {
@@ -216,7 +217,7 @@ impl CookieJar {
     }
     
     /// Build Cookie header for a request
-    pub fn cookie_header(&self, url: &url::Url) -> Option<String> {
+    pub fn cookie_header(&self, url: &Url) -> Option<String> {
         let cookies = self.get_for_url(url);
         if cookies.is_empty() {
             return None;
@@ -232,7 +233,7 @@ impl CookieJar {
     }
     
     /// Process Set-Cookie headers from a response
-    pub fn process_set_cookies(&mut self, url: &url::Url, headers: &[(String, String)]) {
+    pub fn process_set_cookies(&mut self, url: &Url, headers: &[(String, String)]) {
         let domain = url.host_str().unwrap_or("");
         
         for (name, value) in headers {
@@ -335,7 +336,7 @@ mod tests {
         let cookie = Cookie::new("test", "value", "example.com");
         jar.add(cookie);
         
-        let url = url::Url::parse("https://example.com/page").unwrap();
+        let url = Url::parse("https://example.com/page").unwrap();
         let cookies = jar.get_for_url(&url);
         assert_eq!(cookies.len(), 1);
         assert_eq!(cookies[0].name, "test");

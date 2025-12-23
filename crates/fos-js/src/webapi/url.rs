@@ -1,98 +1,90 @@
 //! URL and URLSearchParams
 //!
-//! Web URL parsing and search params.
+//! Web URL parsing and search params using custom RFC 3986 parser.
+
+use fos_dom::url::{Url as CoreUrl, Query, percent_decode, percent_encode};
 
 /// JavaScript URL
 #[derive(Debug, Clone)]
 pub struct JsUrl {
-    pub href: String,
-    pub protocol: String,
-    pub host: String,
-    pub hostname: String,
-    pub port: String,
-    pub pathname: String,
-    pub search: String,
-    pub hash: String,
-    pub username: String,
-    pub password: String,
-    pub origin: String,
-    pub search_params: JsUrlSearchParams,
+    inner: CoreUrl,
 }
 
 impl JsUrl {
     /// Parse a URL string
     pub fn parse(url: &str) -> Option<Self> {
-        // Simple URL parsing
-        let href = url.to_string();
-        
-        // Extract protocol
-        let (protocol, rest) = url.split_once("://")
-            .map(|(p, r)| (format!("{}:", p), r))
-            .unwrap_or_default();
-        
-        // Extract hash
-        let (rest, hash) = rest.rsplit_once('#')
-            .map(|(r, h)| (r, format!("#{}", h)))
-            .unwrap_or((rest, String::new()));
-        
-        // Extract search
-        let (rest, search) = rest.split_once('?')
-            .map(|(r, s)| (r, format!("?{}", s)))
-            .unwrap_or((rest, String::new()));
-        
-        // Extract auth
-        let (auth, rest) = if rest.contains('@') {
-            rest.split_once('@').unwrap_or(("", rest))
-        } else {
-            ("", rest)
-        };
-        
-        let (username, password) = auth.split_once(':')
-            .map(|(u, p)| (u.to_string(), p.to_string()))
-            .unwrap_or_default();
-        
-        // Extract host and path
-        let (host_port, pathname) = rest.split_once('/')
-            .map(|(h, p)| (h, format!("/{}", p)))
-            .unwrap_or((rest, "/".to_string()));
-        
-        let (hostname, port) = host_port.split_once(':')
-            .map(|(h, p)| (h.to_string(), p.to_string()))
-            .unwrap_or((host_port.to_string(), String::new()));
-        
-        let host = if port.is_empty() {
-            hostname.clone()
-        } else {
-            format!("{}:{}", hostname, port)
-        };
-        
-        let origin = format!("{}//{}", protocol, host);
-        
-        let search_params = JsUrlSearchParams::parse(&search);
-        
-        Some(Self {
-            href,
-            protocol,
-            host,
-            hostname,
-            port,
-            pathname,
-            search,
-            hash,
-            username,
-            password,
-            origin,
-            search_params,
-        })
+        CoreUrl::parse(url).ok().map(|inner| Self { inner })
+    }
+    
+    /// Get href
+    pub fn href(&self) -> String {
+        self.inner.to_string()
+    }
+    
+    /// Get protocol (e.g., "https:")
+    pub fn protocol(&self) -> String {
+        format!("{}:", self.inner.scheme())
+    }
+    
+    /// Get host (hostname:port)
+    pub fn host(&self) -> String {
+        self.inner.host_with_port()
+    }
+    
+    /// Get hostname only
+    pub fn hostname(&self) -> String {
+        self.inner.host_str().unwrap_or("").to_string()
+    }
+    
+    /// Get port as string
+    pub fn port(&self) -> String {
+        self.inner.port().map(|p| p.to_string()).unwrap_or_default()
+    }
+    
+    /// Get pathname
+    pub fn pathname(&self) -> String {
+        self.inner.path().to_string()
+    }
+    
+    /// Get search (with leading ?)
+    pub fn search(&self) -> String {
+        self.inner.query_params()
+            .map(|q| format!("?{}", q.to_string()))
+            .unwrap_or_default()
+    }
+    
+    /// Get hash (with leading #)
+    pub fn hash(&self) -> String {
+        self.inner.fragment()
+            .map(|f| format!("#{}", f))
+            .unwrap_or_default()
+    }
+    
+    /// Get username
+    pub fn username(&self) -> String {
+        self.inner.username().to_string()
+    }
+    
+    /// Get password
+    pub fn password(&self) -> String {
+        self.inner.password().unwrap_or("").to_string()
+    }
+    
+    /// Get origin
+    pub fn origin(&self) -> String {
+        self.inner.origin()
+    }
+    
+    /// Get search params
+    pub fn search_params(&self) -> JsUrlSearchParams {
+        self.inner.query_params()
+            .map(|q| JsUrlSearchParams::from_query(q.clone()))
+            .unwrap_or_default()
     }
     
     /// Convert back to string
     pub fn to_string(&self) -> String {
-        let mut url = format!("{}//{}", self.protocol, self.host);
-        url.push_str(&self.pathname);
-        url.push_str(&self.search);
-        url.push_str(&self.hash);
-        url
+        self.inner.to_string()
     }
 }
 
@@ -107,13 +99,20 @@ impl JsUrlSearchParams {
         Self::default()
     }
     
+    pub fn from_query(query: Query) -> Self {
+        let params = query.entries()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self { params }
+    }
+    
     pub fn parse(search: &str) -> Self {
         let query = search.strip_prefix('?').unwrap_or(search);
         let params = query.split('&')
             .filter(|s| !s.is_empty())
             .filter_map(|pair| {
                 let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                Some((decode_uri(k), decode_uri(v)))
+                Some((percent_decode(k), percent_decode(v)))
             })
             .collect();
         Self { params }
@@ -159,18 +158,10 @@ impl JsUrlSearchParams {
     
     pub fn to_string(&self) -> String {
         self.params.iter()
-            .map(|(k, v)| format!("{}={}", encode_uri(k), encode_uri(v)))
+            .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
             .collect::<Vec<_>>()
             .join("&")
     }
-}
-
-fn decode_uri(s: &str) -> String {
-    s.replace('+', " ")
-}
-
-fn encode_uri(s: &str) -> String {
-    s.replace(' ', "+")
 }
 
 #[cfg(test)]
@@ -181,12 +172,12 @@ mod tests {
     fn test_url_parse() {
         let url = JsUrl::parse("https://example.com:8080/path?q=1#hash").unwrap();
         
-        assert_eq!(url.protocol, "https:");
-        assert_eq!(url.hostname, "example.com");
-        assert_eq!(url.port, "8080");
-        assert_eq!(url.pathname, "/path");
-        assert_eq!(url.search, "?q=1");
-        assert_eq!(url.hash, "#hash");
+        assert_eq!(url.protocol(), "https:");
+        assert_eq!(url.hostname(), "example.com");
+        assert_eq!(url.port(), "8080");
+        assert_eq!(url.pathname(), "/path");
+        assert_eq!(url.search(), "?q=1");
+        assert_eq!(url.hash(), "#hash");
     }
     
     #[test]

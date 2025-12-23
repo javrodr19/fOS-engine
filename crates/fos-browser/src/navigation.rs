@@ -2,7 +2,7 @@
 //!
 //! URL handling, history, and navigation.
 
-use url::Url;
+use fos_engine::url::{Url, ParseError};
 use std::collections::VecDeque;
 
 /// Navigation history
@@ -105,6 +105,11 @@ pub fn normalize_url(input: &str) -> Result<String, UrlError> {
         return Ok(input.to_string());
     }
     
+    // Handle fos: URLs
+    if input.starts_with("fos:") {
+        return Ok(input.to_string());
+    }
+    
     // Add https:// if no scheme
     let with_scheme = if !input.contains("://") {
         format!("https://{}", input)
@@ -115,9 +120,9 @@ pub fn normalize_url(input: &str) -> Result<String, UrlError> {
     // Parse and validate
     let url = Url::parse(&with_scheme).map_err(|e| UrlError::Parse(e.to_string()))?;
     
-    // Only allow http/https
+    // Only allow http/https/about/fos
     match url.scheme() {
-        "http" | "https" | "about" => Ok(url.to_string()),
+        "http" | "https" | "about" | "fos" => Ok(url.to_string()),
         scheme => Err(UrlError::UnsupportedScheme(scheme.to_string())),
     }
 }

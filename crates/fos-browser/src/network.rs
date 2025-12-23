@@ -125,7 +125,7 @@ impl NetworkManager {
         }
         
         // Prefetch DNS for this host (learns patterns)
-        if let Ok(parsed) = url::Url::parse(url) {
+        if let Ok(parsed) = fos_engine::url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
                 self.predictive_dns.prefetch(host);
             }

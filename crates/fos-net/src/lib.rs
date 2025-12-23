@@ -15,7 +15,7 @@ pub mod network_opt;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
-pub use url::Url;
+// Re-export URL from fos-engine (custom RFC 3986 parser)
 pub use websocket::{WebSocket, WebSocketState, WebSocketError, MessageData};
 pub use sse::{EventSource, EventSourceState, SseEvent};
 pub use beacon::{send_beacon, BeaconData};

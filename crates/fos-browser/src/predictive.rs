@@ -47,7 +47,7 @@ impl PredictiveNetwork {
     
     /// Record a page visit for prediction learning
     pub fn record_visit(&mut self, url: &str) {
-        if let Ok(parsed) = url::Url::parse(url) {
+        if let Ok(parsed) = fos_engine::url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
                 // Use fos-net predictive DNS
                 self.dns.prefetch(host);
@@ -84,7 +84,7 @@ impl PredictiveNetwork {
     pub fn update_page_links(&mut self, links: Vec<String>) {
         self.page_links.clear();
         for link in links {
-            if let Ok(parsed) = url::Url::parse(&link) {
+            if let Ok(parsed) = fos_engine::url::Url::parse(&link) {
                 if let Some(host) = parsed.host_str() {
                     self.page_links.insert(host.to_string());
                     // Prefetch DNS for all visible links
@@ -222,7 +222,7 @@ impl ResourceHint {
     
     /// Apply this hint to the predictive network
     pub fn apply(&self, network: &mut PredictiveNetwork) {
-        if let Ok(parsed) = url::Url::parse(&self.url) {
+        if let Ok(parsed) = fos_engine::url::Url::parse(&self.url) {
             if let Some(host) = parsed.host_str() {
                 match self.hint_type {
                     HintType::DnsPrefetch => {

@@ -1,10 +1,10 @@
 //! Location API
 //!
-//! Implements window.location object.
+//! Implements window.location object using custom URL parser.
 
+use fos_dom::url::{Url, ParseError};
 use rquickjs::{Ctx, Function, Object, Value};
 use std::sync::{Arc, Mutex};
-use url::Url;
 
 /// Location state
 pub struct LocationManager {
@@ -12,7 +12,7 @@ pub struct LocationManager {
 }
 
 impl LocationManager {
-    pub fn new(url_str: &str) -> Result<Self, url::ParseError> {
+    pub fn new(url_str: &str) -> Result<Self, ParseError> {
         let url = Url::parse(url_str)?;
         Ok(Self { url })
     }
@@ -25,12 +25,12 @@ impl LocationManager {
     }
     
     /// Full URL
-    pub fn href(&self) -> &str {
-        self.url.as_str()
+    pub fn href(&self) -> String {
+        self.url.to_string()
     }
     
     /// Set href (navigate)
-    pub fn set_href(&mut self, url: &str) -> Result<(), url::ParseError> {
+    pub fn set_href(&mut self, url: &str) -> Result<(), ParseError> {
         self.url = Url::parse(url)?;
         Ok(())
     }
@@ -42,15 +42,12 @@ impl LocationManager {
     
     /// Host (hostname:port)
     pub fn host(&self) -> String {
-        match self.url.port() {
-            Some(port) => format!("{}:{}", self.url.host_str().unwrap_or(""), port),
-            None => self.url.host_str().unwrap_or("").to_string(),
-        }
+        self.url.host_with_port()
     }
     
     /// Hostname only
-    pub fn hostname(&self) -> &str {
-        self.url.host_str().unwrap_or("")
+    pub fn hostname(&self) -> String {
+        self.url.host_str().unwrap_or("").to_string()
     }
     
     /// Port
@@ -65,17 +62,21 @@ impl LocationManager {
     
     /// Search/query string (including ?)
     pub fn search(&self) -> String {
-        self.url.query().map(|q| format!("?{}", q)).unwrap_or_default()
+        self.url.query_params()
+            .map(|q| format!("?{}", q.to_string()))
+            .unwrap_or_default()
     }
     
     /// Hash/fragment (including #)
     pub fn hash(&self) -> String {
-        self.url.fragment().map(|f| format!("#{}", f)).unwrap_or_default()
+        self.url.fragment()
+            .map(|f| format!("#{}", f))
+            .unwrap_or_default()
     }
     
     /// Origin
     pub fn origin(&self) -> String {
-        self.url.origin().ascii_serialization()
+        self.url.origin()
     }
 }
 
@@ -87,7 +88,7 @@ pub fn install_location(ctx: &Ctx, location: Arc<Mutex<LocationManager>>) -> Res
     // href getter
     let l = location.clone();
     obj.set("getHref", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().href().to_string())
+        Ok(l.lock().unwrap().href())
     })?)?;
     
     // protocol
@@ -105,7 +106,7 @@ pub fn install_location(ctx: &Ctx, location: Arc<Mutex<LocationManager>>) -> Res
     // hostname
     let l = location.clone();
     obj.set("getHostname", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().hostname().to_string())
+        Ok(l.lock().unwrap().hostname())
     })?)?;
     
     // pathname

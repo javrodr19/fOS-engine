@@ -122,8 +122,8 @@ mod tests {
     #[test]
     fn test_url_parsing() {
         let url = WebApiManager::parse_url("https://example.com/path?q=1").unwrap();
-        assert_eq!(url.hostname, "example.com");
-        assert_eq!(url.pathname, "/path");
+        assert_eq!(url.hostname(), "example.com");
+        assert_eq!(url.pathname(), "/path");
     }
     
     #[test]

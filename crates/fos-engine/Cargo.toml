@@ -45,4 +45,3 @@ mimalloc = { version = "0.1", optional = true }
 # Common deps
 tracing.workspace = true
 thiserror.workspace = true
-url.workspace = true

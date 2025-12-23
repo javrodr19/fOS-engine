@@ -29,6 +29,7 @@ pub mod compact_node;
 pub mod query_cache;
 pub mod autonomous_elements;
 pub mod accessibility;
+pub mod url;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;

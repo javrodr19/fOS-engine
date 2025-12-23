@@ -11,4 +11,3 @@ fos-dom = { path = "../fos-dom" }
 rquickjs.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-url.workspace = true

@@ -146,7 +146,7 @@ impl DownloadManager {
     }
     
     fn filename_from_url(url: &str) -> Option<String> {
-        let parsed = url::Url::parse(url).ok()?;
+        let parsed = fos_engine::url::Url::parse(url).ok()?;
         let path = parsed.path();
         let filename = path.rsplit('/').next()?;
         if filename.is_empty() {

@@ -138,7 +138,7 @@ impl UrlBar {
         self.focused = false;
     }
     
-    /// Render the URL bar
+    /// Render the URL bar - simplified, keyboard-only (no buttons)
     pub fn render(
         &self,
         buffer: &mut [u32],
@@ -150,115 +150,65 @@ impl UrlBar {
         let height = URL_BAR_HEIGHT as usize;
         let width = buffer_width - x_start;
         
-        // Fill background
+        // Fill background with dark teal to match tab bar
+        let bg_color = 0xFF1A3A3A; // Dark teal
         for dy in 0..height {
             for dx in 0..width {
                 let px = x_start + dx;
                 let py = y_start + dy;
                 if px < buffer_width && py < buffer_height {
-                    buffer[py * buffer_width + px] = colors::BG;
+                    buffer[py * buffer_width + px] = bg_color;
                 }
             }
         }
         
-        // Draw buttons
-        let mut x_offset = x_start + 4;
+        // Draw URL text - full width, no buttons
+        let text_color = if self.focused { 0xFFFFFFFF } else { 0xFFC0C0C0 };
         
-        // Back button
-        self.draw_button(
-            buffer, buffer_width, buffer_height,
-            x_offset, y_start + 2,
-            '←',
-            self.can_back,
-            self.hovered_button == Some(UrlBarButton::Back),
-        );
-        x_offset += BUTTON_SIZE as usize + 2;
+        // Calculate how many chars can fit
+        let available_width = width.saturating_sub(16);
+        let max_chars = available_width / 7;
         
-        // Forward button
-        self.draw_button(
-            buffer, buffer_width, buffer_height,
-            x_offset, y_start + 2,
-            '→',
-            self.can_forward,
-            self.hovered_button == Some(UrlBarButton::Forward),
-        );
-        x_offset += BUTTON_SIZE as usize + 2;
-        
-        // Reload button
-        self.draw_button(
-            buffer, buffer_width, buffer_height,
-            x_offset, y_start + 2,
-            if self.loading { '×' } else { '↻' },
-            true,
-            self.hovered_button == Some(UrlBarButton::Reload),
-        );
-        x_offset += BUTTON_SIZE as usize + 8;
-        
-        // URL input field
-        let input_x = x_offset;
-        let input_width = width - (x_offset - x_start) - BUTTON_SIZE as usize - 12;
-        
-        // Input background
-        for dy in 2..height - 2 {
-            for dx in 0..input_width {
-                let px = input_x + dx;
-                let py = y_start + dy;
-                if px < buffer_width && py < buffer_height {
-                    buffer[py * buffer_width + px] = colors::INPUT_BG;
-                }
-            }
-        }
-        
-        // Loading progress bar
-        if self.loading && self.progress > 0.0 {
-            let progress_width = ((input_width as f32) * self.progress) as usize;
-            for dx in 0..progress_width {
-                let px = input_x + dx;
-                let py = y_start + height - 3;
-                if px < buffer_width && py < buffer_height {
-                    buffer[py * buffer_width + px] = colors::LOADING;
-                }
-            }
-        }
-        
-        // Draw URL text
-        let display_url = if self.input.len() > 80 {
-            format!("{}...", &self.input[..77])
+        let display_url: String = if self.input.len() > max_chars {
+            format!("{}…", &self.input[..max_chars.saturating_sub(1)])
         } else {
             self.input.clone()
         };
         
-        let text_color = if self.focused { colors::TEXT } else { colors::TEXT_DIM };
         self.draw_text(
             buffer, buffer_width, buffer_height,
-            input_x + 8, y_start + 10,
+            x_start + 8, y_start + height / 2 - 4,
             &display_url,
             text_color,
         );
         
         // Draw cursor if focused
         if self.focused {
-            let cursor_x = input_x + 8 + (self.cursor.min(80) * 7);
+            let visible_cursor = self.cursor.min(max_chars);
+            let cursor_x = x_start + 8 + visible_cursor * 7;
             for dy in 4..height - 4 {
                 let py = y_start + dy;
                 if cursor_x < buffer_width && py < buffer_height {
-                    buffer[py * buffer_width + cursor_x] = colors::TEXT;
+                    buffer[py * buffer_width + cursor_x] = 0xFFFFFFFF;
                 }
             }
         }
         
-        // Menu button
-        let menu_x = buffer_width - BUTTON_SIZE as usize - 4;
-        self.draw_button(
-            buffer, buffer_width, buffer_height,
-            menu_x, y_start + 2,
-            '≡',
-            true,
-            self.hovered_button == Some(UrlBarButton::Menu),
-        );
+        // Loading indicator - subtle line at top
+        if self.loading {
+            let progress_width = ((width as f32) * self.progress.max(0.3)) as usize;
+            for dx in 0..progress_width {
+                let px = x_start + dx;
+                let py = y_start;
+                if px < buffer_width && py < buffer_height {
+                    buffer[py * buffer_width + px] = colors::LOADING;
+                }
+            }
+        }
     }
     
     /// Draw a button
+    #[allow(dead_code)]
     fn draw_button(
         &self,
         buffer: &mut [u32],

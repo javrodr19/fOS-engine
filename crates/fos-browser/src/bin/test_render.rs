@@ -8,7 +8,7 @@ fn main() {
     
     // Create loader and renderer
     let loader = Loader::new();
-    let renderer = PageRenderer::new(800, 600);
+    let mut renderer = PageRenderer::new(800, 600);
     
     // Test with a simple page first
     let test_html = r#"
@@ -29,7 +29,7 @@ fn main() {
     
     println!("Rendering test HTML...");
     
-    match renderer.render_html(test_html, "about:test") {
+    match renderer.render_html(test_html, "about:test", 0.0) {
         Some(rendered) => {
             println!("✓ Rendered: {}x{} ({} bytes)", 
                 rendered.width, 
@@ -53,7 +53,7 @@ fn main() {
             );
             
             // Render it
-            match renderer.render_html(&page.html, &page.url) {
+            match renderer.render_html(&page.html, &page.url, 0.0) {
                 Some(rendered) => {
                     println!("✓ Rendered: {}x{} ({} bytes pixels)", 
                         rendered.width, 

@@ -1,25 +1,24 @@
 //! Tab Bar Component
 //!
-//! Vertical tab bar on the left side.
+//! Vertical tab bar on the left side - keyboard-only, no buttons.
 
 use crate::tab::{TabId, TabManager};
 
-/// Tab bar width in pixels
-pub const TAB_BAR_WIDTH: u32 = 40;
+/// Tab bar width in pixels (wider to show tab titles)
+pub const TAB_BAR_WIDTH: u32 = 120;
 
 /// Tab height
-pub const TAB_HEIGHT: u32 = 36;
+pub const TAB_HEIGHT: u32 = 24;
 
-/// Colors (ARGB format)
+/// Colors (ARGB format) - Teal/green theme
 pub mod colors {
-    pub const BG: u32 = 0xFF1A1A1A;
-    pub const TAB_ACTIVE: u32 = 0xFF2D2D2D;
-    pub const TAB_HOVER: u32 = 0xFF252525;
-    pub const TAB_INACTIVE: u32 = 0xFF1A1A1A;
-    pub const TEXT: u32 = 0xFFE0E0E0;
-    pub const TEXT_DIM: u32 = 0xFF808080;
-    pub const ACCENT: u32 = 0xFF4A9EFF;
-    pub const NEW_TAB_BTN: u32 = 0xFF3D3D3D;
+    pub const BG: u32 = 0xFF1A3A3A;           // Dark teal background
+    pub const TAB_ACTIVE: u32 = 0xFF2A5A5A;   // Lighter teal for active
+    pub const TAB_HOVER: u32 = 0xFF254A4A;    // Medium teal for hover
+    pub const TAB_INACTIVE: u32 = 0xFF1A3A3A; // Same as bg
+    pub const TEXT: u32 = 0xFFE0E0E0;         // White text
+    pub const TEXT_DIM: u32 = 0xFF80A0A0;     // Dimmed teal text
+    pub const ACCENT: u32 = 0xFF40C0C0;       // Bright teal accent
 }
 
 /// Tab bar state
@@ -102,52 +101,28 @@ impl TabBar {
                 );
             }
             
-            // Draw first letter of title as icon
-            let first_char = tab.title.chars().next().unwrap_or('?');
-            self.draw_char(
+            // Draw tab title (truncated to fit)
+            let title = &tab.title;
+            let max_chars = ((TAB_BAR_WIDTH - 10) / 7) as usize; // ~7px per char
+            let display_title: String = if title.len() > max_chars {
+                format!("{}…", &title[..max_chars.saturating_sub(1)])
+            } else {
+                title.clone()
+            };
+            
+            self.draw_text(
                 buffer,
                 buffer_width,
                 buffer_height,
-                (width / 2) as i32 - 4,
-                y_offset + 10,
-                first_char,
+                5,
+                y_offset + 6,
+                &display_title,
                 colors::TEXT,
             );
             
-            y_offset += TAB_HEIGHT as i32 + 2;
+            y_offset += TAB_HEIGHT as i32 + 1;
         }
-        
-        // Draw new tab button
-        let new_tab_y = y_offset as usize + 8;
-        if new_tab_y + 28 < buffer_height {
-            let btn_color = if self.hovered_new_tab {
-                colors::TAB_HOVER
-            } else {
-                colors::NEW_TAB_BTN
-            };
-            
-            self.draw_rect(
-                buffer,
-                buffer_width,
-                buffer_height,
-                6,
-                new_tab_y,
-                width - 12,
-                28,
-                btn_color,
-            );
-            
-            // Draw + symbol
-            self.draw_char(
-                buffer,
-                buffer_width,
-                buffer_height,
-                (width / 2) as i32 - 4,
-                new_tab_y as i32 + 6,
-                '+',
-                colors::TEXT_DIM,
-            );
-        }
+        // No new tab button - keyboard only (Ctrl+T)
     }
     
     /// Draw a filled rectangle
@@ -185,6 +160,24 @@ impl TabBar {
         color: u32,
     ) {
         super::font::draw_char(buffer, buffer_width, buffer_height, x, y, c, color);
+    }
+    
+    /// Draw text string
+    fn draw_text(
+        &self,
+        buffer: &mut [u32],
+        buffer_width: usize,
+        buffer_height: usize,
+        x: i32,
+        y: i32,
+        text: &str,
+        color: u32,
+    ) {
+        let mut x_pos = x;
+        for c in text.chars() {
+            self.draw_char(buffer, buffer_width, buffer_height, x_pos, y, c, color);
+            x_pos += 7; // Character width + spacing
+        }
     }
     
     /// Handle mouse move

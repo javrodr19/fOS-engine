@@ -2,6 +2,7 @@
 //!
 //! Handles multiple browser tabs.
 
+use crate::navigation::History;
 use crate::page::Page;
 use std::collections::HashMap;
 
@@ -23,11 +24,22 @@ pub struct Tab {
     pub loading: bool,
     /// Favicon (if loaded)
     pub favicon: Option<Vec<u8>>,
+    /// Navigation history
+    pub history: History,
+    /// Cached HTML content (for instant tab switching)
+    pub cached_html: Option<String>,
+    /// Needs reload from network
+    pub needs_network_load: bool,
 }
 
 impl Tab {
     /// Create a new tab
     pub fn new(id: TabId, url: &str) -> Self {
+        let mut history = History::new();
+        let needs_load = url != "about:blank";
+        if needs_load {
+            history.navigate(url);
+        }
         Self {
             id,
             url: url.to_string(),
@@ -35,15 +47,58 @@ impl Tab {
             page: None,
             loading: false,
             favicon: None,
+            history,
+            cached_html: None,
+            needs_network_load: needs_load,
         }
     }
     
-    /// Navigate to URL
+    /// Navigate to URL (triggers network load)
     pub fn navigate(&mut self, url: &str) {
+        self.history.navigate(url);
         self.url = url.to_string();
         self.loading = true;
         self.title = "Loading...".to_string();
-        // Page loading happens async
+        self.cached_html = None; // Clear cache for new URL
+        self.needs_network_load = true;
+    }
+    
+    /// Go back in history
+    pub fn go_back(&mut self) -> Option<String> {
+        if let Some(url) = self.history.go_back() {
+            self.url = url.clone();
+            self.loading = true;
+            self.title = "Loading...".to_string();
+            self.cached_html = None; // TODO: Could cache per-URL
+            self.needs_network_load = true;
+            Some(url)
+        } else {
+            None
+        }
+    }
+    
+    /// Go forward in history
+    pub fn go_forward(&mut self) -> Option<String> {
+        if let Some(url) = self.history.go_forward() {
+            self.url = url.clone();
+            self.loading = true;
+            self.title = "Loading...".to_string();
+            self.cached_html = None;
+            self.needs_network_load = true;
+            Some(url)
+        } else {
+            None
+        }
+    }
+    
+    /// Can go back
+    pub fn can_go_back(&self) -> bool {
+        self.history.can_go_back()
+    }
+    
+    /// Can go forward
+    pub fn can_go_forward(&self) -> bool {
+        self.history.can_go_forward()
     }
     
     /// Set page content after loading
@@ -164,6 +219,28 @@ impl TabManager {
     /// Get tab count
     pub fn count(&self) -> usize {
         self.tabs.len()
+    }
+    
+    /// Select previous tab (go up in list)
+    pub fn select_previous_tab(&mut self) {
+        if let Some(active_id) = self.active {
+            if let Some(pos) = self.order.iter().position(|&id| id == active_id) {
+                if pos > 0 {
+                    self.active = Some(self.order[pos - 1]);
+                }
+            }
+        }
+    }
+    
+    /// Select next tab (go down in list)
+    pub fn select_next_tab(&mut self) {
+        if let Some(active_id) = self.active {
+            if let Some(pos) = self.order.iter().position(|&id| id == active_id) {
+                if pos + 1 < self.order.len() {
+                    self.active = Some(self.order[pos + 1]);
+                }
+            }
+        }
     }
     
     /// Check if a tab is active

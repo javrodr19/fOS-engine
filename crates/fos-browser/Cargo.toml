@@ -14,6 +14,28 @@ fos-dom = { path = "../fos-dom" }
 fos-css = { path = "../fos-css" }
 fos-layout = { path = "../fos-layout" }
 fos-render = { path = "../fos-render" }
+fos-text = { path = "../fos-text" }
+
+# JavaScript runtime
+fos-js = { path = "../fos-js" }
+
+# Networking (HTTP cache, prefetch, XHR)
+fos-net = { path = "../fos-net" }
+
+# Security (CORS, CSP)
+fos-security = { path = "../fos-security" }
+
+# Accessibility
+fos-a11y = { path = "../fos-a11y" }
+
+# Developer tools
+fos-devtools = { path = "../fos-devtools" }
+
+# Media (video, audio)
+fos-media = { path = "../fos-media" }
+
+# Canvas (2D and WebGL)
+fos-canvas = { path = "../fos-canvas" }
 
 # Window management (minimal)
 winit = "0.30"
@@ -33,6 +55,9 @@ smol = "2.0"
 # Logging
 log = "0.4"
 env_logger = "0.11"
+
+# Error handling
+thiserror = "1.0"
 
 [features]
 default = []

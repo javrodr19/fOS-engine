@@ -1,22 +1,35 @@
 //! Font loading and matching module
+//!
+//! Custom font parser implementation - replaces ttf-parser and fontdb.
 
-mod database;
+// Custom parser (replaces ttf-parser)
+pub mod parser;
+// WOFF decoder
+pub mod woff;
+// String interning for font names
+mod intern;
+// Arena allocator for efficient parsing
+pub mod arena;
+// Fixed-point arithmetic for variable font axes
+pub mod fixed_point;
+// Custom database (replaces fontdb)
+mod custom_database;
+
+// Original modules
 mod face;
 mod matching;
 pub mod variable;
 pub mod emoji;
 pub mod optimization;
 
-pub use database::FontDatabase;
+// Re-export from custom implementations
+pub use custom_database::{CustomFontDatabase as FontDatabase, FontId, FontEntry, FontSource};
 pub use face::FontFace;
-pub use matching::FontQuery;
+pub use matching::{FontQuery, resolve_generic_family};
 pub use variable::{FontAxis, VariableFont, VariableFontInstance, NamedInstance, axis_tags};
 pub use emoji::{EmojiRenderer, ColorGlyph, ColorFontFormat, is_emoji};
 pub use optimization::{FontSubsetter, GlyphStreamer, SharedFontCache, MmapFont, GlyphMetricsCache};
-
-/// Unique identifier for a loaded font
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FontId(pub fontdb::ID);
+pub use parser::{GlyphId, OutlineBuilder, BoundingBox, FontParser};
 
 /// Font weight (100-900)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,24 +60,4 @@ pub enum FontStyle {
     Normal,
     Italic,
     Oblique,
-}
-
-impl From<fontdb::Style> for FontStyle {
-    fn from(style: fontdb::Style) -> Self {
-        match style {
-            fontdb::Style::Normal => FontStyle::Normal,
-            fontdb::Style::Italic => FontStyle::Italic,
-            fontdb::Style::Oblique => FontStyle::Oblique,
-        }
-    }
-}
-
-impl From<FontStyle> for fontdb::Style {
-    fn from(style: FontStyle) -> Self {
-        match style {
-            FontStyle::Normal => fontdb::Style::Normal,
-            FontStyle::Italic => fontdb::Style::Italic,
-            FontStyle::Oblique => fontdb::Style::Oblique,
-        }
-    }
 }

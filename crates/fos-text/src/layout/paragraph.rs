@@ -78,13 +78,13 @@ impl ParagraphLayout {
         }
         
         // Get line height from font metrics
-        let line_height = db.with_face_data(font_id, |data, _| {
-            ttf_parser::Face::parse(data, 0)
-                .map(|face| {
-                    let upem = face.units_per_em() as f32;
-                    let ascender = face.ascender() as f32;
-                    let descender = face.descender() as f32;
-                    let gap = face.line_gap() as f32;
+        let line_height = db.with_face_data(font_id, |data, index| {
+            crate::font::FontParser::parse_index(data, index)
+                .map(|parser| {
+                    let upem = parser.units_per_em() as f32;
+                    let ascender = parser.ascender() as f32;
+                    let descender = parser.descender() as f32;
+                    let gap = parser.line_gap() as f32;
                     (ascender - descender + gap) * self.style.font_size / upem * self.style.line_height
                 })
                 .unwrap_or(self.style.font_size * self.style.line_height)

@@ -8,25 +8,22 @@ description = "Text rendering and font handling for fOS browser engine"
 
 [features]
 default = ["bundled-fonts"]
-# Use bundled font rendering (rustybuzz + ttf-parser)
+# Use bundled font rendering (custom parser + rustybuzz)
 bundled-fonts = []
 # Use system FreeType for font rendering (smaller binary, requires libfreetype)
 system-freetype = []
 
 [dependencies]
-# Font database and matching
-fontdb.workspace = true
-
-# Text shaping (HarfBuzz port) - can use system harfbuzz if desired
+# Text shaping (HarfBuzz port) - kept for complex text layout
 rustybuzz.workspace = true
-
-# Font file parsing
-ttf-parser.workspace = true
 
 # Rendering (for glyph rasterization)
 tiny-skia.workspace = true
 
 # Error handling
 thiserror.workspace = true
+
+# Optional: for system font scanning
+glob = "0.3"
 
 [dev-dependencies]

@@ -2,8 +2,10 @@
 //!
 //! Implementation of OpenType variable fonts (OpenType 1.8+).
 //! Variable fonts allow continuous variation along design axes.
+//! Uses Fixed16 for deterministic, cross-platform axis calculations.
 
 use std::collections::HashMap;
+use super::fixed_point::Fixed16;
 
 /// Variable font axis definition
 #[derive(Debug, Clone)]
@@ -12,12 +14,12 @@ pub struct FontAxis {
     pub tag: [u8; 4],
     /// Human-readable name
     pub name: String,
-    /// Minimum value
-    pub min_value: f32,
-    /// Default value
-    pub default_value: f32,
-    /// Maximum value
-    pub max_value: f32,
+    /// Minimum value (Fixed16 for determinism)
+    pub min_value: Fixed16,
+    /// Default value (Fixed16 for determinism)
+    pub default_value: Fixed16,
+    /// Maximum value (Fixed16 for determinism)
+    pub max_value: Fixed16,
     /// Whether this is a registered axis
     pub is_registered: bool,
 }
@@ -25,6 +27,18 @@ pub struct FontAxis {
 impl FontAxis {
     /// Create a new font axis
     pub fn new(tag: [u8; 4], name: &str, min: f32, default: f32, max: f32) -> Self {
+        Self {
+            tag,
+            name: name.to_string(),
+            min_value: Fixed16::from_f32(min),
+            default_value: Fixed16::from_f32(default),
+            max_value: Fixed16::from_f32(max),
+            is_registered: is_registered_axis(&tag),
+        }
+    }
+    
+    /// Create with Fixed16 values directly
+    pub fn new_fixed(tag: [u8; 4], name: &str, min: Fixed16, default: Fixed16, max: Fixed16) -> Self {
         Self {
             tag,
             name: name.to_string(),
@@ -40,15 +54,39 @@ impl FontAxis {
         String::from_utf8_lossy(&self.tag).to_string()
     }
     
-    /// Clamp value to axis range
-    pub fn clamp(&self, value: f32) -> f32 {
+    /// Clamp value to axis range (Fixed16)
+    pub fn clamp(&self, value: Fixed16) -> Fixed16 {
         value.clamp(self.min_value, self.max_value)
     }
     
+    /// Clamp f32 value to axis range
+    pub fn clamp_f32(&self, value: f32) -> f32 {
+        self.clamp(Fixed16::from_f32(value)).to_f32()
+    }
+    
     /// Normalize value to 0..1 range
-    pub fn normalize(&self, value: f32) -> f32 {
+    pub fn normalize(&self, value: Fixed16) -> Fixed16 {
         let clamped = self.clamp(value);
-        (clamped - self.min_value) / (self.max_value - self.min_value)
+        let range = self.max_value - self.min_value;
+        if range.to_bits() == 0 {
+            return Fixed16::ZERO;
+        }
+        (clamped - self.min_value) / range
+    }
+    
+    /// Get min value as f32 (for compatibility)
+    pub fn min_f32(&self) -> f32 {
+        self.min_value.to_f32()
+    }
+    
+    /// Get max value as f32 (for compatibility)
+    pub fn max_f32(&self) -> f32 {
+        self.max_value.to_f32()
+    }
+    
+    /// Get default value as f32 (for compatibility)
+    pub fn default_f32(&self) -> f32 {
+        self.default_value.to_f32()
     }
 }
 
@@ -72,11 +110,11 @@ pub mod axis_tags {
     pub const OPTICAL_SIZE: [u8; 4] = *b"opsz";
 }
 
-/// Variable font instance
+/// Variable font instance with Fixed16 coordinates
 #[derive(Debug, Clone)]
 pub struct VariableFontInstance {
-    /// Axis values for this instance
-    pub coordinates: HashMap<[u8; 4], f32>,
+    /// Axis values for this instance (Fixed16 for determinism)
+    pub coordinates: HashMap<[u8; 4], Fixed16>,
 }
 
 impl Default for VariableFontInstance {
@@ -93,44 +131,54 @@ impl VariableFontInstance {
         }
     }
     
-    /// Set axis value
-    pub fn set_axis(&mut self, tag: [u8; 4], value: f32) {
+    /// Set axis value (Fixed16)
+    pub fn set_axis(&mut self, tag: [u8; 4], value: Fixed16) {
         self.coordinates.insert(tag, value);
     }
     
-    /// Get axis value
-    pub fn get_axis(&self, tag: &[u8; 4]) -> Option<f32> {
+    /// Set axis value (f32 convenience)
+    pub fn set_axis_f32(&mut self, tag: [u8; 4], value: f32) {
+        self.set_axis(tag, Fixed16::from_f32(value));
+    }
+    
+    /// Get axis value (Fixed16)
+    pub fn get_axis(&self, tag: &[u8; 4]) -> Option<Fixed16> {
         self.coordinates.get(tag).copied()
+    }
+    
+    /// Get axis value as f32
+    pub fn get_axis_f32(&self, tag: &[u8; 4]) -> Option<f32> {
+        self.get_axis(tag).map(|v| v.to_f32())
     }
     
     /// Set weight (wght axis)
     pub fn set_weight(&mut self, weight: f32) {
-        self.set_axis(axis_tags::WEIGHT, weight);
+        self.set_axis_f32(axis_tags::WEIGHT, weight);
     }
     
     /// Set width (wdth axis)
     pub fn set_width(&mut self, width: f32) {
-        self.set_axis(axis_tags::WIDTH, width);
+        self.set_axis_f32(axis_tags::WIDTH, width);
     }
     
     /// Set slant (slnt axis)
     pub fn set_slant(&mut self, slant: f32) {
-        self.set_axis(axis_tags::SLANT, slant);
+        self.set_axis_f32(axis_tags::SLANT, slant);
     }
     
     /// Set italic (ital axis)
     pub fn set_italic(&mut self, italic: f32) {
-        self.set_axis(axis_tags::ITALIC, italic);
+        self.set_axis_f32(axis_tags::ITALIC, italic);
     }
     
     /// Convert CSS font-weight to axis value
-    pub fn from_css_weight(weight: u16) -> f32 {
-        weight as f32
+    pub fn from_css_weight(weight: u16) -> Fixed16 {
+        Fixed16::from_i32(weight as i32)
     }
     
     /// Convert CSS font-stretch to axis value  
-    pub fn from_css_stretch(stretch: &str) -> f32 {
-        match stretch {
+    pub fn from_css_stretch(stretch: &str) -> Fixed16 {
+        let value = match stretch {
             "ultra-condensed" => 50.0,
             "extra-condensed" => 62.5,
             "condensed" => 75.0,
@@ -141,7 +189,8 @@ impl VariableFontInstance {
             "extra-expanded" => 150.0,
             "ultra-expanded" => 200.0,
             _ => 100.0,
-        }
+        };
+        Fixed16::from_f32(value)
     }
 }
 
@@ -195,18 +244,23 @@ impl VariableFont {
         instance
     }
     
-    /// Interpolate between two instances
-    pub fn interpolate(&self, a: &VariableFontInstance, b: &VariableFontInstance, t: f32) -> VariableFontInstance {
+    /// Interpolate between two instances (deterministic with Fixed16)
+    pub fn interpolate(&self, a: &VariableFontInstance, b: &VariableFontInstance, t: Fixed16) -> VariableFontInstance {
         let mut result = VariableFontInstance::new();
         
         for axis in &self.axes {
             let va = a.get_axis(&axis.tag).unwrap_or(axis.default_value);
             let vb = b.get_axis(&axis.tag).unwrap_or(axis.default_value);
-            let interpolated = va + (vb - va) * t;
+            let interpolated = va.lerp(vb, t);
             result.set_axis(axis.tag, axis.clamp(interpolated));
         }
         
         result
+    }
+    
+    /// Interpolate with f32 t value (convenience)
+    pub fn interpolate_f32(&self, a: &VariableFontInstance, b: &VariableFontInstance, t: f32) -> VariableFontInstance {
+        self.interpolate(a, b, Fixed16::from_f32(t))
     }
 }
 
@@ -233,23 +287,47 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_font_axis() {
+    fn test_font_axis_fixed16() {
         let axis = FontAxis::new(*b"wght", "Weight", 100.0, 400.0, 900.0);
         assert_eq!(axis.tag_string(), "wght");
         assert!(axis.is_registered);
-        assert_eq!(axis.clamp(50.0), 100.0);
-        assert_eq!(axis.clamp(1000.0), 900.0);
+        
+        // Test clamping with Fixed16
+        let clamped = axis.clamp(Fixed16::from_f32(50.0));
+        assert!((clamped.to_f32() - 100.0).abs() < 0.01);
+        
+        let clamped = axis.clamp(Fixed16::from_f32(1000.0));
+        assert!((clamped.to_f32() - 900.0).abs() < 0.01);
     }
     
     #[test]
-    fn test_variable_font_instance() {
+    fn test_variable_font_instance_fixed16() {
         let mut instance = VariableFontInstance::new();
         instance.set_weight(700.0);
-        assert_eq!(instance.get_axis(&axis_tags::WEIGHT), Some(700.0));
+        
+        let weight = instance.get_axis_f32(&axis_tags::WEIGHT);
+        assert!((weight.unwrap() - 700.0).abs() < 0.01);
     }
     
     #[test]
-    fn test_variable_font() {
+    fn test_variable_font_interpolation() {
+        let mut font = VariableFont::new("Test Font");
+        font.add_axis(FontAxis::new(*b"wght", "Weight", 100.0, 400.0, 900.0));
+        
+        let mut a = VariableFontInstance::new();
+        a.set_weight(100.0);
+        
+        let mut b = VariableFontInstance::new();
+        b.set_weight(900.0);
+        
+        // Interpolate at 50%
+        let result = font.interpolate_f32(&a, &b, 0.5);
+        let weight = result.get_axis_f32(&axis_tags::WEIGHT).unwrap();
+        assert!((weight - 500.0).abs() < 1.0);
+    }
+    
+    #[test]
+    fn test_variable_font_default() {
         let mut font = VariableFont::new("Test Font");
         font.add_axis(FontAxis::new(*b"wght", "Weight", 100.0, 400.0, 900.0));
         font.add_axis(FontAxis::new(*b"wdth", "Width", 75.0, 100.0, 125.0));
@@ -258,6 +336,7 @@ mod tests {
         assert!(!font.has_axis(&axis_tags::SLANT));
         
         let default = font.default_instance();
-        assert_eq!(default.get_axis(&axis_tags::WEIGHT), Some(400.0));
+        let weight = default.get_axis_f32(&axis_tags::WEIGHT).unwrap();
+        assert!((weight - 400.0).abs() < 0.01);
     }
 }

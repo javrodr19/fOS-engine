@@ -1,6 +1,8 @@
 //! Glyph rasterization
+//!
+//! Uses custom font parser for outline extraction.
 
-use ttf_parser::{Face, GlyphId, OutlineBuilder};
+use crate::font::parser::{FontParser, GlyphId, OutlineBuilder};
 
 /// A rasterized glyph
 #[derive(Debug, Clone)]
@@ -53,24 +55,24 @@ impl GlyphRasterizer {
         glyph_id: u16,
         font_size: f32,
     ) -> Option<RasterizedGlyph> {
-        let face = Face::parse(font_data, face_index).ok()?;
-        self.rasterize_from_face(&face, glyph_id, font_size)
+        let parser = FontParser::parse_index(font_data, face_index).ok()?;
+        self.rasterize_from_parser(&parser, glyph_id, font_size)
     }
     
-    /// Rasterize a glyph from a parsed face
-    pub fn rasterize_from_face(
+    /// Rasterize a glyph from a parsed font
+    pub fn rasterize_from_parser(
         &self,
-        face: &Face,
+        parser: &FontParser,
         glyph_id: u16,
         font_size: f32,
     ) -> Option<RasterizedGlyph> {
         let glyph = GlyphId(glyph_id);
         
         // Get glyph bounding box
-        let bbox = face.glyph_bounding_box(glyph)?;
+        let bbox = parser.glyph_bounding_box(glyph)?;
         
         // Scale factor
-        let scale = font_size / face.units_per_em() as f32;
+        let scale = font_size / parser.units_per_em() as f32;
         
         // Calculate dimensions
         let width = ((bbox.x_max - bbox.x_min) as f32 * scale).ceil() as u32;
@@ -82,7 +84,7 @@ impl GlyphRasterizer {
         
         // Create outline builder for tiny-skia
         let mut builder = PathBuilder::new(scale, bbox.x_min as f32, bbox.y_max as f32);
-        face.outline_glyph(glyph, &mut builder)?;
+        parser.outline_glyph(glyph, &mut builder)?;
         let path = builder.finish()?;
         
         // Create pixmap
@@ -124,7 +126,7 @@ impl Default for GlyphRasterizer {
     }
 }
 
-/// Path builder that converts ttf-parser outlines to tiny-skia paths
+/// Path builder that converts custom parser outlines to tiny-skia paths
 struct PathBuilder {
     builder: tiny_skia::PathBuilder,
     scale: f32,

@@ -46,6 +46,13 @@ impl JsArray {
     }
     pub fn len(&self) -> usize { self.elements.len() }
     pub fn is_empty(&self) -> bool { self.elements.is_empty() }
+    
+    pub fn shift(&mut self) -> JsVal {
+        if self.elements.is_empty() { JsVal::Undefined }
+        else { self.elements.remove(0) }
+    }
+    
+    pub fn reverse(&mut self) { self.elements.reverse(); }
 }
 
 /// JavaScript function

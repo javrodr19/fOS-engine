@@ -26,6 +26,7 @@ pub enum Opcode {
     SetGlobal = 23,      // name_idx: u16
     GetUpvalue = 24,     // idx: u16
     SetUpvalue = 25,     // idx: u16
+    CloseUpvalue = 26,   // Close upvalue at stack top
     
     // Properties
     GetProperty = 30,    // name_idx: u16
@@ -72,6 +73,7 @@ pub enum Opcode {
     // Functions
     Call = 90,           // argc: u8
     Return = 91,
+    Closure = 92,        // const_idx: u16, upvalue_count: u8, then upvalue_info
     
     // Objects
     NewObject = 100,
@@ -109,7 +111,29 @@ pub struct CompiledFunction {
     pub name: Option<Box<str>>,
     pub arity: u8,
     pub locals_count: u16,
+    pub upvalue_count: u8,
+    pub upvalues: Vec<UpvalueInfo>,
     pub bytecode: Bytecode,
+}
+
+/// Upvalue capture info
+#[derive(Debug, Clone, Copy)]
+pub struct UpvalueInfo {
+    pub index: u16,
+    pub is_local: bool, // true = capture local, false = capture parent upvalue
+}
+
+impl CompiledFunction {
+    pub fn new(name: Option<Box<str>>, arity: u8) -> Self {
+        Self {
+            name,
+            arity,
+            locals_count: 0,
+            upvalue_count: 0,
+            upvalues: Vec::new(),
+            bytecode: Bytecode::new(),
+        }
+    }
 }
 
 impl Bytecode {

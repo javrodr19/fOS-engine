@@ -2,15 +2,16 @@
 //!
 //! Compiles AST to bytecode.
 
-use super::ast::{Ast, AstNode, AstNodeKind, NodeId, LiteralValue, BinaryOp, VarKind};
-use super::bytecode::{Bytecode, Opcode, Constant};
-use std::collections::HashMap;
+use super::ast::{Ast, AstNode, AstNodeKind, NodeId, LiteralValue, BinaryOp, VarKind, UnaryOp, LogicalOp, AssignOp};
+use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction};
 
 /// Compiler
 pub struct Compiler {
     bytecode: Bytecode,
     locals: Vec<Local>,
     scope_depth: u32,
+    loop_start: Option<usize>,
+    loop_exit: Vec<usize>,
 }
 
 struct Local {
@@ -25,7 +26,13 @@ impl Default for Compiler {
 
 impl Compiler {
     pub fn new() -> Self {
-        Self { bytecode: Bytecode::new(), locals: Vec::new(), scope_depth: 0 }
+        Self {
+            bytecode: Bytecode::new(),
+            locals: Vec::new(),
+            scope_depth: 0,
+            loop_start: None,
+            loop_exit: Vec::new(),
+        }
     }
     
     pub fn compile(mut self, ast: &Ast) -> Result<Bytecode, String> {
@@ -36,21 +43,14 @@ impl Compiler {
         Ok(self.bytecode)
     }
     
-    /// Compile a statement, optionally not popping expression values (for REPL)
     fn compile_statement(&mut self, ast: &Ast, id: NodeId, is_last: bool) -> Result<(), String> {
         let node = ast.get(id).ok_or("Invalid node")?;
         match &node.kind {
             AstNodeKind::ExpressionStatement { expr } => {
                 self.compile_node(ast, *expr)?;
-                // For the last expression in a program, don't pop - return it as result
-                if !is_last {
-                    self.bytecode.emit(Opcode::Pop);
-                }
+                if !is_last { self.bytecode.emit(Opcode::Pop); }
             }
-            _ => {
-                // For other statements, compile normally
-                self.compile_node(ast, id)?;
-            }
+            _ => { self.compile_node(ast, id)?; }
         }
         Ok(())
     }
@@ -59,12 +59,9 @@ impl Compiler {
         let node = ast.get(id).ok_or("Invalid node")?;
         match &node.kind {
             AstNodeKind::Program { body } => {
-                // For each statement except the last, compile normally
-                // For the last expression statement, don't pop its value
                 let len = body.len();
                 for (i, stmt) in body.iter().enumerate() {
-                    let is_last = i == len - 1;
-                    self.compile_statement(ast, *stmt, is_last)?;
+                    self.compile_statement(ast, *stmt, i == len - 1)?;
                 }
             }
             AstNodeKind::ExpressionStatement { expr } => {
@@ -120,6 +117,9 @@ impl Compiler {
                     self.bytecode.emit_u16(idx);
                 }
             }
+            AstNodeKind::ThisExpression => {
+                self.bytecode.emit(Opcode::LoadUndefined); // TODO: Proper this binding
+            }
             AstNodeKind::BinaryExpression { operator, left, right } => {
                 self.compile_node(ast, *left)?;
                 self.compile_node(ast, *right)?;
@@ -138,6 +138,89 @@ impl Compiler {
                     BinaryOp::StrictEqual => self.bytecode.emit(Opcode::StrictEq),
                     BinaryOp::StrictNotEqual => self.bytecode.emit(Opcode::StrictNe),
                     _ => {}
+                }
+            }
+            AstNodeKind::UnaryExpression { operator, argument } => {
+                self.compile_node(ast, *argument)?;
+                match operator {
+                    UnaryOp::Minus => self.bytecode.emit(Opcode::Neg),
+                    UnaryOp::Not => self.bytecode.emit(Opcode::Not),
+                    UnaryOp::BitwiseNot => self.bytecode.emit(Opcode::BitNot),
+                    UnaryOp::Typeof => self.bytecode.emit(Opcode::Typeof),
+                    _ => {}
+                }
+            }
+            AstNodeKind::LogicalExpression { operator, left, right } => {
+                self.compile_node(ast, *left)?;
+                let jump = match operator {
+                    LogicalOp::And => self.emit_jump(Opcode::JumpIfFalse),
+                    LogicalOp::Or => self.emit_jump(Opcode::JumpIfTrue),
+                    LogicalOp::NullishCoalescing => self.emit_jump(Opcode::JumpIfTrue), // Simplified
+                };
+                self.bytecode.emit(Opcode::Pop);
+                self.compile_node(ast, *right)?;
+                self.patch_jump(jump);
+            }
+            AstNodeKind::AssignmentExpression { left, right, .. } => {
+                self.compile_node(ast, *right)?;
+                self.bytecode.emit(Opcode::Dup);
+                if let Some(left_node) = ast.get(*left) {
+                    if let AstNodeKind::Identifier { name } = &left_node.kind {
+                        if let Some(slot) = self.resolve_local(name) {
+                            self.bytecode.emit(Opcode::SetLocal);
+                            self.bytecode.emit_u16(slot);
+                        } else {
+                            let idx = self.bytecode.add_name(name);
+                            self.bytecode.emit(Opcode::SetGlobal);
+                            self.bytecode.emit_u16(idx);
+                        }
+                    }
+                }
+            }
+            AstNodeKind::CallExpression { callee, arguments } => {
+                self.compile_node(ast, *callee)?;
+                for arg in arguments { self.compile_node(ast, *arg)?; }
+                self.bytecode.emit(Opcode::Call);
+                self.bytecode.emit_u8(arguments.len() as u8);
+            }
+            AstNodeKind::MemberExpression { object, property, computed } => {
+                self.compile_node(ast, *object)?;
+                if *computed {
+                    self.compile_node(ast, *property)?;
+                    self.bytecode.emit(Opcode::GetIndex);
+                } else if let Some(prop_node) = ast.get(*property) {
+                    if let AstNodeKind::Identifier { name } = &prop_node.kind {
+                        let idx = self.bytecode.add_name(name);
+                        self.bytecode.emit(Opcode::GetProperty);
+                        self.bytecode.emit_u16(idx);
+                    }
+                }
+            }
+            AstNodeKind::ArrayExpression { elements } => {
+                for elem in elements.iter().rev() {
+                    if let Some(e) = elem { self.compile_node(ast, *e)?; }
+                    else { self.bytecode.emit(Opcode::LoadUndefined); }
+                }
+                self.bytecode.emit(Opcode::NewArray);
+                self.bytecode.emit_u16(elements.len() as u16);
+            }
+            AstNodeKind::ObjectExpression { properties } => {
+                self.bytecode.emit(Opcode::NewObject);
+                for prop in properties {
+                    if let Some(prop_node) = ast.get(*prop) {
+                        if let AstNodeKind::Property { key, value, .. } = &prop_node.kind {
+                            self.bytecode.emit(Opcode::Dup);
+                            if let Some(key_node) = ast.get(*key) {
+                                if let AstNodeKind::Identifier { name } = &key_node.kind {
+                                    let idx = self.bytecode.add_name(name);
+                                    self.compile_node(ast, *value)?;
+                                    self.bytecode.emit(Opcode::SetProperty);
+                                    self.bytecode.emit_u16(idx);
+                                }
+                            }
+                            self.bytecode.emit(Opcode::Pop);
+                        }
+                    }
                 }
             }
             AstNodeKind::ReturnStatement { argument } => {
@@ -163,6 +246,8 @@ impl Compiler {
             }
             AstNodeKind::WhileStatement { test, body } => {
                 let loop_start = self.bytecode.len();
+                let old_start = self.loop_start.replace(loop_start);
+                
                 self.compile_node(ast, *test)?;
                 let exit_jump = self.emit_jump(Opcode::JumpIfFalse);
                 self.bytecode.emit(Opcode::Pop);
@@ -170,10 +255,133 @@ impl Compiler {
                 self.emit_loop(loop_start);
                 self.patch_jump(exit_jump);
                 self.bytecode.emit(Opcode::Pop);
+                
+                // Patch break statements
+                for exit in std::mem::take(&mut self.loop_exit) {
+                    self.patch_jump(exit);
+                }
+                self.loop_start = old_start;
+            }
+            AstNodeKind::ForStatement { init, test, update, body } => {
+                self.scope_depth += 1;
+                if let Some(init) = init { self.compile_node(ast, *init)?; }
+                
+                let loop_start = self.bytecode.len();
+                let old_start = self.loop_start.replace(loop_start);
+                
+                let exit_jump = if let Some(test) = test {
+                    self.compile_node(ast, *test)?;
+                    let j = self.emit_jump(Opcode::JumpIfFalse);
+                    self.bytecode.emit(Opcode::Pop);
+                    Some(j)
+                } else { None };
+                
+                self.compile_node(ast, *body)?;
+                if let Some(update) = update {
+                    self.compile_node(ast, *update)?;
+                    self.bytecode.emit(Opcode::Pop);
+                }
+                
+                self.emit_loop(loop_start);
+                if let Some(j) = exit_jump { self.patch_jump(j); self.bytecode.emit(Opcode::Pop); }
+                
+                for exit in std::mem::take(&mut self.loop_exit) {
+                    self.patch_jump(exit);
+                }
+                self.loop_start = old_start;
+                self.end_scope();
+            }
+            AstNodeKind::BreakStatement => {
+                let jump = self.emit_jump(Opcode::Jump);
+                self.loop_exit.push(jump);
+            }
+            AstNodeKind::ContinueStatement => {
+                if let Some(start) = self.loop_start {
+                    self.emit_loop(start);
+                }
+            }
+            AstNodeKind::FunctionDeclaration { id, params, body, .. } |
+            AstNodeKind::FunctionExpression { id, params, body, .. } => {
+                // Get function name if available
+                let name = id.and_then(|n| {
+                    ast.get(n).and_then(|node| {
+                        if let AstNodeKind::Identifier { name } = &node.kind {
+                            Some(name.clone())
+                        } else { None }
+                    })
+                });
+                
+                // Compile function body with new compiler
+                let func = self.compile_function(ast, name, params, *body)?;
+                
+                // Add compiled function to constants
+                let const_idx = self.bytecode.add_constant(Constant::Function(Box::new(func)));
+                
+                // Emit LoadConst to push the function onto the stack
+                self.bytecode.emit(Opcode::LoadConst);
+                self.bytecode.emit_u16(const_idx);
+                
+                // If this is a function declaration (not expression), bind it to a name
+                if let AstNodeKind::FunctionDeclaration { id: Some(name_id), .. } = &node.kind {
+                    if let Some(name_node) = ast.get(*name_id) {
+                        if let AstNodeKind::Identifier { name } = &name_node.kind {
+                            // Bind to local or global
+                            if self.scope_depth > 0 {
+                                self.define_local(name.clone());
+                            } else {
+                                let name_idx = self.bytecode.add_name(name);
+                                self.bytecode.emit(Opcode::SetGlobal);
+                                self.bytecode.emit_u16(name_idx);
+                                self.bytecode.emit(Opcode::Pop);
+                            }
+                        }
+                    }
+                }
+            }
+            AstNodeKind::ArrowFunctionExpression { params, body, .. } => {
+                // Compile arrow function body
+                let func = self.compile_function(ast, None, params, *body)?;
+                let const_idx = self.bytecode.add_constant(Constant::Function(Box::new(func)));
+                self.bytecode.emit(Opcode::LoadConst);
+                self.bytecode.emit_u16(const_idx);
             }
             _ => {}
         }
         Ok(())
+    }
+    
+    /// Compile a function body into a CompiledFunction
+    fn compile_function(&mut self, ast: &Ast, name: Option<Box<str>>, params: &[NodeId], body: NodeId) -> Result<CompiledFunction, String> {
+        use super::bytecode::CompiledFunction;
+        
+        // Create a new compiler for the function body
+        let mut func_compiler = Compiler::new();
+        func_compiler.scope_depth = 1; // Function starts at scope depth 1
+        
+        // Add parameters as locals
+        for param in params {
+            if let Some(param_node) = ast.get(*param) {
+                if let AstNodeKind::Identifier { name } = &param_node.kind {
+                    func_compiler.define_local(name.clone());
+                }
+            }
+        }
+        
+        // Compile function body
+        func_compiler.compile_node(ast, body)?;
+        
+        // Ensure function returns something
+        func_compiler.bytecode.emit(Opcode::LoadUndefined);
+        func_compiler.bytecode.emit(Opcode::Return);
+        
+        Ok(CompiledFunction {
+            name,
+            arity: params.len() as u8,
+            locals_count: func_compiler.locals.len() as u16,
+            upvalue_count: 0, // TODO: Track upvalues
+            upvalues: Vec::new(),
+            bytecode: func_compiler.bytecode,
+        })
     }
     
     fn emit_jump(&mut self, op: Opcode) -> usize {

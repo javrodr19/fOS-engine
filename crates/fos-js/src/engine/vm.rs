@@ -1,17 +1,34 @@
 //! Virtual Machine
 //!
-//! Stack-based bytecode interpreter.
+//! Stack-based bytecode interpreter with closure support.
 
-use super::bytecode::{Bytecode, Opcode, Constant};
+use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction};
 use super::value::JsVal;
-use super::object::{JsObject, JsArray, JsFunction};
+use super::object::{JsObject, JsArray};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-/// Call frame
+/// Open upvalue - points to stack slot
+/// Closed upvalue - holds the value itself
+#[derive(Debug, Clone)]
+pub enum Upvalue {
+    Open { stack_idx: usize },
+    Closed { value: JsVal },
+}
+
+/// Runtime closure
+#[derive(Debug, Clone)]
+pub struct Closure {
+    pub function: Arc<CompiledFunction>,
+    pub upvalues: Vec<Arc<Mutex<Upvalue>>>,
+}
+
+/// Call frame for function execution
 #[derive(Debug)]
 struct CallFrame {
+    closure: Arc<Closure>,
     ip: usize,
-    bp: usize, // Base pointer into stack
+    bp: usize, // Base pointer - start of this frame's stack slots
 }
 
 /// Virtual Machine
@@ -20,7 +37,8 @@ pub struct VirtualMachine {
     globals: HashMap<Box<str>, JsVal>,
     objects: Vec<JsObject>,
     arrays: Vec<JsArray>,
-    functions: Vec<JsFunction>,
+    closures: Vec<Arc<Closure>>,
+    open_upvalues: Vec<Arc<Mutex<Upvalue>>>,
     frames: Vec<CallFrame>,
 }
 
@@ -35,11 +53,13 @@ impl VirtualMachine {
             globals: HashMap::new(),
             objects: Vec::new(),
             arrays: Vec::new(),
-            functions: Vec::new(),
+            closures: Vec::new(),
+            open_upvalues: Vec::new(),
             frames: Vec::new(),
         }
     }
     
+    /// Run top-level bytecode
     pub fn run(&mut self, bytecode: &Bytecode) -> Result<JsVal, String> {
         let mut ip = 0;
         
@@ -60,7 +80,16 @@ impl VirtualMachine {
                     match &bytecode.constants[idx] {
                         Constant::Number(n) => self.stack.push(JsVal::Number(*n)),
                         Constant::String(s) => self.stack.push(JsVal::String(s.clone())),
-                        Constant::Function(_) => self.stack.push(JsVal::Undefined),
+                        Constant::Function(f) => {
+                            // Create closure without upvalues for now
+                            let closure = Arc::new(Closure {
+                                function: Arc::new((**f).clone()),
+                                upvalues: Vec::new(),
+                            });
+                            let idx = self.closures.len() as u32;
+                            self.closures.push(closure);
+                            self.stack.push(JsVal::Function(idx));
+                        }
                     }
                 }
                 Opcode::LoadNull => self.stack.push(JsVal::Null),
@@ -108,6 +137,13 @@ impl VirtualMachine {
                     }
                 }
                 
+                // Bitwise
+                Opcode::BitNot => {
+                    if let Some(val) = self.stack.pop() {
+                        self.stack.push(JsVal::Number(!(val.to_number() as i32) as f64));
+                    }
+                }
+                
                 // Comparison
                 Opcode::Lt => self.compare_op(|a, b| a < b)?,
                 Opcode::Le => self.compare_op(|a, b| a <= b)?,
@@ -131,6 +167,13 @@ impl VirtualMachine {
                     }
                 }
                 
+                // Typeof
+                Opcode::Typeof => {
+                    if let Some(val) = self.stack.pop() {
+                        self.stack.push(JsVal::String(val.type_of().into()));
+                    }
+                }
+                
                 // Jumps
                 Opcode::Jump => {
                     let offset = self.read_i16(bytecode, &mut ip);
@@ -146,6 +189,90 @@ impl VirtualMachine {
                     let offset = self.read_i16(bytecode, &mut ip);
                     if self.stack.last().map(|v| v.is_truthy()).unwrap_or(false) {
                         ip = (ip as i32 + offset as i32) as usize;
+                    }
+                }
+                
+                // Objects/Arrays
+                Opcode::NewObject => {
+                    let obj_id = self.objects.len() as u32;
+                    self.objects.push(JsObject::new());
+                    self.stack.push(JsVal::Object(obj_id));
+                }
+                Opcode::NewArray => {
+                    let count = self.read_u16(bytecode, &mut ip) as usize;
+                    let mut arr = JsArray::with_capacity(count);
+                    for _ in 0..count {
+                        arr.push(self.stack.pop().unwrap_or(JsVal::Undefined));
+                    }
+                    let arr_id = self.arrays.len() as u32;
+                    self.arrays.push(arr);
+                    self.stack.push(JsVal::Array(arr_id));
+                }
+                Opcode::GetProperty => {
+                    let name_idx = self.read_u16(bytecode, &mut ip) as usize;
+                    let name = &bytecode.names[name_idx];
+                    if let Some(JsVal::Object(obj_id)) = self.stack.pop() {
+                        if let Some(obj) = self.objects.get(obj_id as usize) {
+                            let val = obj.get(name).cloned().unwrap_or(JsVal::Undefined);
+                            self.stack.push(val);
+                        } else {
+                            self.stack.push(JsVal::Undefined);
+                        }
+                    } else {
+                        self.stack.push(JsVal::Undefined);
+                    }
+                }
+                Opcode::SetProperty => {
+                    let name_idx = self.read_u16(bytecode, &mut ip) as usize;
+                    let name = bytecode.names[name_idx].to_string();
+                    let val = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    if let Some(JsVal::Object(obj_id)) = self.stack.last() {
+                        if let Some(obj) = self.objects.get_mut(*obj_id as usize) {
+                            obj.set(&name, val);
+                        }
+                    }
+                }
+                Opcode::GetIndex => {
+                    let idx = self.stack.pop().unwrap_or(JsVal::Undefined).to_number() as usize;
+                    if let Some(JsVal::Array(arr_id)) = self.stack.pop() {
+                        if let Some(arr) = self.arrays.get(arr_id as usize) {
+                            self.stack.push(arr.get(idx));
+                        } else {
+                            self.stack.push(JsVal::Undefined);
+                        }
+                    } else {
+                        self.stack.push(JsVal::Undefined);
+                    }
+                }
+                
+                Opcode::Call => {
+                    let argc = bytecode.code[ip] as usize;
+                    ip += 1;
+                    
+                    // Pop arguments in reverse order
+                    let mut args: Vec<JsVal> = Vec::with_capacity(argc);
+                    for _ in 0..argc {
+                        args.push(self.stack.pop().unwrap_or(JsVal::Undefined));
+                    }
+                    args.reverse();
+                    
+                    // Pop the callee
+                    let callee = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    
+                    match callee {
+                        JsVal::Function(func_id) => {
+                            if let Some(closure) = self.closures.get(func_id as usize).cloned() {
+                                // Execute function
+                                let result = self.call_function(&closure, &args)?;
+                                self.stack.push(result);
+                            } else {
+                                self.stack.push(JsVal::Undefined);
+                            }
+                        }
+                        _ => {
+                            // Not callable
+                            self.stack.push(JsVal::Undefined);
+                        }
                     }
                 }
                 
@@ -192,6 +319,161 @@ impl VirtualMachine {
             (JsVal::String(a), JsVal::String(b)) => a == b,
             _ => false,
         }
+    }
+    
+    /// Execute a function call
+    fn call_function(&mut self, closure: &Closure, args: &[JsVal]) -> Result<JsVal, String> {
+        let func = &closure.function;
+        let bytecode = &func.bytecode;
+        
+        // Save current stack position as base
+        let bp = self.stack.len();
+        
+        // Push arguments as locals (pad with undefined if needed)
+        for i in 0..func.arity as usize {
+            self.stack.push(args.get(i).cloned().unwrap_or(JsVal::Undefined));
+        }
+        
+        // Execute the function's bytecode
+        let mut ip = 0;
+        while ip < bytecode.code.len() {
+            let op = bytecode.code[ip];
+            ip += 1;
+            
+            match Opcode::try_from(op).unwrap_or(Opcode::Halt) {
+                Opcode::Halt => break,
+                Opcode::Pop => { self.stack.pop(); }
+                Opcode::Dup => {
+                    if let Some(val) = self.stack.last().cloned() { self.stack.push(val); }
+                }
+                
+                Opcode::LoadConst => {
+                    let idx = self.read_u16(bytecode, &mut ip) as usize;
+                    match &bytecode.constants[idx] {
+                        Constant::Number(n) => self.stack.push(JsVal::Number(*n)),
+                        Constant::String(s) => self.stack.push(JsVal::String(s.clone())),
+                        Constant::Function(f) => {
+                            let closure = Arc::new(Closure {
+                                function: Arc::new((**f).clone()),
+                                upvalues: Vec::new(),
+                            });
+                            let idx = self.closures.len() as u32;
+                            self.closures.push(closure);
+                            self.stack.push(JsVal::Function(idx));
+                        }
+                    }
+                }
+                Opcode::LoadNull => self.stack.push(JsVal::Null),
+                Opcode::LoadUndefined => self.stack.push(JsVal::Undefined),
+                Opcode::LoadTrue => self.stack.push(JsVal::Bool(true)),
+                Opcode::LoadFalse => self.stack.push(JsVal::Bool(false)),
+                Opcode::LoadZero => self.stack.push(JsVal::Number(0.0)),
+                Opcode::LoadOne => self.stack.push(JsVal::Number(1.0)),
+                
+                Opcode::GetLocal => {
+                    let slot = self.read_u16(bytecode, &mut ip) as usize;
+                    let abs_slot = bp + slot;
+                    let val = self.stack.get(abs_slot).cloned().unwrap_or(JsVal::Undefined);
+                    self.stack.push(val);
+                }
+                Opcode::SetLocal => {
+                    let slot = self.read_u16(bytecode, &mut ip) as usize;
+                    let abs_slot = bp + slot;
+                    if let Some(val) = self.stack.last().cloned() {
+                        if abs_slot < self.stack.len() { self.stack[abs_slot] = val; }
+                    }
+                }
+                Opcode::GetGlobal => {
+                    let idx = self.read_u16(bytecode, &mut ip) as usize;
+                    let name = &bytecode.names[idx];
+                    let val = self.globals.get(name).cloned().unwrap_or(JsVal::Undefined);
+                    self.stack.push(val);
+                }
+                Opcode::SetGlobal => {
+                    let idx = self.read_u16(bytecode, &mut ip) as usize;
+                    let name = bytecode.names[idx].clone();
+                    if let Some(val) = self.stack.last().cloned() {
+                        self.globals.insert(name, val);
+                    }
+                }
+                
+                Opcode::Add => self.binary_op(|a, b| a + b)?,
+                Opcode::Sub => self.binary_op(|a, b| a - b)?,
+                Opcode::Mul => self.binary_op(|a, b| a * b)?,
+                Opcode::Div => self.binary_op(|a, b| a / b)?,
+                Opcode::Mod => self.binary_op(|a, b| a % b)?,
+                Opcode::Neg => {
+                    if let Some(val) = self.stack.pop() {
+                        self.stack.push(JsVal::Number(-val.to_number()));
+                    }
+                }
+                
+                Opcode::Lt => self.compare_op(|a, b| a < b)?,
+                Opcode::Le => self.compare_op(|a, b| a <= b)?,
+                Opcode::Gt => self.compare_op(|a, b| a > b)?,
+                Opcode::Ge => self.compare_op(|a, b| a >= b)?,
+                Opcode::Eq | Opcode::StrictEq => {
+                    let b = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    let a = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    self.stack.push(JsVal::Bool(self.values_equal(&a, &b)));
+                }
+                Opcode::Ne | Opcode::StrictNe => {
+                    let b = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    let a = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    self.stack.push(JsVal::Bool(!self.values_equal(&a, &b)));
+                }
+                Opcode::Not => {
+                    if let Some(val) = self.stack.pop() {
+                        self.stack.push(JsVal::Bool(!val.is_truthy()));
+                    }
+                }
+                
+                Opcode::Jump => {
+                    let offset = self.read_i16(bytecode, &mut ip);
+                    ip = (ip as i32 + offset as i32) as usize;
+                }
+                Opcode::JumpIfFalse => {
+                    let offset = self.read_i16(bytecode, &mut ip);
+                    if !self.stack.last().map(|v| v.is_truthy()).unwrap_or(false) {
+                        ip = (ip as i32 + offset as i32) as usize;
+                    }
+                }
+                Opcode::JumpIfTrue => {
+                    let offset = self.read_i16(bytecode, &mut ip);
+                    if self.stack.last().map(|v| v.is_truthy()).unwrap_or(false) {
+                        ip = (ip as i32 + offset as i32) as usize;
+                    }
+                }
+                
+                Opcode::Call => {
+                    let argc = bytecode.code[ip] as usize;
+                    ip += 1;
+                    let mut call_args: Vec<JsVal> = Vec::with_capacity(argc);
+                    for _ in 0..argc { call_args.push(self.stack.pop().unwrap_or(JsVal::Undefined)); }
+                    call_args.reverse();
+                    let callee = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    if let JsVal::Function(fid) = callee {
+                        if let Some(c) = self.closures.get(fid as usize).cloned() {
+                            let result = self.call_function(&c, &call_args)?;
+                            self.stack.push(result);
+                        } else { self.stack.push(JsVal::Undefined); }
+                    } else { self.stack.push(JsVal::Undefined); }
+                }
+                
+                Opcode::Return => {
+                    let result = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    // Clean up locals
+                    self.stack.truncate(bp);
+                    return Ok(result);
+                }
+                
+                _ => {}
+            }
+        }
+        
+        // Clean up and return undefined if no explicit return
+        self.stack.truncate(bp);
+        Ok(JsVal::Undefined)
     }
     
     pub fn set_global(&mut self, name: &str, val: JsVal) { self.globals.insert(name.into(), val); }

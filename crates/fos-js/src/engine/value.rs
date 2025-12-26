@@ -5,7 +5,7 @@
 use std::fmt;
 
 /// JavaScript runtime value
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum JsVal {
     Undefined,
     Null,

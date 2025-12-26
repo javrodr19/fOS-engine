@@ -53,7 +53,7 @@ impl LineBreaker {
     pub fn break_lines(
         text: &str,
         max_width: f32,
-        measure_fn: impl Fn(&str) -> f32,
+        mut measure_fn: impl FnMut(&str) -> f32,
     ) -> Vec<(usize, usize)> {
         if text.is_empty() {
             return Vec::new();

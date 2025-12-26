@@ -71,7 +71,7 @@ impl ParagraphLayout {
         text: &str,
         db: &FontDatabase,
         font_id: FontId,
-        shaper: &TextShaper,
+        shaper: &mut TextShaper,
     ) -> Result<TextLayout> {
         if text.is_empty() {
             return Ok(TextLayout::empty());
@@ -91,14 +91,14 @@ impl ParagraphLayout {
         }).unwrap_or(self.style.font_size * self.style.line_height);
         
         // Measure function for line breaking
-        let measure = |s: &str| -> f32 {
+        let mut measure = |s: &str| -> f32 {
             shaper.shape(db, font_id, s, self.style.font_size)
                 .map(|run| run.width())
                 .unwrap_or(0.0)
         };
         
         // Break into lines
-        let line_ranges = LineBreaker::break_lines(text, self.style.max_width, measure);
+        let line_ranges = LineBreaker::break_lines(text, self.style.max_width, &mut measure);
         
         // Build layout
         let mut lines = Vec::new();
@@ -106,7 +106,9 @@ impl ParagraphLayout {
         
         for (start, end) in line_ranges {
             let line_text = &text[start..end].trim_end();
-            let width = measure(line_text);
+            let width = shaper.shape(db, font_id, line_text, self.style.font_size)
+                .map(|run| run.width())
+                .unwrap_or(0.0);
             max_width = max_width.max(width);
             
             let x_offset = match self.style.align {

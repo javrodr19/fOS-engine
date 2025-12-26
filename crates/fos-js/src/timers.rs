@@ -2,7 +2,8 @@
 //!
 //! Implements setTimeout and setInterval.
 
-use rquickjs::{Ctx, Function, Object, Value};
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,75 +120,60 @@ impl TimerManager {
 }
 
 /// Install timer APIs into global object
-pub fn install_timers(ctx: &Ctx, timer_manager: Arc<Mutex<TimerManager>>) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
-    
-    // setTimeout - simplified version that stores callback as string
-    // Full version would store actual function reference
+pub fn install_timers<C: JsContextApi>(ctx: &C, timer_manager: Arc<Mutex<TimerManager>>) -> Result<(), JsError> {
+    // setTimeout
     let tm = timer_manager.clone();
-    globals.set("setTimeout", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<u32, rquickjs::Error> {
+    ctx.set_global_function("setTimeout", move |args| {
         if args.is_empty() {
-            return Ok(0);
+            return Ok(JsValue::Number(0.0));
         }
         
-        // Get callback (as string for now)
-        let callback = if let Some(s) = args[0].as_string() {
-            s.to_string().unwrap_or_default()
-        } else {
-            return Ok(0);
-        };
-        
-        // Get delay
+        let callback = args[0].as_string().unwrap_or("").to_string();
         let delay = if args.len() > 1 {
-            args[1].as_int().unwrap_or(0) as u64
+            args[1].as_number().unwrap_or(0.0) as u64
         } else {
             0
         };
         
         let id = tm.lock().unwrap().set_timeout(callback, delay);
-        Ok(id)
-    })?)?;
+        Ok(JsValue::Number(id as f64))
+    })?;
     
     // clearTimeout
     let tm = timer_manager.clone();
-    globals.set("clearTimeout", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
+    ctx.set_global_function("clearTimeout", move |args| {
+        if let Some(id) = args.first().and_then(|v| v.as_number()) {
             tm.lock().unwrap().clear(id as u32);
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // setInterval
     let tm = timer_manager.clone();
-    globals.set("setInterval", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<u32, rquickjs::Error> {
+    ctx.set_global_function("setInterval", move |args| {
         if args.is_empty() {
-            return Ok(0);
+            return Ok(JsValue::Number(0.0));
         }
         
-        let callback = if let Some(s) = args[0].as_string() {
-            s.to_string().unwrap_or_default()
-        } else {
-            return Ok(0);
-        };
-        
+        let callback = args[0].as_string().unwrap_or("").to_string();
         let delay = if args.len() > 1 {
-            args[1].as_int().unwrap_or(0).max(1) as u64 // Minimum 1ms
+            args[1].as_number().unwrap_or(1.0).max(1.0) as u64
         } else {
             1
         };
         
         let id = tm.lock().unwrap().set_interval(callback, delay);
-        Ok(id)
-    })?)?;
+        Ok(JsValue::Number(id as f64))
+    })?;
     
     // clearInterval
     let tm = timer_manager;
-    globals.set("clearInterval", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
+    ctx.set_global_function("clearInterval", move |args| {
+        if let Some(id) = args.first().and_then(|v| v.as_number()) {
             tm.lock().unwrap().clear(id as u32);
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     Ok(())
 }

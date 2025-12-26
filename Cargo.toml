@@ -33,9 +33,6 @@ mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 html5ever = "0.36"
 lightningcss = "1.0.0-alpha.68"
 
-# JavaScript engine (tiny - 2MB)
-rquickjs = "0.9"
-
 # Rendering
 tiny-skia = "0.11"
 # wgpu = "23.0"  # GPU rendering (Phase 3+)

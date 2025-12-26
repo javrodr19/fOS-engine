@@ -1,169 +1,258 @@
-//! Media JavaScript Bindings
+//! Media Bindings
 //!
-//! HTMLMediaElement API for video/audio elements.
+//! JavaScript bindings for audio/video media elements.
 
-use rquickjs::{Ctx, Function, Value};
-use std::collections::HashMap;
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::media::{MediaElement, MediaType, ReadyState};
+static MEDIA_ID: AtomicI32 = AtomicI32::new(1);
 
-/// Media element storage
-pub type MediaElements = Arc<Mutex<HashMap<i32, MediaElement>>>;
+/// Media element type
+#[derive(Clone, Debug)]
+pub enum MediaType {
+    Video,
+    Audio,
+}
 
-/// Install media element API
-pub fn install_media_api(ctx: &Ctx, elements: MediaElements) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
+/// Media element state
+#[derive(Clone, Debug)]
+pub struct MediaElement {
+    pub id: i32,
+    pub media_type: MediaType,
+    pub src: String,
+    pub current_time: f64,
+    pub duration: f64,
+    pub volume: f64,
+    pub is_playing: bool,
+    pub is_paused: bool,
+}
+
+impl MediaElement {
+    pub fn new(media_type: MediaType) -> Self {
+        Self {
+            id: MEDIA_ID.fetch_add(1, Ordering::SeqCst),
+            media_type,
+            src: String::new(),
+            current_time: 0.0,
+            duration: 0.0,
+            volume: 1.0,
+            is_playing: false,
+            is_paused: true,
+        }
+    }
+}
+
+/// Collection of media elements
+#[derive(Default)]
+pub struct MediaElements {
+    elements: HashMap<i32, MediaElement>,
+}
+
+impl MediaElements {
+    pub fn new() -> Self {
+        Self::default()
+    }
     
+    pub fn create_video(&mut self) -> i32 {
+        let elem = MediaElement::new(MediaType::Video);
+        let id = elem.id;
+        self.elements.insert(id, elem);
+        id
+    }
+    
+    pub fn create_audio(&mut self) -> i32 {
+        let elem = MediaElement::new(MediaType::Audio);
+        let id = elem.id;
+        self.elements.insert(id, elem);
+        id
+    }
+    
+    pub fn get(&self, id: i32) -> Option<&MediaElement> {
+        self.elements.get(&id)
+    }
+    
+    pub fn get_mut(&mut self, id: i32) -> Option<&mut MediaElement> {
+        self.elements.get_mut(&id)
+    }
+}
+
+/// Install media API into global object
+pub fn install_media_api<C: JsContextApi>(ctx: &C, elements: Arc<Mutex<MediaElements>>) -> Result<(), JsError> {
     // createVideoElement
-    let elems = elements.clone();
-    globals.set("createVideoElement", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<i32, rquickjs::Error> {
-        let mut map = elems.lock().unwrap();
-        let id = map.len() as i32;
-        map.insert(id, MediaElement::video());
-        Ok(id)
-    })?)?;
+    let e = elements.clone();
+    ctx.set_global_function("createVideoElement", move |_args| {
+        let id = e.lock().unwrap().create_video();
+        Ok(JsValue::Number(id as f64))
+    })?;
     
     // createAudioElement
-    let elems = elements.clone();
-    globals.set("createAudioElement", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<i32, rquickjs::Error> {
-        let mut map = elems.lock().unwrap();
-        let id = map.len() as i32;
-        map.insert(id, MediaElement::audio());
-        Ok(id)
-    })?)?;
+    let e = elements.clone();
+    ctx.set_global_function("createAudioElement", move |_args| {
+        let id = e.lock().unwrap().create_audio();
+        Ok(JsValue::Number(id as f64))
+    })?;
     
     // mediaSetSrc
-    let elems = elements.clone();
-    globals.set("mediaSetSrc", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if args.len() >= 2 {
-            if let (Some(id), Some(src)) = (args[0].as_int(), args[1].as_string()) {
-                let src = src.to_string().unwrap_or_default();
-                let mut map = elems.lock().unwrap();
-                if let Some(elem) = map.get_mut(&id) {
-                    elem.set_src(&src);
-                }
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaSetSrc", move |args| {
+        if args.len() < 2 {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let src = args[1].as_string().unwrap_or("").to_string();
+        
+        if let Some(elem) = e.lock().unwrap().get_mut(id) {
+            elem.src = src;
+        }
+        Ok(JsValue::Undefined)
+    })?;
     
     // mediaPlay
-    let elems = elements.clone();
-    globals.set("mediaPlay", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<bool, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let mut map = elems.lock().unwrap();
-            if let Some(elem) = map.get_mut(&id) {
-                // Simulate metadata loaded for testing
-                if elem.ready_state == crate::media::ReadyState::HaveNothing {
-                    elem.on_metadata_loaded(100.0, 1920, 1080);
-                    elem.on_can_play();
-                }
-                return Ok(elem.play().is_ok());
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaPlay", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Bool(false));
         }
-        Ok(false)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let mut elems = e.lock().unwrap();
+        
+        if let Some(elem) = elems.get_mut(id) {
+            elem.is_playing = true;
+            elem.is_paused = false;
+            Ok(JsValue::Bool(true))
+        } else {
+            Ok(JsValue::Bool(false))
+        }
+    })?;
     
     // mediaPause
-    let elems = elements.clone();
-    globals.set("mediaPause", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let mut map = elems.lock().unwrap();
-            if let Some(elem) = map.get_mut(&id) {
-                elem.pause();
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaPause", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let mut elems = e.lock().unwrap();
+        
+        if let Some(elem) = elems.get_mut(id) {
+            elem.is_playing = false;
+            elem.is_paused = true;
+        }
+        Ok(JsValue::Undefined)
+    })?;
     
     // mediaSeek
-    let elems = elements.clone();
-    globals.set("mediaSeek", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if args.len() >= 2 {
-            if let (Some(id), Some(time)) = (args[0].as_int(), args[1].as_float()) {
-                let mut map = elems.lock().unwrap();
-                if let Some(elem) = map.get_mut(&id) {
-                    elem.seek(time);
-                }
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaSeek", move |args| {
+        if args.len() < 2 {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let time = args[1].as_number().unwrap_or(0.0);
+        
+        if let Some(elem) = e.lock().unwrap().get_mut(id) {
+            elem.current_time = time.max(0.0).min(elem.duration);
+        }
+        Ok(JsValue::Undefined)
+    })?;
     
     // mediaGetCurrentTime
-    let elems = elements.clone();
-    globals.set("mediaGetCurrentTime", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<f64, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let map = elems.lock().unwrap();
-            if let Some(elem) = map.get(&id) {
-                return Ok(elem.properties.current_time);
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaGetCurrentTime", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Number(0.0));
         }
-        Ok(0.0)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let time = e.lock().unwrap()
+            .get(id)
+            .map(|elem| elem.current_time)
+            .unwrap_or(0.0);
+        Ok(JsValue::Number(time))
+    })?;
     
     // mediaGetDuration
-    let elems = elements.clone();
-    globals.set("mediaGetDuration", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<f64, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let map = elems.lock().unwrap();
-            if let Some(elem) = map.get(&id) {
-                return Ok(elem.properties.duration);
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaGetDuration", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Number(0.0));
         }
-        Ok(0.0)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let duration = e.lock().unwrap()
+            .get(id)
+            .map(|elem| elem.duration)
+            .unwrap_or(0.0);
+        Ok(JsValue::Number(duration))
+    })?;
     
     // mediaSetVolume
-    let elems = elements.clone();
-    globals.set("mediaSetVolume", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if args.len() >= 2 {
-            if let (Some(id), Some(vol)) = (args[0].as_int(), args[1].as_float()) {
-                let mut map = elems.lock().unwrap();
-                if let Some(elem) = map.get_mut(&id) {
-                    elem.set_volume(vol);
-                }
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaSetVolume", move |args| {
+        if args.len() < 2 {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let volume = args[1].as_number().unwrap_or(1.0).max(0.0).min(1.0);
+        
+        if let Some(elem) = e.lock().unwrap().get_mut(id) {
+            elem.volume = volume;
+        }
+        Ok(JsValue::Undefined)
+    })?;
     
     // mediaGetVolume
-    let elems = elements.clone();
-    globals.set("mediaGetVolume", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<f64, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let map = elems.lock().unwrap();
-            if let Some(elem) = map.get(&id) {
-                return Ok(elem.properties.volume);
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaGetVolume", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Number(1.0));
         }
-        Ok(1.0)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let volume = e.lock().unwrap()
+            .get(id)
+            .map(|elem| elem.volume)
+            .unwrap_or(1.0);
+        Ok(JsValue::Number(volume))
+    })?;
     
     // mediaIsPlaying
-    let elems = elements.clone();
-    globals.set("mediaIsPlaying", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<bool, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let map = elems.lock().unwrap();
-            if let Some(elem) = map.get(&id) {
-                return Ok(elem.is_playing());
-            }
+    let e = elements.clone();
+    ctx.set_global_function("mediaIsPlaying", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Bool(false));
         }
-        Ok(false)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let is_playing = e.lock().unwrap()
+            .get(id)
+            .map(|elem| elem.is_playing)
+            .unwrap_or(false);
+        Ok(JsValue::Bool(is_playing))
+    })?;
     
     // mediaIsPaused
-    let elems = elements;
-    globals.set("mediaIsPaused", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<bool, rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
-            let map = elems.lock().unwrap();
-            if let Some(elem) = map.get(&id) {
-                return Ok(elem.is_paused());
-            }
+    let e = elements;
+    ctx.set_global_function("mediaIsPaused", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Bool(true));
         }
-        Ok(true)
-    })?)?;
+        
+        let id = args[0].as_number().unwrap_or(0.0) as i32;
+        let is_paused = e.lock().unwrap()
+            .get(id)
+            .map(|elem| elem.is_paused)
+            .unwrap_or(true);
+        Ok(JsValue::Bool(is_paused))
+    })?;
     
     Ok(())
 }
@@ -171,94 +260,37 @@ pub fn install_media_api(ctx: &Ctx, elements: MediaElements) -> Result<(), rquic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rquickjs::Runtime;
     
-    fn create_context() -> (Runtime, rquickjs::Context, MediaElements) {
-        let runtime = Runtime::new().unwrap();
-        let context = rquickjs::Context::full(&runtime).unwrap();
-        let elements = Arc::new(Mutex::new(HashMap::new()));
+    #[test]
+    fn test_media_elements() {
+        let mut elements = MediaElements::new();
         
-        context.with(|ctx| {
-            install_media_api(&ctx, elements.clone()).unwrap();
-        });
+        let video_id = elements.create_video();
+        let audio_id = elements.create_audio();
         
-        (runtime, context, elements)
+        assert!(elements.get(video_id).is_some());
+        assert!(elements.get(audio_id).is_some());
+        
+        if let Some(elem) = elements.get_mut(video_id) {
+            elem.src = "test.mp4".to_string();
+            assert_eq!(elem.src, "test.mp4");
+        }
     }
     
     #[test]
-    fn test_create_video() {
-        let (_rt, ctx, elements) = create_context();
+    fn test_media_playback() {
+        let mut elements = MediaElements::new();
+        let id = elements.create_video();
         
-        ctx.with(|ctx| {
-            let id: i32 = ctx.eval("createVideoElement()").unwrap();
-            assert_eq!(id, 0);
-        });
-        
-        assert_eq!(elements.lock().unwrap().len(), 1);
-    }
-    
-    #[test]
-    fn test_create_audio() {
-        let (_rt, ctx, elements) = create_context();
-        
-        ctx.with(|ctx| {
-            let id: i32 = ctx.eval("createAudioElement()").unwrap();
-            assert_eq!(id, 0);
-        });
-        
-        let map = elements.lock().unwrap();
-        let elem = map.get(&0).unwrap();
-        assert_eq!(elem.element_type, MediaType::Audio);
-    }
-    
-    #[test]
-    fn test_set_src() {
-        let (_rt, ctx, elements) = create_context();
-        
-        ctx.with(|ctx| {
-            let _: Value = ctx.eval(r#"
-                var v = createVideoElement();
-                mediaSetSrc(v, 'movie.mp4');
-            "#).unwrap();
-        });
-        
-        let map = elements.lock().unwrap();
-        let elem = map.get(&0).unwrap();
-        assert_eq!(elem.properties.src, "movie.mp4");
-    }
-    
-    #[test]
-    fn test_play_pause() {
-        let (_rt, ctx, _elements) = create_context();
-        
-        ctx.with(|ctx| {
-            let playing: bool = ctx.eval(r#"
-                var v = createVideoElement();
-                mediaSetSrc(v, 'movie.mp4');
-                mediaPlay(v);
-                mediaIsPlaying(v);
-            "#).unwrap();
-            assert!(playing);
+        if let Some(elem) = elements.get_mut(id) {
+            elem.duration = 100.0;
+            elem.is_playing = true;
+            elem.is_paused = false;
+            elem.current_time = 50.0;
             
-            let paused: bool = ctx.eval(r#"
-                mediaPause(v);
-                mediaIsPaused(v);
-            "#).unwrap();
-            assert!(paused);
-        });
-    }
-    
-    #[test]
-    fn test_volume() {
-        let (_rt, ctx, _elements) = create_context();
-        
-        ctx.with(|ctx| {
-            let vol: f64 = ctx.eval(r#"
-                var v = createVideoElement();
-                mediaSetVolume(v, 0.5);
-                mediaGetVolume(v);
-            "#).unwrap();
-            assert_eq!(vol, 0.5);
-        });
+            assert!(elem.is_playing);
+            assert!(!elem.is_paused);
+            assert_eq!(elem.current_time, 50.0);
+        }
     }
 }

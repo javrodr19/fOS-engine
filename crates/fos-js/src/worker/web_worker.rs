@@ -2,7 +2,8 @@
 //!
 //! Background script execution in separate contexts.
 
-use rquickjs::{Runtime, Context, Ctx, Function, Object, Value};
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 
@@ -146,47 +147,43 @@ impl WorkerManager {
 }
 
 /// Install Worker API into global
-pub fn install_worker_api(
-    ctx: &Ctx,
+pub fn install_worker_api<C: JsContextApi>(
+    ctx: &C,
     manager: Arc<Mutex<WorkerManager>>,
-) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
-    
+) -> Result<(), JsError> {
     // Worker constructor (simplified - takes script content, not URL)
     let mgr = manager.clone();
-    globals.set("Worker", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<i32, rquickjs::Error> {
+    ctx.set_global_function("Worker", move |args| {
         if let Some(script) = args.first().and_then(|v| v.as_string()) {
-            let script = script.to_string().unwrap_or_default();
-            let id = mgr.lock().unwrap().create_worker(script);
-            Ok(id as i32)
+            let id = mgr.lock().unwrap().create_worker(script.to_string());
+            Ok(JsValue::Number(id as f64))
         } else {
-            Ok(-1)
+            Ok(JsValue::Number(-1.0))
         }
-    })?)?;
+    })?;
     
     // postMessage to worker
     let mgr = manager.clone();
-    globals.set("postMessageToWorker", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_global_function("postMessageToWorker", move |args| {
         if args.len() >= 2 {
             if let (Some(id), Some(data)) = (
-                args[0].as_int(),
+                args[0].as_number(),
                 args[1].as_string(),
             ) {
-                let data = data.to_string().unwrap_or_default();
-                mgr.lock().unwrap().post_message(id as u32, data);
+                mgr.lock().unwrap().post_message(id as u32, data.to_string());
             }
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // terminateWorker
     let mgr = manager;
-    globals.set("terminateWorker", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if let Some(id) = args.first().and_then(|v| v.as_int()) {
+    ctx.set_global_function("terminateWorker", move |args| {
+        if let Some(id) = args.first().and_then(|v| v.as_number()) {
             mgr.lock().unwrap().terminate_worker(id as u32);
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     Ok(())
 }

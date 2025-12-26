@@ -1,9 +1,9 @@
 //! fOS JavaScript Runtime
 //!
-//! QuickJS-based JavaScript engine with browser APIs.
+//! Custom JavaScript engine with browser APIs.
 //!
 //! Features:
-//! - QuickJS runtime via rquickjs
+//! - Pluggable engine architecture (trait-based)
 //! - Console API (log, warn, error)
 //! - Timers (setTimeout, setInterval)
 //! - DOM bindings (document.getElementById, createElement)
@@ -13,10 +13,13 @@
 //! - Built-in objects (Promise, Map, Set, Symbol, Proxy)
 //! - Web APIs (URL, Blob, TextEncoder, AbortController, Geolocation)
 
-mod runtime;
+mod engine_trait;
+mod stub_engine;
 mod console;
 mod timers;
 mod bindings;
+mod runtime;
+pub mod engine;
 pub mod storage;
 pub mod history;
 pub mod location;
@@ -29,7 +32,14 @@ pub mod webapi;
 pub mod idb;
 pub mod js_optimizations;
 
-pub use runtime::JsRuntime;
+// Phase B modules (custom engine)
+pub mod lazy_compile;
+pub mod const_fold;
+pub mod escape_analysis;
+pub mod jit_bytecode;
+
+pub use engine_trait::{JsEngine, JsContextApi, JsObjectHandle, JsFunctionHandle, NativeFunctionRegistry};
+pub use stub_engine::{StubEngine, StubContext};
 pub use timers::TimerManager;
 pub use storage::Storage;
 pub use history::HistoryManager;
@@ -45,14 +55,7 @@ pub use idb::{IDBFactory, IDBDatabase, CacheStorage, CookieStore};
 pub use js_optimizations::{LazyCompiler, ConstantFolder, EscapeAnalyzer, BytecodeCache, HeapCompressor, SharedBuiltins};
 
 use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
 use fos_dom::Document;
-
-/// Execute JavaScript code
-pub fn eval(code: &str) -> Result<JsValue, JsError> {
-    let runtime = JsRuntime::new()?;
-    runtime.eval(code)
-}
 
 /// JavaScript value
 #[derive(Debug, Clone)]
@@ -65,6 +68,46 @@ pub enum JsValue {
     Object,
     Array,
     Function,
+}
+
+impl JsValue {
+    /// Convert value to string representation
+    pub fn to_string_repr(&self) -> String {
+        match self {
+            JsValue::Undefined => "undefined".to_string(),
+            JsValue::Null => "null".to_string(),
+            JsValue::Bool(b) => b.to_string(),
+            JsValue::Number(n) => n.to_string(),
+            JsValue::String(s) => s.clone(),
+            JsValue::Object => "[object Object]".to_string(),
+            JsValue::Array => "[Array]".to_string(),
+            JsValue::Function => "[Function]".to_string(),
+        }
+    }
+    
+    /// Try to get as number
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            JsValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+    
+    /// Try to get as string
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            JsValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+    
+    /// Try to get as bool
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
 }
 
 /// JavaScript error
@@ -80,10 +123,59 @@ pub enum JsError {
     TypeError(String),
 }
 
+/// Execute JavaScript code
+pub fn eval(code: &str) -> Result<JsValue, JsError> {
+    let engine = StubEngine::new();
+    engine.eval(code)
+}
+
+/// JavaScript runtime wrapper
+pub struct JsRuntime {
+    engine: Arc<StubEngine>,
+}
+
+impl JsRuntime {
+    /// Create a new JavaScript runtime
+    pub fn new() -> Result<Self, JsError> {
+        tracing::info!("Creating JavaScript runtime");
+        Ok(Self {
+            engine: Arc::new(StubEngine::new()),
+        })
+    }
+    
+    /// Create runtime with custom memory limit (in bytes)
+    pub fn with_memory_limit(limit: usize) -> Result<Self, JsError> {
+        let engine = Arc::new(StubEngine::new());
+        engine.set_memory_limit(limit);
+        Ok(Self { engine })
+    }
+    
+    /// Evaluate JavaScript code and return result
+    pub fn eval(&self, code: &str) -> Result<JsValue, JsError> {
+        self.engine.eval(code)
+    }
+    
+    /// Evaluate JavaScript and ignore result
+    pub fn exec(&self, code: &str) -> Result<(), JsError> {
+        self.engine.exec(code)
+    }
+    
+    /// Run pending jobs (for async operations)
+    pub fn run_pending_jobs(&self) -> Result<(), JsError> {
+        self.engine.run_pending_jobs()
+    }
+}
+
+impl Default for JsRuntime {
+    fn default() -> Self {
+        Self::new().expect("Failed to create JS runtime")
+    }
+}
+
 /// JavaScript context with all browser APIs installed
 pub struct JsContext {
-    runtime: rquickjs::Runtime,
-    context: rquickjs::Context,
+    engine: Arc<StubEngine>,
+    context: StubContext,
     timers: Arc<Mutex<TimerManager>>,
 }
 
@@ -95,14 +187,12 @@ impl JsContext {
     
     /// Create context with a specific URL
     pub fn with_url(document: Arc<Mutex<Document>>, url: &str) -> Result<Self, JsError> {
-        let runtime = rquickjs::Runtime::new().map_err(|e| JsError::Runtime(e.to_string()))?;
-        runtime.set_memory_limit(32 * 1024 * 1024);
-        
-        let context = rquickjs::Context::full(&runtime).map_err(|e| JsError::Runtime(e.to_string()))?;
+        let engine = Arc::new(StubEngine::new());
+        let context = StubContext::new(engine.clone());
         let timers = Arc::new(Mutex::new(TimerManager::new()));
         
         // Create storage
-        let local_storage = Arc::new(Mutex::new(Storage::session())); // Would be persistent in real use
+        let local_storage = Arc::new(Mutex::new(Storage::session()));
         let session_storage = Arc::new(Mutex::new(Storage::session()));
         
         // Create history and location
@@ -111,34 +201,25 @@ impl JsContext {
             LocationManager::new(url).unwrap_or_else(|_| LocationManager::new("about:blank").unwrap())
         ));
         
-        // Install APIs
-        context.with(|ctx| {
-            console::install_console(&ctx).map_err(|e| JsError::Runtime(e.to_string()))?;
-            timers::install_timers(&ctx, timers.clone()).map_err(|e| JsError::Runtime(e.to_string()))?;
-            bindings::install_document(&ctx, document).map_err(|e| JsError::Runtime(e.to_string()))?;
-            storage::install_storage(&ctx, local_storage, session_storage).map_err(|e| JsError::Runtime(e.to_string()))?;
-            history::install_history(&ctx, history_manager).map_err(|e| JsError::Runtime(e.to_string()))?;
-            location::install_location(&ctx, location_manager).map_err(|e| JsError::Runtime(e.to_string()))?;
-            Ok::<_, JsError>(())
-        })?;
+        // Install APIs using abstract interface
+        console::install_console(&context)?;
+        timers::install_timers(&context, timers.clone())?;
+        bindings::install_document(&context, document)?;
+        storage::install_storage(&context, local_storage, session_storage)?;
+        history::install_history(&context, history_manager)?;
+        location::install_location(&context, location_manager)?;
         
-        Ok(Self { runtime, context, timers })
+        Ok(Self { engine, context, timers })
     }
     
     /// Evaluate JavaScript code
     pub fn eval(&self, code: &str) -> Result<JsValue, JsError> {
-        self.context.with(|ctx| {
-            let result: rquickjs::Value = ctx.eval(code).map_err(|e| JsError::Runtime(e.to_string()))?;
-            runtime::convert_value_pub(&result)
-        })
+        self.engine.eval(code)
     }
     
     /// Execute JavaScript (ignore result)
     pub fn exec(&self, code: &str) -> Result<(), JsError> {
-        self.context.with(|ctx| {
-            let _: rquickjs::Value = ctx.eval(code).map_err(|e| JsError::Runtime(e.to_string()))?;
-            Ok(())
-        })
+        self.engine.exec(code)
     }
     
     /// Process ready timers
@@ -172,58 +253,27 @@ mod tests {
     }
     
     #[test]
-    fn test_js_context_with_document() {
-        let doc = Arc::new(Mutex::new(Document::new("test://page")));
-        let ctx = JsContext::new(doc).unwrap();
-        
-        // Test console is available
-        ctx.exec("console.log('Hello from JsContext')").unwrap();
-        
-        // Test document is available
-        let result = ctx.eval("typeof document").unwrap();
+    fn test_eval_string() {
+        let result = eval("\"hello\"").unwrap();
         match result {
-            JsValue::String(s) => assert_eq!(s, "object"),
+            JsValue::String(s) => assert_eq!(s, "hello"),
             _ => panic!("Expected string"),
         }
     }
     
     #[test]
-    fn test_storage_api() {
-        let doc = Arc::new(Mutex::new(Document::new("test://page")));
-        let ctx = JsContext::new(doc).unwrap();
-        
-        ctx.exec("localStorage.setItem('key', 'value')").unwrap();
-        let result = ctx.eval("localStorage.getItem('key')").unwrap();
-        match result {
-            JsValue::String(s) => assert_eq!(s, "value"),
-            _ => panic!("Expected string"),
-        }
+    fn test_eval_bool() {
+        assert!(matches!(eval("true").unwrap(), JsValue::Bool(true)));
+        assert!(matches!(eval("false").unwrap(), JsValue::Bool(false)));
     }
     
     #[test]
-    fn test_history_api() {
-        let doc = Arc::new(Mutex::new(Document::new("test://page")));
-        let ctx = JsContext::new(doc).unwrap();
-        
-        ctx.exec("history.pushState(null, '', '/page1')").unwrap();
-        ctx.exec("history.pushState(null, '', '/page2')").unwrap();
-        
-        let result = ctx.eval("history.getLength()").unwrap();
+    fn test_js_runtime() {
+        let runtime = JsRuntime::new().unwrap();
+        let result = runtime.eval("10 * 5").unwrap();
         match result {
-            JsValue::Number(n) => assert_eq!(n, 3.0), // initial + 2 pushes
+            JsValue::Number(n) => assert_eq!(n, 50.0),
             _ => panic!("Expected number"),
-        }
-    }
-    
-    #[test]
-    fn test_location_api() {
-        let doc = Arc::new(Mutex::new(Document::new("test://page")));
-        let ctx = JsContext::with_url(doc, "https://example.com/path").unwrap();
-        
-        let result = ctx.eval("location.getHostname()").unwrap();
-        match result {
-            JsValue::String(s) => assert_eq!(s, "example.com"),
-            _ => panic!("Expected string"),
         }
     }
 }

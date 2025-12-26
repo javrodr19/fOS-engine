@@ -199,7 +199,9 @@ impl EscapeAnalyzer {
         while changed {
             changed = false;
             
-            for conn in &self.connections {
+            // Clone connections to avoid borrow checker issue
+            let connections = self.connections.clone();
+            for conn in &connections {
                 let new_changed = self.process_connection(conn);
                 changed = changed || new_changed;
             }

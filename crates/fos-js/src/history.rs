@@ -1,16 +1,17 @@
 //! History API
 //!
-//! Implements history.pushState, back, forward, go.
+//! Implements window.history object.
 
-use rquickjs::{Ctx, Function, Object, Value};
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use std::sync::{Arc, Mutex};
 
 /// History entry
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct HistoryEntry {
     pub url: String,
     pub title: String,
-    pub state: Option<String>, // JSON-serialized state
+    pub state: Option<String>,
 }
 
 /// History manager
@@ -31,7 +32,12 @@ impl HistoryManager {
         }
     }
     
-    /// Push a new history entry
+    /// Get current entry
+    pub fn current(&self) -> &HistoryEntry {
+        &self.entries[self.current]
+    }
+    
+    /// Push a new state
     pub fn push_state(&mut self, state: Option<String>, title: String, url: String) {
         // Remove forward history
         self.entries.truncate(self.current + 1);
@@ -40,119 +46,96 @@ impl HistoryManager {
         self.current = self.entries.len() - 1;
     }
     
-    /// Replace current entry
+    /// Replace current state
     pub fn replace_state(&mut self, state: Option<String>, title: String, url: String) {
-        if let Some(entry) = self.entries.get_mut(self.current) {
-            entry.url = url;
-            entry.title = title;
-            entry.state = state;
-        }
+        self.entries[self.current] = HistoryEntry { url, title, state };
     }
     
     /// Go back
-    pub fn back(&mut self) -> Option<&HistoryEntry> {
+    pub fn back(&mut self) {
         if self.current > 0 {
             self.current -= 1;
-            Some(&self.entries[self.current])
-        } else {
-            None
         }
     }
     
     /// Go forward
-    pub fn forward(&mut self) -> Option<&HistoryEntry> {
-        if self.current + 1 < self.entries.len() {
+    pub fn forward(&mut self) {
+        if self.current < self.entries.len() - 1 {
             self.current += 1;
-            Some(&self.entries[self.current])
-        } else {
-            None
         }
     }
     
-    /// Go to specific offset
-    pub fn go(&mut self, delta: i32) -> Option<&HistoryEntry> {
+    /// Go by delta
+    pub fn go(&mut self, delta: i32) {
         let new_index = (self.current as i32 + delta) as usize;
         if new_index < self.entries.len() {
             self.current = new_index;
-            Some(&self.entries[self.current])
-        } else {
-            None
         }
     }
     
-    /// Get current entry
-    pub fn current(&self) -> &HistoryEntry {
-        &self.entries[self.current]
-    }
-    
-    /// Get history length
+    /// History length
     pub fn length(&self) -> usize {
         self.entries.len()
     }
 }
 
 /// Install history API into global
-pub fn install_history(ctx: &Ctx, history: Arc<Mutex<HistoryManager>>) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
-    let obj = Object::new(ctx.clone())?;
+pub fn install_history<C: JsContextApi>(ctx: &C, history: Arc<Mutex<HistoryManager>>) -> Result<(), JsError> {
+    let obj = ctx.create_object()?;
     
     // pushState
     let h = history.clone();
-    obj.set("pushState", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        let state = args.get(0).and_then(|v| {
-            if v.is_null() || v.is_undefined() { None }
-            else { Some("{}".to_string()) } // Simplified
-        });
-        let title = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-        let url = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+    ctx.set_function(&obj, "pushState", move |args| {
+        let state = args.first().and_then(|v| v.as_string()).map(|s| s.to_string());
+        let title = args.get(1).and_then(|v| v.as_string()).unwrap_or("").to_string();
+        let url = args.get(2).and_then(|v| v.as_string()).unwrap_or("").to_string();
         
         h.lock().unwrap().push_state(state, title, url);
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // replaceState
     let h = history.clone();
-    obj.set("replaceState", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        let state = args.get(0).and_then(|v| {
-            if v.is_null() || v.is_undefined() { None }
-            else { Some("{}".to_string()) }
-        });
-        let title = args.get(1).and_then(|v| v.as_string()).map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
-        let url = args.get(2).and_then(|v| v.as_string()).map(|s| s.to_string().unwrap_or_default()).unwrap_or_default();
+    ctx.set_function(&obj, "replaceState", move |args| {
+        let state = args.first().and_then(|v| v.as_string()).map(|s| s.to_string());
+        let title = args.get(1).and_then(|v| v.as_string()).unwrap_or("").to_string();
+        let url = args.get(2).and_then(|v| v.as_string()).unwrap_or("").to_string();
         
         h.lock().unwrap().replace_state(state, title, url);
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // back
     let h = history.clone();
-    obj.set("back", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_function(&obj, "back", move |_args| {
         h.lock().unwrap().back();
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // forward
     let h = history.clone();
-    obj.set("forward", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_function(&obj, "forward", move |_args| {
         h.lock().unwrap().forward();
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // go
     let h = history.clone();
-    obj.set("go", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        let delta = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+    ctx.set_function(&obj, "go", move |args| {
+        let delta = args.first().and_then(|v| v.as_number()).unwrap_or(0.0) as i32;
         h.lock().unwrap().go(delta);
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
-    // length
+    // getLength
     let h = history;
-    obj.set("getLength", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<i32, rquickjs::Error> {
-        Ok(h.lock().unwrap().length() as i32)
-    })?)?;
+    ctx.set_function(&obj, "getLength", move |_args| {
+        let len = h.lock().unwrap().length();
+        Ok(JsValue::Number(len as f64))
+    })?;
     
-    globals.set("history", obj)?;
+    ctx.set_global("history", JsValue::Object)?;
+    
     Ok(())
 }
 
@@ -161,35 +144,27 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_history_push() {
-        let mut history = HistoryManager::new("https://example.com");
-        
-        history.push_state(None, "Page 2".into(), "https://example.com/page2".into());
-        assert_eq!(history.length(), 2);
-        assert_eq!(history.current().url, "https://example.com/page2");
-    }
-    
-    #[test]
     fn test_history_navigation() {
-        let mut history = HistoryManager::new("https://example.com");
+        let mut history = HistoryManager::new("https://example.com/");
+        
         history.push_state(None, "".into(), "/page1".into());
         history.push_state(None, "".into(), "/page2".into());
         
-        history.back();
-        assert_eq!(history.current().url, "/page1");
+        assert_eq!(history.length(), 3);
+        assert_eq!(history.current().url, "/page2");
         
         history.back();
-        assert_eq!(history.current().url, "https://example.com");
+        assert_eq!(history.current().url, "/page1");
         
         history.forward();
-        assert_eq!(history.current().url, "/page1");
+        assert_eq!(history.current().url, "/page2");
     }
     
     #[test]
     fn test_history_replace() {
-        let mut history = HistoryManager::new("https://example.com");
-        history.replace_state(None, "New Title".into(), "https://example.com/new".into());
+        let mut history = HistoryManager::new("https://example.com/old");
         
+        history.replace_state(None, "".into(), "https://example.com/new".into());
         assert_eq!(history.length(), 1);
         assert_eq!(history.current().url, "https://example.com/new");
     }

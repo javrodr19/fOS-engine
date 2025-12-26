@@ -1,54 +1,36 @@
 //! Storage APIs
 //!
-//! localStorage and sessionStorage implementations.
+//! Implements localStorage and sessionStorage.
 
-use rquickjs::{Ctx, Function, Object, Value};
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::fs;
-use std::path::PathBuf;
 
-/// Storage backend
-#[derive(Debug, Default)]
+/// Web Storage implementation
 pub struct Storage {
     data: HashMap<String, String>,
-    persistent: bool,
-    path: Option<PathBuf>,
+    is_persistent: bool,
 }
 
 impl Storage {
-    /// Create in-memory storage (sessionStorage)
+    /// Create localStorage (persistent)
+    pub fn local() -> Self {
+        Self {
+            data: HashMap::new(),
+            is_persistent: true,
+        }
+    }
+    
+    /// Create sessionStorage (session-only)
     pub fn session() -> Self {
         Self {
             data: HashMap::new(),
-            persistent: false,
-            path: None,
+            is_persistent: false,
         }
     }
     
-    /// Create persistent storage (localStorage)
-    pub fn local(path: PathBuf) -> Self {
-        let mut storage = Self {
-            data: HashMap::new(),
-            persistent: true,
-            path: Some(path.clone()),
-        };
-        
-        // Load existing data
-        if path.exists() {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                for line in contents.lines() {
-                    if let Some((key, value)) = line.split_once('\t') {
-                        storage.data.insert(key.to_string(), value.to_string());
-                    }
-                }
-            }
-        }
-        
-        storage
-    }
-    
-    /// Get item
+    /// Get item by key
     pub fn get_item(&self, key: &str) -> Option<&str> {
         self.data.get(key).map(|s| s.as_str())
     }
@@ -56,19 +38,21 @@ impl Storage {
     /// Set item
     pub fn set_item(&mut self, key: &str, value: &str) {
         self.data.insert(key.to_string(), value.to_string());
-        self.persist();
     }
     
     /// Remove item
     pub fn remove_item(&mut self, key: &str) {
         self.data.remove(key);
-        self.persist();
     }
     
     /// Clear all items
     pub fn clear(&mut self) {
         self.data.clear();
-        self.persist();
+    }
+    
+    /// Number of items
+    pub fn length(&self) -> usize {
+        self.data.len()
     }
     
     /// Get key at index
@@ -76,108 +60,112 @@ impl Storage {
         self.data.keys().nth(index).map(|s| s.as_str())
     }
     
-    /// Get number of items
-    pub fn length(&self) -> usize {
-        self.data.len()
-    }
-    
-    /// Persist to disk if persistent
-    fn persist(&self) {
-        if self.persistent {
-            if let Some(path) = &self.path {
-                let contents: String = self.data
-                    .iter()
-                    .map(|(k, v)| format!("{}\t{}", k, v))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let _ = fs::write(path, contents);
-            }
-        }
+    /// Check if persistent
+    pub fn is_persistent(&self) -> bool {
+        self.is_persistent
     }
 }
 
-/// Install localStorage and sessionStorage into global
-pub fn install_storage(
-    ctx: &Ctx,
-    local: Arc<Mutex<Storage>>,
-    session: Arc<Mutex<Storage>>,
-) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
+/// Install storage APIs into global object
+pub fn install_storage<C: JsContextApi>(
+    ctx: &C,
+    local_storage: Arc<Mutex<Storage>>,
+    session_storage: Arc<Mutex<Storage>>,
+) -> Result<(), JsError> {
+    // Create localStorage object
+    let local_obj = ctx.create_object()?;
+    install_storage_methods(ctx, &local_obj, local_storage)?;
+    ctx.set_global("localStorage", JsValue::Object)?;
     
-    // localStorage
-    globals.set("localStorage", create_storage_object(ctx, local)?)?;
-    
-    // sessionStorage
-    globals.set("sessionStorage", create_storage_object(ctx, session)?)?;
+    // Create sessionStorage object
+    let session_obj = ctx.create_object()?;
+    install_storage_methods(ctx, &session_obj, session_storage)?;
+    ctx.set_global("sessionStorage", JsValue::Object)?;
     
     Ok(())
 }
 
-fn create_storage_object<'js>(ctx: &Ctx<'js>, storage: Arc<Mutex<Storage>>) -> Result<Object<'js>, rquickjs::Error> {
-    let obj = Object::new(ctx.clone())?;
-    
+fn install_storage_methods<C: JsContextApi>(
+    ctx: &C,
+    obj: &crate::engine_trait::JsObjectHandle,
+    storage: Arc<Mutex<Storage>>,
+) -> Result<(), JsError> {
     // getItem
     let s = storage.clone();
-    obj.set("getItem", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<Option<String>, rquickjs::Error> {
-        if let Some(key) = args.first().and_then(|v| v.as_string()) {
-            let key = key.to_string().unwrap_or_default();
-            let storage = s.lock().unwrap();
-            return Ok(storage.get_item(&key).map(|v| v.to_string()));
+    ctx.set_function(obj, "getItem", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Null);
         }
-        Ok(None)
-    })?)?;
+        
+        let key = args[0].as_string().unwrap_or("");
+        let storage = s.lock().unwrap();
+        
+        match storage.get_item(key) {
+            Some(value) => Ok(JsValue::String(value.to_string())),
+            None => Ok(JsValue::Null),
+        }
+    })?;
     
     // setItem
     let s = storage.clone();
-    obj.set("setItem", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if args.len() >= 2 {
-            if let (Some(key), Some(value)) = (args[0].as_string(), args[1].as_string()) {
-                let key = key.to_string().unwrap_or_default();
-                let value = value.to_string().unwrap_or_default();
-                let mut storage = s.lock().unwrap();
-                storage.set_item(&key, &value);
-            }
+    ctx.set_function(obj, "setItem", move |args| {
+        if args.len() < 2 {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let key = args[0].as_string().unwrap_or("");
+        let value = args[1].as_string().unwrap_or("");
+        
+        let mut storage = s.lock().unwrap();
+        storage.set_item(key, value);
+        Ok(JsValue::Undefined)
+    })?;
     
     // removeItem
     let s = storage.clone();
-    obj.set("removeItem", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        if let Some(key) = args.first().and_then(|v| v.as_string()) {
-            let key = key.to_string().unwrap_or_default();
-            let mut storage = s.lock().unwrap();
-            storage.remove_item(&key);
+    ctx.set_function(obj, "removeItem", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Undefined);
         }
-        Ok(())
-    })?)?;
+        
+        let key = args[0].as_string().unwrap_or("");
+        let mut storage = s.lock().unwrap();
+        storage.remove_item(key);
+        Ok(JsValue::Undefined)
+    })?;
     
     // clear
     let s = storage.clone();
-    obj.set("clear", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_function(obj, "clear", move |_args| {
         let mut storage = s.lock().unwrap();
         storage.clear();
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
-    // length
+    // getLength
     let s = storage.clone();
-    obj.set("getLength", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<i32, rquickjs::Error> {
+    ctx.set_function(obj, "getLength", move |_args| {
         let storage = s.lock().unwrap();
-        Ok(storage.length() as i32)
-    })?)?;
+        Ok(JsValue::Number(storage.length() as f64))
+    })?;
     
     // key
     let s = storage;
-    obj.set("key", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<Option<String>, rquickjs::Error> {
-        if let Some(index) = args.first().and_then(|v| v.as_int()) {
-            let storage = s.lock().unwrap();
-            return Ok(storage.key(index as usize).map(|k| k.to_string()));
+    ctx.set_function(obj, "key", move |args| {
+        if args.is_empty() {
+            return Ok(JsValue::Null);
         }
-        Ok(None)
-    })?)?;
+        
+        let index = args[0].as_number().unwrap_or(0.0) as usize;
+        let storage = s.lock().unwrap();
+        
+        match storage.key(index) {
+            Some(key) => Ok(JsValue::String(key.to_string())),
+            None => Ok(JsValue::Null),
+        }
+    })?;
     
-    Ok(obj)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -185,35 +173,27 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_session_storage() {
+    fn test_storage_basic() {
         let mut storage = Storage::session();
         
-        storage.set_item("key1", "value1");
-        assert_eq!(storage.get_item("key1"), Some("value1"));
+        storage.set_item("key", "value");
+        assert_eq!(storage.get_item("key"), Some("value"));
+        assert_eq!(storage.length(), 1);
         
-        storage.set_item("key2", "value2");
-        assert_eq!(storage.length(), 2);
-        
-        storage.remove_item("key1");
-        assert_eq!(storage.get_item("key1"), None);
-        
-        storage.clear();
+        storage.remove_item("key");
+        assert_eq!(storage.get_item("key"), None);
         assert_eq!(storage.length(), 0);
     }
     
     #[test]
-    fn test_storage_key() {
+    fn test_storage_clear() {
         let mut storage = Storage::session();
+        
         storage.set_item("a", "1");
         storage.set_item("b", "2");
+        assert_eq!(storage.length(), 2);
         
-        // Keys may be in any order
-        let key0 = storage.key(0);
-        let key1 = storage.key(1);
-        let key2 = storage.key(2);
-        
-        assert!(key0.is_some());
-        assert!(key1.is_some());
-        assert!(key2.is_none());
+        storage.clear();
+        assert_eq!(storage.length(), 0);
     }
 }

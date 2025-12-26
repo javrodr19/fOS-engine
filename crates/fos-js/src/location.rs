@@ -2,8 +2,9 @@
 //!
 //! Implements window.location object using custom URL parser.
 
+use crate::{JsValue, JsError};
+use crate::engine_trait::JsContextApi;
 use fos_dom::url::{Url, ParseError};
-use rquickjs::{Ctx, Function, Object, Value};
 use std::sync::{Arc, Mutex};
 
 /// Location state
@@ -81,86 +82,89 @@ impl LocationManager {
 }
 
 /// Install location API into global
-pub fn install_location(ctx: &Ctx, location: Arc<Mutex<LocationManager>>) -> Result<(), rquickjs::Error> {
-    let globals = ctx.globals();
-    let obj = Object::new(ctx.clone())?;
+pub fn install_location<C: JsContextApi>(ctx: &C, location: Arc<Mutex<LocationManager>>) -> Result<(), JsError> {
+    let obj = ctx.create_object()?;
     
-    // href getter
+    // getHref
     let l = location.clone();
-    obj.set("getHref", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().href())
-    })?)?;
+    ctx.set_function(&obj, "getHref", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().href()))
+    })?;
     
-    // protocol
+    // getProtocol
     let l = location.clone();
-    obj.set("getProtocol", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().protocol())
-    })?)?;
+    ctx.set_function(&obj, "getProtocol", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().protocol()))
+    })?;
     
-    // host
+    // getHost
     let l = location.clone();
-    obj.set("getHost", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().host())
-    })?)?;
+    ctx.set_function(&obj, "getHost", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().host()))
+    })?;
     
-    // hostname
+    // getHostname
     let l = location.clone();
-    obj.set("getHostname", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().hostname())
-    })?)?;
+    ctx.set_function(&obj, "getHostname", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().hostname()))
+    })?;
     
-    // pathname
+    // getPort
     let l = location.clone();
-    obj.set("getPathname", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().pathname().to_string())
-    })?)?;
+    ctx.set_function(&obj, "getPort", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().port()))
+    })?;
     
-    // search
+    // getPathname
     let l = location.clone();
-    obj.set("getSearch", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().search())
-    })?)?;
+    ctx.set_function(&obj, "getPathname", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().pathname().to_string()))
+    })?;
     
-    // hash
+    // getSearch
     let l = location.clone();
-    obj.set("getHash", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().hash())
-    })?)?;
+    ctx.set_function(&obj, "getSearch", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().search()))
+    })?;
     
-    // origin
+    // getHash
     let l = location.clone();
-    obj.set("getOrigin", Function::new(ctx.clone(), move |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<String, rquickjs::Error> {
-        Ok(l.lock().unwrap().origin())
-    })?)?;
+    ctx.set_function(&obj, "getHash", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().hash()))
+    })?;
     
-    // assign (navigate)
+    // getOrigin
     let l = location.clone();
-    obj.set("assign", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_function(&obj, "getOrigin", move |_args| {
+        Ok(JsValue::String(l.lock().unwrap().origin()))
+    })?;
+    
+    // assign
+    let l = location.clone();
+    ctx.set_function(&obj, "assign", move |args| {
         if let Some(url) = args.first().and_then(|v| v.as_string()) {
-            let url = url.to_string().unwrap_or_default();
-            let _ = l.lock().unwrap().set_href(&url);
+            let _ = l.lock().unwrap().set_href(url);
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
-    // replace (navigate without history)
+    // replace
     let l = location.clone();
-    obj.set("replace", Function::new(ctx.clone(), move |_ctx: Ctx, args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
+    ctx.set_function(&obj, "replace", move |args| {
         if let Some(url) = args.first().and_then(|v| v.as_string()) {
-            let url = url.to_string().unwrap_or_default();
-            let _ = l.lock().unwrap().set_href(&url);
+            let _ = l.lock().unwrap().set_href(url);
         }
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
     // reload
-    obj.set("reload", Function::new(ctx.clone(), |_ctx: Ctx, _args: rquickjs::function::Rest<Value>| -> Result<(), rquickjs::Error> {
-        // Would trigger page reload
+    ctx.set_function(&obj, "reload", |_args| {
         tracing::info!("location.reload() called");
-        Ok(())
-    })?)?;
+        Ok(JsValue::Undefined)
+    })?;
     
-    globals.set("location", obj)?;
+    ctx.set_global("location", JsValue::Object)?;
+    
     Ok(())
 }
 

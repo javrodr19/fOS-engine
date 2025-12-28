@@ -93,6 +93,13 @@ pub enum Opcode {
     GetPrototype = 130,
     SetPrototype = 131,
     
+    // Iteration
+    GetIterator = 140,   // Get Symbol.iterator from object
+    IteratorNext = 141,  // Call iterator.next()
+    IteratorDone = 142,  // Check if iterator is done
+    ForOfInit = 143,     // Initialize for-of loop
+    ForInInit = 144,     // Initialize for-in loop (get keys)
+    
     Halt = 255,
 }
 

@@ -1,10 +1,12 @@
 //! Virtual Machine
 //!
-//! Stack-based bytecode interpreter with closure support.
+//! Stack-based bytecode interpreter with closure and async support.
 
 use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction};
 use super::value::JsVal;
 use super::object::{JsObject, JsArray};
+use super::promise::{JsPromise, PromiseState};
+use super::event_loop::EventLoop;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +52,10 @@ pub struct VirtualMachine {
     frames: Vec<CallFrame>,
     try_handlers: Vec<TryHandler>,
     current_error: Option<JsVal>,
+    // Async support
+    event_loop: EventLoop,
+    promises: Vec<JsPromise>,
+    pending_microtasks: Vec<u32>, // Callback IDs to execute
 }
 
 impl Default for VirtualMachine {
@@ -68,6 +74,9 @@ impl VirtualMachine {
             frames: Vec::new(),
             try_handlers: Vec::new(),
             current_error: None,
+            event_loop: EventLoop::new(),
+            promises: Vec::new(),
+            pending_microtasks: Vec::new(),
         }
     }
     
@@ -224,12 +233,9 @@ impl VirtualMachine {
                     let name_idx = self.read_u16(bytecode, &mut ip) as usize;
                     let name = &bytecode.names[name_idx];
                     if let Some(JsVal::Object(obj_id)) = self.stack.pop() {
-                        if let Some(obj) = self.objects.get(obj_id as usize) {
-                            let val = obj.get(name).cloned().unwrap_or(JsVal::Undefined);
-                            self.stack.push(val);
-                        } else {
-                            self.stack.push(JsVal::Undefined);
-                        }
+                        // Walk prototype chain
+                        let val = self.get_property_with_prototype(obj_id, name);
+                        self.stack.push(val);
                     } else {
                         self.stack.push(JsVal::Undefined);
                     }
@@ -479,6 +485,64 @@ impl VirtualMachine {
                     return Ok(result);
                 }
                 
+                // Error handling
+                Opcode::TryStart => {
+                    let catch_offset = self.read_i16(bytecode, &mut ip);
+                    let catch_ip = (ip as i32 + catch_offset as i32) as usize;
+                    self.try_handlers.push(TryHandler {
+                        catch_ip,
+                        stack_level: self.stack.len(),
+                        frame_level: self.frames.len(),
+                    });
+                }
+                Opcode::TryEnd => {
+                    self.try_handlers.pop();
+                }
+                Opcode::Throw => {
+                    let error = self.stack.pop().unwrap_or(JsVal::Undefined);
+                    if let Some(handler) = self.try_handlers.pop() {
+                        // Unwind stack to handler level
+                        self.stack.truncate(handler.stack_level);
+                        // Push error value for catch
+                        self.stack.push(error);
+                        // Jump to catch block
+                        ip = handler.catch_ip;
+                    } else {
+                        // Uncaught error
+                        self.current_error = Some(error);
+                        return Err("Uncaught error".to_string());
+                    }
+                }
+                
+                // Prototype operations
+                Opcode::GetPrototype => {
+                    if let Some(JsVal::Object(obj_id)) = self.stack.pop() {
+                        if let Some(obj) = self.objects.get(obj_id as usize) {
+                            if let Some(proto_id) = obj.prototype() {
+                                self.stack.push(JsVal::Object(proto_id));
+                            } else {
+                                self.stack.push(JsVal::Null);
+                            }
+                        } else {
+                            self.stack.push(JsVal::Null);
+                        }
+                    } else {
+                        self.stack.push(JsVal::Null);
+                    }
+                }
+                Opcode::SetPrototype => {
+                    let proto = self.stack.pop().unwrap_or(JsVal::Null);
+                    if let Some(JsVal::Object(obj_id)) = self.stack.last() {
+                        if let Some(obj) = self.objects.get_mut(*obj_id as usize) {
+                            match proto {
+                                JsVal::Object(proto_id) => obj.set_prototype(Some(proto_id)),
+                                JsVal::Null => obj.set_prototype(None),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                
                 _ => {}
             }
         }
@@ -486,6 +550,22 @@ impl VirtualMachine {
         // Clean up and return undefined if no explicit return
         self.stack.truncate(bp);
         Ok(JsVal::Undefined)
+    }
+    
+    /// Walk prototype chain to find property
+    fn get_property_with_prototype(&self, obj_id: u32, name: &str) -> JsVal {
+        let mut current_id = Some(obj_id);
+        while let Some(id) = current_id {
+            if let Some(obj) = self.objects.get(id as usize) {
+                if let Some(val) = obj.get(name) {
+                    return val.clone();
+                }
+                current_id = obj.prototype();
+            } else {
+                break;
+            }
+        }
+        JsVal::Undefined
     }
     
     pub fn set_global(&mut self, name: &str, val: JsVal) { self.globals.insert(name.into(), val); }

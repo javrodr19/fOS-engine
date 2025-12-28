@@ -115,6 +115,12 @@ impl Compiler {
                         self.bytecode.emit(Opcode::LoadConst);
                         self.bytecode.emit_u16(idx);
                     }
+                    LiteralValue::BigInt(s) => {
+                        // BigInt stored as string, load as constant
+                        let idx = self.bytecode.add_constant(Constant::String(s.clone()));
+                        self.bytecode.emit(Opcode::LoadConst);
+                        self.bytecode.emit_u16(idx);
+                    }
                 }
             }
             AstNodeKind::Identifier { name } => {
@@ -150,7 +156,7 @@ impl Compiler {
                     _ => {}
                 }
             }
-            AstNodeKind::UnaryExpression { operator, argument } => {
+            AstNodeKind::UnaryExpression { operator, argument, .. } => {
                 self.compile_node(ast, *argument)?;
                 match operator {
                     UnaryOp::Minus => self.bytecode.emit(Opcode::Neg),
@@ -193,7 +199,7 @@ impl Compiler {
                 self.bytecode.emit(Opcode::Call);
                 self.bytecode.emit_u8(arguments.len() as u8);
             }
-            AstNodeKind::MemberExpression { object, property, computed } => {
+            AstNodeKind::MemberExpression { object, property, computed, .. } => {
                 self.compile_node(ast, *object)?;
                 if *computed {
                     self.compile_node(ast, *property)?;

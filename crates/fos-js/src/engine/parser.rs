@@ -3,7 +3,7 @@
 //! Parses tokens into AST. Supports ES2023 syntax.
 
 use super::lexer::Lexer;
-use super::ast::{Ast, AstNode, AstNodeKind, NodeId, LiteralValue, VarKind, BinaryOp, UnaryOp, LogicalOp};
+use super::ast::{Ast, AstNode, AstNodeKind, NodeId, LiteralValue, VarKind, BinaryOp, UnaryOp, LogicalOp, PropertyKind};
 use super::token::{Token, TokenKind, Span};
 
 /// Parser error
@@ -108,7 +108,7 @@ impl<'src> Parser<'src> {
         let body = self.parse_block_statement()?;
         
         Ok(self.ast.add_node(AstNode::new(
-            AstNodeKind::FunctionDeclaration { id, params, body, is_async: false },
+            AstNodeKind::FunctionDeclaration { id, params, body, is_async: false, is_generator: false },
             start.merge(self.previous.span),
         )))
     }
@@ -423,7 +423,7 @@ impl<'src> Parser<'src> {
                 self.advance();
                 let argument = self.parse_unary()?;
                 Ok(self.ast.add_node(AstNode::new(
-                    AstNodeKind::UnaryExpression { operator: UnaryOp::Not, argument },
+                    AstNodeKind::UnaryExpression { operator: UnaryOp::Not, argument, prefix: true },
                     start.merge(self.ast.get(argument).unwrap().span),
                 )))
             }
@@ -431,7 +431,7 @@ impl<'src> Parser<'src> {
                 self.advance();
                 let argument = self.parse_unary()?;
                 Ok(self.ast.add_node(AstNode::new(
-                    AstNodeKind::UnaryExpression { operator: UnaryOp::Minus, argument },
+                    AstNodeKind::UnaryExpression { operator: UnaryOp::Minus, argument, prefix: true },
                     start.merge(self.ast.get(argument).unwrap().span),
                 )))
             }
@@ -439,7 +439,7 @@ impl<'src> Parser<'src> {
                 self.advance();
                 let argument = self.parse_unary()?;
                 Ok(self.ast.add_node(AstNode::new(
-                    AstNodeKind::UnaryExpression { operator: UnaryOp::Typeof, argument },
+                    AstNodeKind::UnaryExpression { operator: UnaryOp::Typeof, argument, prefix: true },
                     start.merge(self.ast.get(argument).unwrap().span),
                 )))
             }
@@ -466,7 +466,7 @@ impl<'src> Parser<'src> {
                 self.consume(TokenKind::RBracket)?;
                 let span = self.ast.get(expr).unwrap().span.merge(self.previous.span);
                 expr = self.ast.add_node(AstNode::new(
-                    AstNodeKind::MemberExpression { object: expr, property, computed: true },
+                    AstNodeKind::MemberExpression { object: expr, property, computed: true, optional: false },
                     span,
                 ));
             } else {
@@ -485,7 +485,7 @@ impl<'src> Parser<'src> {
             let property = self.parse_identifier()?;
             let span = self.ast.get(object).unwrap().span.merge(self.previous.span);
             object = self.ast.add_node(AstNode::new(
-                AstNodeKind::MemberExpression { object, property, computed: false },
+                AstNodeKind::MemberExpression { object, property, computed: false, optional: false },
                 span,
             ));
         }
@@ -602,7 +602,7 @@ impl<'src> Parser<'src> {
             
             let span = self.ast.get(key).unwrap().span.merge(self.ast.get(value).unwrap().span);
             properties.push(self.ast.add_node(AstNode::new(
-                AstNodeKind::Property { key, value, computed: false },
+                AstNodeKind::Property { key, value, computed: false, shorthand: false, kind: PropertyKind::Init },
                 span,
             )));
             
@@ -633,7 +633,7 @@ impl<'src> Parser<'src> {
         let body = self.parse_block_statement()?;
         
         Ok(self.ast.add_node(AstNode::new(
-            AstNodeKind::FunctionExpression { id, params, body, is_async: false },
+            AstNodeKind::FunctionExpression { id, params, body, is_async: false, is_generator: false },
             start.merge(self.previous.span),
         )))
     }

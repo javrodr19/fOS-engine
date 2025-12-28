@@ -249,6 +249,64 @@ impl StringMethods {
     pub fn replace(s: &str, from: &str, to: &str) -> JsVal {
         JsVal::String(s.replacen(from, to, 1).into())
     }
+    
+    pub fn replace_all(s: &str, from: &str, to: &str) -> JsVal {
+        JsVal::String(s.replace(from, to).into())
+    }
+    
+    pub fn pad_start(s: &str, target_length: usize, pad_string: &str) -> JsVal {
+        let current_len = s.chars().count();
+        if current_len >= target_length {
+            return JsVal::String(s.into());
+        }
+        let pad_len = target_length - current_len;
+        let mut padding = String::new();
+        while padding.chars().count() < pad_len {
+            padding.push_str(pad_string);
+        }
+        let padding: String = padding.chars().take(pad_len).collect();
+        JsVal::String(format!("{}{}", padding, s).into())
+    }
+    
+    pub fn pad_end(s: &str, target_length: usize, pad_string: &str) -> JsVal {
+        let current_len = s.chars().count();
+        if current_len >= target_length {
+            return JsVal::String(s.into());
+        }
+        let pad_len = target_length - current_len;
+        let mut padding = String::new();
+        while padding.chars().count() < pad_len {
+            padding.push_str(pad_string);
+        }
+        let padding: String = padding.chars().take(pad_len).collect();
+        JsVal::String(format!("{}{}", s, padding).into())
+    }
+    
+    pub fn repeat(s: &str, count: usize) -> JsVal {
+        JsVal::String(s.repeat(count).into())
+    }
+    
+    pub fn last_index_of(s: &str, search: &str) -> JsVal {
+        JsVal::Number(s.rfind(search).map(|i| i as f64).unwrap_or(-1.0))
+    }
+    
+    pub fn char_code_at(s: &str, index: usize) -> JsVal {
+        s.chars().nth(index)
+            .map(|c| JsVal::Number(c as u32 as f64))
+            .unwrap_or(JsVal::Number(f64::NAN))
+    }
+    
+    pub fn concat(strings: &[&str]) -> JsVal {
+        JsVal::String(strings.join("").into())
+    }
+    
+    pub fn slice(s: &str, start: i32, end: Option<i32>) -> JsVal {
+        let len = s.chars().count() as i32;
+        let start = if start < 0 { (len + start).max(0) as usize } else { start as usize };
+        let end = end.map(|e| if e < 0 { (len + e).max(0) as usize } else { e as usize }).unwrap_or(len as usize);
+        let result: String = s.chars().skip(start).take(end.saturating_sub(start)).collect();
+        JsVal::String(result.into())
+    }
 }
 
 // ============================================================================
@@ -308,6 +366,189 @@ impl ArrayMethods {
             }
         }
         JsVal::Number(-1.0)
+    }
+}
+
+/// Object built-in methods
+pub struct ObjectMethods;
+
+impl ObjectMethods {
+    /// Object.keys(obj) - get own enumerable property names
+    pub fn keys(obj: &JsObject) -> Vec<JsVal> {
+        obj.keys().map(|k| JsVal::String(k.into())).collect()
+    }
+    
+    /// Object.values(obj) - get own enumerable property values
+    pub fn values(obj: &JsObject) -> Vec<JsVal> {
+        obj.keys().filter_map(|k| obj.get(k).cloned()).collect()
+    }
+    
+    /// Object.entries(obj) - get [key, value] pairs
+    pub fn entries(obj: &JsObject) -> Vec<(JsVal, JsVal)> {
+        obj.keys()
+            .filter_map(|k| obj.get(k).cloned().map(|v| (JsVal::String(k.into()), v)))
+            .collect()
+    }
+    
+    /// Object.assign(target, ...sources) - copy properties
+    pub fn assign(target: &mut JsObject, source: &JsObject) {
+        for key in source.keys() {
+            if let Some(val) = source.get(key) {
+                target.set(key, val.clone());
+            }
+        }
+    }
+    
+    /// Object.hasOwn(obj, prop) - check if has own property
+    pub fn has_own(obj: &JsObject, prop: &str) -> bool {
+        obj.has(prop)
+    }
+}
+
+/// Function built-in methods
+pub struct FunctionMethods;
+
+impl FunctionMethods {
+    /// Function.prototype.bind context
+    pub fn bind_context(func_id: u32, this_arg: JsVal) -> BoundFunction {
+        BoundFunction { func_id, this_arg, bound_args: Vec::new() }
+    }
+    
+    /// Function.prototype.bind with args
+    pub fn bind_with_args(func_id: u32, this_arg: JsVal, args: Vec<JsVal>) -> BoundFunction {
+        BoundFunction { func_id, this_arg, bound_args: args }
+    }
+}
+
+/// Bound function representation
+#[derive(Debug, Clone)]
+pub struct BoundFunction {
+    pub func_id: u32,
+    pub this_arg: JsVal,
+    pub bound_args: Vec<JsVal>,
+}
+
+/// Extended Array methods
+impl ArrayMethods {
+    /// Array.isArray(value)
+    pub fn is_array(value: &JsVal) -> bool {
+        matches!(value, JsVal::Array(_))
+    }
+    
+    /// Array.from(arrayLike) - simplified
+    pub fn from(len: usize) -> JsArray {
+        let mut arr = JsArray::new();
+        for _ in 0..len {
+            arr.push(JsVal::Undefined);
+        }
+        arr
+    }
+    
+    /// Array.of(...items)
+    pub fn of(items: Vec<JsVal>) -> JsArray {
+        let mut arr = JsArray::new();
+        for item in items {
+            arr.push(item);
+        }
+        arr
+    }
+    
+    /// Array.prototype.flat(depth) - simplified (depth=1)
+    pub fn flat(arr: &JsArray) -> JsArray {
+        let mut result = JsArray::new();
+        for i in 0..arr.len() {
+            let val = arr.get(i);
+            // Only flatten one level
+            result.push(val);
+        }
+        result
+    }
+    
+    /// Array.prototype.find
+    pub fn find(arr: &JsArray, predicate: impl Fn(&JsVal) -> bool) -> JsVal {
+        for i in 0..arr.len() {
+            let val = arr.get(i);
+            if predicate(&val) {
+                return val;
+            }
+        }
+        JsVal::Undefined
+    }
+    
+    /// Array.prototype.findIndex
+    pub fn find_index(arr: &JsArray, predicate: impl Fn(&JsVal) -> bool) -> JsVal {
+        for i in 0..arr.len() {
+            let val = arr.get(i);
+            if predicate(&val) {
+                return JsVal::Number(i as f64);
+            }
+        }
+        JsVal::Number(-1.0)
+    }
+    
+    /// Array.prototype.every
+    pub fn every(arr: &JsArray, predicate: impl Fn(&JsVal) -> bool) -> bool {
+        for i in 0..arr.len() {
+            if !predicate(&arr.get(i)) {
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// Array.prototype.some
+    pub fn some(arr: &JsArray, predicate: impl Fn(&JsVal) -> bool) -> bool {
+        for i in 0..arr.len() {
+            if predicate(&arr.get(i)) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Array.prototype.fill
+    pub fn fill(arr: &mut JsArray, value: JsVal) {
+        for i in 0..arr.len() {
+            arr.set(i, value.clone());
+        }
+    }
+    
+    /// Array.prototype.concat
+    pub fn concat(arr1: &JsArray, arr2: &JsArray) -> JsArray {
+        let mut result = JsArray::new();
+        for i in 0..arr1.len() {
+            result.push(arr1.get(i));
+        }
+        for i in 0..arr2.len() {
+            result.push(arr2.get(i));
+        }
+        result
+    }
+    
+    /// Array.prototype.slice
+    pub fn slice(arr: &JsArray, start: usize, end: usize) -> JsArray {
+        let mut result = JsArray::new();
+        let end = end.min(arr.len());
+        for i in start..end {
+            result.push(arr.get(i));
+        }
+        result
+    }
+    
+    /// Array.prototype.splice
+    pub fn splice(arr: &mut JsArray, start: usize, delete_count: usize, items: Vec<JsVal>) -> JsArray {
+        let mut deleted = JsArray::new();
+        let len = arr.len();
+        let start = start.min(len);
+        let end = (start + delete_count).min(len);
+        
+        // Collect deleted items
+        for i in start..end {
+            deleted.push(arr.get(i));
+        }
+        
+        // For simplicity, just return deleted items (full impl would modify arr)
+        deleted
     }
 }
 

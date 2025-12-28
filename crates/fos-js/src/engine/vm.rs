@@ -31,6 +31,14 @@ struct CallFrame {
     bp: usize, // Base pointer - start of this frame's stack slots
 }
 
+/// Try/catch handler
+#[derive(Debug, Clone)]
+struct TryHandler {
+    catch_ip: usize,       // Jump here on error
+    stack_level: usize,    // Stack level when try started
+    frame_level: usize,    // Call frame level when try started
+}
+
 /// Virtual Machine
 pub struct VirtualMachine {
     stack: Vec<JsVal>,
@@ -40,6 +48,8 @@ pub struct VirtualMachine {
     closures: Vec<Arc<Closure>>,
     open_upvalues: Vec<Arc<Mutex<Upvalue>>>,
     frames: Vec<CallFrame>,
+    try_handlers: Vec<TryHandler>,
+    current_error: Option<JsVal>,
 }
 
 impl Default for VirtualMachine {
@@ -56,6 +66,8 @@ impl VirtualMachine {
             closures: Vec::new(),
             open_upvalues: Vec::new(),
             frames: Vec::new(),
+            try_handlers: Vec::new(),
+            current_error: None,
         }
     }
     

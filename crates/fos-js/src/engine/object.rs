@@ -25,6 +25,7 @@ impl JsObject {
     pub fn has(&self, key: &str) -> bool { self.properties.contains_key(key) }
     pub fn keys(&self) -> impl Iterator<Item = &str> { self.properties.keys().map(|k| &**k) }
     pub fn prototype(&self) -> Option<u32> { self.prototype }
+    pub fn set_prototype(&mut self, proto: Option<u32>) { self.prototype = proto; }
 }
 
 /// JavaScript array

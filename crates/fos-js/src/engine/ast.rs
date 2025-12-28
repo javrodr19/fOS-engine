@@ -76,6 +76,18 @@ pub enum AstNodeKind {
     SpreadElement { argument: NodeId },
     AwaitExpression { argument: NodeId },
     TemplateLiteral { quasis: Vec<NodeId>, expressions: Vec<NodeId> },
+    
+    // Error handling
+    TryStatement { block: NodeId, handler: Option<NodeId>, finalizer: Option<NodeId> },
+    CatchClause { param: Option<NodeId>, body: NodeId },
+    ThrowStatement { argument: NodeId },
+    
+    // Classes
+    ClassDeclaration { id: Option<NodeId>, superclass: Option<NodeId>, body: NodeId },
+    ClassExpression { id: Option<NodeId>, superclass: Option<NodeId>, body: NodeId },
+    ClassBody { body: Vec<NodeId> },
+    MethodDefinition { key: NodeId, value: NodeId, kind: MethodKind, is_static: bool, computed: bool },
+    SuperExpression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,3 +111,7 @@ pub enum LogicalOp { And, Or, NullishCoalescing }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignOp { Assign, AddAssign, SubAssign, MulAssign, DivAssign, ModAssign }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodKind { Constructor, Method, Get, Set }
+

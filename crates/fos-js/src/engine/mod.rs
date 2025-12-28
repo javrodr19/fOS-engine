@@ -14,6 +14,8 @@
 //! - DOM Bindings: JavaScript DOM API bindings
 //! - Inline Cache: Property access optimization
 //! - JIT: Baseline Just-In-Time compiler
+//! - Promise: Async/await support
+//! - Regex: Regular expression support
 
 pub mod token;
 pub mod lexer;
@@ -31,6 +33,8 @@ pub mod integration;
 pub mod dom_bindings;
 pub mod inline_cache;
 pub mod jit;
+pub mod promise;
+pub mod regex;
 
 pub use token::{Token, TokenKind, Span};
 pub use lexer::Lexer;
@@ -47,6 +51,8 @@ pub use integration::{JsInterner, JsFixed, StringInterner, InternedString, Fixed
 pub use dom_bindings::{DomDocument, DomElement, NodeType};
 pub use inline_cache::{InlineCacheManager, ShapeRegistry, ShapeId};
 pub use jit::{BaselineJit, JitTier, JitStats};
+pub use promise::{JsPromise, PromiseState, AsyncState};
+pub use regex::{JsRegex, RegexFlags, RegexMatch};
 
 
 

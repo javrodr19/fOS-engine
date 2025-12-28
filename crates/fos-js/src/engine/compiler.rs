@@ -3,12 +3,13 @@
 //! Compiles AST to bytecode.
 
 use super::ast::{Ast, AstNode, AstNodeKind, NodeId, LiteralValue, BinaryOp, VarKind, UnaryOp, LogicalOp, AssignOp};
-use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction};
+use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction, UpvalueInfo};
 
 /// Compiler
 pub struct Compiler {
     bytecode: Bytecode,
     locals: Vec<Local>,
+    upvalues: Vec<CompilerUpvalue>,
     scope_depth: u32,
     loop_start: Option<usize>,
     loop_exit: Vec<usize>,
@@ -18,6 +19,14 @@ struct Local {
     name: Box<str>,
     depth: u32,
     slot: u16,
+    is_captured: bool,
+}
+
+/// Upvalue during compilation
+#[derive(Clone)]
+struct CompilerUpvalue {
+    index: u16,
+    is_local: bool,
 }
 
 impl Default for Compiler {
@@ -29,6 +38,7 @@ impl Compiler {
         Self {
             bytecode: Bytecode::new(),
             locals: Vec::new(),
+            upvalues: Vec::new(),
             scope_depth: 0,
             loop_start: None,
             loop_exit: Vec::new(),
@@ -345,6 +355,108 @@ impl Compiler {
                 self.bytecode.emit(Opcode::LoadConst);
                 self.bytecode.emit_u16(const_idx);
             }
+            
+            // Try/Catch/Throw
+            AstNodeKind::TryStatement { block, handler, finalizer } => {
+                // Emit TryStart - if error, jumps to catch handler
+                let catch_jump = self.emit_jump(Opcode::TryStart);
+                
+                // Compile try block
+                self.compile_node(ast, *block)?;
+                
+                // Emit TryEnd to pop handler
+                self.bytecode.emit(Opcode::TryEnd);
+                
+                // Jump over catch block
+                let finally_jump = self.emit_jump(Opcode::Jump);
+                
+                // Patch catch jump
+                self.patch_jump(catch_jump);
+                
+                // Compile catch handler if present
+                if let Some(handler_id) = handler {
+                    self.compile_node(ast, *handler_id)?;
+                }
+                
+                // Patch finally jump
+                self.patch_jump(finally_jump);
+                
+                // Compile finalizer if present
+                if let Some(finalizer_id) = finalizer {
+                    self.compile_node(ast, *finalizer_id)?;
+                }
+            }
+            AstNodeKind::CatchClause { param, body } => {
+                // If param present, create binding for error
+                if let Some(param_id) = param {
+                    if let Some(param_node) = ast.get(*param_id) {
+                        if let AstNodeKind::Identifier { name } = &param_node.kind {
+                            self.define_local(name.clone());
+                        }
+                    }
+                }
+                self.compile_node(ast, *body)?;
+            }
+            AstNodeKind::ThrowStatement { argument } => {
+                self.compile_node(ast, *argument)?;
+                self.bytecode.emit(Opcode::Throw);
+            }
+            
+            // Classes
+            AstNodeKind::ClassDeclaration { id, superclass, body } |
+            AstNodeKind::ClassExpression { id, superclass, body } => {
+                // Compile superclass if present
+                if let Some(super_id) = superclass {
+                    self.compile_node(ast, *super_id)?;
+                } else {
+                    self.bytecode.emit(Opcode::LoadNull);
+                }
+                
+                // Create class object
+                self.bytecode.emit(Opcode::NewObject);
+                
+                // Compile class body (methods)
+                self.compile_node(ast, *body)?;
+                
+                // If class declaration, bind to name
+                if let AstNodeKind::ClassDeclaration { id: Some(name_id), .. } = &node.kind {
+                    if let Some(name_node) = ast.get(*name_id) {
+                        if let AstNodeKind::Identifier { name } = &name_node.kind {
+                            if self.scope_depth > 0 {
+                                self.define_local(name.clone());
+                            } else {
+                                let name_idx = self.bytecode.add_name(name);
+                                self.bytecode.emit(Opcode::SetGlobal);
+                                self.bytecode.emit_u16(name_idx);
+                            }
+                        }
+                    }
+                }
+            }
+            AstNodeKind::ClassBody { body } => {
+                for member in body {
+                    self.compile_node(ast, *member)?;
+                }
+            }
+            AstNodeKind::MethodDefinition { key, value, kind, is_static, .. } => {
+                // Get method name
+                if let Some(key_node) = ast.get(*key) {
+                    if let AstNodeKind::Identifier { name } = &key_node.kind {
+                        // Compile method function
+                        self.compile_node(ast, *value)?;
+                        
+                        // Set property on class/prototype
+                        let name_idx = self.bytecode.add_name(name);
+                        self.bytecode.emit(Opcode::SetProperty);
+                        self.bytecode.emit_u16(name_idx);
+                    }
+                }
+            }
+            AstNodeKind::SuperExpression => {
+                // TODO: Implement proper super reference
+                self.bytecode.emit(Opcode::LoadUndefined);
+            }
+            
             _ => {}
         }
         Ok(())
@@ -404,7 +516,7 @@ impl Compiler {
     
     fn define_local(&mut self, name: Box<str>) {
         let slot = self.locals.len() as u16;
-        self.locals.push(Local { name, depth: self.scope_depth, slot });
+        self.locals.push(Local { name, depth: self.scope_depth, slot, is_captured: false });
     }
     
     fn resolve_local(&self, name: &str) -> Option<u16> {

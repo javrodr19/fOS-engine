@@ -84,8 +84,15 @@ pub enum Opcode {
     Instanceof = 111,
     In = 112,
     
-    // Control
+    // Error handling
     Throw = 120,
+    TryStart = 121,      // catch_offset: i16 - jump to catch block if error
+    TryEnd = 122,        // Pop try handler
+    
+    // Prototype
+    GetPrototype = 130,
+    SetPrototype = 131,
+    
     Halt = 255,
 }
 

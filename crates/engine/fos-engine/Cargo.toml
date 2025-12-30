@@ -30,14 +30,14 @@ fos-css = { path = "../fos-css" }
 fos-dom = { path = "../fos-dom" }
 fos-layout = { path = "../fos-layout" }
 fos-render = { path = "../fos-render" }
-fos-js = { path = "../fos-js" }
+fos-js = { path = "../../js/fos-js" }
 fos-net = { path = "../fos-net" }
 
 # Optional components (feature-gated)
-fos-canvas = { path = "../fos-canvas", optional = true }
-fos-media = { path = "../fos-media", optional = true }
-fos-devtools = { path = "../fos-devtools", optional = true }
-fos-a11y = { path = "../fos-a11y", optional = true }
+fos-canvas = { path = "../../browser/fos-canvas", optional = true }
+fos-media = { path = "../../browser/fos-media", optional = true }
+fos-devtools = { path = "../../browser/fos-devtools", optional = true }
+fos-a11y = { path = "../../browser/fos-a11y", optional = true }
 
 # Phase 23: Optional allocator
 mimalloc = { version = "0.1", optional = true }

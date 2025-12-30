@@ -8,19 +8,19 @@ default-run = "fos-browser"
 
 [dependencies]
 # Core engine components
-fos-engine = { path = "../fos-engine" }
-fos-html = { path = "../fos-html" }
-fos-dom = { path = "../fos-dom" }
-fos-css = { path = "../fos-css" }
-fos-layout = { path = "../fos-layout" }
-fos-render = { path = "../fos-render" }
-fos-text = { path = "../fos-text" }
+fos-engine = { path = "../../engine/fos-engine" }
+fos-html = { path = "../../engine/fos-html" }
+fos-dom = { path = "../../engine/fos-dom" }
+fos-css = { path = "../../engine/fos-css" }
+fos-layout = { path = "../../engine/fos-layout" }
+fos-render = { path = "../../engine/fos-render" }
+fos-text = { path = "../../engine/fos-text" }
 
 # JavaScript runtime
-fos-js = { path = "../fos-js" }
+fos-js = { path = "../../js/fos-js" }
 
 # Networking (HTTP cache, prefetch, XHR)
-fos-net = { path = "../fos-net" }
+fos-net = { path = "../../engine/fos-net" }
 
 # Security (CORS, CSP)
 fos-security = { path = "../fos-security" }

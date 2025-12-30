@@ -1,6 +1,10 @@
-# Generated files
+# Build output
 /target/
-Cargo.lock
+**/target/
+
+# Cargo registry/cache (dependencies)
+/registry/
+**/.cargo/
 
 # IDE
 .idea/
@@ -20,13 +24,18 @@ Thumbs.db
 *.a
 *.lib
 *.exe
+*.rlib
+*.rmeta
 
 # Debug
 *.pdb
+*.dSYM/
 
 # Coverage
 *.gcno
 *.gcda
+*.profraw
+*.profdata
 lcov.info
 tarpaulin-report.html
 
@@ -34,8 +43,10 @@ tarpaulin-report.html
 perf.data
 perf.data.old
 flamegraph.svg
+cachegrind.out.*
+callgrind.out.*
 
-# Documentation
+# Documentation (generated)
 /doc/
 
 # Logs
@@ -48,3 +59,9 @@ flamegraph.svg
 # Environment
 .env
 .env.local
+
+# Rust incremental compilation cache
+incremental/
+
+# MSVC Windows debug info
+*.pdb

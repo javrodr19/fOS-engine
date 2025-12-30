@@ -1,21 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/fos-html",
-    "crates/fos-css",
-    "crates/fos-dom",
-    "crates/fos-layout",
-    "crates/fos-render",
-    "crates/fos-text",
-    "crates/fos-js",
-    "crates/fos-net",
-    "crates/fos-canvas",
-    "crates/fos-media",
-    "crates/fos-security",
-    "crates/fos-a11y",
-    "crates/fos-devtools",
-    "crates/fos-engine",
-    "crates/fos-browser",
+    # JS Engine
+    "crates/js/fos-js",
+    
+    # Core Engine
+    "crates/engine/fos-engine",
+    "crates/engine/fos-html",
+    "crates/engine/fos-css",
+    "crates/engine/fos-dom",
+    "crates/engine/fos-layout",
+    "crates/engine/fos-render",
+    "crates/engine/fos-text",
+    "crates/engine/fos-net",
+    
+    # Browser
+    "crates/browser/fos-browser",
+    "crates/browser/fos-canvas",
+    "crates/browser/fos-media",
+    "crates/browser/fos-security",
+    "crates/browser/fos-a11y",
+    "crates/browser/fos-devtools",
 ]
 
 [workspace.package]

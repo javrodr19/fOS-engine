@@ -7,7 +7,7 @@ license.workspace = true
 description = "JavaScript runtime for fOS Engine"
 
 [dependencies]
-fos-dom = { path = "../fos-dom" }
+fos-dom = { path = "../../engine/fos-dom" }
 tracing.workspace = true
 thiserror.workspace = true
 

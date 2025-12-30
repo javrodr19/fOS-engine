@@ -432,7 +432,7 @@ pub struct BoundFunction {
 impl ArrayMethods {
     /// Array.isArray(value)
     pub fn is_array(value: &JsVal) -> bool {
-        matches!(value, JsVal::Array(_))
+        value.is_array()
     }
     
     /// Array.from(arrayLike) - simplified
@@ -558,16 +558,16 @@ mod tests {
     
     #[test]
     fn test_math_functions() {
-        assert!(matches!(math_abs(&[JsVal::Number(-5.0)]), JsVal::Number(n) if n == 5.0));
-        assert!(matches!(math_floor(&[JsVal::Number(5.7)]), JsVal::Number(n) if n == 5.0));
-        assert!(matches!(math_ceil(&[JsVal::Number(5.1)]), JsVal::Number(n) if n == 6.0));
-        assert!(matches!(math_sqrt(&[JsVal::Number(16.0)]), JsVal::Number(n) if n == 4.0));
+        assert_eq!(math_abs(&[JsVal::Number(-5.0)]).as_number(), Some(5.0));
+        assert_eq!(math_floor(&[JsVal::Number(5.7)]).as_number(), Some(5.0));
+        assert_eq!(math_ceil(&[JsVal::Number(5.1)]).as_number(), Some(6.0));
+        assert_eq!(math_sqrt(&[JsVal::Number(16.0)]).as_number(), Some(4.0));
     }
     
     #[test]
     fn test_string_methods() {
-        assert!(matches!(StringMethods::to_upper_case("hello"), JsVal::String(s) if &*s == "HELLO"));
-        assert!(matches!(StringMethods::length("hello"), JsVal::Number(n) if n == 5.0));
-        assert!(matches!(StringMethods::index_of("hello", "ll"), JsVal::Number(n) if n == 2.0));
+        assert_eq!(StringMethods::to_upper_case("hello").as_string().as_deref(), Some("HELLO"));
+        assert_eq!(StringMethods::length("hello").as_number(), Some(5.0));
+        assert_eq!(StringMethods::index_of("hello", "ll").as_number(), Some(2.0));
     }
 }

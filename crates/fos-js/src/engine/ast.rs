@@ -1,34 +1,69 @@
 //! Abstract Syntax Tree
 //!
 //! AST node definitions for JavaScript.
+//! Uses arena-style allocation with Vec<AstNode> and NodeId indices.
 
 use super::token::Span;
 
-/// AST Node ID
+/// AST Node ID - Compact reference (4 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
 
 /// Abstract Syntax Tree container
-#[derive(Debug, Default)]
+/// Pre-allocates space for typical source files.
+#[derive(Debug)]
 pub struct Ast {
     nodes: Vec<AstNode>,
     root: Option<NodeId>,
 }
 
+impl Default for Ast {
+    fn default() -> Self {
+        Self {
+            // Pre-allocate for ~500 nodes (typical medium-sized file)
+            nodes: Vec::with_capacity(512),
+            root: None,
+        }
+    }
+}
+
 impl Ast {
     pub fn new() -> Self { Self::default() }
     
+    /// Create with specific capacity for large files
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            root: None,
+        }
+    }
+    
+    #[inline]
     pub fn add_node(&mut self, node: AstNode) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         id
     }
     
+    #[inline]
     pub fn get(&self, id: NodeId) -> Option<&AstNode> { self.nodes.get(id.0 as usize) }
+    
+    #[inline]
     pub fn set_root(&mut self, id: NodeId) { self.root = Some(id); }
+    
+    #[inline]
     pub fn root(&self) -> Option<NodeId> { self.root }
+    
+    #[inline]
     pub fn len(&self) -> usize { self.nodes.len() }
+    
+    #[inline]
     pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+    
+    /// Memory usage in bytes (approximate)
+    pub fn memory_usage(&self) -> usize {
+        std::mem::size_of::<Self>() + self.nodes.capacity() * std::mem::size_of::<AstNode>()
+    }
 }
 
 /// AST Node

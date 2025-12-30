@@ -165,6 +165,18 @@ impl Bytecode {
     pub fn emit_i16(&mut self, val: i16) { self.emit_u16(val as u16); }
     
     pub fn add_constant(&mut self, c: Constant) -> u16 {
+        // Deduplicate number and string constants
+        for (i, existing) in self.constants.iter().enumerate() {
+            match (&c, existing) {
+                (Constant::Number(a), Constant::Number(b)) if a.to_bits() == b.to_bits() => {
+                    return i as u16;
+                }
+                (Constant::String(a), Constant::String(b)) if a == b => {
+                    return i as u16;
+                }
+                _ => {}
+            }
+        }
         let idx = self.constants.len() as u16;
         self.constants.push(c);
         idx

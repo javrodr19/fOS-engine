@@ -43,22 +43,22 @@ impl GarbageCollector {
         let mut worklist: Vec<u32> = Vec::new();
         
         for root in roots {
-            match root {
-                JsVal::Object(id) | JsVal::Array(id) | JsVal::Function(id) => {
-                    if marked.insert(*id) { worklist.push(*id); }
-                }
-                _ => {}
+            let id = root.as_object_id()
+                .or_else(|| root.as_array_id())
+                .or_else(|| root.as_function_id());
+            if let Some(id) = id {
+                if marked.insert(id) { worklist.push(id); }
             }
         }
         
         while let Some(id) = worklist.pop() {
             if let Some(obj) = objects.get(id as usize) {
                 for val in obj.keys().filter_map(|k| obj.get(k)) {
-                    match val {
-                        JsVal::Object(id) | JsVal::Array(id) | JsVal::Function(id) => {
-                            if marked.insert(*id) { worklist.push(*id); }
-                        }
-                        _ => {}
+                    let id = val.as_object_id()
+                        .or_else(|| val.as_array_id())
+                        .or_else(|| val.as_function_id());
+                    if let Some(id) = id {
+                        if marked.insert(id) { worklist.push(id); }
                     }
                 }
             }

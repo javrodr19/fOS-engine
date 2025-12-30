@@ -40,15 +40,16 @@ impl CustomEngine {
     
     /// Convert internal JsVal to external JsValue
     fn convert_value(val: &JsVal) -> JsValue {
-        match val {
-            JsVal::Undefined => JsValue::Undefined,
-            JsVal::Null => JsValue::Null,
-            JsVal::Bool(b) => JsValue::Bool(*b),
-            JsVal::Number(n) => JsValue::Number(*n),
-            JsVal::String(s) => JsValue::String(s.to_string()),
-            JsVal::Object(_) => JsValue::Object,
-            JsVal::Array(_) => JsValue::Array,
-            JsVal::Function(_) => JsValue::Function,
+        use super::value::JsValKind::*;
+        match val.kind() {
+            Undefined => JsValue::Undefined,
+            Null => JsValue::Null,
+            Bool(b) => JsValue::Bool(b),
+            Number(n) => JsValue::Number(n),
+            String(s) => JsValue::String(s.to_string()),
+            Object(_) => JsValue::Object,
+            Array(_) => JsValue::Array,
+            Function(_) => JsValue::Function,
         }
     }
 }

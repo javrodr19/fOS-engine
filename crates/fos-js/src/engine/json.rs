@@ -2,7 +2,7 @@
 //!
 //! JSON.parse and JSON.stringify for JavaScript.
 
-use super::value::JsVal;
+use super::value::{JsVal, JsValKind};
 use super::object::{JsObject, JsArray};
 
 /// JSON parser
@@ -135,9 +135,9 @@ impl<'a> JsonParser<'a> {
         
         loop {
             self.skip_whitespace();
-            let key = match self.parse_string()? {
-                JsVal::String(s) => s,
-                _ => return Err("Expected string key".into()),
+            let key = match self.parse_string()?.as_string() {
+                Some(s) => s,
+                None => return Err("Expected string key".into()),
             };
             self.skip_whitespace();
             self.expect(':')?;
@@ -169,19 +169,20 @@ impl<'a> JsonParser<'a> {
 
 /// JSON stringifier
 pub fn stringify(value: &JsVal) -> String {
-    match value {
-        JsVal::Undefined => "undefined".to_string(),
-        JsVal::Null => "null".to_string(),
-        JsVal::Bool(b) => b.to_string(),
-        JsVal::Number(n) => {
+    use JsValKind::*;
+    match value.kind() {
+        Undefined => "undefined".to_string(),
+        Null => "null".to_string(),
+        Bool(b) => b.to_string(),
+        Number(n) => {
             if n.is_nan() { "null".to_string() }
             else if n.is_infinite() { "null".to_string() }
             else { format!("{}", n) }
         }
-        JsVal::String(s) => format!("\"{}\"", escape_string(s)),
-        JsVal::Object(_) => "{}".to_string(), // Simplified
-        JsVal::Array(_) => "[]".to_string(),  // Simplified
-        JsVal::Function(_) => "undefined".to_string(),
+        String(s) => format!("\"{}\"", escape_string(&s)),
+        Object(_) => "{}".to_string(),
+        Array(_) => "[]".to_string(),
+        Function(_) => "undefined".to_string(),
     }
 }
 

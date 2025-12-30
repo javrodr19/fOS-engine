@@ -232,7 +232,7 @@ impl VirtualMachine {
                 Opcode::GetProperty => {
                     let name_idx = self.read_u16(bytecode, &mut ip) as usize;
                     let name = &bytecode.names[name_idx];
-                    if let Some(JsVal::Object(obj_id)) = self.stack.pop() {
+                    if let Some(obj_id) = self.stack.pop().and_then(|v| v.as_object_id()) {
                         // Walk prototype chain
                         let val = self.get_property_with_prototype(obj_id, name);
                         self.stack.push(val);
@@ -244,15 +244,15 @@ impl VirtualMachine {
                     let name_idx = self.read_u16(bytecode, &mut ip) as usize;
                     let name = bytecode.names[name_idx].to_string();
                     let val = self.stack.pop().unwrap_or(JsVal::Undefined);
-                    if let Some(JsVal::Object(obj_id)) = self.stack.last() {
-                        if let Some(obj) = self.objects.get_mut(*obj_id as usize) {
+                    if let Some(obj_id) = self.stack.last().and_then(|v| v.as_object_id()) {
+                        if let Some(obj) = self.objects.get_mut(obj_id as usize) {
                             obj.set(&name, val);
                         }
                     }
                 }
                 Opcode::GetIndex => {
                     let idx = self.stack.pop().unwrap_or(JsVal::Undefined).to_number() as usize;
-                    if let Some(JsVal::Array(arr_id)) = self.stack.pop() {
+                    if let Some(arr_id) = self.stack.pop().and_then(|v| v.as_array_id()) {
                         if let Some(arr) = self.arrays.get(arr_id as usize) {
                             self.stack.push(arr.get(idx));
                         } else {
@@ -277,20 +277,17 @@ impl VirtualMachine {
                     // Pop the callee
                     let callee = self.stack.pop().unwrap_or(JsVal::Undefined);
                     
-                    match callee {
-                        JsVal::Function(func_id) => {
-                            if let Some(closure) = self.closures.get(func_id as usize).cloned() {
-                                // Execute function
-                                let result = self.call_function(&closure, &args)?;
-                                self.stack.push(result);
-                            } else {
-                                self.stack.push(JsVal::Undefined);
-                            }
-                        }
-                        _ => {
-                            // Not callable
+                    if let Some(func_id) = callee.as_function_id() {
+                        if let Some(closure) = self.closures.get(func_id as usize).cloned() {
+                            // Execute function
+                            let result = self.call_function(&closure, &args)?;
+                            self.stack.push(result);
+                        } else {
                             self.stack.push(JsVal::Undefined);
                         }
+                    } else {
+                        // Not callable
+                        self.stack.push(JsVal::Undefined);
                     }
                 }
                 
@@ -330,11 +327,12 @@ impl VirtualMachine {
     }
     
     fn values_equal(&self, a: &JsVal, b: &JsVal) -> bool {
-        match (a, b) {
-            (JsVal::Undefined, JsVal::Undefined) | (JsVal::Null, JsVal::Null) => true,
-            (JsVal::Bool(a), JsVal::Bool(b)) => a == b,
-            (JsVal::Number(a), JsVal::Number(b)) => a == b,
-            (JsVal::String(a), JsVal::String(b)) => a == b,
+        use super::value::JsValKind::*;
+        match (a.kind(), b.kind()) {
+            (Undefined, Undefined) | (Null, Null) => true,
+            (Bool(a), Bool(b)) => a == b,
+            (Number(a), Number(b)) => a == b,
+            (String(a), String(b)) => a == b,
             _ => false,
         }
     }
@@ -470,7 +468,7 @@ impl VirtualMachine {
                     for _ in 0..argc { call_args.push(self.stack.pop().unwrap_or(JsVal::Undefined)); }
                     call_args.reverse();
                     let callee = self.stack.pop().unwrap_or(JsVal::Undefined);
-                    if let JsVal::Function(fid) = callee {
+                    if let Some(fid) = callee.as_function_id() {
                         if let Some(c) = self.closures.get(fid as usize).cloned() {
                             let result = self.call_function(&c, &call_args)?;
                             self.stack.push(result);
@@ -516,7 +514,7 @@ impl VirtualMachine {
                 
                 // Prototype operations
                 Opcode::GetPrototype => {
-                    if let Some(JsVal::Object(obj_id)) = self.stack.pop() {
+                    if let Some(obj_id) = self.stack.pop().and_then(|v| v.as_object_id()) {
                         if let Some(obj) = self.objects.get(obj_id as usize) {
                             if let Some(proto_id) = obj.prototype() {
                                 self.stack.push(JsVal::Object(proto_id));
@@ -532,12 +530,12 @@ impl VirtualMachine {
                 }
                 Opcode::SetPrototype => {
                     let proto = self.stack.pop().unwrap_or(JsVal::Null);
-                    if let Some(JsVal::Object(obj_id)) = self.stack.last() {
-                        if let Some(obj) = self.objects.get_mut(*obj_id as usize) {
-                            match proto {
-                                JsVal::Object(proto_id) => obj.set_prototype(Some(proto_id)),
-                                JsVal::Null => obj.set_prototype(None),
-                                _ => {}
+                    if let Some(obj_id) = self.stack.last().and_then(|v| v.as_object_id()) {
+                        if let Some(obj) = self.objects.get_mut(obj_id as usize) {
+                            if let Some(proto_id) = proto.as_object_id() {
+                                obj.set_prototype(Some(proto_id));
+                            } else if proto.is_null() {
+                                obj.set_prototype(None);
                             }
                         }
                     }

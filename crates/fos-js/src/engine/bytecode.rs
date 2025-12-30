@@ -1,6 +1,7 @@
 //! Bytecode definitions
 //!
 //! Stack-based bytecode for the JavaScript VM.
+//! Uses compact encoding for common operations.
 
 /// Bytecode instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,23 +11,41 @@ pub enum Opcode {
     Pop = 0,
     Dup = 1,
     
+    // === COMPACT OPCODES (single byte, no operands) ===
+    // Small integers 0-7 (inline in opcode)
+    LoadSmallInt0 = 2,
+    LoadSmallInt1 = 3,
+    LoadSmallInt2 = 4,
+    LoadSmallInt3 = 5,
+    LoadSmallInt4 = 6,
+    LoadSmallInt5 = 7,
+    LoadSmallInt6 = 8,
+    LoadSmallInt7 = 9,
+    
     // Constants
     LoadConst = 10,      // idx: u16
     LoadNull = 11,
     LoadUndefined = 12,
     LoadTrue = 13,
     LoadFalse = 14,
-    LoadZero = 15,
-    LoadOne = 16,
+    LoadZero = 15,       // Alias for LoadSmallInt0
+    LoadOne = 16,        // Alias for LoadSmallInt1
+    LoadMinusOne = 17,   // -1 (common)
     
-    // Variables
-    GetLocal = 20,       // idx: u16
-    SetLocal = 21,       // idx: u16
-    GetGlobal = 22,      // name_idx: u16
-    SetGlobal = 23,      // name_idx: u16
-    GetUpvalue = 24,     // idx: u16
-    SetUpvalue = 25,     // idx: u16
-    CloseUpvalue = 26,   // Close upvalue at stack top
+    // === FAST LOCAL ACCESS (single byte for locals 0-3) ===
+    GetLocal0 = 18,
+    GetLocal1 = 19,
+    SetLocal0 = 20,      // Note: reusing old GetLocal slot
+    SetLocal1 = 21,      // Note: reusing old SetLocal slot
+    
+    // Variables (with operand)
+    GetLocal = 22,       // idx: u16 (for locals >= 4)
+    SetLocal = 23,       // idx: u16
+    GetGlobal = 24,      // name_idx: u16
+    SetGlobal = 25,      // name_idx: u16
+    GetUpvalue = 26,     // idx: u16
+    SetUpvalue = 27,     // idx: u16
+    CloseUpvalue = 28,   // Close upvalue at stack top
     
     // Properties
     GetProperty = 30,    // name_idx: u16
@@ -42,6 +61,8 @@ pub enum Opcode {
     Mod = 44,
     Pow = 45,
     Neg = 46,
+    Inc = 47,            // Increment (+1, common)
+    Dec = 48,            // Decrement (-1, common)
     
     // Bitwise
     BitAnd = 50,
@@ -69,15 +90,21 @@ pub enum Opcode {
     Jump = 80,           // offset: i16
     JumpIfFalse = 81,    // offset: i16
     JumpIfTrue = 82,     // offset: i16
+    JumpIfFalseOrPop = 83, // Short-circuit AND
+    JumpIfTrueOrPop = 84,  // Short-circuit OR
     
     // Functions
     Call = 90,           // argc: u8
-    Return = 91,
-    Closure = 92,        // const_idx: u16, upvalue_count: u8, then upvalue_info
+    Call0 = 91,          // No args (common)
+    Call1 = 92,          // 1 arg (common)
+    Return = 93,
+    ReturnUndefined = 94, // Common: return without value
+    Closure = 95,        // const_idx: u16, upvalue_count: u8, then upvalue_info
     
     // Objects
     NewObject = 100,
     NewArray = 101,      // count: u16
+    NewArray0 = 102,     // Empty array (common)
     
     // Special
     Typeof = 110,

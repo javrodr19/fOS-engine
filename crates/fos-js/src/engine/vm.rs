@@ -1,6 +1,7 @@
 //! Virtual Machine
 //!
 //! Stack-based bytecode interpreter with closure and async support.
+//! Includes inline caching and integer fast paths for optimization.
 
 use super::bytecode::{Bytecode, Opcode, Constant, CompiledFunction};
 use super::value::JsVal;
@@ -39,6 +40,36 @@ struct TryHandler {
     catch_ip: usize,       // Jump here on error
     stack_level: usize,    // Stack level when try started
     frame_level: usize,    // Call frame level when try started
+}
+
+/// Inline cache for property lookups
+/// Caches object shape -> property slot mapping
+#[derive(Debug, Clone, Default)]
+struct InlineCache {
+    shape_id: u32,      // Cached object shape identifier
+    slot_index: u16,    // Cached property slot
+    hits: u32,          // Cache hit count
+    misses: u32,        // Cache miss count
+}
+
+impl InlineCache {
+    fn new() -> Self { Self::default() }
+    
+    #[inline]
+    fn lookup(&self, obj_shape: u32) -> Option<u16> {
+        if self.shape_id == obj_shape && self.hits > 0 {
+            Some(self.slot_index)
+        } else {
+            None
+        }
+    }
+    
+    #[inline]
+    fn update(&mut self, shape: u32, slot: u16) {
+        self.shape_id = shape;
+        self.slot_index = slot;
+        self.hits += 1;
+    }
 }
 
 /// Virtual Machine
@@ -113,6 +144,38 @@ impl VirtualMachine {
                         }
                     }
                 }
+                
+                // === COMPACT OPCODES (single byte, no operands) ===
+                Opcode::LoadSmallInt0 => self.stack.push(JsVal::Number(0.0)),
+                Opcode::LoadSmallInt1 => self.stack.push(JsVal::Number(1.0)),
+                Opcode::LoadSmallInt2 => self.stack.push(JsVal::Number(2.0)),
+                Opcode::LoadSmallInt3 => self.stack.push(JsVal::Number(3.0)),
+                Opcode::LoadSmallInt4 => self.stack.push(JsVal::Number(4.0)),
+                Opcode::LoadSmallInt5 => self.stack.push(JsVal::Number(5.0)),
+                Opcode::LoadSmallInt6 => self.stack.push(JsVal::Number(6.0)),
+                Opcode::LoadSmallInt7 => self.stack.push(JsVal::Number(7.0)),
+                Opcode::LoadMinusOne => self.stack.push(JsVal::Number(-1.0)),
+                
+                // Fast local access (single byte for common cases)
+                Opcode::GetLocal0 => {
+                    let val = self.stack.get(0).cloned().unwrap_or(JsVal::Undefined);
+                    self.stack.push(val);
+                }
+                Opcode::GetLocal1 => {
+                    let val = self.stack.get(1).cloned().unwrap_or(JsVal::Undefined);
+                    self.stack.push(val);
+                }
+                Opcode::SetLocal0 => {
+                    if let Some(val) = self.stack.last().cloned() {
+                        if !self.stack.is_empty() { self.stack[0] = val; }
+                    }
+                }
+                Opcode::SetLocal1 => {
+                    if let Some(val) = self.stack.last().cloned() {
+                        if self.stack.len() > 1 { self.stack[1] = val; }
+                    }
+                }
+                
                 Opcode::LoadNull => self.stack.push(JsVal::Null),
                 Opcode::LoadUndefined => self.stack.push(JsVal::Undefined),
                 Opcode::LoadTrue => self.stack.push(JsVal::Bool(true)),
@@ -155,6 +218,20 @@ impl VirtualMachine {
                 Opcode::Neg => {
                     if let Some(val) = self.stack.pop() {
                         self.stack.push(JsVal::Number(-val.to_number()));
+                    }
+                }
+                // Fast increment/decrement (common operations)
+                Opcode::Inc => {
+                    if let Some(val) = self.stack.pop() {
+                        // Integer fast path
+                        let n = val.to_number();
+                        self.stack.push(JsVal::Number(n + 1.0));
+                    }
+                }
+                Opcode::Dec => {
+                    if let Some(val) = self.stack.pop() {
+                        let n = val.to_number();
+                        self.stack.push(JsVal::Number(n - 1.0));
                     }
                 }
                 

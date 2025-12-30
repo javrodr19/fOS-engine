@@ -1,14 +1,80 @@
-//! JavaScript Objects
+//! JavaScript Objects - Optimized
 //!
-//! Runtime object representation.
+//! Uses SmallVec for stack allocation of small objects.
 
 use super::value::JsVal;
-use std::collections::HashMap;
 
-/// JavaScript object
+/// Stack-allocated small vector (inline up to N elements)
+#[derive(Debug, Clone)]
+pub struct SmallVec<T, const N: usize> {
+    inline: [Option<T>; N],
+    overflow: Option<Vec<T>>,
+    len: usize,
+}
+
+impl<T: Clone, const N: usize> Default for SmallVec<T, N> {
+    fn default() -> Self {
+        Self {
+            inline: std::array::from_fn(|_| None),
+            overflow: None,
+            len: 0,
+        }
+    }
+}
+
+impl<T: Clone, const N: usize> SmallVec<T, N> {
+    pub fn new() -> Self { Self::default() }
+    
+    pub fn push(&mut self, val: T) {
+        if self.len < N {
+            self.inline[self.len] = Some(val);
+        } else {
+            if self.overflow.is_none() {
+                self.overflow = Some(Vec::new());
+            }
+            self.overflow.as_mut().unwrap().push(val);
+        }
+        self.len += 1;
+    }
+    
+    pub fn get(&self, idx: usize) -> Option<&T> {
+        if idx < N {
+            self.inline[idx].as_ref()
+        } else {
+            self.overflow.as_ref()?.get(idx - N)
+        }
+    }
+    
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+        if idx < N {
+            self.inline[idx].as_mut()
+        } else {
+            self.overflow.as_mut()?.get_mut(idx - N)
+        }
+    }
+    
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+    
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.inline.iter()
+            .take(self.len.min(N))
+            .filter_map(|x| x.as_ref())
+            .chain(self.overflow.iter().flat_map(|v| v.iter()))
+    }
+}
+
+/// Property entry for SmallVec storage
+#[derive(Debug, Clone)]
+struct Property {
+    key: Box<str>,
+    value: JsVal,
+}
+
+/// JavaScript object - uses SmallVec for ≤4 properties (zero heap)
 #[derive(Debug, Clone, Default)]
 pub struct JsObject {
-    properties: HashMap<Box<str>, JsVal>,
+    properties: SmallVec<Property, 4>,  // Stack-allocated for ≤4 props
     prototype: Option<u32>,
 }
 
@@ -16,19 +82,62 @@ impl JsObject {
     pub fn new() -> Self { Self::default() }
     
     pub fn with_prototype(proto: u32) -> Self {
-        Self { properties: HashMap::new(), prototype: Some(proto) }
+        Self { properties: SmallVec::new(), prototype: Some(proto) }
     }
     
-    pub fn get(&self, key: &str) -> Option<&JsVal> { self.properties.get(key) }
-    pub fn set(&mut self, key: &str, value: JsVal) { self.properties.insert(key.into(), value); }
-    pub fn delete(&mut self, key: &str) -> bool { self.properties.remove(key).is_some() }
-    pub fn has(&self, key: &str) -> bool { self.properties.contains_key(key) }
-    pub fn keys(&self) -> impl Iterator<Item = &str> { self.properties.keys().map(|k| &**k) }
+    pub fn get(&self, key: &str) -> Option<&JsVal> {
+        for i in 0..self.properties.len() {
+            if let Some(prop) = self.properties.get(i) {
+                if &*prop.key == key {
+                    return Some(&prop.value);
+                }
+            }
+        }
+        None
+    }
+    
+    pub fn set(&mut self, key: &str, value: JsVal) {
+        // Check if key exists
+        for i in 0..self.properties.len() {
+            if let Some(prop) = self.properties.get_mut(i) {
+                if &*prop.key == key {
+                    prop.value = value;
+                    return;
+                }
+            }
+        }
+        // Add new property
+        self.properties.push(Property { key: key.into(), value });
+    }
+    
+    pub fn delete(&mut self, key: &str) -> bool {
+        // Note: simplified - doesn't compact, just marks as undefined
+        for i in 0..self.properties.len() {
+            if let Some(prop) = self.properties.get(i) {
+                if &*prop.key == key {
+                    if let Some(p) = self.properties.get_mut(i) {
+                        p.value = JsVal::Undefined;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    pub fn has(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+    
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.properties.iter().map(|p| &*p.key)
+    }
+    
     pub fn prototype(&self) -> Option<u32> { self.prototype }
     pub fn set_prototype(&mut self, proto: Option<u32>) { self.prototype = proto; }
 }
 
-/// JavaScript array
+/// JavaScript array - pre-allocated with capacity
 #[derive(Debug, Clone, Default)]
 pub struct JsArray {
     elements: Vec<JsVal>,
@@ -60,13 +169,42 @@ impl JsArray {
 #[derive(Debug, Clone)]
 pub struct JsFunction {
     pub name: Option<Box<str>>,
-    pub arity: u8,
-    pub bytecode_offset: u32,
-    pub upvalues: Vec<u32>,
+    pub params: Vec<Box<str>>,
+    pub bytecode_id: u32,
 }
 
 impl JsFunction {
-    pub fn new(name: Option<Box<str>>, arity: u8, offset: u32) -> Self {
-        Self { name, arity, bytecode_offset: offset, upvalues: Vec::new() }
+    pub fn new(name: Option<Box<str>>, params: Vec<Box<str>>, bytecode_id: u32) -> Self {
+        Self { name, params, bytecode_id }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_smallvec_inline() {
+        let mut sv: SmallVec<i32, 4> = SmallVec::new();
+        sv.push(1); sv.push(2); sv.push(3); sv.push(4);
+        assert_eq!(sv.len(), 4);
+        assert!(sv.overflow.is_none()); // All inline!
+    }
+    
+    #[test]
+    fn test_smallvec_overflow() {
+        let mut sv: SmallVec<i32, 4> = SmallVec::new();
+        for i in 0..10 { sv.push(i); }
+        assert_eq!(sv.len(), 10);
+        assert!(sv.overflow.is_some());
+    }
+    
+    #[test]
+    fn test_object_small() {
+        let mut obj = JsObject::new();
+        obj.set("a", JsVal::Number(1.0));
+        obj.set("b", JsVal::Number(2.0));
+        assert!(obj.properties.overflow.is_none()); // Stack-allocated!
+        assert_eq!(obj.get("a").and_then(|v| v.as_number()), Some(1.0));
     }
 }

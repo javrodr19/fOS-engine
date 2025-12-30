@@ -29,6 +29,14 @@ struct CompilerUpvalue {
     is_local: bool,
 }
 
+/// Result of constant folding
+#[derive(Debug, Clone)]
+enum FoldResult {
+    Number(f64),
+    String(Box<str>),
+    Bool(bool),
+}
+
 impl Default for Compiler {
     fn default() -> Self { Self::new() }
 }
@@ -137,23 +145,48 @@ impl Compiler {
                 self.bytecode.emit(Opcode::LoadUndefined); // TODO: Proper this binding
             }
             AstNodeKind::BinaryExpression { operator, left, right } => {
-                self.compile_node(ast, *left)?;
-                self.compile_node(ast, *right)?;
-                match operator {
-                    BinaryOp::Add => self.bytecode.emit(Opcode::Add),
-                    BinaryOp::Sub => self.bytecode.emit(Opcode::Sub),
-                    BinaryOp::Mul => self.bytecode.emit(Opcode::Mul),
-                    BinaryOp::Div => self.bytecode.emit(Opcode::Div),
-                    BinaryOp::Mod => self.bytecode.emit(Opcode::Mod),
-                    BinaryOp::LessThan => self.bytecode.emit(Opcode::Lt),
-                    BinaryOp::LessThanEq => self.bytecode.emit(Opcode::Le),
-                    BinaryOp::GreaterThan => self.bytecode.emit(Opcode::Gt),
-                    BinaryOp::GreaterThanEq => self.bytecode.emit(Opcode::Ge),
-                    BinaryOp::Equal => self.bytecode.emit(Opcode::Eq),
-                    BinaryOp::NotEqual => self.bytecode.emit(Opcode::Ne),
-                    BinaryOp::StrictEqual => self.bytecode.emit(Opcode::StrictEq),
-                    BinaryOp::StrictNotEqual => self.bytecode.emit(Opcode::StrictNe),
-                    _ => {}
+                // === CONSTANT FOLDING OPTIMIZATION ===
+                if let Some(result) = self.try_fold_binary(ast, *left, *right, *operator) {
+                    // Fold succeeded - emit constant directly
+                    match result {
+                        FoldResult::Number(n) => {
+                            if n == 0.0 { self.bytecode.emit(Opcode::LoadZero); }
+                            else if n == 1.0 { self.bytecode.emit(Opcode::LoadOne); }
+                            else {
+                                let idx = self.bytecode.add_constant(Constant::Number(n));
+                                self.bytecode.emit(Opcode::LoadConst);
+                                self.bytecode.emit_u16(idx);
+                            }
+                        }
+                        FoldResult::String(s) => {
+                            let idx = self.bytecode.add_constant(Constant::String(s));
+                            self.bytecode.emit(Opcode::LoadConst);
+                            self.bytecode.emit_u16(idx);
+                        }
+                        FoldResult::Bool(b) => {
+                            self.bytecode.emit(if b { Opcode::LoadTrue } else { Opcode::LoadFalse });
+                        }
+                    }
+                } else {
+                    // Normal compilation path
+                    self.compile_node(ast, *left)?;
+                    self.compile_node(ast, *right)?;
+                    match operator {
+                        BinaryOp::Add => self.bytecode.emit(Opcode::Add),
+                        BinaryOp::Sub => self.bytecode.emit(Opcode::Sub),
+                        BinaryOp::Mul => self.bytecode.emit(Opcode::Mul),
+                        BinaryOp::Div => self.bytecode.emit(Opcode::Div),
+                        BinaryOp::Mod => self.bytecode.emit(Opcode::Mod),
+                        BinaryOp::LessThan => self.bytecode.emit(Opcode::Lt),
+                        BinaryOp::LessThanEq => self.bytecode.emit(Opcode::Le),
+                        BinaryOp::GreaterThan => self.bytecode.emit(Opcode::Gt),
+                        BinaryOp::GreaterThanEq => self.bytecode.emit(Opcode::Ge),
+                        BinaryOp::Equal => self.bytecode.emit(Opcode::Eq),
+                        BinaryOp::NotEqual => self.bytecode.emit(Opcode::Ne),
+                        BinaryOp::StrictEqual => self.bytecode.emit(Opcode::StrictEq),
+                        BinaryOp::StrictNotEqual => self.bytecode.emit(Opcode::StrictNe),
+                        _ => {}
+                    }
                 }
             }
             AstNodeKind::UnaryExpression { operator, argument, .. } => {
@@ -535,5 +568,74 @@ impl Compiler {
             self.bytecode.emit(Opcode::Pop);
         }
         self.scope_depth -= 1;
+    }
+    
+    /// Try to fold a binary expression at compile time
+    fn try_fold_binary(&self, ast: &Ast, left: NodeId, right: NodeId, op: BinaryOp) -> Option<FoldResult> {
+        let left_val = self.extract_constant(ast, left)?;
+        let right_val = self.extract_constant(ast, right)?;
+        
+        match (left_val, right_val) {
+            (FoldResult::Number(a), FoldResult::Number(b)) => {
+                let result = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Mod => a % b,
+                    BinaryOp::Pow => a.powf(b),
+                    _ => return self.try_fold_comparison(a, b, op),
+                };
+                Some(FoldResult::Number(result))
+            }
+            (FoldResult::String(a), FoldResult::String(b)) if op == BinaryOp::Add => {
+                // String concatenation
+                Some(FoldResult::String(format!("{}{}", a, b).into()))
+            }
+            _ => None,
+        }
+    }
+    
+    fn try_fold_comparison(&self, a: f64, b: f64, op: BinaryOp) -> Option<FoldResult> {
+        let result = match op {
+            BinaryOp::LessThan => a < b,
+            BinaryOp::LessThanEq => a <= b,
+            BinaryOp::GreaterThan => a > b,
+            BinaryOp::GreaterThanEq => a >= b,
+            BinaryOp::Equal | BinaryOp::StrictEqual => a == b,
+            BinaryOp::NotEqual | BinaryOp::StrictNotEqual => a != b,
+            _ => return None,
+        };
+        Some(FoldResult::Bool(result))
+    }
+    
+    /// Extract a constant value from an AST node
+    fn extract_constant(&self, ast: &Ast, id: NodeId) -> Option<FoldResult> {
+        let node = ast.get(id)?;
+        match &node.kind {
+            AstNodeKind::Literal { value } => match value {
+                LiteralValue::Number(n) => Some(FoldResult::Number(*n)),
+                LiteralValue::String(s) => Some(FoldResult::String(s.clone())),
+                LiteralValue::Bool(b) => Some(FoldResult::Bool(*b)),
+                _ => None,
+            },
+            // Recursively fold nested expressions
+            AstNodeKind::BinaryExpression { operator, left, right } => {
+                self.try_fold_binary(ast, *left, *right, *operator)
+            }
+            AstNodeKind::UnaryExpression { operator, argument, .. } => {
+                self.try_fold_unary(ast, *argument, *operator)
+            }
+            _ => None,
+        }
+    }
+    
+    fn try_fold_unary(&self, ast: &Ast, arg: NodeId, op: UnaryOp) -> Option<FoldResult> {
+        let val = self.extract_constant(ast, arg)?;
+        match (val, op) {
+            (FoldResult::Number(n), UnaryOp::Minus) => Some(FoldResult::Number(-n)),
+            (FoldResult::Bool(b), UnaryOp::Not) => Some(FoldResult::Bool(!b)),
+            _ => None,
+        }
     }
 }

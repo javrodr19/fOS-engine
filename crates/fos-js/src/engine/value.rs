@@ -79,35 +79,82 @@ thread_local! {
     static STRING_POOL: RefCell<StringPool> = RefCell::new(StringPool::new());
 }
 
-/// String interning pool
+/// String interning pool with precomputed hash for O(1) lookup
 #[derive(Default)]
 pub struct StringPool {
-    strings: Vec<Box<str>>,
+    strings: Vec<HashedString>,
+    lookup: std::collections::HashMap<u64, u32>,  // hash -> id
+}
+
+/// String with precomputed hash
+#[derive(Debug, Clone)]
+pub struct HashedString {
+    pub string: Box<str>,
+    pub hash: u64,
+}
+
+impl HashedString {
+    #[inline]
+    pub fn new(s: Box<str>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        Self { string: s, hash: hasher.finish() }
+    }
+    
+    #[inline]
+    pub fn from_str(s: &str) -> Self {
+        Self::new(s.into())
+    }
 }
 
 impl StringPool {
-    pub fn new() -> Self { Self { strings: Vec::new() } }
+    pub fn new() -> Self { Self { strings: Vec::new(), lookup: std::collections::HashMap::new() } }
+    
+    #[inline]
+    fn compute_hash(s: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
     
     pub fn intern(&mut self, s: &str) -> u32 {
-        for (i, existing) in self.strings.iter().enumerate() {
-            if &**existing == s { return i as u32; }
+        let hash = Self::compute_hash(s);
+        // O(1) lookup
+        if let Some(&id) = self.lookup.get(&hash) {
+            // Verify match (handle collisions)
+            if &*self.strings[id as usize].string == s {
+                return id;
+            }
         }
         let id = self.strings.len() as u32;
-        self.strings.push(s.into());
+        self.strings.push(HashedString::from_str(s));
+        self.lookup.insert(hash, id);
         id
     }
     
     pub fn intern_boxed(&mut self, s: Box<str>) -> u32 {
-        for (i, existing) in self.strings.iter().enumerate() {
-            if &**existing == &*s { return i as u32; }
+        let hash = Self::compute_hash(&s);
+        if let Some(&id) = self.lookup.get(&hash) {
+            if &*self.strings[id as usize].string == &*s {
+                return id;
+            }
         }
         let id = self.strings.len() as u32;
-        self.strings.push(s);
+        self.lookup.insert(hash, id);
+        self.strings.push(HashedString::new(s));
         id
     }
     
     pub fn get(&self, id: u32) -> Option<&str> {
-        self.strings.get(id as usize).map(|s| &**s)
+        self.strings.get(id as usize).map(|s| &*s.string)
+    }
+    
+    /// Get hash for ID (O(1) for comparisons)
+    #[inline]
+    pub fn get_hash(&self, id: u32) -> Option<u64> {
+        self.strings.get(id as usize).map(|s| s.hash)
     }
 }
 

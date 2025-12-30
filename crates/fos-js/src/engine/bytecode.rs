@@ -100,6 +100,7 @@ pub enum Opcode {
     Return = 93,
     ReturnUndefined = 94, // Common: return without value
     Closure = 95,        // const_idx: u16, upvalue_count: u8, then upvalue_info
+    TailCall = 96,       // Tail call optimization - reuse stack frame
     
     // Objects
     NewObject = 100,

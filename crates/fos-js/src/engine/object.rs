@@ -179,6 +179,102 @@ impl JsFunction {
     }
 }
 
+// === COPY-ON-WRITE ARRAY ===
+
+use std::rc::Rc;
+use std::cell::RefCell;
+
+/// Copy-on-Write array wrapper
+/// Clones only on mutation, allows cheap sharing
+#[derive(Debug, Clone)]
+pub struct CowArray {
+    data: Rc<RefCell<Vec<JsVal>>>,
+}
+
+impl Default for CowArray {
+    fn default() -> Self { Self::new() }
+}
+
+impl CowArray {
+    pub fn new() -> Self {
+        Self { data: Rc::new(RefCell::new(Vec::new())) }
+    }
+    
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { data: Rc::new(RefCell::new(Vec::with_capacity(cap))) }
+    }
+    
+    /// Check if we need to clone before mutation
+    fn ensure_unique(&mut self) {
+        if Rc::strong_count(&self.data) > 1 {
+            // Clone the data before mutating - get clone first to avoid borrow conflict
+            let cloned = (*self.data.borrow()).clone();
+            self.data = Rc::new(RefCell::new(cloned));
+        }
+    }
+    
+    pub fn push(&mut self, val: JsVal) {
+        self.ensure_unique();
+        self.data.borrow_mut().push(val);
+    }
+    
+    pub fn get(&self, idx: usize) -> JsVal {
+        self.data.borrow().get(idx).cloned().unwrap_or(JsVal::Undefined)
+    }
+    
+    pub fn set(&mut self, idx: usize, val: JsVal) {
+        self.ensure_unique();
+        let mut data = self.data.borrow_mut();
+        if idx >= data.len() { data.resize(idx + 1, JsVal::Undefined); }
+        data[idx] = val;
+    }
+    
+    pub fn len(&self) -> usize { self.data.borrow().len() }
+    pub fn is_empty(&self) -> bool { self.data.borrow().is_empty() }
+}
+
+// === STRING ROPE for O(1) concatenation ===
+
+/// Rope structure for efficient string concatenation
+#[derive(Debug, Clone)]
+pub enum StringRope {
+    Leaf(Box<str>),
+    Concat(Rc<StringRope>, Rc<StringRope>),
+}
+
+impl StringRope {
+    pub fn new(s: &str) -> Self { StringRope::Leaf(s.into()) }
+    
+    /// O(1) concatenation
+    pub fn concat(left: Rc<StringRope>, right: Rc<StringRope>) -> Self {
+        StringRope::Concat(left, right)
+    }
+    
+    /// Flatten to string (O(n) but deferred)
+    pub fn to_string(&self) -> String {
+        let mut buf = String::new();
+        self.collect(&mut buf);
+        buf
+    }
+    
+    fn collect(&self, buf: &mut String) {
+        match self {
+            StringRope::Leaf(s) => buf.push_str(s),
+            StringRope::Concat(left, right) => {
+                left.collect(buf);
+                right.collect(buf);
+            }
+        }
+    }
+    
+    pub fn len(&self) -> usize {
+        match self {
+            StringRope::Leaf(s) => s.len(),
+            StringRope::Concat(left, right) => left.len() + right.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

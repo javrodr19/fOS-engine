@@ -37,6 +37,22 @@ pub mod integration;
 // Optimization
 pub mod inline_cache;
 pub mod jit;
+pub mod bytecode_cache;
+pub mod simd_ops;
+pub mod object_pool;
+pub mod optimizer;
+pub mod type_profiler;
+pub mod loop_analyzer;
+pub mod register_vm;
+pub mod x64_codegen;
+pub mod osr;
+pub mod stack_to_reg;
+pub mod executable_jit;
+pub mod unified_engine;
+pub mod guards;
+pub mod reg_to_native;
+pub mod execution_hooks;
+pub mod optimized_vm;
 
 // DOM
 pub mod dom_bindings;

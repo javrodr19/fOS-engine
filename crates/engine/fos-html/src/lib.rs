@@ -5,9 +5,11 @@
 
 mod parser;
 pub mod preload;
+pub mod serializer;
 
 pub use parser::HtmlParser;
 pub use fos_dom::{Document, DomTree, Node, NodeId};
+pub use serializer::{HtmlSerializer, get_inner_html, get_outer_html, FragmentContext, parse_fragment};
 
 /// Parse an HTML string into a Document
 pub fn parse(html: &str) -> Document {
@@ -18,3 +20,4 @@ pub fn parse(html: &str) -> Document {
 pub fn parse_with_url(html: &str, url: &str) -> Document {
     HtmlParser::new().parse_with_url(html, url)
 }
+

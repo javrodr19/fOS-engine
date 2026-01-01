@@ -30,6 +30,9 @@ pub mod query_cache;
 pub mod autonomous_elements;
 pub mod accessibility;
 pub mod url;
+pub mod template;
+pub mod tree_walker;
+pub mod range;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
@@ -57,8 +60,14 @@ pub use css_scope::{ScopedStyleSheet, ScopedRule};
 pub use event_opt::{CoalescedEventManager, EventType, EventListener, DelegatedHandler, EventThrottler};
 pub use compact_node::{CompactNode, CompactNodeId, NodeFlags, SmallChildren, ElementNameId, DomGeneration};
 pub use query_cache::{QueryCache, DomNormalizer, AttributeDeduplicator, BorrowedStr};
-pub use autonomous_elements::{AutonomousElement, CustomizedBuiltIn, EnhancedCustomElementRegistry, ElementInternals};
+pub use autonomous_elements::{AutonomousElement, CustomizedBuiltIn, EnhancedCustomElementRegistry};
 pub use accessibility::{AriaRole, AriaState, AccessibilityTree, AccessibilityNode, FocusTrap, ScreenReaderOutput};
+pub use template::{HTMLTemplateElement, TemplateContent, TemplateRegistry, DeclarativeTemplate};
+pub use tree_walker::{TreeWalker, NodeIterator, WhatToShow, NodeType, FilterResult, NodeFilter, DocumentTraversal};
+pub use range::{Range as DomRange, Selection as DomSelection, BoundaryPoint, RangeCompare, SelectionType};
+pub use shadow::{ShadowRootInit, ShadowError, CowNode};
+pub use observer::{MutationObserverInit, MutationRecord, MutationType, RootMargin, IntersectionObserverEntry, ResizeObserverEntry, ResizeObserverSize, ResizeObserverBoxOptions};
+pub use custom_elements::{CustomElementOptions, LifecycleCallback, LifecycleCallbackInfo, CallbackQueue, ElementInternals, UpgradeCandidate};
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

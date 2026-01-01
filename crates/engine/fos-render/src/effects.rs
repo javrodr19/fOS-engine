@@ -47,6 +47,159 @@ impl BoxShadow {
     }
 }
 
+// ============================================================================
+// Text Shadow
+// ============================================================================
+
+/// Text shadow definition (CSS text-shadow)
+#[derive(Debug, Clone, Default)]
+pub struct TextShadow {
+    /// Horizontal offset in pixels
+    pub offset_x: f32,
+    /// Vertical offset in pixels
+    pub offset_y: f32,
+    /// Blur radius (gaussian blur)
+    pub blur_radius: f32,
+    /// Shadow color
+    pub color: Color,
+}
+
+impl TextShadow {
+    /// Create a simple text shadow
+    pub fn new(offset_x: f32, offset_y: f32, blur: f32, color: Color) -> Self {
+        Self {
+            offset_x,
+            offset_y,
+            blur_radius: blur,
+            color,
+        }
+    }
+    
+    /// Create a drop shadow (common pattern)
+    pub fn drop(color: Color) -> Self {
+        Self::new(1.0, 1.0, 2.0, color)
+    }
+    
+    /// Create a glow effect (text-shadow with zero offset and blur)
+    pub fn glow(blur: f32, color: Color) -> Self {
+        Self::new(0.0, 0.0, blur, color)
+    }
+    
+    /// Create a hard shadow (no blur)
+    pub fn hard(offset_x: f32, offset_y: f32, color: Color) -> Self {
+        Self::new(offset_x, offset_y, 0.0, color)
+    }
+    
+    /// Check if this shadow has no visible effect
+    pub fn is_none(&self) -> bool {
+        self.color.a == 0 || 
+        (self.offset_x == 0.0 && self.offset_y == 0.0 && self.blur_radius == 0.0)
+    }
+}
+
+/// A list of text shadows (CSS allows multiple text-shadows)
+#[derive(Debug, Clone, Default)]
+pub struct TextShadowList {
+    pub shadows: Vec<TextShadow>,
+}
+
+impl TextShadowList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn push(mut self, shadow: TextShadow) -> Self {
+        self.shadows.push(shadow);
+        self
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.shadows.is_empty()
+    }
+}
+
+/// Paint text shadows at glyph positions
+/// 
+/// This is a simplified implementation that draws shadow rectangles
+/// for each glyph bounding box. A full implementation would use
+/// actual glyph rendering with offset.
+pub fn paint_text_shadows(
+    canvas: &mut Canvas,
+    glyphs: &[(f32, f32, f32, f32)], // x, y, width, height for each glyph
+    shadows: &TextShadowList,
+) {
+    // Paint shadows in reverse order (last shadow is painted first/bottom)
+    for shadow in shadows.shadows.iter().rev() {
+        if shadow.is_none() {
+            continue;
+        }
+        
+        for &(glyph_x, glyph_y, glyph_w, glyph_h) in glyphs {
+            let shadow_x = glyph_x + shadow.offset_x;
+            let shadow_y = glyph_y + shadow.offset_y;
+            
+            if shadow.blur_radius <= 0.0 {
+                // Hard shadow
+                fill_rect_alpha_internal(canvas, shadow_x, shadow_y, glyph_w, glyph_h, shadow.color);
+            } else {
+                // Blurred shadow - approximate with multiple passes
+                let passes = (shadow.blur_radius / 2.0).ceil() as i32;
+                let base_alpha = shadow.color.a as f32 / passes as f32;
+                
+                for i in 0..passes {
+                    let expand = (i as f32 / passes as f32) * shadow.blur_radius;
+                    let alpha = (base_alpha * (1.0 - i as f32 / passes as f32)) as u8;
+                    
+                    if alpha > 0 {
+                        let color = Color::rgba(shadow.color.r, shadow.color.g, shadow.color.b, alpha);
+                        fill_rect_alpha_internal(
+                            canvas,
+                            shadow_x - expand,
+                            shadow_y - expand,
+                            glyph_w + expand * 2.0,
+                            glyph_h + expand * 2.0,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Internal helper for text shadow painting
+fn fill_rect_alpha_internal(canvas: &mut Canvas, x: f32, y: f32, width: f32, height: f32, color: Color) {
+    let x_start = x.max(0.0) as u32;
+    let y_start = y.max(0.0) as u32;
+    let x_end = ((x + width) as u32).min(canvas.width());
+    let y_end = ((y + height) as u32).min(canvas.height());
+    
+    if color.a == 255 {
+        for py in y_start..y_end {
+            for px in x_start..x_end {
+                canvas.set_pixel(px, py, color);
+            }
+        }
+    } else if color.a > 0 {
+        let alpha = color.a as f32 / 255.0;
+        let inv_alpha = 1.0 - alpha;
+        
+        for py in y_start..y_end {
+            for px in x_start..x_end {
+                if let Some(bg) = canvas.get_pixel(px, py) {
+                    let blended = Color::rgba(
+                        (color.r as f32 * alpha + bg.r as f32 * inv_alpha) as u8,
+                        (color.g as f32 * alpha + bg.g as f32 * inv_alpha) as u8,
+                        (color.b as f32 * alpha + bg.b as f32 * inv_alpha) as u8,
+                        255,
+                    );
+                    canvas.set_pixel(px, py, blended);
+                }
+            }
+        }
+    }
+}
+
 /// Overflow behavior
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Overflow {

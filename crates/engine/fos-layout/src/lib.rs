@@ -36,6 +36,7 @@ pub use flex::{
 pub use grid::{
     TrackSize, GridTemplate, GridPlacement, GridLine, GridArea,
     GridLayoutContext, resolve_placement, layout_grid_children,
+    GridArena,
 };
 pub use multicolumn::{
     MultiColumnStyle, MultiColumnContext, ColumnRule, ColumnRuleStyle,

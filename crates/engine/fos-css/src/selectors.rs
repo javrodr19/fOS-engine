@@ -527,6 +527,210 @@ impl SelectorBloomFilter {
     }
 }
 
+// ============================================================================
+// Forgiving Selector Parsing
+// ============================================================================
+
+/// Parse a forgiving selector list (for :is() and :where())
+/// 
+/// Unlike normal selector parsing, this silently ignores invalid selectors
+/// rather than failing the entire parse. This matches CSS Selectors Level 4
+/// behavior for :is() and :where() pseudo-classes.
+pub fn parse_forgiving_selector_list(input: &str) -> Vec<SelectorComponent> {
+    let mut results = Vec::new();
+    
+    for selector_str in input.split(',') {
+        let selector_str = selector_str.trim();
+        if selector_str.is_empty() {
+            continue;
+        }
+        
+        // Try to parse each selector, ignore failures
+        if let Some(component) = parse_simple_selector(selector_str) {
+            results.push(component);
+        }
+        // Invalid selectors are silently ignored (forgiving behavior)
+    }
+    
+    results
+}
+
+/// Parse a simple selector (type, class, id, or attribute)
+pub fn parse_simple_selector(input: &str) -> Option<SelectorComponent> {
+    let input = input.trim();
+    
+    if input.is_empty() {
+        return None;
+    }
+    
+    // Universal selector
+    if input == "*" {
+        return Some(SelectorComponent::Universal);
+    }
+    
+    // ID selector
+    if let Some(id) = input.strip_prefix('#') {
+        if !id.is_empty() && is_valid_ident(id) {
+            return Some(SelectorComponent::Id(id.to_string()));
+        }
+        return None;
+    }
+    
+    // Class selector
+    if let Some(class) = input.strip_prefix('.') {
+        if !class.is_empty() && is_valid_ident(class) {
+            return Some(SelectorComponent::Class(class.to_string()));
+        }
+        return None;
+    }
+    
+    // Attribute selector
+    if input.starts_with('[') && input.ends_with(']') {
+        return parse_attribute_selector(&input[1..input.len()-1]);
+    }
+    
+    // Pseudo-class
+    if let Some(pseudo) = input.strip_prefix(':') {
+        if let Some(pseudo) = input.strip_prefix("::") {
+            if let Some(pe) = PseudoElement::parse(pseudo) {
+                return Some(SelectorComponent::PseudoElement(pe));
+            }
+        } else if let Some(pc) = parse_pseudo_class(pseudo) {
+            return Some(SelectorComponent::PseudoClass(pc));
+        }
+        return None;
+    }
+    
+    // Type selector (tag name)
+    if is_valid_ident(input) {
+        return Some(SelectorComponent::Type(input.to_lowercase()));
+    }
+    
+    None
+}
+
+/// Check if string is a valid CSS identifier
+fn is_valid_ident(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    
+    let mut chars = s.chars();
+    
+    // First character must be a letter, underscore, or hyphen followed by non-digit
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '-' => {}
+        _ => return false,
+    }
+    
+    // Rest can be letters, digits, underscores, hyphens
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Parse an attribute selector content (without brackets)
+fn parse_attribute_selector(content: &str) -> Option<SelectorComponent> {
+    let content = content.trim();
+    
+    // Case-insensitive flag
+    let (content, case_insensitive) = if content.ends_with(" i") || content.ends_with(" I") {
+        (&content[..content.len()-2], true)
+    } else {
+        (content, false)
+    };
+    
+    // Check for different matchers
+    for (op, matcher_fn) in [
+        ("~=", AttributeMatcher::Contains as fn(String) -> AttributeMatcher),
+        ("|=", AttributeMatcher::DashMatch as fn(String) -> AttributeMatcher),
+        ("^=", AttributeMatcher::Prefix as fn(String) -> AttributeMatcher),
+        ("$=", AttributeMatcher::Suffix as fn(String) -> AttributeMatcher),
+        ("*=", AttributeMatcher::Substring as fn(String) -> AttributeMatcher),
+        ("=", AttributeMatcher::Exact as fn(String) -> AttributeMatcher),
+    ] {
+        if let Some(pos) = content.find(op) {
+            let name = content[..pos].trim().to_string();
+            let value = content[pos + op.len()..].trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            
+            return Some(SelectorComponent::Attribute(AttributeSelector {
+                name,
+                matcher: Some(matcher_fn(value)),
+                case_insensitive,
+            }));
+        }
+    }
+    
+    // Just attribute presence [attr]
+    Some(SelectorComponent::Attribute(AttributeSelector {
+        name: content.to_string(),
+        matcher: None,
+        case_insensitive,
+    }))
+}
+
+/// Parse a pseudo-class name
+fn parse_pseudo_class(input: &str) -> Option<PseudoClass> {
+    // Handle functional pseudo-classes
+    if let Some(paren_pos) = input.find('(') {
+        let name = &input[..paren_pos];
+        let arg = input[paren_pos+1..].trim_end_matches(')');
+        
+        return match name {
+            "nth-child" => NthExpression::parse(arg).map(PseudoClass::NthChild),
+            "nth-last-child" => NthExpression::parse(arg).map(PseudoClass::NthLastChild),
+            "nth-of-type" => NthExpression::parse(arg).map(PseudoClass::NthOfType),
+            "nth-last-of-type" => NthExpression::parse(arg).map(PseudoClass::NthLastOfType),
+            "not" => parse_simple_selector(arg).map(|s| PseudoClass::Not(Box::new(s))),
+            "is" => Some(PseudoClass::Is(parse_forgiving_selector_list(arg))),
+            "where" => Some(PseudoClass::Where(parse_forgiving_selector_list(arg))),
+            "has" => Some(PseudoClass::Has(parse_forgiving_selector_list(arg))),
+            "lang" => Some(PseudoClass::Lang(arg.to_string())),
+            "dir" => match arg {
+                "ltr" => Some(PseudoClass::Dir(Direction::Ltr)),
+                "rtl" => Some(PseudoClass::Dir(Direction::Rtl)),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+    
+    // Simple pseudo-classes
+    match input {
+        "hover" => Some(PseudoClass::Hover),
+        "active" => Some(PseudoClass::Active),
+        "focus" => Some(PseudoClass::Focus),
+        "focus-visible" => Some(PseudoClass::FocusVisible),
+        "focus-within" => Some(PseudoClass::FocusWithin),
+        "link" => Some(PseudoClass::Link),
+        "visited" => Some(PseudoClass::Visited),
+        "enabled" => Some(PseudoClass::Enabled),
+        "disabled" => Some(PseudoClass::Disabled),
+        "checked" => Some(PseudoClass::Checked),
+        "indeterminate" => Some(PseudoClass::Indeterminate),
+        "required" => Some(PseudoClass::Required),
+        "optional" => Some(PseudoClass::Optional),
+        "valid" => Some(PseudoClass::Valid),
+        "invalid" => Some(PseudoClass::Invalid),
+        "read-only" => Some(PseudoClass::ReadOnly),
+        "read-write" => Some(PseudoClass::ReadWrite),
+        "placeholder-shown" => Some(PseudoClass::PlaceholderShown),
+        "default" => Some(PseudoClass::Default),
+        "root" => Some(PseudoClass::Root),
+        "empty" => Some(PseudoClass::Empty),
+        "first-child" => Some(PseudoClass::FirstChild),
+        "last-child" => Some(PseudoClass::LastChild),
+        "only-child" => Some(PseudoClass::OnlyChild),
+        "first-of-type" => Some(PseudoClass::FirstOfType),
+        "last-of-type" => Some(PseudoClass::LastOfType),
+        "only-of-type" => Some(PseudoClass::OnlyOfType),
+        "target" => Some(PseudoClass::Target),
+        "scope" => Some(PseudoClass::Scope),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

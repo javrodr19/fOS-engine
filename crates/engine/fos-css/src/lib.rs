@@ -34,7 +34,8 @@ pub use variables::{
 pub use selectors::{
     PseudoElement, PseudoClass, NthExpression, SelectorComponent,
     AttributeSelector, AttributeMatcher, ElementContext, ElementStates,
-    match_component, match_pseudo_class, SelectorBloomFilter,
+    match_component, match_pseudo_class, SelectorBloomFilter, Direction,
+    parse_forgiving_selector_list, parse_simple_selector,
 };
 pub use style_cache::{StyleCache, StyleCacheKey, SharedStyle, CacheStats};
 pub use container::{ContainerContext, ContainerQuery, ContainerRegistry};

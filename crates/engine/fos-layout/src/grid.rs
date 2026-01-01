@@ -1,9 +1,84 @@
 //! CSS Grid Layout Module
 //!
 //! Implements CSS Grid Layout (Level 1) for the fOS browser engine.
+//! Uses arena allocation for efficient grid track storage during layout.
 
 use crate::{LayoutTree, LayoutBoxId, BoxDimensions};
 use crate::box_model::EdgeSizes;
+
+// ============================================================================
+// Arena Allocation for Grid Layout
+// ============================================================================
+
+/// Simple bump allocator for grid layout calculations
+/// Avoids repeated heap allocations during layout passes
+#[derive(Debug)]
+pub struct GridArena {
+    /// Pre-allocated storage for track sizes
+    track_buffer: Vec<f32>,
+    /// Pre-allocated storage for positions
+    position_buffer: Vec<f32>,
+    /// Current offset in track buffer
+    track_offset: usize,
+    /// Current offset in position buffer
+    position_offset: usize,
+}
+
+impl Default for GridArena {
+    fn default() -> Self {
+        Self::new(64) // Default capacity for 64 tracks
+    }
+}
+
+impl GridArena {
+    /// Create a new grid arena with specified capacity
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            track_buffer: vec![0.0; capacity * 2], // For columns and rows
+            position_buffer: vec![0.0; capacity * 2 + 2], // +1 for each dimension
+            track_offset: 0,
+            position_offset: 0,
+        }
+    }
+    
+    /// Reset the arena for reuse
+    pub fn reset(&mut self) {
+        self.track_offset = 0;
+        self.position_offset = 0;
+    }
+    
+    /// Allocate space for track sizes
+    pub fn alloc_tracks(&mut self, count: usize) -> &mut [f32] {
+        let start = self.track_offset;
+        let end = start + count;
+        
+        // Grow buffer if needed
+        if end > self.track_buffer.len() {
+            self.track_buffer.resize(end * 2, 0.0);
+        }
+        
+        self.track_offset = end;
+        &mut self.track_buffer[start..end]
+    }
+    
+    /// Allocate space for positions (count + 1)
+    pub fn alloc_positions(&mut self, count: usize) -> &mut [f32] {
+        let start = self.position_offset;
+        let end = start + count + 1; // Positions are count + 1
+        
+        if end > self.position_buffer.len() {
+            self.position_buffer.resize(end * 2, 0.0);
+        }
+        
+        self.position_offset = end;
+        &mut self.position_buffer[start..end]
+    }
+    
+    /// Get current track buffer usage
+    pub fn track_usage(&self) -> usize {
+        self.track_offset
+    }
+}
 
 /// Grid track sizing
 #[derive(Debug, Clone, PartialEq)]

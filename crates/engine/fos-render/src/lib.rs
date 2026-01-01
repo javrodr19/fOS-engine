@@ -46,6 +46,7 @@ pub use image::{ImageRenderer, ImageDecoder, DecodedImage, ImageCache, ImageForm
 pub use effects::{
     BoxShadow, Overflow, ClipRect, paint_box_shadow, apply_opacity,
     Outline, OutlineStyle, ClipPath, paint_outline,
+    TextShadow, TextShadowList, paint_text_shadows,
 };
 pub use transform::{
     Transform2D, TransformOrigin, transform_around_origin,

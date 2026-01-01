@@ -1,7 +1,298 @@
 //! Border painting
+//! 
+//! Implements CSS border-style and border-image support.
 
 use crate::{Canvas, Color};
 use crate::paint::{Border, BorderStyle, BorderRadius};
+
+// ============================================================================
+// Border Image Support
+// ============================================================================
+
+/// CSS border-image definition
+#[derive(Debug, Clone)]
+pub struct BorderImage {
+    /// Source image data (RGBA, width, height)
+    pub source: Option<BorderImageSource>,
+    /// Slice values (top, right, bottom, left) in pixels or percentages
+    pub slice: BorderImageSlice,
+    /// Width of border-image (overrides border-width)
+    pub width: BorderImageWidth,
+    /// Outset (how far the image extends beyond border box)
+    pub outset: EdgeValues,
+    /// How to fill the middle area
+    pub repeat: BorderImageRepeat,
+    /// Fill the middle slice
+    pub fill: bool,
+}
+
+impl Default for BorderImage {
+    fn default() -> Self {
+        Self {
+            source: None,
+            slice: BorderImageSlice::default(),
+            width: BorderImageWidth::default(),
+            outset: EdgeValues::default(),
+            repeat: BorderImageRepeat::default(),
+            fill: false,
+        }
+    }
+}
+
+/// Border image source
+#[derive(Debug, Clone)]
+pub struct BorderImageSource {
+    /// RGBA pixel data
+    pub data: Vec<u8>,
+    /// Image width
+    pub width: u32,
+    /// Image height
+    pub height: u32,
+}
+
+/// Border image slice values
+#[derive(Debug, Clone, Default)]
+pub struct BorderImageSlice {
+    pub top: SliceValue,
+    pub right: SliceValue,
+    pub bottom: SliceValue,
+    pub left: SliceValue,
+}
+
+impl BorderImageSlice {
+    pub fn all(value: f32) -> Self {
+        Self {
+            top: SliceValue::Pixels(value),
+            right: SliceValue::Pixels(value),
+            bottom: SliceValue::Pixels(value),
+            left: SliceValue::Pixels(value),
+        }
+    }
+    
+    pub fn percent(value: f32) -> Self {
+        Self {
+            top: SliceValue::Percent(value),
+            right: SliceValue::Percent(value),
+            bottom: SliceValue::Percent(value),
+            left: SliceValue::Percent(value),
+        }
+    }
+}
+
+/// Slice value (pixels or percentage)
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SliceValue {
+    #[default]
+    Auto,
+    Pixels(f32),
+    Percent(f32),
+}
+
+impl SliceValue {
+    pub fn resolve(&self, dimension: f32) -> f32 {
+        match self {
+            SliceValue::Auto => 0.0,
+            SliceValue::Pixels(px) => *px,
+            SliceValue::Percent(pct) => dimension * pct / 100.0,
+        }
+    }
+}
+
+/// Border image width
+#[derive(Debug, Clone, Default)]
+pub struct BorderImageWidth {
+    pub top: WidthValue,
+    pub right: WidthValue,
+    pub bottom: WidthValue,
+    pub left: WidthValue,
+}
+
+/// Width value for border-image-width
+#[derive(Debug, Clone, Copy, Default)]
+pub enum WidthValue {
+    #[default]
+    Auto,
+    Pixels(f32),
+    Percent(f32),
+    Number(f32), // Multiplier of border-width
+}
+
+/// Edge values for outset
+#[derive(Debug, Clone, Default)]
+pub struct EdgeValues {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+impl EdgeValues {
+    pub fn all(value: f32) -> Self {
+        Self { top: value, right: value, bottom: value, left: value }
+    }
+}
+
+/// Border image repeat mode
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BorderImageRepeat {
+    pub horizontal: RepeatMode,
+    pub vertical: RepeatMode,
+}
+
+/// How to repeat/scale border image slices
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RepeatMode {
+    #[default]
+    Stretch,
+    Repeat,
+    Round,
+    Space,
+}
+
+/// Paint a border image
+pub fn paint_border_image(
+    canvas: &mut Canvas,
+    x: f32, y: f32,
+    width: f32, height: f32,
+    image: &BorderImage,
+) {
+    let source = match &image.source {
+        Some(s) => s,
+        None => return,
+    };
+    
+    if source.width == 0 || source.height == 0 {
+        return;
+    }
+    
+    // Calculate slice regions
+    let slice_top = image.slice.top.resolve(source.height as f32);
+    let slice_right = image.slice.right.resolve(source.width as f32);
+    let slice_bottom = image.slice.bottom.resolve(source.height as f32);
+    let slice_left = image.slice.left.resolve(source.width as f32);
+    
+    // Apply outset
+    let draw_x = x - image.outset.left;
+    let draw_y = y - image.outset.top;
+    let draw_w = width + image.outset.left + image.outset.right;
+    let draw_h = height + image.outset.top + image.outset.bottom;
+    
+    // Draw corner slices (always stretched to fit)
+    // Top-left corner
+    draw_image_slice(
+        canvas, source,
+        0.0, 0.0, slice_left, slice_top, // src
+        draw_x, draw_y, slice_left, slice_top, // dst
+    );
+    
+    // Top-right corner
+    draw_image_slice(
+        canvas, source,
+        source.width as f32 - slice_right, 0.0, slice_right, slice_top,
+        draw_x + draw_w - slice_right, draw_y, slice_right, slice_top,
+    );
+    
+    // Bottom-left corner
+    draw_image_slice(
+        canvas, source,
+        0.0, source.height as f32 - slice_bottom, slice_left, slice_bottom,
+        draw_x, draw_y + draw_h - slice_bottom, slice_left, slice_bottom,
+    );
+    
+    // Bottom-right corner
+    draw_image_slice(
+        canvas, source,
+        source.width as f32 - slice_right, source.height as f32 - slice_bottom, slice_right, slice_bottom,
+        draw_x + draw_w - slice_right, draw_y + draw_h - slice_bottom, slice_right, slice_bottom,
+    );
+    
+    // Edge slices (stretched for now - full implementation would handle repeat modes)
+    let edge_w = source.width as f32 - slice_left - slice_right;
+    let edge_h = source.height as f32 - slice_top - slice_bottom;
+    let dst_edge_w = draw_w - slice_left - slice_right;
+    let dst_edge_h = draw_h - slice_top - slice_bottom;
+    
+    // Top edge
+    draw_image_slice(
+        canvas, source,
+        slice_left, 0.0, edge_w, slice_top,
+        draw_x + slice_left, draw_y, dst_edge_w, slice_top,
+    );
+    
+    // Bottom edge
+    draw_image_slice(
+        canvas, source,
+        slice_left, source.height as f32 - slice_bottom, edge_w, slice_bottom,
+        draw_x + slice_left, draw_y + draw_h - slice_bottom, dst_edge_w, slice_bottom,
+    );
+    
+    // Left edge
+    draw_image_slice(
+        canvas, source,
+        0.0, slice_top, slice_left, edge_h,
+        draw_x, draw_y + slice_top, slice_left, dst_edge_h,
+    );
+    
+    // Right edge
+    draw_image_slice(
+        canvas, source,
+        source.width as f32 - slice_right, slice_top, slice_right, edge_h,
+        draw_x + draw_w - slice_right, draw_y + slice_top, slice_right, dst_edge_h,
+    );
+    
+    // Center fill (if enabled)
+    if image.fill && edge_w > 0.0 && edge_h > 0.0 {
+        draw_image_slice(
+            canvas, source,
+            slice_left, slice_top, edge_w, edge_h,
+            draw_x + slice_left, draw_y + slice_top, dst_edge_w, dst_edge_h,
+        );
+    }
+}
+
+/// Draw a slice of the source image to the canvas (with scaling)
+fn draw_image_slice(
+    canvas: &mut Canvas,
+    source: &BorderImageSource,
+    src_x: f32, src_y: f32, src_w: f32, src_h: f32,
+    dst_x: f32, dst_y: f32, dst_w: f32, dst_h: f32,
+) {
+    if src_w <= 0.0 || src_h <= 0.0 || dst_w <= 0.0 || dst_h <= 0.0 {
+        return;
+    }
+    
+    let dst_x_start = dst_x.max(0.0) as u32;
+    let dst_y_start = dst_y.max(0.0) as u32;
+    let dst_x_end = ((dst_x + dst_w) as u32).min(canvas.width());
+    let dst_y_end = ((dst_y + dst_h) as u32).min(canvas.height());
+    
+    for py in dst_y_start..dst_y_end {
+        for px in dst_x_start..dst_x_end {
+            // Map destination pixel to source
+            let rel_x = (px as f32 - dst_x) / dst_w;
+            let rel_y = (py as f32 - dst_y) / dst_h;
+            
+            let sx = (src_x + rel_x * src_w) as u32;
+            let sy = (src_y + rel_y * src_h) as u32;
+            
+            if sx < source.width && sy < source.height {
+                let idx = ((sy * source.width + sx) * 4) as usize;
+                if idx + 3 < source.data.len() {
+                    let color = Color::rgba(
+                        source.data[idx],
+                        source.data[idx + 1],
+                        source.data[idx + 2],
+                        source.data[idx + 3],
+                    );
+                    
+                    if color.a > 0 {
+                        canvas.set_pixel(px, py, color);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Paint borders around a box
 pub fn paint_border(

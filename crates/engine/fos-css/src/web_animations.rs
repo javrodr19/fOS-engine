@@ -1,9 +1,122 @@
 //! Web Animations API
 //!
 //! Implementation of the Web Animations API for JavaScript access to CSS animations.
+//! Uses Fixed16 for deterministic timing calculations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// ============================================================================
+// Fixed-Point Timing for Deterministic Animations
+// ============================================================================
+
+/// Fixed-point 16.16 number for deterministic animation timing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+#[repr(transparent)]
+pub struct Fixed16(i32);
+
+impl Fixed16 {
+    const FRAC_BITS: u32 = 16;
+    const SCALE: i32 = 1 << Self::FRAC_BITS;
+    
+    pub const ZERO: Fixed16 = Fixed16(0);
+    pub const ONE: Fixed16 = Fixed16(Self::SCALE);
+    
+    #[inline]
+    pub const fn from_f64(value: f64) -> Self {
+        Self((value * Self::SCALE as f64) as i32)
+    }
+    
+    #[inline]
+    pub const fn to_f64(self) -> f64 {
+        self.0 as f64 / Self::SCALE as f64
+    }
+    
+    #[inline]
+    pub fn clamp(self, min: Self, max: Self) -> Self {
+        Self(self.0.max(min.0).min(max.0))
+    }
+    
+    #[inline]
+    pub fn lerp(self, other: Self, t: Self) -> Self {
+        let diff = (other.0 as i64 - self.0 as i64) * t.0 as i64;
+        Self(self.0 + (diff >> Self::FRAC_BITS) as i32)
+    }
+}
+
+impl std::ops::Add for Fixed16 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+
+impl std::ops::Sub for Fixed16 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+
+impl std::ops::Mul for Fixed16 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Self(((self.0 as i64 * rhs.0 as i64) >> Self::FRAC_BITS) as i32)
+    }
+}
+
+impl std::ops::Div for Fixed16 {
+    type Output = Self;
+    fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 { return Self::ZERO; }
+        Self((((self.0 as i64) << Self::FRAC_BITS) / rhs.0 as i64) as i32)
+    }
+}
+
+/// Deterministic timing for animations using Fixed16
+#[derive(Debug, Clone, Default)]
+pub struct DeterministicTiming {
+    /// Current time in fixed-point ms
+    pub current_time: Fixed16,
+    /// Duration in fixed-point ms
+    pub duration: Fixed16,
+    /// Delay in fixed-point ms
+    pub delay: Fixed16,
+    /// Playback rate as fixed-point
+    pub playback_rate: Fixed16,
+}
+
+impl DeterministicTiming {
+    pub fn new(duration_ms: f64) -> Self {
+        Self {
+            current_time: Fixed16::ZERO,
+            duration: Fixed16::from_f64(duration_ms),
+            delay: Fixed16::ZERO,
+            playback_rate: Fixed16::ONE,
+        }
+    }
+    
+    /// Get progress (0.0 - 1.0) as Fixed16
+    pub fn progress(&self) -> Fixed16 {
+        if self.duration.0 == 0 {
+            return Fixed16::ONE;
+        }
+        (self.current_time / self.duration).clamp(Fixed16::ZERO, Fixed16::ONE)
+    }
+    
+    /// Advance time by delta ms
+    pub fn tick(&mut self, delta_ms: f64) {
+        let delta = Fixed16::from_f64(delta_ms);
+        let scaled = delta * self.playback_rate;
+        self.current_time = self.current_time + scaled;
+    }
+    
+    /// Check if animation has completed
+    pub fn is_complete(&self) -> bool {
+        self.current_time.0 >= self.duration.0
+    }
+    
+    /// Reset to beginning
+    pub fn reset(&mut self) {
+        self.current_time = Fixed16::ZERO;
+    }
+}
 
 /// Animation playback state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

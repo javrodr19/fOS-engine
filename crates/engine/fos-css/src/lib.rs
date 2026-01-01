@@ -40,7 +40,10 @@ pub use selectors::{
 pub use style_cache::{StyleCache, StyleCacheKey, SharedStyle, CacheStats};
 pub use container::{ContainerContext, ContainerQuery, ContainerRegistry};
 pub use mask::{Mask, MaskLayer, MaskImage, Isolation, MaskComposite, MaskMode};
-pub use web_animations::{Animation, AnimationEffect, Keyframe, PlayState, DocumentAnimations};
+pub use web_animations::{
+    Animation, AnimationEffect, Keyframe, PlayState, DocumentAnimations,
+    Fixed16 as AnimationFixed16, DeterministicTiming,
+};
 pub use rule_tree::{RuleTree, RuleNode, PackedValue, ColorInterner, RuleSpecificity, CascadeLevel};
 pub use inheritance::{InheritanceSnapshot, InheritedProperties, CustomPropertyResolver, OnDemandStyler};
 pub use selector_opt::{SelectorIndex, RtlMatcher, HybridSelector, CompiledSelector};

@@ -1,8 +1,105 @@
 //! CSS Filter Effects
 //!
-//! Implements CSS filter and backdrop-filter properties.
+//! Implements CSS filter and backdrop-filter properties with SIMD optimizations.
 
 use crate::{Canvas, Color};
+
+// ============================================================================
+// SIMD-Optimized Batch Color Processing
+// ============================================================================
+
+/// Process 4 colors at once with brightness filter (SIMD-friendly)
+#[inline]
+pub fn brightness_4(colors: [Color; 4], amount: f32) -> [Color; 4] {
+    [
+        Color::rgba(
+            (colors[0].r as f32 * amount).min(255.0) as u8,
+            (colors[0].g as f32 * amount).min(255.0) as u8,
+            (colors[0].b as f32 * amount).min(255.0) as u8,
+            colors[0].a,
+        ),
+        Color::rgba(
+            (colors[1].r as f32 * amount).min(255.0) as u8,
+            (colors[1].g as f32 * amount).min(255.0) as u8,
+            (colors[1].b as f32 * amount).min(255.0) as u8,
+            colors[1].a,
+        ),
+        Color::rgba(
+            (colors[2].r as f32 * amount).min(255.0) as u8,
+            (colors[2].g as f32 * amount).min(255.0) as u8,
+            (colors[2].b as f32 * amount).min(255.0) as u8,
+            colors[2].a,
+        ),
+        Color::rgba(
+            (colors[3].r as f32 * amount).min(255.0) as u8,
+            (colors[3].g as f32 * amount).min(255.0) as u8,
+            (colors[3].b as f32 * amount).min(255.0) as u8,
+            colors[3].a,
+        ),
+    ]
+}
+
+/// Process 4 colors at once with grayscale filter (SIMD-friendly)
+#[inline]
+pub fn grayscale_4(colors: [Color; 4], amount: f32) -> [Color; 4] {
+    let inv = 1.0 - amount;
+    
+    std::array::from_fn(|i| {
+        let c = colors[i];
+        let gray = (c.r as f32 * 0.299 + c.g as f32 * 0.587 + c.b as f32 * 0.114) as u8;
+        Color::rgba(
+            (c.r as f32 * inv + gray as f32 * amount) as u8,
+            (c.g as f32 * inv + gray as f32 * amount) as u8,
+            (c.b as f32 * inv + gray as f32 * amount) as u8,
+            c.a,
+        )
+    })
+}
+
+/// Blend 4 color pairs at once (SIMD-friendly)
+#[inline]
+pub fn blend_4(bases: [Color; 4], tops: [Color; 4], mode: &BlendMode) -> [Color; 4] {
+    [
+        mode.blend(bases[0], tops[0]),
+        mode.blend(bases[1], tops[1]),
+        mode.blend(bases[2], tops[2]),
+        mode.blend(bases[3], tops[3]),
+    ]
+}
+
+/// Invert 4 colors at once (SIMD-friendly)
+#[inline]
+pub fn invert_4(colors: [Color; 4], amount: f32) -> [Color; 4] {
+    let inv = 1.0 - amount;
+    
+    std::array::from_fn(|i| {
+        let c = colors[i];
+        Color::rgba(
+            (c.r as f32 * inv + (255 - c.r) as f32 * amount) as u8,
+            (c.g as f32 * inv + (255 - c.g) as f32 * amount) as u8,
+            (c.b as f32 * inv + (255 - c.b) as f32 * amount) as u8,
+            c.a,
+        )
+    })
+}
+
+/// Alpha blend 4 color pairs (SIMD-friendly)
+#[inline]
+pub fn alpha_blend_4(bgs: [Color; 4], fgs: [Color; 4]) -> [Color; 4] {
+    std::array::from_fn(|i| {
+        let bg = bgs[i];
+        let fg = fgs[i];
+        let alpha = fg.a as f32 / 255.0;
+        let inv_alpha = 1.0 - alpha;
+        
+        Color::rgba(
+            (bg.r as f32 * inv_alpha + fg.r as f32 * alpha) as u8,
+            (bg.g as f32 * inv_alpha + fg.g as f32 * alpha) as u8,
+            (bg.b as f32 * inv_alpha + fg.b as f32 * alpha) as u8,
+            255,
+        )
+    })
+}
 
 /// CSS filter function
 #[derive(Debug, Clone, PartialEq)]

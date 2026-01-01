@@ -17,6 +17,7 @@ pub mod web_animations;
 pub mod rule_tree;
 pub mod inheritance;
 pub mod selector_opt;
+pub mod transitions;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
@@ -26,6 +27,9 @@ pub use computed::PropertyMask;
 pub use variables::{
     VariableScope, CustomPropertyValue, ResolvedValue,
     CalcExpression, css_min, css_max, css_clamp,
+    CssVarInterner, InternedVarName,
+    Fixed16 as CalcFixed16, css_min_fixed, css_max_fixed, css_clamp_fixed,
+    CalcExpressionFixed,
 };
 pub use selectors::{
     PseudoElement, PseudoClass, NthExpression, SelectorComponent,
@@ -39,6 +43,10 @@ pub use web_animations::{Animation, AnimationEffect, Keyframe, PlayState, Docume
 pub use rule_tree::{RuleTree, RuleNode, PackedValue, ColorInterner, RuleSpecificity, CascadeLevel};
 pub use inheritance::{InheritanceSnapshot, InheritedProperties, CustomPropertyResolver, OnDemandStyler};
 pub use selector_opt::{SelectorIndex, RtlMatcher, HybridSelector, CompiledSelector};
+pub use transitions::{
+    Transition, ActiveTransition, TransitionEngine,
+    TimingFunction, StepPosition, Fixed16 as TransitionFixed16,
+};
 
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {

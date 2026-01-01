@@ -318,6 +318,220 @@ pub fn css_clamp(min: f32, preferred: f32, max: f32) -> f32 {
     preferred.max(min).min(max)
 }
 
+// ============================================================================
+// StringInterner-Based CSS Variable Names
+// ============================================================================
+
+/// Interned CSS variable name (memory-efficient storage)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InternedVarName {
+    id: u32,
+}
+
+/// CSS Variable name interner for memory-efficient variable storage
+#[derive(Debug, Default)]
+pub struct CssVarInterner {
+    names: Vec<String>,
+    lookup: std::collections::HashMap<String, u32>,
+}
+
+impl CssVarInterner {
+    /// Create a new CSS variable interner
+    pub fn new() -> Self {
+        let mut interner = Self::default();
+        // Pre-intern common CSS custom property patterns
+        for name in COMMON_CSS_VARS {
+            interner.intern(name);
+        }
+        interner
+    }
+    
+    /// Intern a variable name
+    pub fn intern(&mut self, name: &str) -> InternedVarName {
+        if let Some(&id) = self.lookup.get(name) {
+            return InternedVarName { id };
+        }
+        
+        let id = self.names.len() as u32;
+        self.names.push(name.to_string());
+        self.lookup.insert(name.to_string(), id);
+        InternedVarName { id }
+    }
+    
+    /// Get the original name from an interned value
+    pub fn get(&self, interned: InternedVarName) -> Option<&str> {
+        self.names.get(interned.id as usize).map(|s| s.as_str())
+    }
+    
+    /// Number of interned variable names
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+const COMMON_CSS_VARS: &[&str] = &[
+    "--primary-color",
+    "--secondary-color",
+    "--background-color",
+    "--text-color",
+    "--accent-color",
+    "--font-size",
+    "--font-family",
+    "--spacing",
+    "--border-radius",
+    "--shadow",
+    "--transition",
+    "--z-index",
+];
+
+// ============================================================================
+// Fixed-Point Calc Functions
+// ============================================================================
+
+/// Fixed-point 16.16 number for deterministic calc() evaluation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+#[repr(transparent)]
+pub struct Fixed16(i32);
+
+impl Fixed16 {
+    const FRAC_BITS: u32 = 16;
+    const SCALE: i32 = 1 << Self::FRAC_BITS;
+    
+    pub const ZERO: Fixed16 = Fixed16(0);
+    pub const ONE: Fixed16 = Fixed16(Self::SCALE);
+    
+    #[inline]
+    pub const fn from_f32(value: f32) -> Self {
+        Self((value * Self::SCALE as f32) as i32)
+    }
+    
+    #[inline]
+    pub const fn to_f32(self) -> f32 {
+        self.0 as f32 / Self::SCALE as f32
+    }
+    
+    #[inline]
+    pub fn clamp(self, min: Self, max: Self) -> Self {
+        Self(self.0.max(min.0).min(max.0))
+    }
+}
+
+impl std::ops::Add for Fixed16 {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+
+impl std::ops::Sub for Fixed16 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+
+impl std::ops::Mul for Fixed16 {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Self(((self.0 as i64 * rhs.0 as i64) >> Self::FRAC_BITS) as i32)
+    }
+}
+
+impl std::ops::Div for Fixed16 {
+    type Output = Self;
+    fn div(self, rhs: Self) -> Self {
+        if rhs.0 == 0 { return Self::ZERO; }
+        Self((((self.0 as i64) << Self::FRAC_BITS) / rhs.0 as i64) as i32)
+    }
+}
+
+/// Fixed-point min() for deterministic results
+pub fn css_min_fixed(values: &[Fixed16]) -> Fixed16 {
+    values.iter().copied().min().unwrap_or(Fixed16::ZERO)
+}
+
+/// Fixed-point max() for deterministic results
+pub fn css_max_fixed(values: &[Fixed16]) -> Fixed16 {
+    values.iter().copied().max().unwrap_or(Fixed16::ZERO)
+}
+
+/// Fixed-point clamp() for deterministic results
+pub fn css_clamp_fixed(min: Fixed16, preferred: Fixed16, max: Fixed16) -> Fixed16 {
+    preferred.clamp(min, max)
+}
+
+/// Fixed-point calc expression evaluation
+#[derive(Debug, Clone)]
+pub struct CalcExpressionFixed {
+    tokens: Vec<CalcTokenFixed>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CalcTokenFixed {
+    Number(Fixed16),
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl CalcExpressionFixed {
+    /// Evaluate a simple calc expression (a op b)
+    pub fn evaluate_simple(a: Fixed16, op: char, b: Fixed16) -> Fixed16 {
+        match op {
+            '+' => a + b,
+            '-' => a - b,
+            '*' => a * b,
+            '/' => a / b,
+            _ => a,
+        }
+    }
+    
+    /// Parse and evaluate a simple "a + b" style expression
+    pub fn parse_and_eval(expr: &str, percentage_base: Fixed16) -> Option<Fixed16> {
+        let expr = expr.trim()
+            .strip_prefix("calc(")?
+            .strip_suffix(')')?;
+        
+        // Very simple parsing for "a op b" format
+        for op in ['+', '-', '*', '/'] {
+            if let Some(pos) = expr.find(op) {
+                let left = expr[..pos].trim();
+                let right = expr[pos+1..].trim();
+                
+                let a = Self::parse_value(left, percentage_base)?;
+                let b = Self::parse_value(right, percentage_base)?;
+                
+                return Some(Self::evaluate_simple(a, op, b));
+            }
+        }
+        
+        Self::parse_value(expr, percentage_base)
+    }
+    
+    fn parse_value(s: &str, percentage_base: Fixed16) -> Option<Fixed16> {
+        let s = s.trim();
+        
+        if s.ends_with("px") {
+            let v: f32 = s.trim_end_matches("px").parse().ok()?;
+            return Some(Fixed16::from_f32(v));
+        }
+        if s.ends_with('%') {
+            let v: f32 = s.trim_end_matches('%').parse().ok()?;
+            let pct = Fixed16::from_f32(v / 100.0);
+            return Some(pct * percentage_base);
+        }
+        if s.ends_with("em") || s.ends_with("rem") {
+            let v: f32 = s.trim_end_matches("em").trim_end_matches('r').parse().ok()?;
+            return Some(Fixed16::from_f32(v * 16.0));
+        }
+        
+        let v: f32 = s.parse().ok()?;
+        Some(Fixed16::from_f32(v))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

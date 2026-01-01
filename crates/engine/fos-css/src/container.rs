@@ -34,17 +34,39 @@ pub enum ContainerType {
 /// Container query condition
 #[derive(Debug, Clone)]
 pub enum ContainerQuery {
+    // Size queries
     MinWidth(f32),
     MaxWidth(f32),
     MinHeight(f32),
     MaxHeight(f32),
     Width(f32),
     Height(f32),
+    
+    // Inline/block size queries (writing-mode aware)
+    MinInlineSize(f32),
+    MaxInlineSize(f32),
+    MinBlockSize(f32),
+    MaxBlockSize(f32),
+    
     AspectRatio(f32, f32),
     Orientation(Orientation),
+    
+    // Style queries (CSS style())
+    Style(StyleQuery),
+    
+    // Logical combinators
     And(Vec<ContainerQuery>),
     Or(Vec<ContainerQuery>),
     Not(Box<ContainerQuery>),
+}
+
+/// Style query for style() container queries
+#[derive(Debug, Clone)]
+pub struct StyleQuery {
+    /// Property name
+    pub property: String,
+    /// Expected value (optional - if None, checks if property is set)
+    pub value: Option<String>,
 }
 
 /// Orientation
@@ -76,6 +98,13 @@ impl ContainerContext {
             ContainerQuery::MaxHeight(h) => self.height <= *h,
             ContainerQuery::Width(w) => (self.width - w).abs() < 0.01,
             ContainerQuery::Height(h) => (self.height - h).abs() < 0.01,
+            
+            // Inline/block size queries
+            ContainerQuery::MinInlineSize(s) => self.inline_size >= *s,
+            ContainerQuery::MaxInlineSize(s) => self.inline_size <= *s,
+            ContainerQuery::MinBlockSize(s) => self.block_size >= *s,
+            ContainerQuery::MaxBlockSize(s) => self.block_size <= *s,
+            
             ContainerQuery::AspectRatio(w, h) => {
                 let target = w / h;
                 (self.aspect_ratio - target).abs() < 0.01
@@ -88,6 +117,10 @@ impl ContainerContext {
                 };
                 current == *o
             }
+            
+            // Style query (needs external style context - simplified)
+            ContainerQuery::Style(_) => false, // Requires computed style lookup
+            
             ContainerQuery::And(queries) => queries.iter().all(|q| self.matches(q)),
             ContainerQuery::Or(queries) => queries.iter().any(|q| self.matches(q)),
             ContainerQuery::Not(query) => !self.matches(query),

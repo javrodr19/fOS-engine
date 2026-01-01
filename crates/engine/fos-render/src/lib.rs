@@ -35,6 +35,7 @@ pub mod gpu;
 pub mod webgl;
 pub mod webgpu;
 pub mod render_opt;
+pub mod gradient;
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};
@@ -54,11 +55,19 @@ pub use animation::{
     TimingFunction, Transition, Keyframe, KeyframeAnimation, 
     AnimatedValue, AnimationInstance, AnimationDirection, FillMode
 };
-pub use filters::{FilterFunction, FilterList, BlendMode, apply_filters};
+pub use filters::{
+    FilterFunction, FilterList, BlendMode, apply_filters,
+    brightness_4, grayscale_4, blend_4, invert_4, alpha_blend_4,
+};
 pub use gpu::{GpuRenderer, GpuConfig, GpuState, GpuBackend, RenderFrame, TextureId, GpuError};
 pub use webgl::{WebGLRenderingContext, WebGLVersion, ShaderType, TextureFormat};
 pub use webgpu::{GPUDevice, GPURenderPipeline, GPUComputePipeline, GPUBuffer, GPUTexture};
 pub use render_opt::{DisplayList, TextureAtlas, DirtyRectTracker, OcclusionCuller, RenderTreeDiffer, OffscreenCanvas};
+pub use gradient::{
+    Gradient, ColorStop, GradientDirection, RadialShape, RadialExtent,
+    fill_gradient, fill_linear_gradient, fill_radial_gradient, fill_conic_gradient,
+    parse_gradient,
+};
 
 /// Color (RGBA)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

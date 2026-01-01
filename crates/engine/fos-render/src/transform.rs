@@ -166,6 +166,66 @@ impl Transform2D {
     pub fn to_tiny_skia(&self) -> tiny_skia::Transform {
         tiny_skia::Transform::from_row(self.a, self.b, self.c, self.d, self.e, self.f)
     }
+    
+    // ========================================================================
+    // SIMD-Optimized Batch Operations
+    // ========================================================================
+    
+    /// Transform 4 points at once (SIMD-friendly batch processing)
+    /// Returns [(x0, y0), (x1, y1), (x2, y2), (x3, y3)]
+    #[inline]
+    pub fn transform_points_4(&self, points: [(f32, f32); 4]) -> [(f32, f32); 4] {
+        [
+            (self.a * points[0].0 + self.c * points[0].1 + self.e,
+             self.b * points[0].0 + self.d * points[0].1 + self.f),
+            (self.a * points[1].0 + self.c * points[1].1 + self.e,
+             self.b * points[1].0 + self.d * points[1].1 + self.f),
+            (self.a * points[2].0 + self.c * points[2].1 + self.e,
+             self.b * points[2].0 + self.d * points[2].1 + self.f),
+            (self.a * points[3].0 + self.c * points[3].1 + self.e,
+             self.b * points[3].0 + self.d * points[3].1 + self.f),
+        ]
+    }
+    
+    /// Transform an array of points using batch processing
+    pub fn transform_points(&self, points: &[(f32, f32)]) -> Vec<(f32, f32)> {
+        let mut result = Vec::with_capacity(points.len());
+        let mut i = 0;
+        
+        // Process 4 points at a time
+        while i + 4 <= points.len() {
+            let batch = [points[i], points[i+1], points[i+2], points[i+3]];
+            let transformed = self.transform_points_4(batch);
+            result.extend_from_slice(&transformed);
+            i += 4;
+        }
+        
+        // Handle remaining points
+        while i < points.len() {
+            result.push(self.transform_point(points[i].0, points[i].1));
+            i += 1;
+        }
+        
+        result
+    }
+    
+    /// Transform bounding box corners and return new axis-aligned bounds
+    pub fn transform_bounds(&self, x: f32, y: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+        let corners = [
+            (x, y),
+            (x + w, y),
+            (x, y + h),
+            (x + w, y + h),
+        ];
+        let transformed = self.transform_points_4(corners);
+        
+        let min_x = transformed.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+        let max_x = transformed.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+        let min_y = transformed.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+        let max_y = transformed.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+        
+        (min_x, min_y, max_x - min_x, max_y - min_y)
+    }
 }
 
 /// Transform origin point

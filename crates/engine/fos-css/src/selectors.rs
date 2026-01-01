@@ -95,6 +95,9 @@ pub enum PseudoClass {
     Where(Vec<SelectorComponent>),
     Has(Vec<SelectorComponent>),
     
+    // Scope pseudo-class (matches the element the selector is scoped to)
+    Scope,
+    
     // Other
     Target,
     Lang(String),
@@ -320,6 +323,7 @@ pub struct ElementStates {
     pub is_target: bool,
     pub is_root: bool,
     pub is_empty: bool,
+    pub is_scope: bool,
 }
 
 /// Match a selector component against an element
@@ -394,6 +398,9 @@ pub fn match_pseudo_class(pseudo: &PseudoClass, element: &ElementContext) -> boo
             selectors.iter().any(|s| match_component(s, element))
         }
         PseudoClass::Has(_) => false, // Complex - requires checking descendants
+        
+        // Scope pseudo-class
+        PseudoClass::Scope => element.states.is_scope,
         
         // Other
         PseudoClass::Target => element.states.is_target,

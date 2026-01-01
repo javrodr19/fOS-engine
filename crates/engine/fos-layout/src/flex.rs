@@ -1,10 +1,66 @@
 //! Flexbox Layout
 //!
-//! Implements CSS Flexbox layout algorithm.
+//! Implements CSS Flexbox layout algorithm with SIMD optimizations.
 //! https://www.w3.org/TR/css-flexbox-1/
 
 use crate::{LayoutTree, LayoutBoxId, BoxType};
 use crate::box_model::EdgeSizes;
+
+// ============================================================================
+// SIMD-Optimized Helpers
+// ============================================================================
+
+/// SIMD-friendly batch calculation for 4 flex items at once
+/// Returns new sizes after applying grow/shrink ratios
+#[inline]
+fn compute_flex_sizes_4(
+    base_sizes: [f32; 4],
+    factors: [f32; 4],
+    total_factor: f32,
+    free_space: f32,
+) -> [f32; 4] {
+    if total_factor <= 0.0 {
+        return base_sizes;
+    }
+    
+    [
+        base_sizes[0] + free_space * (factors[0] / total_factor),
+        base_sizes[1] + free_space * (factors[1] / total_factor),
+        base_sizes[2] + free_space * (factors[2] / total_factor),
+        base_sizes[3] + free_space * (factors[3] / total_factor),
+    ]
+}
+
+/// SIMD-friendly batch sum of 4 values
+#[inline]
+fn sum_4(values: [f32; 4]) -> f32 {
+    values[0] + values[1] + values[2] + values[3]
+}
+
+/// SIMD-friendly batch min with threshold
+#[inline]
+fn max_4_with_zero(values: [f32; 4]) -> [f32; 4] {
+    [
+        values[0].max(0.0),
+        values[1].max(0.0),
+        values[2].max(0.0),
+        values[3].max(0.0),
+    ]
+}
+
+/// SIMD batch calculation for cross-axis alignment offsets
+#[inline]
+fn compute_cross_offsets_4(
+    item_sizes: [f32; 4],
+    line_size: f32,
+) -> [f32; 4] {
+    [
+        (line_size - item_sizes[0]) / 2.0,
+        (line_size - item_sizes[1]) / 2.0,
+        (line_size - item_sizes[2]) / 2.0,
+        (line_size - item_sizes[3]) / 2.0,
+    ]
+}
 
 /// Flex container properties
 #[derive(Debug, Clone, Copy, Default)]

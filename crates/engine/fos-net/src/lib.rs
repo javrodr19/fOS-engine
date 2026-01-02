@@ -20,6 +20,9 @@ pub mod cookies;
 pub mod client;
 pub mod coalescing;
 pub mod prefetch;
+pub mod cors;
+pub mod streaming;
+pub mod priority;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
@@ -32,10 +35,14 @@ pub use http3::{QuicConnection, Http3Connection, QuicError};
 pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};
 pub use connection_pool::{ConnectionPool, PooledConnection, PoolConfig, HostKey, AcquireResult};
 pub use client::{HttpClient, HttpClientBuilder, ClientConfig};
-pub use cookies::{Cookie, CookieJar, SameSite};
+pub use cookies::{Cookie, CookieJar, SameSite, PartitionKey, PartitionedCookieJar};
 pub use tcp::{TcpConnection, TcpConfig, BufferedTcpConnection};
 pub use tls::{TlsStream, TlsConfig, TlsState};
 pub use http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
+pub use cors::{CorsHandler, CorsCheck, CorsMode, CredentialsMode, CorsError, PreflightRequest, PreflightResponse, Origin as CorsOrigin};
+pub use streaming::{StreamingBody, StreamIterator, StreamState, TransferEncoding, ProgressBody, detect_encoding};
+pub use priority::{RequestPriority, PriorityQueue, PrioritizedRequest, ResourceType, BandwidthHints, QueueStats};
+
 
 /// HTTP Response
 #[derive(Debug)]

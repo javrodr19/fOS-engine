@@ -1,6 +1,7 @@
 //! Cookie Handling
 //!
-//! Cookie jar with domain/path matching and StringInterner for memory efficiency.
+//! Cookie jar with domain/path matching, StringInterner for memory efficiency,
+//! and cookie partitioning (CHIPS) for cross-site tracking prevention.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +25,8 @@ pub struct Cookie {
     pub http_only: bool,
     /// SameSite attribute
     pub same_site: SameSite,
+    /// Partitioned cookie flag (CHIPS)
+    pub partitioned: bool,
 }
 
 /// SameSite attribute values
@@ -50,6 +53,22 @@ impl Cookie {
             secure: false,
             http_only: false,
             same_site: SameSite::Lax,
+            partitioned: false,
+        }
+    }
+    
+    /// Create a partitioned cookie
+    pub fn new_partitioned(name: &str, value: &str, domain: &str, path: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            value: value.to_string(),
+            domain: domain.to_string(),
+            path: path.to_string(),
+            expires: None,
+            secure: true, // Partitioned cookies must be Secure
+            http_only: false,
+            same_site: SameSite::None, // Partitioned cookies typically use SameSite=None
+            partitioned: true,
         }
     }
     
@@ -109,6 +128,58 @@ impl Cookie {
     }
 }
 
+/// Cookie partition key based on top-level site
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PartitionKey {
+    /// Top-level site (scheme + eTLD+1)
+    pub top_level_site: String,
+}
+
+impl PartitionKey {
+    /// Create partition key from top-level site
+    pub fn new(top_level_site: &str) -> Self {
+        Self {
+            top_level_site: top_level_site.to_lowercase(),
+        }
+    }
+    
+    /// Create partition key from URL
+    pub fn from_url(url: &str) -> Option<Self> {
+        // Extract scheme and host
+        let url = url.trim();
+        let scheme_end = url.find("://")?;
+        let scheme = &url[..scheme_end];
+        let rest = &url[scheme_end + 3..];
+        let path_start = rest.find('/').unwrap_or(rest.len());
+        let host = &rest[..path_start].to_lowercase();
+        
+        // Get eTLD+1 (simplified: get last two components or fewer)
+        let etld_plus_1 = Self::get_etld_plus_1(host);
+        
+        Some(Self {
+            top_level_site: format!("{}://{}", scheme, etld_plus_1),
+        })
+    }
+    
+    /// Extract eTLD+1 from host (simplified implementation)
+    fn get_etld_plus_1(host: &str) -> String {
+        let parts: Vec<&str> = host.split('.').collect();
+        
+        // Handle IP addresses  
+        if parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+            return host.to_string();
+        }
+        
+        // Simple eTLD+1 extraction (last 2 parts)
+        // Production would use public suffix list
+        if parts.len() >= 2 {
+            parts[parts.len() - 2..].join(".")
+        } else {
+            host.to_string()
+        }
+    }
+}
+
 /// Parse a Set-Cookie header
 pub fn parse_set_cookie(header: &str, request_domain: &str) -> Option<Cookie> {
     let mut parts = header.split(';');
@@ -128,6 +199,7 @@ pub fn parse_set_cookie(header: &str, request_domain: &str) -> Option<Cookie> {
         secure: false,
         http_only: false,
         same_site: SameSite::Lax,
+        partitioned: false,
     };
     
     // Parse attributes
@@ -139,6 +211,10 @@ pub fn parse_set_cookie(header: &str, request_domain: &str) -> Option<Cookie> {
             cookie.secure = true;
         } else if lower == "httponly" {
             cookie.http_only = true;
+        } else if lower == "partitioned" {
+            cookie.partitioned = true;
+            // Partitioned cookies must be Secure
+            cookie.secure = true;
         } else if let Some(value) = part.strip_prefix("Domain=").or_else(|| part.strip_prefix("domain=")) {
             cookie.domain = value.trim().to_string();
         } else if let Some(value) = part.strip_prefix("Path=").or_else(|| part.strip_prefix("path=")) {
@@ -256,6 +332,144 @@ impl CookieJar {
     }
 }
 
+/// Partitioned cookie jar for CHIPS (Cookies Having Independent Partitioned State)
+/// 
+/// Stores cookies partitioned by top-level site to prevent cross-site tracking.
+#[derive(Debug, Default)]
+pub struct PartitionedCookieJar {
+    /// Unpartitioned (first-party) cookies
+    unpartitioned: CookieJar,
+    /// Partitioned cookies by top-level site
+    partitioned: HashMap<PartitionKey, CookieJar>,
+}
+
+impl PartitionedCookieJar {
+    /// Create new partitioned cookie jar
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Add cookie with partition context
+    pub fn add(&mut self, cookie: Cookie, partition_key: Option<&PartitionKey>) {
+        if cookie.partitioned {
+            // Partitioned cookies require a partition key
+            if let Some(key) = partition_key {
+                let jar = self.partitioned.entry(key.clone()).or_default();
+                jar.add(cookie);
+            }
+            // Silently ignore partitioned cookies without partition key
+        } else {
+            self.unpartitioned.add(cookie);
+        }
+    }
+    
+    /// Add from Set-Cookie header with partition context
+    pub fn add_from_header(
+        &mut self,
+        header: &str,
+        request_domain: &str,
+        partition_key: Option<&PartitionKey>,
+    ) {
+        if let Some(cookie) = parse_set_cookie(header, request_domain) {
+            self.add(cookie, partition_key);
+        }
+    }
+    
+    /// Get cookies for a request with partition context
+    pub fn get_cookies(
+        &self,
+        domain: &str,
+        path: &str,
+        is_secure: bool,
+        partition_key: Option<&PartitionKey>,
+    ) -> Vec<&Cookie> {
+        let mut result = self.unpartitioned.get_cookies(domain, path, is_secure);
+        
+        // Add partitioned cookies for this partition
+        if let Some(key) = partition_key {
+            if let Some(jar) = self.partitioned.get(key) {
+                result.extend(jar.get_cookies(domain, path, is_secure));
+            }
+        }
+        
+        result
+    }
+    
+    /// Get Cookie header for request
+    pub fn get_cookie_header(
+        &self,
+        domain: &str,
+        path: &str,
+        is_secure: bool,
+        partition_key: Option<&PartitionKey>,
+    ) -> Option<String> {
+        let cookies = self.get_cookies(domain, path, is_secure, partition_key);
+        
+        if cookies.is_empty() {
+            None
+        } else {
+            Some(cookies.iter()
+                .map(|c| c.serialize())
+                .collect::<Vec<_>>()
+                .join("; "))
+        }
+    }
+    
+    /// Get unpartitioned cookie jar
+    pub fn unpartitioned(&self) -> &CookieJar {
+        &self.unpartitioned
+    }
+    
+    /// Get unpartitioned cookie jar (mutable)
+    pub fn unpartitioned_mut(&mut self) -> &mut CookieJar {
+        &mut self.unpartitioned
+    }
+    
+    /// Get partitioned jar for a specific partition
+    pub fn partition(&self, key: &PartitionKey) -> Option<&CookieJar> {
+        self.partitioned.get(key)
+    }
+    
+    /// Cleanup expired cookies in all jars
+    pub fn cleanup(&mut self) {
+        self.unpartitioned.cleanup();
+        
+        for jar in self.partitioned.values_mut() {
+            jar.cleanup();
+        }
+        
+        // Remove empty partitions
+        self.partitioned.retain(|_, jar| !jar.is_empty());
+    }
+    
+    /// Clear all cookies
+    pub fn clear(&mut self) {
+        self.unpartitioned.clear();
+        self.partitioned.clear();
+    }
+    
+    /// Clear cookies for a specific partition
+    pub fn clear_partition(&mut self, key: &PartitionKey) {
+        self.partitioned.remove(key);
+    }
+    
+    /// Get total cookie count
+    pub fn len(&self) -> usize {
+        self.unpartitioned.len() + 
+            self.partitioned.values().map(|j| j.len()).sum::<usize>()
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    /// Get number of partitions
+    pub fn partition_count(&self) -> usize {
+        self.partitioned.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +483,18 @@ mod tests {
         assert_eq!(cookie.value, "abc123");
         assert!(cookie.http_only);
         assert!(cookie.secure);
+        assert!(!cookie.partitioned);
+    }
+    
+    #[test]
+    fn test_partitioned_cookie_parse() {
+        let header = "tracking=x; Path=/; Secure; SameSite=None; Partitioned";
+        let cookie = parse_set_cookie(header, "tracker.com").unwrap();
+        
+        assert_eq!(cookie.name, "tracking");
+        assert!(cookie.partitioned);
+        assert!(cookie.secure); // Partitioned requires Secure
+        assert_eq!(cookie.same_site, SameSite::None);
     }
     
     #[test]
@@ -305,5 +531,62 @@ mod tests {
         
         // Secure cookie sent on HTTPS
         assert_eq!(jar.get_cookies("example.com", "/", true).len(), 1);
+    }
+    
+    #[test]
+    fn test_partition_key() {
+        let key = PartitionKey::from_url("https://www.example.com/path").unwrap();
+        assert_eq!(key.top_level_site, "https://example.com");
+        
+        let key2 = PartitionKey::from_url("https://sub.example.com/").unwrap();
+        assert_eq!(key.top_level_site, key2.top_level_site);
+    }
+    
+    #[test]
+    fn test_partitioned_cookie_jar() {
+        let mut jar = PartitionedCookieJar::new();
+        
+        // Add first-party cookie
+        jar.add_from_header("session=abc", "example.com", None);
+        
+        // Add partitioned cookie for a third-party embed
+        let partition = PartitionKey::new("https://toplevel.com");
+        jar.add_from_header(
+            "widget=xyz; Secure; Partitioned",
+            "embed.com",
+            Some(&partition),
+        );
+        
+        // Without partition context, only see first-party
+        let cookies = jar.get_cookies("example.com", "/", true, None);
+        assert_eq!(cookies.len(), 1);
+        
+        // With partition context, see both (for their domains)
+        // Note: embed.com cookie only matches embed.com domain
+        let cookies = jar.get_cookies("embed.com", "/", true, Some(&partition));
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].partitioned);
+    }
+    
+    #[test]
+    fn test_partitioned_isolation() {
+        let mut jar = PartitionedCookieJar::new();
+        
+        let partition_a = PartitionKey::new("https://site-a.com");
+        let partition_b = PartitionKey::new("https://site-b.com");
+        
+        // Same embed on two different sites
+        jar.add_from_header("id=A; Secure; Partitioned", "tracker.com", Some(&partition_a));
+        jar.add_from_header("id=B; Secure; Partitioned", "tracker.com", Some(&partition_b));
+        
+        // Site A only sees Site A's cookie
+        let cookies = jar.get_cookies("tracker.com", "/", true, Some(&partition_a));
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "A");
+        
+        // Site B only sees Site B's cookie
+        let cookies = jar.get_cookies("tracker.com", "/", true, Some(&partition_b));
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "B");
     }
 }

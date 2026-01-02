@@ -3,13 +3,15 @@
 //! Canvas 2D and WebGL APIs for the fOS browser engine.
 //!
 //! Features:
-//! - CanvasRenderingContext2D
+//! - CanvasRenderingContext2D with SIMD acceleration
 //! - Path2D
 //! - ImageData
 //! - Transforms and compositing
 //! - OffscreenCanvas
-//! - WebGL 1.0
+//! - WebGL 1.0 with resource pooling
 
+pub mod simd;
+pub mod pool;
 pub mod context2d;
 pub mod path;
 pub mod transforms;

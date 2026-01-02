@@ -31,6 +31,10 @@ pub mod builtins;
 pub mod webapi;
 pub mod idb;
 pub mod js_optimizations;
+pub mod dom_bindings;
+pub mod event_bindings;
+pub mod compress;
+pub mod cow;
 
 // Phase B modules (custom engine)
 pub mod lazy_compile;

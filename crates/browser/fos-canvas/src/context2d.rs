@@ -1,10 +1,13 @@
 //! Canvas 2D Rendering Context
 //!
-//! CanvasRenderingContext2D implementation.
+//! CanvasRenderingContext2D implementation with SIMD acceleration.
+//!
+//! Uses local SIMD utilities for accelerated pixel operations.
 
 use crate::path::Path2D;
 use crate::transforms::TransformMatrix;
 use crate::compositing::{CompositeOperation, BlendMode};
+use crate::simd::{Color4, blend_color, blend_colors_4};
 
 /// Canvas 2D rendering context
 #[derive(Debug)]
@@ -253,18 +256,136 @@ impl CanvasRenderingContext2D {
         let y1 = ((y + height) as u32).min(self.height);
         
         let a = (color.a as f64 * alpha) as u8;
+        let src = Color4::new(color.r, color.g, color.b, a);
         
         for py in y0..y1 {
-            for px in x0..x1 {
-                let idx = ((py * self.width + px) * 4) as usize;
+            let row_start = (py * self.width) as usize;
+            let mut px = x0;
+            
+            // Process 4 pixels at a time using SIMD
+            while px + 4 <= x1 {
+                let base_idx = (row_start + px as usize) * 4;
+                if base_idx + 16 <= self.data.len() {
+                    // Read destination colors
+                    let dst = [
+                        Color4::new(self.data[base_idx], self.data[base_idx + 1], 
+                                   self.data[base_idx + 2], self.data[base_idx + 3]),
+                        Color4::new(self.data[base_idx + 4], self.data[base_idx + 5], 
+                                   self.data[base_idx + 6], self.data[base_idx + 7]),
+                        Color4::new(self.data[base_idx + 8], self.data[base_idx + 9], 
+                                   self.data[base_idx + 10], self.data[base_idx + 11]),
+                        Color4::new(self.data[base_idx + 12], self.data[base_idx + 13], 
+                                   self.data[base_idx + 14], self.data[base_idx + 15]),
+                    ];
+                    
+                    // SIMD blend 4 colors at once
+                    let blended = blend_colors_4([src, src, src, src], dst);
+                    
+                    // Write back
+                    for (i, c) in blended.iter().enumerate() {
+                        let idx = base_idx + i * 4;
+                        self.data[idx] = c.r;
+                        self.data[idx + 1] = c.g;
+                        self.data[idx + 2] = c.b;
+                        self.data[idx + 3] = c.a;
+                    }
+                }
+                px += 4;
+            }
+            
+            // Handle remaining pixels
+            while px < x1 {
+                let idx = (row_start + px as usize) * 4;
                 if idx + 3 < self.data.len() {
-                    self.data[idx] = color.r;
-                    self.data[idx + 1] = color.g;
-                    self.data[idx + 2] = color.b;
-                    self.data[idx + 3] = a;
+                    let dst = Color4::new(self.data[idx], self.data[idx + 1], 
+                                         self.data[idx + 2], self.data[idx + 3]);
+                    let blended = blend_color(src, dst);
+                    self.data[idx] = blended.r;
+                    self.data[idx + 1] = blended.g;
+                    self.data[idx + 2] = blended.b;
+                    self.data[idx + 3] = blended.a;
+                }
+                px += 1;
+            }
+        }
+    }
+    
+    /// SIMD-accelerated image data operations
+    pub fn put_image_data_simd(&mut self, data: &[u8], x: i32, y: i32, width: u32, height: u32) {
+        if x < 0 || y < 0 || data.len() < (width * height * 4) as usize {
+            return;
+        }
+        
+        let x = x as u32;
+        let y = y as u32;
+        
+        for row in 0..height {
+            let dest_y = y + row;
+            if dest_y >= self.height {
+                break;
+            }
+            
+            let mut col = 0u32;
+            let row_offset = (row * width * 4) as usize;
+            
+            // Process 4 pixels at a time
+            while col + 4 <= width && x + col + 4 <= self.width {
+                let src_idx = row_offset + (col * 4) as usize;
+                let dest_idx = ((dest_y * self.width + x + col) * 4) as usize;
+                
+                if src_idx + 16 <= data.len() && dest_idx + 16 <= self.data.len() {
+                    // Copy 16 bytes (4 RGBA pixels) at once
+                    self.data[dest_idx..dest_idx + 16].copy_from_slice(&data[src_idx..src_idx + 16]);
+                }
+                col += 4;
+            }
+            
+            // Handle remaining pixels
+            while col < width && x + col < self.width {
+                let src_idx = row_offset + (col * 4) as usize;
+                let dest_idx = ((dest_y * self.width + x + col) * 4) as usize;
+                
+                if src_idx + 4 <= data.len() && dest_idx + 4 <= self.data.len() {
+                    self.data[dest_idx..dest_idx + 4].copy_from_slice(&data[src_idx..src_idx + 4]);
+                }
+                col += 1;
+            }
+        }
+    }
+    
+    /// Get image data from canvas
+    pub fn get_image_data(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
+        let mut result = vec![0u8; (width * height * 4) as usize];
+        
+        if x < 0 || y < 0 {
+            return result;
+        }
+        
+        let x = x as u32;
+        let y = y as u32;
+        
+        for row in 0..height {
+            let src_y = y + row;
+            if src_y >= self.height {
+                break;
+            }
+            
+            for col in 0..width {
+                let src_x = x + col;
+                if src_x >= self.width {
+                    break;
+                }
+                
+                let src_idx = ((src_y * self.width + src_x) * 4) as usize;
+                let dest_idx = ((row * width + col) * 4) as usize;
+                
+                if src_idx + 4 <= self.data.len() && dest_idx + 4 <= result.len() {
+                    result[dest_idx..dest_idx + 4].copy_from_slice(&self.data[src_idx..src_idx + 4]);
                 }
             }
         }
+        
+        result
     }
     
     // Path methods

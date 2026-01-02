@@ -1,10 +1,11 @@
 //! WebGL Module
 //!
-//! WebGL 1.0 implementation.
+//! WebGL 1.0 implementation with resource pooling.
 
 pub mod context;
 pub mod framebuffer;
 pub mod extensions;
+pub mod resource_pool;
 
 pub use context::{
     WebGLRenderingContext, WebGLProgram, WebGLShader, WebGLBuffer,
@@ -20,3 +21,7 @@ pub use framebuffer::{
 pub use extensions::{
     ExtensionRegistry, OesVertexArrayObject, AngleInstancedArrays,
 };
+pub use resource_pool::{
+    WebGLResourcePool, PooledWebGLContext, PoolStats,
+};
+

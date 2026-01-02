@@ -1,6 +1,7 @@
 //! Web APIs Module
 //!
-//! URL, TextEncoder, Blob, AbortController, Geolocation, Notifications, Sensors, Push.
+//! URL, TextEncoder, Blob, AbortController, Geolocation, Notifications, Sensors, Push,
+//! Fetch API, XMLHttpRequest.
 
 pub mod url;
 pub mod encoding;
@@ -14,6 +15,8 @@ pub mod push;
 pub mod formdata;
 pub mod file_reader;
 pub mod vibration;
+pub mod fetch;
+pub mod xhr;
 
 pub use url::{JsUrl, JsUrlSearchParams};
 pub use encoding::{TextEncoder, TextDecoder};
@@ -27,3 +30,6 @@ pub use push::{PushManager, PushSubscription};
 pub use formdata::{FormData, FormDataValue, FileEntry};
 pub use file_reader::{FileReader, FileReaderState, FileReaderResult};
 pub use vibration::{VibrationController, VibrationPattern, PermissionPromptManager, PermissionType};
+pub use fetch::{Request, Response, Headers, FetchManager, HttpMethod, RequestBody, FetchResult};
+pub use xhr::{XMLHttpRequest, XhrManager, XhrReadyState, XhrResponseType, XhrResponse};
+

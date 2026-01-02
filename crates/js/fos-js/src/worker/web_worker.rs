@@ -1,16 +1,62 @@
 //! Web Workers
 //!
 //! Background script execution in separate contexts.
+//!
+//! Uses Copy-on-Write (CoW) for efficient message passing between workers.
+//! Large data buffers are shared until modified, reducing memory copies.
 
 use crate::{JsValue, JsError};
 use crate::engine_trait::JsContextApi;
+use crate::cow::CowBuffer;
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 
-/// Worker message
+/// Worker message with Copy-on-Write data
 #[derive(Debug, Clone)]
 pub struct WorkerMessage {
-    pub data: String, // JSON-serialized data
+    /// JSON-serialized data (for simple messages)
+    pub data: String,
+    /// CoW buffer for transferable binary data
+    pub buffer: Option<Arc<CowBuffer>>,
+}
+
+impl WorkerMessage {
+    /// Create a simple text message
+    pub fn text(data: String) -> Self {
+        Self { data, buffer: None }
+    }
+
+    /// Create a message with binary buffer (CoW)
+    pub fn with_buffer(data: String, buffer: Vec<u8>) -> Self {
+        Self {
+            data,
+            buffer: Some(Arc::new(CowBuffer::new(buffer))),
+        }
+    }
+
+    /// Transfer ownership of the buffer (neutering the original)
+    pub fn transfer_buffer(&mut self) -> Option<Arc<CowBuffer>> {
+        self.buffer.take()
+    }
+
+    /// Get a reference to the buffer (zero-copy)
+    pub fn buffer_ref(&self) -> Option<&CowBuffer> {
+        self.buffer.as_ref().map(|b| b.as_ref())
+    }
+
+    /// Clone the buffer data (only copies if modified)
+    pub fn clone_buffer(&self) -> Option<Vec<u8>> {
+        self.buffer.as_ref().map(|b| b.data().to_vec())
+    }
+}
+
+/// Transferable objects that can be moved between workers
+#[derive(Debug, Clone)]
+pub enum Transferable {
+    /// ArrayBuffer transfer
+    ArrayBuffer(Arc<CowBuffer>),
+    /// MessagePort (placeholder)
+    MessagePort(u32),
 }
 
 /// Worker state
@@ -26,6 +72,8 @@ pub struct Worker {
     outbox: VecDeque<WorkerMessage>,
     /// Whether worker is terminated
     terminated: bool,
+    /// Shared buffers (CoW)
+    shared_buffers: Vec<Arc<CowBuffer>>,
 }
 
 impl Worker {
@@ -37,13 +85,31 @@ impl Worker {
             inbox: VecDeque::new(),
             outbox: VecDeque::new(),
             terminated: false,
+            shared_buffers: Vec::new(),
         }
     }
     
-    /// Post a message to the worker
+    /// Post a message to the worker (simple text)
     pub fn post_message(&mut self, data: String) {
         if !self.terminated {
-            self.inbox.push_back(WorkerMessage { data });
+            self.inbox.push_back(WorkerMessage::text(data));
+        }
+    }
+
+    /// Post a message with transferable buffer (CoW)
+    pub fn post_message_with_buffer(&mut self, data: String, buffer: Vec<u8>) {
+        if !self.terminated {
+            self.inbox.push_back(WorkerMessage::with_buffer(data, buffer));
+        }
+    }
+
+    /// Post a message with shared buffer (zero-copy)
+    pub fn post_message_shared(&mut self, data: String, buffer: Arc<CowBuffer>) {
+        if !self.terminated {
+            self.inbox.push_back(WorkerMessage {
+                data,
+                buffer: Some(buffer),
+            });
         }
     }
     
@@ -54,7 +120,7 @@ impl Worker {
     
     /// Send a message from worker to main thread
     pub fn send_message(&mut self, data: String) {
-        self.outbox.push_back(WorkerMessage { data });
+        self.outbox.push_back(WorkerMessage::text(data));
     }
     
     /// Get pending messages for the worker

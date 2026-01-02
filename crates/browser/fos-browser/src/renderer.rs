@@ -90,7 +90,7 @@ impl PageRenderer {
     }
     
     /// Measure text width using the text renderer
-    pub fn measure_text(&self, text: &str, font_size: f32) -> f32 {
+    pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
         if let Some(font_id) = self.default_font {
             self.text_renderer.measure_text(text, font_id, font_size)
         } else {

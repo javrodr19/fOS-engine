@@ -18,6 +18,7 @@ pub mod audio;
 pub mod webrtc;
 pub mod codecs;
 pub mod eme;
+pub mod buffer_pool;
 
 pub use element::{
     HTMLVideoElement, HTMLAudioElement, HTMLMediaElement,

@@ -79,6 +79,10 @@ pub mod workers;
 pub mod service_worker;
 /// IndexedDB storage
 pub mod indexeddb;
+/// Web Animations with Fixed-Point timing
+pub mod web_animations;
+/// WebRTC for real-time communications
+pub mod webrtc;
 
 // ============================================================================
 // PERFORMANCE MODULES - Memory and rendering optimizations from fos-engine

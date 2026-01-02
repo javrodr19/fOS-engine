@@ -32,17 +32,20 @@ impl NavigationIntegration {
     
     /// Navigate back in history
     pub fn back(&mut self) -> Option<String> {
-        self.history.back().map(|e| e.url.clone())
+        self.history.back();
+        Some(self.history.current().url.clone())
     }
     
     /// Navigate forward in history
     pub fn forward(&mut self) -> Option<String> {
-        self.history.forward().map(|e| e.url.clone())
+        self.history.forward();
+        Some(self.history.current().url.clone())
     }
     
     /// Navigate by delta
     pub fn go(&mut self, delta: i32) -> Option<String> {
-        self.history.go(delta).map(|e| e.url.clone())
+        self.history.go(delta);
+        Some(self.history.current().url.clone())
     }
     
     /// Get history length

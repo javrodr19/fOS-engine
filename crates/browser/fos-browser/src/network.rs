@@ -48,7 +48,7 @@ impl NetworkManager {
     pub fn get_http2_connection(&mut self, host: &str) -> Option<&mut Http2Connection> {
         if !self.http2_pool.contains_key(host) {
             // Create new HTTP/2 connection
-            self.http2_pool.insert(host.to_string(), Http2Connection::new());
+            self.http2_pool.insert(host.to_string(), Http2Connection::new_client());
         }
         self.http2_pool.get_mut(host)
     }

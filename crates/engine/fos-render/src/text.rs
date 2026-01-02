@@ -112,7 +112,7 @@ impl TextRenderer {
     }
     
     /// Measure text width
-    pub fn measure_text(&self, text: &str, font_id: FontId, font_size: f32) -> f32 {
+    pub fn measure_text(&mut self, text: &str, font_id: FontId, font_size: f32) -> f32 {
         self.shaper.shape(&self.fonts, font_id, text, font_size)
             .map(|run| run.width())
             .unwrap_or(0.0)

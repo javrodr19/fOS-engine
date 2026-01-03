@@ -9,13 +9,14 @@
 //! - Border painting (solid, dashed, dotted)
 //! - Layout tree painter
 //! - Text rendering
-//! - Image rendering
+//! - Image rendering with custom decoders (PNG, JPEG, GIF, WebP, SVG)
 //! - Visual effects (box-shadow, opacity, overflow)
 //! - CSS transforms (rotate, scale, skew, translate)
 //! - CSS animations (transitions, keyframes)
 //! - CSS filters (blur, brightness, contrast, etc.)
-//! - GPU compositing and layer management
-//! - GPU rendering with wgpu (optional)
+//! - GPU compositing with tiered memory management
+//! - Tile-based rendering with pooled buffers
+//! - Copy-on-Write layer management
 
 mod canvas;
 mod paint;
@@ -36,6 +37,9 @@ pub mod webgl;
 pub mod webgpu;
 pub mod render_opt;
 pub mod gradient;
+pub mod gpu_tiered;
+pub mod tile_renderer;
+
 
 pub use canvas::Canvas;
 pub use paint::{FillStyle, StrokeStyle, Border, BorderSide, BorderStyle, BorderRadius, DashPattern};

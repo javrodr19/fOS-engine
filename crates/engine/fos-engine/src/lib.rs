@@ -44,6 +44,7 @@ pub mod alloc;
 pub mod simd;
 pub mod fixed_point;
 pub mod visibility;
+pub mod tiered_memory;
 
 // Phase 7: Compatibility Testing
 pub mod compat;
@@ -74,6 +75,7 @@ pub use alloc::{SlabAllocator, PoolAllocator, TypedPool, AllocStats};
 pub use simd::{SimdLevel, Color4, Bounds, blend_color, lerp_f32, lerp_f32x4};
 pub use fixed_point::{Fixed16, Fixed8, FixedRect};
 pub use visibility::{VisibilityState, Viewport, ElementVisibility, CullingContext};
+pub use tiered_memory::{Tier, TieredData, TieredMemory, TierViewport, NodePosition, TieredStats};
 
 // Phase 7 exports
 pub use compat::{CompatibilityTester, CompatibilityReport, TestResult, FeatureChecker};

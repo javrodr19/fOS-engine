@@ -61,6 +61,20 @@ pub mod storage;
 pub mod history;
 /// Form data handling
 pub mod forms;
+/// Form autofill with profiles
+pub mod autofill;
+/// Datalist element support
+pub mod datalist;
+/// Constraint validation API
+pub mod constraint_validation;
+/// File upload handling
+pub mod file_upload;
+/// Form history and autocomplete
+pub mod form_history;
+/// ContentEditable support
+pub mod contenteditable;
+/// Input mode and virtual keyboard
+pub mod input_mode;
 /// Cookie management
 pub mod cookies;
 /// Advanced networking (WebSocket, XHR, SSE)
@@ -230,6 +244,13 @@ pub use intern::{StringInterner, TagInterner, CssPropInterner};
 
 // Form and cookie exports
 pub use forms::{FormData, FormCollector, FormMethod};
+pub use autofill::{AutofillManager, AutofillProfile, AutofillFieldType};
+pub use datalist::{Datalist, DatalistRegistry, DatalistOption};
+pub use constraint_validation::{ValidityState as ConstraintValidityState, FormValidator, ValidatableElement};
+pub use file_upload::{FileUploadManager, FileList, FileEntry, AcceptFilter};
+pub use form_history::{FormHistoryManager, FieldKey};
+pub use contenteditable::{ContentEditor, EditCommand, EditSelection};
+pub use input_mode::{InputMode, EnterKeyHint, VirtualKeyboardManager};
 pub use cookies::{Cookie, CookieJar};
 pub use service_worker::{ServiceWorkerManager, CacheStorage};
 pub use indexeddb::{IDBFactory, IDBDatabase};

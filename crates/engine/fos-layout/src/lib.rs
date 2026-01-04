@@ -22,6 +22,7 @@ mod multicolumn;
 mod table;
 pub mod lazy;
 pub mod subgrid;
+pub mod streaming_layout;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};
@@ -48,6 +49,10 @@ pub use table::{
     build_table_structure,
 };
 pub use subgrid::{Subgrid, SubgridContext};
+pub use streaming_layout::{
+    StreamingLayoutEngine, LayoutChunk, StreamBoxType, IncrementalContext,
+    StreamLayoutBox, StreamLayoutStats, LayoutYield, ViewportPriority,
+};
 
 use fos_dom::{DomTree, NodeId, Document};
 use fos_css::computed::{ComputedStyle, Display};

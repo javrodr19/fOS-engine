@@ -33,6 +33,8 @@ pub mod url;
 pub mod template;
 pub mod tree_walker;
 pub mod range;
+pub mod compressed_dom;
+pub mod rope;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
@@ -68,6 +70,11 @@ pub use range::{Range as DomRange, Selection as DomSelection, BoundaryPoint, Ran
 pub use shadow::{ShadowRootInit, ShadowError, CowNode};
 pub use observer::{MutationObserverInit, MutationRecord, MutationType, RootMargin, IntersectionObserverEntry, ResizeObserverEntry, ResizeObserverSize, ResizeObserverBoxOptions};
 pub use custom_elements::{CustomElementOptions, LifecycleCallback, LifecycleCallbackInfo, CallbackQueue, ElementInternals, UpgradeCandidate};
+pub use compressed_dom::{
+    CompressedTree, StringTable, CompressionStats, CompressedNodeType,
+    NodeInfo, DecompressedNode, DomDelta, DeltaOp, LazyDecompressor,
+};
+pub use rope::{Rope, RopeSlice, RopeBuilder, ChunkIter, LineIter};
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

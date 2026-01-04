@@ -18,6 +18,7 @@ pub mod rule_tree;
 pub mod inheritance;
 pub mod selector_opt;
 pub mod transitions;
+pub mod style_sharing;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
@@ -50,6 +51,10 @@ pub use selector_opt::{SelectorIndex, RtlMatcher, HybridSelector, CompiledSelect
 pub use transitions::{
     Transition, ActiveTransition, TransitionEngine,
     TimingFunction, StepPosition, Fixed16 as TransitionFixed16,
+};
+pub use style_sharing::{
+    StyleSharingCache, StyleKey, SharedStyleRef, SharingStats,
+    StyleBloomKey, StyleHasher, ElementContext as SharingElementContext,
 };
 
 /// Parse a CSS stylesheet

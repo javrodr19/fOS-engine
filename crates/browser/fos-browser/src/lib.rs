@@ -124,6 +124,12 @@ pub mod simd;
 pub mod visibility;
 /// String interning
 pub mod intern;
+/// Speculative parsing for resource discovery
+pub mod speculative_parser;
+/// Frame scheduling and budget management
+pub mod frame_scheduler;
+/// Tab hibernation for memory efficiency
+pub mod hibernation;
 
 // ============================================================================
 // OPTIONAL MODULES - Feature-gated for smaller binary size
@@ -241,6 +247,9 @@ pub use cow::{Cow, CowBuffer, CowString, BumpAllocator};
 pub use simd::{SimdLevel, Color4, Bounds, blend_color};
 pub use visibility::{VisibilityState, Viewport, CullingContext};
 pub use intern::{StringInterner, TagInterner, CssPropInterner};
+pub use speculative_parser::{SpeculativeParser, SpeculativeHint, ResourceType as SpecResourceType, Priority as SpecPriority, PreloadQueue};
+pub use frame_scheduler::{FrameScheduler, FramePhase, FrameBudget, FrameStats, TaskPriority, IdleDeadline};
+pub use hibernation::{TabHibernator, HibernationState, TabSnapshot, HibernationPolicy, MemoryPressure, HibernationStats};
 
 // Form and cookie exports
 pub use forms::{FormData, FormCollector, FormMethod};

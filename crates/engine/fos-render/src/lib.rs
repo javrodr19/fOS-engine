@@ -39,6 +39,8 @@ pub mod render_opt;
 pub mod gradient;
 pub mod gpu_tiered;
 pub mod tile_renderer;
+pub mod partial_invalidation;
+pub mod layer_cache;
 
 
 pub use canvas::Canvas;
@@ -72,6 +74,14 @@ pub use gradient::{
     Gradient, ColorStop, GradientDirection, RadialShape, RadialExtent,
     fill_gradient, fill_linear_gradient, fill_radial_gradient, fill_conic_gradient,
     parse_gradient,
+};
+pub use partial_invalidation::{
+    PartialInvalidationTracker, InvalidationFlags, InvalidationScope,
+    DirtyRegion, LayerInvalidation, PropertyInvalidation, NodeInvalidation, InvalidationStats,
+};
+pub use layer_cache::{
+    LayerTreeCache, LayerCacheKey, CachedLayer, CacheStats,
+    LayerTree, Layer,
 };
 
 /// Color (RGBA)

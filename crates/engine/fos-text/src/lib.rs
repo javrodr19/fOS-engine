@@ -14,6 +14,7 @@ pub mod layout;
 pub mod render;
 pub mod glyph_atlas;
 pub mod ruby;
+pub mod mmap_resources;
 
 pub use font::{FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery};
 pub use shaping::{TextShaper, ShapedGlyph, ShapedRun};
@@ -21,6 +22,7 @@ pub use layout::{TextLayout, LineBreaker, ParagraphLayout};
 pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph};
 pub use glyph_atlas::{GlyphAtlasCache, GlyphInfo};
 pub use ruby::{RubyAnnotation, RubyContainer, RubyStyle};
+pub use mmap_resources::{MappedFont, MappingPool, MappingStats, MappedResource};
 
 /// Text rendering error types
 #[derive(Debug, thiserror::Error)]

@@ -6,6 +6,12 @@
 mod parser;
 pub mod preload;
 pub mod serializer;
+pub mod incremental_parser;
+
+pub use incremental_parser::{
+    IncrementalParser, IncrementalTokenizer, Token, TokenizerState,
+    ParsePhase, ParseYield, ChunkBoundary, ParsedNode, ParsedNodeContent,
+};
 
 pub use parser::HtmlParser;
 pub use fos_dom::{Document, DomTree, Node, NodeId};

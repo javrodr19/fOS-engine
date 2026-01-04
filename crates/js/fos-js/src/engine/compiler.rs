@@ -13,6 +13,10 @@ pub struct Compiler {
     scope_depth: u32,
     loop_start: Option<usize>,
     loop_exit: Vec<usize>,
+    /// Track if we're inside a function/method (for this binding)
+    in_function: bool,
+    /// Track if we're inside a class (for super binding)
+    in_class: bool,
 }
 
 struct Local {
@@ -50,6 +54,8 @@ impl Compiler {
             scope_depth: 0,
             loop_start: None,
             loop_exit: Vec::new(),
+            in_function: false,
+            in_class: false,
         }
     }
     
@@ -142,7 +148,9 @@ impl Compiler {
                 }
             }
             AstNodeKind::ThisExpression => {
-                self.bytecode.emit(Opcode::LoadUndefined); // TODO: Proper this binding
+                // Emit LoadThis to push current `this` binding onto stack
+                // In global scope, this is undefined (strict mode) or global object
+                self.bytecode.emit(Opcode::LoadThis);
             }
             AstNodeKind::BinaryExpression { operator, left, right } => {
                 // === CONSTANT FOLDING OPTIMIZATION ===
@@ -492,8 +500,9 @@ impl Compiler {
                 }
             }
             AstNodeKind::SuperExpression => {
-                // TODO: Implement proper super reference
-                self.bytecode.emit(Opcode::LoadUndefined);
+                // Emit LoadSuper for class method super calls
+                // This pushes the parent class prototype for method lookup
+                self.bytecode.emit(Opcode::LoadSuper);
             }
             
             _ => {}

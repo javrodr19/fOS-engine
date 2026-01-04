@@ -128,6 +128,11 @@ pub enum Opcode {
     ForOfInit = 143,     // Initialize for-of loop
     ForInInit = 144,     // Initialize for-in loop (get keys)
     
+    // This/Super binding
+    LoadThis = 150,      // Load current `this` binding
+    LoadSuper = 151,     // Load super reference for method calls
+    BindThis = 152,      // Bind `this` to a function
+    
     Halt = 255,
 }
 

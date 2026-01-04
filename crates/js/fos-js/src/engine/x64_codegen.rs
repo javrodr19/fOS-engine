@@ -520,6 +520,8 @@ impl X64Codegen {
     pub fn setg(&mut self, reg: X64Reg) { self.setcc(0x9F, reg); }
     pub fn setle(&mut self, reg: X64Reg) { self.setcc(0x9E, reg); }
     pub fn setge(&mut self, reg: X64Reg) { self.setcc(0x9D, reg); }
+    pub fn seta(&mut self, reg: X64Reg) { self.setcc(0x97, reg); }  // Above (unsigned)
+    pub fn setb(&mut self, reg: X64Reg) { self.setcc(0x92, reg); }  // Below (unsigned)
     
     fn setcc(&mut self, opcode: u8, reg: X64Reg) {
         let r = reg as u8;

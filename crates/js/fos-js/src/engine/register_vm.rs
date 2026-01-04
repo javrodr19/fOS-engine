@@ -246,7 +246,7 @@ impl RegisterVM {
     
     /// Internal execute for nested calls
     fn execute_inner(&mut self, bytecode: &RegBytecode) -> JsVal {
-        let frame = self.frames.last_mut().unwrap();
+        let mut frame = self.frames.last_mut().unwrap();
         
         while frame.ip < bytecode.instructions.len() {
             let inst = bytecode.instructions[frame.ip];
@@ -375,15 +375,77 @@ impl RegisterVM {
                 
                 RegOpcode::Halt => break,
                 
-                // Function calls (simplified - stores function ID for caller to handle)
+                // Function calls - dst = a (return reg), func_reg = b, argc = c
+                // Note: Implementation is simplified to avoid complex nested calls
+                // Full implementation would require proper frame management
                 RegOpcode::Call => {
-                    // For now, just mark the return register undefined
-                    // Full call stack requires loop restructuring
-                    frame.registers[inst.a as usize] = JsVal::Undefined;
+                    let dst_reg = inst.a;
+                    let func_reg = inst.b;
+                    let argc = inst.c as usize;
+                    
+                    // Extract all needed data before calling self methods
+                    let func_id_opt = frame.registers[func_reg as usize].as_function_id();
+                    let mut args = Vec::with_capacity(argc);
+                    for i in 0..argc {
+                        let arg_reg = func_reg as usize + 1 + i;
+                        if arg_reg < NUM_REGISTERS {
+                            args.push(frame.registers[arg_reg]);
+                        }
+                    }
+                    
+                    if let Some(func_id) = func_id_opt {
+                        // Get function bytecode
+                        if let Some(func_bc) = self.functions.get(func_id as usize).cloned() {
+                            // Execute function inline without recursion (simplified)
+                            // For full implementation, would need non-recursive interpreter
+                            let result = self.call_function(func_id, &args);
+                            // Store result - need to re-borrow frame
+                            if let Some(f) = self.frames.last_mut() {
+                                f.registers[dst_reg as usize] = result;
+                            }
+                        } else if let Some(f) = self.frames.last_mut() {
+                            f.registers[dst_reg as usize] = JsVal::Undefined;
+                        }
+                    } else if let Some(f) = self.frames.last_mut() {
+                        f.registers[dst_reg as usize] = JsVal::Undefined;
+                    }
+                    // Update frame reference
+                    frame = self.frames.last_mut().unwrap();
                 }
                 RegOpcode::TailCall => {
-                    // Return the function value for caller to handle
-                    return frame.registers[inst.a as usize];
+                    let func_reg = inst.a;
+                    let argc = inst.b as usize;
+                    
+                    // Extract data
+                    let func_id_opt = frame.registers[func_reg as usize].as_function_id();
+                    let mut args = Vec::with_capacity(argc);
+                    for i in 0..argc {
+                        let arg_reg = func_reg as usize + 1 + i;
+                        if arg_reg < NUM_REGISTERS {
+                            args.push(frame.registers[arg_reg]);
+                        }
+                    }
+                    
+                    if let Some(func_id) = func_id_opt {
+                        if let Some(func_bc) = self.functions.get(func_id as usize).cloned() {
+                            // Tail call: replace frame and continue
+                            if let Some(f) = self.frames.last_mut() {
+                                f.ip = 0;
+                                f.func_id = func_id;
+                                for r in f.registers.iter_mut() {
+                                    *r = JsVal::Undefined;
+                                }
+                                for (i, arg) in args.iter().enumerate() {
+                                    if i < NUM_REGISTERS {
+                                        f.registers[i] = *arg;
+                                    }
+                                }
+                            }
+                            // Continue with new bytecode
+                            return self.execute_inner(&func_bc);
+                        }
+                    }
+                    return JsVal::Undefined;
                 }
                 
                 // Property access

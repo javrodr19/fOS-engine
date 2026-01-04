@@ -87,6 +87,9 @@ pub struct VirtualMachine {
     event_loop: EventLoop,
     promises: Vec<JsPromise>,
     pending_microtasks: Vec<u32>, // Callback IDs to execute
+    // This/Super bindings
+    this_binding: JsVal,
+    super_binding: Option<JsVal>,
 }
 
 impl Default for VirtualMachine {
@@ -108,6 +111,8 @@ impl VirtualMachine {
             event_loop: EventLoop::new(),
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
+            this_binding: JsVal::Undefined, // Global scope this is undefined in strict mode
+            super_binding: None,
         }
     }
     
@@ -182,6 +187,21 @@ impl VirtualMachine {
                 Opcode::LoadFalse => self.stack.push(JsVal::Bool(false)),
                 Opcode::LoadZero => self.stack.push(JsVal::Number(0.0)),
                 Opcode::LoadOne => self.stack.push(JsVal::Number(1.0)),
+                
+                // This/Super bindings
+                Opcode::LoadThis => {
+                    self.stack.push(self.this_binding);
+                }
+                Opcode::LoadSuper => {
+                    let super_val = self.super_binding.unwrap_or(JsVal::Undefined);
+                    self.stack.push(super_val);
+                }
+                Opcode::BindThis => {
+                    // Bind the top of stack as `this` to a function
+                    if let Some(this_val) = self.stack.pop() {
+                        self.this_binding = this_val;
+                    }
+                }
                 
                 // Variables
                 Opcode::GetLocal => {
@@ -462,6 +482,20 @@ impl VirtualMachine {
                 Opcode::LoadFalse => self.stack.push(JsVal::Bool(false)),
                 Opcode::LoadZero => self.stack.push(JsVal::Number(0.0)),
                 Opcode::LoadOne => self.stack.push(JsVal::Number(1.0)),
+                
+                // This/Super bindings
+                Opcode::LoadThis => {
+                    self.stack.push(self.this_binding);
+                }
+                Opcode::LoadSuper => {
+                    let super_val = self.super_binding.unwrap_or(JsVal::Undefined);
+                    self.stack.push(super_val);
+                }
+                Opcode::BindThis => {
+                    if let Some(this_val) = self.stack.pop() {
+                        self.this_binding = this_val;
+                    }
+                }
                 
                 Opcode::GetLocal => {
                     let slot = self.read_u16(bytecode, &mut ip) as usize;

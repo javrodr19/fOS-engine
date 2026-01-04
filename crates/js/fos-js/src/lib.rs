@@ -44,6 +44,7 @@ pub mod jit_bytecode;
 
 pub use engine_trait::{JsEngine, JsContextApi, JsObjectHandle, JsFunctionHandle, NativeFunctionRegistry};
 pub use stub_engine::{StubEngine, StubContext};
+pub use engine::{CustomEngine, CustomContext};
 pub use timers::TimerManager;
 pub use storage::Storage;
 pub use history::HistoryManager;
@@ -129,27 +130,27 @@ pub enum JsError {
 
 /// Execute JavaScript code
 pub fn eval(code: &str) -> Result<JsValue, JsError> {
-    let engine = StubEngine::new();
+    let engine = CustomEngine::new();
     engine.eval(code)
 }
 
 /// JavaScript runtime wrapper
 pub struct JsRuntime {
-    engine: Arc<StubEngine>,
+    engine: Arc<CustomEngine>,
 }
 
 impl JsRuntime {
     /// Create a new JavaScript runtime
     pub fn new() -> Result<Self, JsError> {
-        tracing::info!("Creating JavaScript runtime");
+        tracing::info!("Creating JavaScript runtime with CustomEngine");
         Ok(Self {
-            engine: Arc::new(StubEngine::new()),
+            engine: Arc::new(CustomEngine::new()),
         })
     }
     
     /// Create runtime with custom memory limit (in bytes)
     pub fn with_memory_limit(limit: usize) -> Result<Self, JsError> {
-        let engine = Arc::new(StubEngine::new());
+        let engine = Arc::new(CustomEngine::new());
         engine.set_memory_limit(limit);
         Ok(Self { engine })
     }
@@ -178,8 +179,8 @@ impl Default for JsRuntime {
 
 /// JavaScript context with all browser APIs installed
 pub struct JsContext {
-    engine: Arc<StubEngine>,
-    context: StubContext,
+    engine: Arc<CustomEngine>,
+    context: CustomContext,
     timers: Arc<Mutex<TimerManager>>,
 }
 
@@ -191,8 +192,8 @@ impl JsContext {
     
     /// Create context with a specific URL
     pub fn with_url(document: Arc<Mutex<Document>>, url: &str) -> Result<Self, JsError> {
-        let engine = Arc::new(StubEngine::new());
-        let context = StubContext::new(engine.clone());
+        let engine = Arc::new(CustomEngine::new());
+        let context = CustomContext::new(engine.clone());
         let timers = Arc::new(Mutex::new(TimerManager::new()));
         
         // Create storage
@@ -249,7 +250,7 @@ mod tests {
     
     #[test]
     fn test_eval_simple() {
-        let result = eval("1 + 1").unwrap();
+        let result = eval("1 + 1;").unwrap();
         match result {
             JsValue::Number(n) => assert_eq!(n, 2.0),
             _ => panic!("Expected number"),
@@ -258,7 +259,7 @@ mod tests {
     
     #[test]
     fn test_eval_string() {
-        let result = eval("\"hello\"").unwrap();
+        let result = eval("\"hello\";").unwrap();
         match result {
             JsValue::String(s) => assert_eq!(s, "hello"),
             _ => panic!("Expected string"),
@@ -267,14 +268,14 @@ mod tests {
     
     #[test]
     fn test_eval_bool() {
-        assert!(matches!(eval("true").unwrap(), JsValue::Bool(true)));
-        assert!(matches!(eval("false").unwrap(), JsValue::Bool(false)));
+        assert!(matches!(eval("true;").unwrap(), JsValue::Bool(true)));
+        assert!(matches!(eval("false;").unwrap(), JsValue::Bool(false)));
     }
     
     #[test]
     fn test_js_runtime() {
         let runtime = JsRuntime::new().unwrap();
-        let result = runtime.eval("10 * 5").unwrap();
+        let result = runtime.eval("10 * 5;").unwrap();
         match result {
             JsValue::Number(n) => assert_eq!(n, 50.0),
             _ => panic!("Expected number"),

@@ -1,6 +1,6 @@
 //! Image decoder for various formats
 //!
-//! Supports PNG, JPEG, GIF, WebP via custom from-scratch decoders.
+//! Supports PNG, JPEG, GIF, WebP, AVIF via custom from-scratch decoders.
 
 use super::decoders::{self, DecodeError};
 
@@ -11,6 +11,7 @@ pub enum ImageFormat {
     Jpeg,
     Gif,
     WebP,
+    Avif,
     Unknown,
 }
 
@@ -41,6 +42,14 @@ impl ImageFormat {
             return Self::WebP;
         }
         
+        // AVIF: ftyp box with avif/avis/mif1 brand
+        if data.len() >= 12 && &data[4..8] == b"ftyp" {
+            let brand = &data[8..12];
+            if brand == b"avif" || brand == b"avis" || brand == b"mif1" {
+                return Self::Avif;
+            }
+        }
+        
         Self::Unknown
     }
     
@@ -51,6 +60,7 @@ impl ImageFormat {
             "jpg" | "jpeg" => Self::Jpeg,
             "gif" => Self::Gif,
             "webp" => Self::WebP,
+            "avif" => Self::Avif,
             _ => Self::Unknown,
         }
     }

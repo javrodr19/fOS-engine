@@ -1,7 +1,7 @@
 //! Custom Image Decoders
 //!
 //! From-scratch image decoders with SIMD acceleration.
-//! Supports PNG, JPEG, GIF, and WebP.
+//! Supports PNG, JPEG, GIF, WebP, and AVIF.
 
 mod simd;
 mod deflate;
@@ -9,6 +9,7 @@ mod png;
 mod jpeg;
 mod gif;
 mod webp;
+pub mod avif;
 
 pub use simd::SimdOps;
 pub use deflate::{Inflate, DeflateError};
@@ -16,6 +17,7 @@ pub use png::{PngDecoder, PngError};
 pub use jpeg::{JpegDecoder, JpegError};
 pub use gif::{GifDecoder, GifError, GifFrame};
 pub use webp::{WebpDecoder, WebpError};
+pub use avif::{AvifDecoder, AvifError, AvifImage, is_avif};
 
 use super::{DecodedImage, ImageFormat};
 
@@ -26,6 +28,7 @@ pub enum DecodeError {
     Jpeg(JpegError),
     Gif(GifError),
     Webp(WebpError),
+    Avif(AvifError),
     UnsupportedFormat,
     InvalidData,
 }
@@ -37,6 +40,7 @@ impl std::fmt::Display for DecodeError {
             Self::Jpeg(e) => write!(f, "JPEG: {}", e),
             Self::Gif(e) => write!(f, "GIF: {}", e),
             Self::Webp(e) => write!(f, "WebP: {}", e),
+            Self::Avif(e) => write!(f, "AVIF: {}", e),
             Self::UnsupportedFormat => write!(f, "Unsupported format"),
             Self::InvalidData => write!(f, "Invalid image data"),
         }
@@ -59,6 +63,10 @@ impl From<GifError> for DecodeError {
 
 impl From<WebpError> for DecodeError {
     fn from(e: WebpError) -> Self { Self::Webp(e) }
+}
+
+impl From<AvifError> for DecodeError {
+    fn from(e: AvifError) -> Self { Self::Avif(e) }
 }
 
 /// Decode image bytes to RGBA pixels
@@ -106,6 +114,16 @@ pub fn decode_format(data: &[u8], format: ImageFormat) -> Result<DecodedImage, D
         }
         ImageFormat::WebP => {
             let mut decoder = WebpDecoder::new();
+            let img = decoder.decode(data)?;
+            Ok(DecodedImage {
+                pixels: img.pixels,
+                width: img.width,
+                height: img.height,
+                format,
+            })
+        }
+        ImageFormat::Avif => {
+            let mut decoder = AvifDecoder::new();
             let img = decoder.decode(data)?;
             Ok(DecodedImage {
                 pixels: img.pixels,

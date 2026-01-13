@@ -143,7 +143,7 @@ impl CustomFontDatabase {
                     self.scan_directory(&path);
                 } else if let Some(ext) = path.extension() {
                     let ext = ext.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc" | "woff") {
+                    if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc" | "woff" | "woff2") {
                         let _ = self.load_font_file(&path);
                     }
                 }
@@ -169,10 +169,13 @@ impl CustomFontDatabase {
     fn load_font_data_with_source(&mut self, data: Vec<u8>, source: FontSource) -> Result<Vec<FontId>> {
         let mut ids = Vec::new();
         
-        // Check for WOFF and decode
-        let data = if super::woff::is_woff(&data) {
+        // Check for WOFF2 or WOFF1 and decode
+        let data = if super::woff2::is_woff2(&data) {
+            super::woff2::decode_woff2(&data)
+                .ok_or_else(|| TextError::FontParsing("Failed to decode WOFF2".into()))?
+        } else if super::woff::is_woff(&data) {
             super::woff::decode_woff(&data)
-                .ok_or_else(|| TextError::FontParsing("Failed to decode WOFF".into()))?
+                .ok_or_else(|| TextError::FontParsing("Failed to decode WOFF1".into()))?
         } else {
             data
         };

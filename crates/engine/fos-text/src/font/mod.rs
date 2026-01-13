@@ -4,8 +4,14 @@
 
 // Custom parser (replaces ttf-parser)
 pub mod parser;
-// WOFF decoder
+// WOFF1 decoder
 pub mod woff;
+// WOFF2 decoder (Brotli + transforms)
+pub mod woff2;
+// WOFF2 optimizations (streaming, caching, mmap)
+pub mod woff2_optimize;
+mod brotli;
+mod woff2_transforms;
 // String interning for font names
 mod intern;
 // Arena allocator for efficient parsing

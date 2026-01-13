@@ -1,12 +1,13 @@
 //! HTTP Client
 //!
-//! Main HTTP client integrating TCP, TLS, HTTP/1.1, HTTP/2, and cookies.
+//! Main HTTP client integrating TCP, TLS, HTTP/1.1, HTTP/2, HTTP/3, and cookies.
 //! Replaces reqwest with a custom zero-dependency implementation.
 
 use std::io::{self, BufReader, Read, Write};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::net::SocketAddr;
 
 use crate::tcp::{TcpConnection, TcpConfig};
 use crate::tls::{TlsStream, TlsConfig, TlsState};
@@ -14,6 +15,13 @@ use crate::http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
 use crate::http2::{Http2Connection, Frame, Http2Event, Http2Error};
 use crate::cookies::{CookieJar, Cookie};
 use crate::connection_pool::{ConnectionPool, HostKey, PoolConfig, AcquireResult, ConnId};
+use crate::quic::{
+    QuicConnection, ConnectionState, QuicStream,
+    QpackEncoder, QpackDecoder,
+    AltSvc, AltSvcCache, AltSvcEntry,
+    Http3Frame, Http3Setting,
+    PushManager, PushState,
+};
 use crate::{Response, NetError};
 
 /// HTTP client configuration
@@ -33,6 +41,12 @@ pub struct ClientConfig {
     pub keep_alive: bool,
     /// Default headers
     pub default_headers: Vec<(String, String)>,
+    /// Enable HTTP/3 (when available via Alt-Svc)
+    pub http3_enabled: bool,
+    /// Prefer HTTP/3 over HTTP/2
+    pub prefer_http3: bool,
+    /// HTTP/3 idle timeout
+    pub http3_idle_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +59,9 @@ impl Default for ClientConfig {
             cookies_enabled: true,
             keep_alive: true,
             default_headers: Vec::new(),
+            http3_enabled: true,
+            prefer_http3: false,
+            http3_idle_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -91,6 +108,18 @@ impl HttpClientBuilder {
         self
     }
     
+    /// Enable or disable HTTP/3 support
+    pub fn http3(mut self, enabled: bool) -> Self {
+        self.config.http3_enabled = enabled;
+        self
+    }
+    
+    /// Prefer HTTP/3 over HTTP/2 when available
+    pub fn prefer_http3(mut self, prefer: bool) -> Self {
+        self.config.prefer_http3 = prefer;
+        self
+    }
+    
     pub fn build(self) -> HttpClient {
         HttpClient::with_config(self.config)
     }
@@ -110,6 +139,8 @@ pub struct HttpClient {
     cookies: CookieJar,
     /// Connection pool
     pool: ConnectionPool,
+    /// Alt-Svc cache for HTTP/3 discovery
+    alt_svc_cache: AltSvcCache,
 }
 
 impl HttpClient {
@@ -134,6 +165,7 @@ impl HttpClient {
             config,
             cookies: CookieJar::new(),
             pool: ConnectionPool::new(pool_config),
+            alt_svc_cache: AltSvcCache::new(),
         }
     }
     
@@ -245,9 +277,26 @@ impl HttpClient {
     
     fn execute_request(&mut self, url: &UrlParts, req: Http1Request) -> Result<Response, NetError> {
         let port = url.port.unwrap_or(if url.is_https { 443 } else { 80 });
-        let addr = format!("{}:{}", url.host, port);
+        let origin = format!("{}:{}", url.host, port);
         
-        // Connect
+        // Check Alt-Svc cache for HTTP/3 support
+        if self.config.http3_enabled && url.is_https {
+            if let Some(alt_entry) = self.alt_svc_cache.get_h3(&url.host) {
+                // Try HTTP/3
+                let h3_host = alt_entry.effective_host(&url.host);
+                let h3_port = alt_entry.port;
+                
+                match self.try_http3(h3_host, h3_port, url, &req) {
+                    Ok(response) => return Ok(response),
+                    Err(_) => {
+                        // Fall back to HTTP/2 or HTTP/1.1
+                    }
+                }
+            }
+        }
+        
+        // Connect via TCP
+        let addr = format!("{}:{}", url.host, port);
         let tcp_config = TcpConfig {
             connect_timeout: self.config.connect_timeout,
             read_timeout: Some(self.config.request_timeout),
@@ -255,7 +304,7 @@ impl HttpClient {
             ..Default::default()
         };
         
-        let mut stream = TcpConnection::connect_with_config(&addr, tcp_config)
+        let stream = TcpConnection::connect_with_config(&addr, tcp_config)
             .map_err(|e| NetError::Network(format!("Connection failed: {}", e)))?;
         
         if url.is_https {
@@ -264,14 +313,53 @@ impl HttpClient {
                 .map_err(|e| NetError::Network(format!("TLS failed: {}", e)))?;
             
             // Check ALPN for HTTP/2
-            if tls.is_h2() {
-                self.send_and_receive_h2(tls, &url, req)
+            let response = if tls.is_h2() {
+                self.send_and_receive_h2(tls, &url, req)?
             } else {
-                self.send_and_receive_tls(tls, req)
+                self.send_and_receive_tls(tls, req)?
+            };
+            
+            // Parse Alt-Svc header for future HTTP/3 discovery
+            if self.config.http3_enabled {
+                for (name, value) in &response.headers {
+                    if name.eq_ignore_ascii_case("alt-svc") {
+                        if let Some(alt_svc) = AltSvc::parse(value) {
+                            self.alt_svc_cache.insert(&url.host, alt_svc);
+                        }
+                    }
+                }
             }
+            
+            Ok(response)
         } else {
             self.send_and_receive_tcp(stream, req)
         }
+    }
+    
+    /// Try HTTP/3 connection (returns error if not available)
+    fn try_http3(&self, _host: &str, _port: u16, _url: &UrlParts, _req: &Http1Request) -> Result<Response, NetError> {
+        // HTTP/3 requires async UDP - for now, return error to fall back
+        // Full implementation would use smol::block_on with UdpSocket
+        Err(NetError::Network("HTTP/3 requires async runtime".into()))
+    }
+    
+    /// Send HTTP/3 request (for future async implementation)
+    #[allow(dead_code)]
+    fn build_h3_request(&self, url: &UrlParts, req: &Http1Request) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (":method".to_string(), req.method.clone()),
+            (":scheme".to_string(), if url.is_https { "https" } else { "http" }.to_string()),
+            (":authority".to_string(), url.host_with_port()),
+            (":path".to_string(), url.path_and_query()),
+        ];
+        
+        for (name, value) in &req.headers {
+            if !name.starts_with(':') && !name.eq_ignore_ascii_case("host") {
+                headers.push((name.to_lowercase(), value.clone()));
+            }
+        }
+        
+        headers
     }
     
     fn send_and_receive_tcp(&self, mut stream: TcpConnection, req: Http1Request) -> Result<Response, NetError> {

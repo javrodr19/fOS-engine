@@ -11,6 +11,7 @@ pub mod beacon;
 pub mod http2;
 pub mod xhr;
 pub mod http3;
+pub mod quic;
 pub mod network_opt;
 pub mod connection_pool;
 pub mod tcp;
@@ -33,7 +34,15 @@ pub use sse::{EventSource, EventSourceState, SseEvent};
 pub use beacon::{send_beacon, BeaconData};
 pub use http2::{Http2Connection, Stream as Http2Stream, Settings as Http2Settings, Frame as Http2Frame, Http2Error, Http2Event, HpackEncoder, HpackDecoder};
 pub use xhr::{XmlHttpRequest, ReadyState, ResponseType, XhrError, FormData, FormDataValue};
-pub use http3::{QuicConnection, Http3Connection, QuicError};
+pub use http3::{QuicConnection as Http3QuicConnection, Http3Connection, QuicError};
+pub use quic::{
+    UdpSocket as QuicUdpSocket, Datagram, EcnMark,
+    QuicPacket, PacketType, LongHeader, ShortHeader, PacketHeader,
+    Frame as QuicFrame, ConnectionId,
+    QuicCrypto, QuicConnection, ConnectionState,
+    QuicStream, StreamState, FlowController, CubicController, LossDetection,
+    QpackEncoder, QpackDecoder,
+};
 pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};
 pub use connection_pool::{ConnectionPool, PooledConnection, PoolConfig, HostKey, AcquireResult};
 pub use client::{HttpClient, HttpClientBuilder, ClientConfig};
@@ -42,10 +51,11 @@ pub use tcp::{TcpConnection, TcpConfig, BufferedTcpConnection};
 pub use tls::{TlsStream, TlsConfig, TlsState};
 pub use http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
 pub use cors::{CorsHandler, CorsCheck, CorsMode, CredentialsMode, CorsError, PreflightRequest, PreflightResponse, Origin as CorsOrigin};
-pub use streaming::{StreamingBody, StreamIterator, StreamState, TransferEncoding, ProgressBody, detect_encoding};
+pub use streaming::{StreamingBody, StreamIterator, StreamState as StreamingState, TransferEncoding, ProgressBody, detect_encoding};
 pub use priority::{RequestPriority, PriorityQueue, PrioritizedRequest, ResourceType, BandwidthHints, QueueStats};
 pub use brotli_dict::{BrotliSharedDict, DictId, DictionaryBuilder, BrotliDecompressor, DictCache};
 pub use request_dedup::{RequestDeduplicator, RequestKey, DeduplicatedResponse, DeduplicationStats, SimpleDeduplicator};
+
 
 
 /// HTTP Response

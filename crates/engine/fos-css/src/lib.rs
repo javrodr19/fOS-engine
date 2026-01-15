@@ -19,6 +19,7 @@ pub mod inheritance;
 pub mod selector_opt;
 pub mod transitions;
 pub mod style_sharing;
+pub mod selector_match_cache;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;
@@ -55,6 +56,9 @@ pub use transitions::{
 pub use style_sharing::{
     StyleSharingCache, StyleKey, SharedStyleRef, SharingStats,
     StyleBloomKey, StyleHasher, ElementContext as SharingElementContext,
+};
+pub use selector_match_cache::{
+    SelectorMatchCache, SelectorMatchKey, BloomFilter, MatchCacheStats,
 };
 
 /// Parse a CSS stylesheet

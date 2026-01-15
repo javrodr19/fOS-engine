@@ -130,6 +130,8 @@ pub mod speculative_parser;
 pub mod frame_scheduler;
 /// Tab hibernation for memory efficiency
 pub mod hibernation;
+/// Unified cache manager for multi-level caching
+pub mod cache_manager;
 
 // ============================================================================
 // OPTIONAL MODULES - Feature-gated for smaller binary size
@@ -250,6 +252,7 @@ pub use intern::{StringInterner, TagInterner, CssPropInterner};
 pub use speculative_parser::{SpeculativeParser, SpeculativeHint, ResourceType as SpecResourceType, Priority as SpecPriority, PreloadQueue};
 pub use frame_scheduler::{FrameScheduler, FramePhase, FrameBudget, FrameStats, TaskPriority, IdleDeadline};
 pub use hibernation::{TabHibernator, HibernationState, TabSnapshot, HibernationPolicy, MemoryPressure, HibernationStats};
+pub use cache_manager::{CacheManager, CacheManagerStats, CacheStats, LruCache, DomCache, CacheType};
 
 // Form and cookie exports
 pub use forms::{FormData, FormCollector, FormMethod};

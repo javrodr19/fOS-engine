@@ -38,6 +38,7 @@ pub mod integration;
 pub mod inline_cache;
 pub mod jit;
 pub mod bytecode_cache;
+pub mod wasm_module_cache;
 pub mod simd_ops;
 pub mod object_pool;
 pub mod optimizer;

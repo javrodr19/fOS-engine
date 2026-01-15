@@ -26,6 +26,7 @@ pub mod streaming;
 pub mod priority;
 pub mod brotli_dict;
 pub mod request_dedup;
+pub mod predictive_cache;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
@@ -55,6 +56,8 @@ pub use streaming::{StreamingBody, StreamIterator, StreamState as StreamingState
 pub use priority::{RequestPriority, PriorityQueue, PrioritizedRequest, ResourceType, BandwidthHints, QueueStats};
 pub use brotli_dict::{BrotliSharedDict, DictId, DictionaryBuilder, BrotliDecompressor, DictCache};
 pub use request_dedup::{RequestDeduplicator, RequestKey, DeduplicatedResponse, DeduplicationStats, SimpleDeduplicator};
+pub use predictive_cache::{PredictiveCache, PredictiveCacheStats, MarkovChain, NormalizedUrl, PrefetchRequest};
+pub use cache::{CacheResult, CacheValidators, CacheEntry, HttpCache, CacheStats, CachePartitionKey};
 
 
 

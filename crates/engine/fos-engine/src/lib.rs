@@ -52,6 +52,14 @@ pub mod compat;
 // Phase 21: Advanced Memory Optimization
 pub mod advanced_mem;
 
+// Architecture Roadmap: Multi-Process Architecture
+pub mod process;
+pub mod ipc;
+pub mod thread;
+pub mod interface;
+pub mod startup;
+pub mod budget;
+
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;
@@ -79,6 +87,32 @@ pub use tiered_memory::{Tier, TieredData, TieredMemory, TierViewport, NodePositi
 
 // Phase 7 exports
 pub use compat::{CompatibilityTester, CompatibilityReport, TestResult, FeatureChecker};
+
+// Architecture exports
+pub use process::{
+    ProcessArchitecture, ProcessType, ProcessId, ProcessState, ProcessArgs, TabId,
+    BrowserProcess, TabInfo, RendererProcess, NetworkProcess, GpuProcess, StorageProcess,
+};
+pub use ipc::{
+    IpcMessage, InlineMessage, SharedMemRef, TypedMessage, MessageType,
+    IpcChannel, ChannelState, IpcListener,
+    SharedMemHandle, SharedMemPool,
+    IpcSerialize, IpcError, MessageFrame,
+};
+pub use thread::{
+    ThreadPool, IoThread, CompositorThread, AudioThread, ThreadPoolArchitecture,
+    Scheduler, Task, TaskPriority, PendingCounts, SchedulerStats,
+};
+pub use interface::{
+    FrameHost, FrameHostProxy, InProcessFrameHost, NavigationResult, NavigationError, JsValue, LoadEvent,
+    NavigationController, NavigationEntry, NavigationState, NavigationTiming,
+};
+pub use startup::{
+    StartupOptimizer, StartupConfig, StartupPhase, StartupTiming, StartupReport,
+    LazyInit, Subsystem,
+    StartupProfile, FrequentOrigin, ProfileGuidedInit,
+};
+pub use budget::{MemoryBudget, MemoryMonitor, MemoryPressureLevel, TabMemoryUsage};
 
 // Re-export core sub-crates (always included)
 pub use fos_html as html;

@@ -60,6 +60,11 @@ pub mod interface;
 pub mod startup;
 pub mod budget;
 
+// Concurrency Optimization
+pub mod concurrent_map;
+pub mod lockfree_queue;
+pub mod parallel;
+
 pub use engine::Engine;
 pub use page::Page;
 pub use config::Config;
@@ -113,6 +118,15 @@ pub use startup::{
     StartupProfile, FrequentOrigin, ProfileGuidedInit,
 };
 pub use budget::{MemoryBudget, MemoryMonitor, MemoryPressureLevel, TabMemoryUsage};
+
+// Concurrency exports
+pub use concurrent_map::{ConcurrentMap, ConcurrentSet};
+pub use lockfree_queue::{SpscQueue, MpscQueue, StealQueue};
+pub use parallel::{
+    parallel_for_each, parallel_for_each_ref, parallel_map, parallel_map_ref,
+    parallel_reduce, scope, join, parallel_chunks_mut,
+    Barrier, ParallelIterator, num_cpus,
+};
 
 // Re-export core sub-crates (always included)
 pub use fos_html as html;

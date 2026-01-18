@@ -5,6 +5,237 @@
 
 use crate::{LayoutTree, LayoutBoxId, BoxType};
 use crate::box_model::EdgeSizes;
+use std::sync::Arc;
+
+// ============================================================================
+// Parallel Intrinsic Size Computation (Phase 4.2)
+// ============================================================================
+
+/// Child intrinsic size result
+#[derive(Debug, Clone, Copy)]
+pub struct FlexChildIntrinsic {
+    /// Child box ID
+    pub box_id: LayoutBoxId,
+    /// Min-content main size
+    pub min_main: f32,
+    /// Max-content main size
+    pub max_main: f32,
+    /// Min-content cross size
+    pub min_cross: f32,
+    /// Max-content cross size
+    pub max_cross: f32,
+}
+
+/// Compute intrinsic sizes for all flex children in parallel
+/// 
+/// This function computes min-content and max-content sizes for all
+/// flex children concurrently, improving layout performance on multi-core CPUs.
+pub fn compute_flex_intrinsic_parallel(
+    tree: &LayoutTree,
+    children: &[LayoutBoxId],
+    is_row: bool,
+) -> Vec<FlexChildIntrinsic> {
+    if children.is_empty() {
+        return Vec::new();
+    }
+    
+    // For small numbers of children, compute sequentially
+    if children.len() < 4 {
+        return children.iter()
+            .map(|&box_id| compute_child_intrinsic(tree, box_id, is_row))
+            .collect();
+    }
+    
+    // Parallel computation using scoped threads
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(children.len());
+    
+    let chunk_size = (children.len() + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|s| {
+        let handles: Vec<_> = children
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk.iter()
+                        .map(|&box_id| compute_child_intrinsic(tree, box_id, is_row))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        
+        handles.into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+/// Compute intrinsic size for a single child
+fn compute_child_intrinsic(
+    tree: &LayoutTree,
+    box_id: LayoutBoxId,
+    is_row: bool,
+) -> FlexChildIntrinsic {
+    let layout_box = match tree.get(box_id) {
+        Some(b) => b,
+        None => return FlexChildIntrinsic {
+            box_id,
+            min_main: 0.0,
+            max_main: 0.0,
+            min_cross: 0.0,
+            max_cross: 0.0,
+        },
+    };
+    
+    let dims = &layout_box.dimensions;
+    
+    // For now, use content dimensions as intrinsic sizes
+    // In a full implementation, this would recursively compute nested layouts
+    let (main, cross) = if is_row {
+        (dims.content.width, dims.content.height)
+    } else {
+        (dims.content.height, dims.content.width)
+    };
+    
+    FlexChildIntrinsic {
+        box_id,
+        min_main: main.max(0.0),
+        max_main: main.max(0.0),
+        min_cross: cross.max(0.0),
+        max_cross: cross.max(0.0),
+    }
+}
+
+/// Batch compute grow/shrink for parallel flex resolution
+pub fn parallel_flex_resolve(
+    intrinsics: &[FlexChildIntrinsic],
+    styles: &[FlexItemStyle],
+    available_space: f32,
+    gap: f32,
+) -> Vec<f32> {
+    if intrinsics.is_empty() {
+        return Vec::new();
+    }
+    
+    let total_gap = gap * (intrinsics.len().saturating_sub(1)) as f32;
+    let available = available_space - total_gap;
+    
+    // Compute base sizes
+    let base_sizes: Vec<f32> = intrinsics.iter()
+        .zip(styles.iter())
+        .map(|(i, s)| match s.basis {
+            FlexBasis::Length(l) => l,
+            _ => i.max_main,
+        })
+        .collect();
+    
+    let used: f32 = base_sizes.iter().sum();
+    let free_space = available - used;
+    
+    if free_space.abs() < 0.001 {
+        return base_sizes;
+    }
+    
+    // Parallel grow/shrink computation for large item counts
+    if intrinsics.len() >= 8 {
+        return parallel_grow_shrink(&base_sizes, styles, free_space);
+    }
+    
+    // Sequential for small counts
+    sequential_grow_shrink(&base_sizes, styles, free_space)
+}
+
+fn parallel_grow_shrink(
+    base_sizes: &[f32],
+    styles: &[FlexItemStyle],
+    free_space: f32,
+) -> Vec<f32> {
+    let is_growing = free_space > 0.0;
+    
+    // Compute total factor
+    let total_factor: f32 = if is_growing {
+        styles.iter().map(|s| s.grow).sum()
+    } else {
+        styles.iter()
+            .zip(base_sizes.iter())
+            .map(|(s, b)| s.shrink * b)
+            .sum()
+    };
+    
+    if total_factor <= 0.0 {
+        return base_sizes.to_vec();
+    }
+    
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(base_sizes.len());
+    
+    let chunk_size = (base_sizes.len() + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|s| {
+        let handles: Vec<_> = base_sizes
+            .chunks(chunk_size)
+            .zip(styles.chunks(chunk_size))
+            .map(|(base_chunk, style_chunk)| {
+                s.spawn(move || {
+                    base_chunk.iter()
+                        .zip(style_chunk.iter())
+                        .map(|(&base, style)| {
+                            if is_growing {
+                                let ratio = style.grow / total_factor;
+                                base + free_space * ratio
+                            } else {
+                                let ratio = (style.shrink * base) / total_factor;
+                                (base + free_space * ratio).max(0.0)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        
+        handles.into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+fn sequential_grow_shrink(
+    base_sizes: &[f32],
+    styles: &[FlexItemStyle],
+    free_space: f32,
+) -> Vec<f32> {
+    let is_growing = free_space > 0.0;
+    
+    let total_factor: f32 = if is_growing {
+        styles.iter().map(|s| s.grow).sum()
+    } else {
+        styles.iter()
+            .zip(base_sizes.iter())
+            .map(|(s, b)| s.shrink * b)
+            .sum()
+    };
+    
+    if total_factor <= 0.0 {
+        return base_sizes.to_vec();
+    }
+    
+    base_sizes.iter()
+        .zip(styles.iter())
+        .map(|(&base, style)| {
+            if is_growing {
+                let ratio = style.grow / total_factor;
+                base + free_space * ratio
+            } else {
+                let ratio = (style.shrink * base) / total_factor;
+                (base + free_space * ratio).max(0.0)
+            }
+        })
+        .collect()
+}
 
 // ============================================================================
 // SIMD-Optimized Helpers

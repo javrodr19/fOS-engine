@@ -41,6 +41,7 @@ pub mod gpu_tiered;
 pub mod tile_renderer;
 pub mod partial_invalidation;
 pub mod layer_cache;
+pub mod parallel_compositor;
 
 
 pub use canvas::Canvas;

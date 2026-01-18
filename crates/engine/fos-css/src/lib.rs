@@ -20,6 +20,9 @@ pub mod selector_opt;
 pub mod transitions;
 pub mod style_sharing;
 pub mod selector_match_cache;
+pub mod parallel_css_parser;
+pub mod parallel_style;
+pub mod subtree_isolation;
 
 pub use parser::CssParser;
 pub use cascade::StyleResolver;

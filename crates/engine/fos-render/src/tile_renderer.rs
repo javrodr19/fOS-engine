@@ -4,7 +4,217 @@
 //! Implements viewport-based priority, tile caching, and dirty rect tracking.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+
+// ============================================================================
+// Parallel Tile Rasterization (Phase 5.1)
+// ============================================================================
+
+/// Display list item for rasterization
+pub trait DisplayItem: Send + Sync {
+    /// Render this item to a pixel buffer
+    fn render(&self, buffer: &mut [u8], width: u32, height: u32, offset_x: f64, offset_y: f64);
+    
+    /// Bounds of this item
+    fn bounds(&self) -> (f64, f64, f64, f64); // (x, y, width, height)
+}
+
+/// Simple display list for tile rasterization
+pub struct DisplayList {
+    items: Vec<Box<dyn DisplayItem>>,
+}
+
+impl DisplayList {
+    /// Create an empty display list
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+    
+    /// Add an item to the display list
+    pub fn push(&mut self, item: Box<dyn DisplayItem>) {
+        self.items.push(item);
+    }
+    
+    /// Get items that intersect a given bounds
+    pub fn items_in_bounds(&self, x: f64, y: f64, width: f64, height: f64) -> Vec<&dyn DisplayItem> {
+        self.items.iter()
+            .filter(|item| {
+                let (ix, iy, iw, ih) = item.bounds();
+                ix < x + width && ix + iw > x && iy < y + height && iy + ih > y
+            })
+            .map(|item| item.as_ref())
+            .collect()
+    }
+    
+    /// Number of items
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    
+    /// Is empty?
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl Default for DisplayList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parallel tile rasterization result
+#[derive(Debug)]
+pub struct RasterResult {
+    /// Tile coordinate
+    pub coord: TileCoord,
+    /// Rendered pixels (RGBA)
+    pub pixels: Vec<u8>,
+    /// Time to rasterize in microseconds
+    pub raster_time_us: u64,
+}
+
+/// Rasterize multiple dirty tiles in parallel
+/// 
+/// This function distributes tile rasterization across multiple threads,
+/// significantly improving render performance on multi-core CPUs.
+pub fn rasterize_tiles_parallel<F>(
+    tiles: &[TileCoord],
+    tile_size: u32,
+    rasterize_fn: F,
+) -> Vec<RasterResult>
+where
+    F: Fn(TileCoord, &mut [u8], u32) + Send + Sync,
+{
+    if tiles.is_empty() {
+        return Vec::new();
+    }
+    
+    // For small tile counts, rasterize sequentially
+    if tiles.len() < 4 {
+        return tiles.iter()
+            .map(|&coord| {
+                let start = Instant::now();
+                let len = (tile_size * tile_size * 4) as usize;
+                let mut pixels = vec![0u8; len];
+                rasterize_fn(coord, &mut pixels, tile_size);
+                RasterResult {
+                    coord,
+                    pixels,
+                    raster_time_us: start.elapsed().as_micros() as u64,
+                }
+            })
+            .collect();
+    }
+    
+    // Parallel rasterization using scoped threads
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(tiles.len());
+    
+    let chunk_size = (tiles.len() + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|s| {
+        let handles: Vec<_> = tiles
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk.iter()
+                        .map(|&coord| {
+                            let start = Instant::now();
+                            let len = (tile_size * tile_size * 4) as usize;
+                            let mut pixels = vec![0u8; len];
+                            rasterize_fn(coord, &mut pixels, tile_size);
+                            RasterResult {
+                                coord,
+                                pixels,
+                                raster_time_us: start.elapsed().as_micros() as u64,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        
+        handles.into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+/// Parallel tile rasterizer with integrated thread pool
+pub struct ParallelTileRasterizer {
+    /// Tile size
+    tile_size: u32,
+    /// Total tiles rendered
+    tiles_rendered: AtomicUsize,
+    /// Total rasterization time in microseconds
+    total_raster_time_us: AtomicUsize,
+}
+
+impl ParallelTileRasterizer {
+    /// Create a new parallel rasterizer
+    pub fn new(tile_size: u32) -> Self {
+        Self {
+            tile_size,
+            tiles_rendered: AtomicUsize::new(0),
+            total_raster_time_us: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Rasterize dirty tiles from a grid using a display list
+    pub fn rasterize_dirty(&self, grid: &TileGrid, display_list: &DisplayList) -> Vec<RasterResult> {
+        let dirty_tiles = grid.get_dirty_tiles();
+        
+        if dirty_tiles.is_empty() {
+            return Vec::new();
+        }
+        
+        let tile_size = self.tile_size;
+        let results = rasterize_tiles_parallel(&dirty_tiles, tile_size, |coord, buffer, size| {
+            // Calculate tile world position
+            let tile_x = coord.col as f64 * size as f64;
+            let tile_y = coord.row as f64 * size as f64;
+            
+            // Get items that intersect this tile
+            let items = display_list.items_in_bounds(
+                tile_x, tile_y, 
+                size as f64, size as f64
+            );
+            
+            // Render each item to the tile buffer
+            for item in items {
+                item.render(buffer, size, size, tile_x, tile_y);
+            }
+        });
+        
+        // Update stats
+        let total_time: u64 = results.iter().map(|r| r.raster_time_us).sum();
+        self.tiles_rendered.fetch_add(results.len(), Ordering::Relaxed);
+        self.total_raster_time_us.fetch_add(total_time as usize, Ordering::Relaxed);
+        
+        results
+    }
+    
+    /// Get number of tiles rendered
+    pub fn tiles_rendered(&self) -> usize {
+        self.tiles_rendered.load(Ordering::Relaxed)
+    }
+    
+    /// Get average rasterization time per tile
+    pub fn avg_raster_time_us(&self) -> f64 {
+        let tiles = self.tiles_rendered.load(Ordering::Relaxed);
+        let time = self.total_raster_time_us.load(Ordering::Relaxed);
+        if tiles > 0 {
+            time as f64 / tiles as f64
+        } else {
+            0.0
+        }
+    }
+}
 
 /// Tile ID type
 pub type TileId = u64;

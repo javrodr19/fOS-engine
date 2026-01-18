@@ -8,6 +8,8 @@
 
 mod pool;
 mod scheduler;
+pub mod work_stealing;
 
 pub use pool::*;
 pub use scheduler::*;
+pub use work_stealing::{WorkStealingScheduler, TaskPriority as WorkStealPriority, ScopedScheduler, scope as work_scope};

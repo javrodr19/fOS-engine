@@ -26,6 +26,7 @@ pub mod streaming_layout;
 pub mod layout_cache;
 pub mod constraint_cache;
 pub mod intrinsic_size_cache;
+pub mod parallel_layout;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};

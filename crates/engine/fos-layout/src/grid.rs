@@ -7,6 +7,236 @@ use crate::{LayoutTree, LayoutBoxId, BoxDimensions};
 use crate::box_model::EdgeSizes;
 
 // ============================================================================
+// Parallel Intrinsic Size Computation (Phase 4.2)
+// ============================================================================
+
+/// Grid item intrinsic size result
+#[derive(Debug, Clone, Copy)]
+pub struct GridItemIntrinsic {
+    /// Item box ID
+    pub box_id: LayoutBoxId,
+    /// Min-content width
+    pub min_width: f32,
+    /// Max-content width
+    pub max_width: f32,
+    /// Min-content height
+    pub min_height: f32,
+    /// Max-content height
+    pub max_height: f32,
+}
+
+/// Compute intrinsic sizes for all grid items in parallel
+/// 
+/// This function computes min-content and max-content sizes for all
+/// grid items concurrently, enabling faster track sizing resolution.
+pub fn compute_grid_item_intrinsic_parallel(
+    tree: &LayoutTree,
+    items: &[LayoutBoxId],
+) -> Vec<GridItemIntrinsic> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    
+    // For small numbers of items, compute sequentially
+    if items.len() < 4 {
+        return items.iter()
+            .map(|&box_id| compute_item_intrinsic(tree, box_id))
+            .collect();
+    }
+    
+    // Parallel computation using scoped threads
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(items.len());
+    
+    let chunk_size = (items.len() + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk.iter()
+                        .map(|&box_id| compute_item_intrinsic(tree, box_id))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        
+        handles.into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+/// Compute intrinsic size for a single grid item
+fn compute_item_intrinsic(
+    tree: &LayoutTree,
+    box_id: LayoutBoxId,
+) -> GridItemIntrinsic {
+    let layout_box = match tree.get(box_id) {
+        Some(b) => b,
+        None => return GridItemIntrinsic {
+            box_id,
+            min_width: 0.0,
+            max_width: 0.0,
+            min_height: 0.0,
+            max_height: 0.0,
+        },
+    };
+    
+    let dims = &layout_box.dimensions;
+    
+    // Use content dimensions as intrinsic sizes
+    GridItemIntrinsic {
+        box_id,
+        min_width: dims.content.width.max(0.0),
+        max_width: dims.content.width.max(0.0),
+        min_height: dims.content.height.max(0.0),
+        max_height: dims.content.height.max(0.0),
+    }
+}
+
+/// Compute grid track sizes using intrinsic item data in parallel
+/// 
+/// This distributes the track sizing algorithm for auto/min-content/max-content
+/// tracks across multiple threads.
+pub fn compute_track_sizes_parallel(
+    tracks: &[TrackSize],
+    container_size: f32,
+    gap: f32,
+    item_contributions: &[(usize, f32)], // (track_index, contribution)
+) -> Vec<f32> {
+    if tracks.is_empty() {
+        return Vec::new();
+    }
+    
+    let num_gaps = tracks.len().saturating_sub(1);
+    let total_gap = gap * num_gaps as f32;
+    let available = container_size - total_gap;
+    
+    // Compute base sizes in parallel for large track counts
+    if tracks.len() >= 8 {
+        return parallel_track_resolve(tracks, available, item_contributions);
+    }
+    
+    // Sequential for small track counts
+    sequential_track_resolve(tracks, available, item_contributions)
+}
+
+fn parallel_track_resolve(
+    tracks: &[TrackSize],
+    available: f32,
+    item_contributions: &[(usize, f32)],
+) -> Vec<f32> {
+    // First pass: compute base sizes
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(tracks.len());
+    
+    let chunk_size = (tracks.len() + num_threads - 1) / num_threads;
+    
+    let base_sizes: Vec<f32> = std::thread::scope(|s| {
+        let handles: Vec<_> = tracks
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let offset = chunk_idx * chunk_size;
+                s.spawn(move || {
+                    chunk.iter()
+                        .enumerate()
+                        .map(|(i, track)| {
+                            let idx = offset + i;
+                            compute_base_track_size(track, available, idx, item_contributions)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        
+        handles.into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    
+    // Second pass: resolve flexible tracks
+    resolve_flexible_tracks(tracks, &base_sizes, available)
+}
+
+fn sequential_track_resolve(
+    tracks: &[TrackSize],
+    available: f32,
+    item_contributions: &[(usize, f32)],
+) -> Vec<f32> {
+    let base_sizes: Vec<f32> = tracks.iter()
+        .enumerate()
+        .map(|(idx, track)| compute_base_track_size(track, available, idx, item_contributions))
+        .collect();
+    
+    resolve_flexible_tracks(tracks, &base_sizes, available)
+}
+
+fn compute_base_track_size(
+    track: &TrackSize,
+    container_size: f32,
+    track_idx: usize,
+    item_contributions: &[(usize, f32)],
+) -> f32 {
+    match track {
+        TrackSize::Length(px) => *px,
+        TrackSize::Percentage(pct) => container_size * pct / 100.0,
+        TrackSize::Auto | TrackSize::MinContent | TrackSize::MaxContent => {
+            // Find max contribution for this track
+            item_contributions.iter()
+                .filter(|(idx, _)| *idx == track_idx)
+                .map(|(_, c)| *c)
+                .fold(0.0f32, |a, b| a.max(b))
+        }
+        TrackSize::FitContent(limit) => {
+            let content_size = item_contributions.iter()
+                .filter(|(idx, _)| *idx == track_idx)
+                .map(|(_, c)| *c)
+                .fold(0.0f32, |a, b| a.max(b));
+            content_size.min(*limit)
+        }
+        TrackSize::MinMax(min, max) => {
+            let min_size = compute_base_track_size(min, container_size, track_idx, item_contributions);
+            let max_size = compute_base_track_size(max, container_size, track_idx, item_contributions);
+            min_size.max(max_size.min(min_size)) // Will be clamped properly later
+        }
+        TrackSize::Fraction(_) => 0.0, // Resolved in second pass
+    }
+}
+
+fn resolve_flexible_tracks(tracks: &[TrackSize], base_sizes: &[f32], available: f32) -> Vec<f32> {
+    let fixed_total: f32 = base_sizes.iter().sum();
+    let remaining = (available - fixed_total).max(0.0);
+    
+    let total_flex: f32 = tracks.iter()
+        .map(|t| t.flex_factor())
+        .sum();
+    
+    if total_flex <= 0.0 {
+        return base_sizes.to_vec();
+    }
+    
+    let fr_size = remaining / total_flex;
+    
+    tracks.iter()
+        .zip(base_sizes.iter())
+        .map(|(track, &base)| {
+            if let TrackSize::Fraction(fr) = track {
+                fr_size * fr
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
 // Arena Allocation for Grid Layout
 // ============================================================================
 

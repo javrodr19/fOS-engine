@@ -7,6 +7,7 @@ mod parser;
 pub mod preload;
 pub mod serializer;
 pub mod incremental_parser;
+pub mod parallel_parser;
 
 pub use incremental_parser::{
     IncrementalParser, IncrementalTokenizer, Token, TokenizerState,

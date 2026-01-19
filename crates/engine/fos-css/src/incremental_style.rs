@@ -2,6 +2,11 @@
 //!
 //! Only restyle changed subtrees. Track style dependencies.
 //! Parallel style resolution. Cache computed styles.
+//!
+//! ## CSS Roadmap Phase 2 Enhancements
+//! - Bloom filter for fast class/attribute invalidation lookup
+//! - Subtree invalidation with minimal traversal
+//! - Dependency-aware caching with automatic cleanup
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,6 +17,57 @@ pub type NodeId = u32;
 /// Style rule ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RuleId(pub u32);
+
+/// Bloom filter for fast invalidation checks
+#[derive(Debug, Clone)]
+pub struct InvalidationBloom {
+    bits: Vec<u64>,
+    num_bits: usize,
+}
+
+impl InvalidationBloom {
+    pub fn new(expected_items: usize) -> Self {
+        let num_bits = (expected_items * 10).max(256);
+        let num_words = (num_bits + 63) / 64;
+        Self {
+            bits: vec![0; num_words],
+            num_bits,
+        }
+    }
+    
+    pub fn insert(&mut self, hash: u64) {
+        let h1 = hash as usize % self.num_bits;
+        let h2 = (hash >> 16) as usize % self.num_bits;
+        let h3 = (hash >> 32) as usize % self.num_bits;
+        
+        self.bits[h1 / 64] |= 1 << (h1 % 64);
+        self.bits[h2 / 64] |= 1 << (h2 % 64);
+        self.bits[h3 / 64] |= 1 << (h3 % 64);
+    }
+    
+    pub fn might_contain(&self, hash: u64) -> bool {
+        let h1 = hash as usize % self.num_bits;
+        let h2 = (hash >> 16) as usize % self.num_bits;
+        let h3 = (hash >> 32) as usize % self.num_bits;
+        
+        (self.bits[h1 / 64] & (1 << (h1 % 64))) != 0 &&
+        (self.bits[h2 / 64] & (1 << (h2 % 64))) != 0 &&
+        (self.bits[h3 / 64] & (1 << (h3 % 64))) != 0
+    }
+    
+    pub fn clear(&mut self) {
+        for word in &mut self.bits {
+            *word = 0;
+        }
+    }
+}
+
+fn hash_string(s: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(s, &mut hasher);
+    hasher.finish()
+}
 
 /// Computed style (immutable, shareable)
 #[derive(Debug, Clone)]

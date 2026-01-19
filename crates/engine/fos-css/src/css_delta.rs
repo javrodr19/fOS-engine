@@ -2,8 +2,14 @@
 //!
 //! Track which CSS properties changed. Only restyle changed.
 //! Property-level dirty bits. Skip unchanged subtrees.
+//!
+//! ## CSS Roadmap Phase 5 Enhancements
+//! - Delta-only style storage: only store property differences from parent
+//! - Efficient property diff computation
+//! - Minimal memory footprint for style changes
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// CSS property ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -370,6 +376,153 @@ impl CssDeltaTracker {
     }
 }
 
+// ============================================================================
+// Delta Style Storage (Phase 5: Surpassing Chromium)
+// ============================================================================
+
+/// A property value that can be stored in a delta
+#[derive(Debug, Clone)]
+pub enum DeltaValue {
+    /// Numeric value (px, em, etc)
+    Number(f32),
+    /// Integer value
+    Integer(i32),
+    /// Color value (packed RGBA)
+    Color(u32),
+    /// String value (font-family, etc)
+    String(Arc<str>),
+    /// Enum value (display, position, etc)
+    Enum(u8),
+    /// None/auto/inherit
+    Keyword(Keyword),
+}
+
+/// CSS keywords
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keyword {
+    Auto,
+    None,
+    Inherit,
+    Initial,
+    Unset,
+}
+
+/// Delta-only style storage - only stores differences from parent
+#[derive(Debug, Clone, Default)]
+pub struct DeltaStyle {
+    /// Properties that differ from parent (sparse storage)
+    pub overrides: HashMap<CssProperty, DeltaValue>,
+    /// Reference to parent style for inheritance
+    pub parent: Option<Arc<DeltaStyle>>,
+    /// Hash for comparison
+    pub hash: u64,
+}
+
+impl DeltaStyle {
+    /// Create a new empty delta style
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Create with a parent
+    pub fn with_parent(parent: Arc<DeltaStyle>) -> Self {
+        Self {
+            overrides: HashMap::new(),
+            parent: Some(parent),
+            hash: 0,
+        }
+    }
+    
+    /// Set a property override
+    pub fn set(&mut self, prop: CssProperty, value: DeltaValue) {
+        self.overrides.insert(prop, value);
+        self.update_hash();
+    }
+    
+    /// Get a property value (checks parent chain)
+    pub fn get(&self, prop: CssProperty) -> Option<&DeltaValue> {
+        if let Some(val) = self.overrides.get(&prop) {
+            return Some(val);
+        }
+        
+        // Check parent chain
+        if let Some(ref parent) = self.parent {
+            return parent.get(prop);
+        }
+        
+        None
+    }
+    
+    /// Check if property is overridden locally
+    pub fn is_overridden(&self, prop: CssProperty) -> bool {
+        self.overrides.contains_key(&prop)
+    }
+    
+    /// Get number of local overrides
+    pub fn override_count(&self) -> usize {
+        self.overrides.len()
+    }
+    
+    /// Compute size in bytes (sparse = smaller)
+    pub fn size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + 
+        self.overrides.len() * (std::mem::size_of::<CssProperty>() + std::mem::size_of::<DeltaValue>())
+    }
+    
+    /// Update hash after changes
+    fn update_hash(&mut self) {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        
+        for (prop, val) in &self.overrides {
+            hasher.write_u8(*prop as u8);
+            match val {
+                DeltaValue::Number(n) => hasher.write_u32(n.to_bits()),
+                DeltaValue::Integer(i) => hasher.write_i32(*i),
+                DeltaValue::Color(c) => hasher.write_u32(*c),
+                DeltaValue::String(s) => std::hash::Hash::hash(s.as_ref(), &mut hasher),
+                DeltaValue::Enum(e) => hasher.write_u8(*e),
+                DeltaValue::Keyword(k) => hasher.write_u8(*k as u8),
+            }
+        }
+        
+        self.hash = hasher.finish();
+    }
+    
+    /// Compare with another delta style
+    pub fn equivalent(&self, other: &DeltaStyle) -> bool {
+        self.hash == other.hash && self.overrides.len() == other.overrides.len()
+    }
+}
+
+/// Compute property differences between two styles
+pub fn compute_delta(base: &DeltaStyle, modified: &DeltaStyle) -> DeltaStyle {
+    let mut delta = DeltaStyle::new();
+    
+    // Add all overrides from modified that differ from base
+    for (prop, val) in &modified.overrides {
+        let base_val = base.overrides.get(prop);
+        if base_val.map_or(true, |bv| !values_equal(bv, val)) {
+            delta.overrides.insert(*prop, val.clone());
+        }
+    }
+    
+    delta.update_hash();
+    delta
+}
+
+fn values_equal(a: &DeltaValue, b: &DeltaValue) -> bool {
+    match (a, b) {
+        (DeltaValue::Number(x), DeltaValue::Number(y)) => (x - y).abs() < 0.001,
+        (DeltaValue::Integer(x), DeltaValue::Integer(y)) => x == y,
+        (DeltaValue::Color(x), DeltaValue::Color(y)) => x == y,
+        (DeltaValue::String(x), DeltaValue::String(y)) => x == y,
+        (DeltaValue::Enum(x), DeltaValue::Enum(y)) => x == y,
+        (DeltaValue::Keyword(x), DeltaValue::Keyword(y)) => x == y,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,4 +591,35 @@ mod tests {
         assert!(CssProperty::Transform.affects_compositing());
         assert!(CssProperty::Opacity.affects_compositing());
     }
+    
+    #[test]
+    fn test_delta_style() {
+        let mut style = DeltaStyle::new();
+        
+        style.set(CssProperty::Width, DeltaValue::Number(100.0));
+        style.set(CssProperty::Color, DeltaValue::Color(0xFF0000FF));
+        
+        assert_eq!(style.override_count(), 2);
+        assert!(style.is_overridden(CssProperty::Width));
+        assert!(!style.is_overridden(CssProperty::Height));
+    }
+    
+    #[test]
+    fn test_delta_style_inheritance() {
+        let mut parent = DeltaStyle::new();
+        parent.set(CssProperty::Color, DeltaValue::Color(0xFF0000FF));
+        
+        let parent = Arc::new(parent);
+        let mut child = DeltaStyle::with_parent(parent);
+        child.set(CssProperty::Width, DeltaValue::Number(50.0));
+        
+        // Child should get color from parent
+        assert!(child.get(CssProperty::Color).is_some());
+        assert!(child.get(CssProperty::Width).is_some());
+        
+        // Only width is locally overridden
+        assert!(!child.is_overridden(CssProperty::Color));
+        assert!(child.is_overridden(CssProperty::Width));
+    }
 }
+

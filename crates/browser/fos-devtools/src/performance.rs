@@ -102,6 +102,132 @@ pub struct ProfileNode {
     pub children: Vec<u32>,
 }
 
+/// Paint event for DevTools timeline
+#[derive(Debug, Clone)]
+pub struct PaintEvent {
+    pub timestamp: f64,
+    pub duration: f64,
+    pub layer_id: u32,
+    pub clip: PaintClip,
+    pub paint_type: PaintType,
+}
+
+/// Paint type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintType {
+    Full,
+    Incremental,
+    Composite,
+}
+
+/// Paint clip region
+#[derive(Debug, Clone, Default)]
+pub struct PaintClip {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Script execution event for profiling
+#[derive(Debug, Clone)]
+pub struct ScriptExecutionEvent {
+    pub timestamp: f64,
+    pub duration: f64,
+    pub function_name: String,
+    pub url: String,
+    pub line: u32,
+    pub column: u32,
+    pub event_type: ScriptEventType,
+    pub call_uid: u64,
+    pub parent_uid: Option<u64>,
+}
+
+/// Script event type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptEventType {
+    FunctionCall,
+    Compile,
+    Execute,
+    GC,
+    ParseHTML,
+    EvaluateScript,
+    EventHandler,
+    TimerFire,
+    RequestAnimationFrame,
+}
+
+/// Flame chart for visualization
+#[derive(Debug, Clone)]
+pub struct FlameChart {
+    pub start_time: f64,
+    pub end_time: f64,
+    pub nodes: Vec<FlameChartNode>,
+    pub max_depth: u32,
+}
+
+impl FlameChart {
+    pub fn new() -> Self {
+        Self {
+            start_time: 0.0,
+            end_time: 0.0,
+            nodes: Vec::new(),
+            max_depth: 0,
+        }
+    }
+    
+    /// Add a node to the flame chart
+    pub fn add_node(&mut self, node: FlameChartNode) {
+        if node.depth > self.max_depth {
+            self.max_depth = node.depth;
+        }
+        if node.start_time < self.start_time || self.nodes.is_empty() {
+            self.start_time = node.start_time;
+        }
+        if node.end_time > self.end_time {
+            self.end_time = node.end_time;
+        }
+        self.nodes.push(node);
+    }
+    
+    /// Get total duration
+    pub fn duration(&self) -> f64 {
+        self.end_time - self.start_time
+    }
+}
+
+impl Default for FlameChart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Flame chart node
+#[derive(Debug, Clone)]
+pub struct FlameChartNode {
+    pub id: u32,
+    pub name: String,
+    pub category: FlameChartCategory,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub depth: u32,
+    pub self_time: f64,
+    pub total_time: f64,
+    pub url: Option<String>,
+    pub line: Option<u32>,
+}
+
+/// Flame chart category for color coding
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlameChartCategory {
+    Scripting,
+    Rendering,
+    Painting,
+    Loading,
+    System,
+    Idle,
+}
+
 /// Performance panel
 #[derive(Debug)]
 pub struct PerformancePanel {
@@ -113,6 +239,14 @@ pub struct PerformancePanel {
     max_entries: usize,
     recording: bool,
     current_frame: Option<FrameTimingInfo>,
+    /// Paint events timeline
+    paint_events: Vec<PaintEvent>,
+    /// Script execution events
+    script_events: Vec<ScriptExecutionEvent>,
+    /// Generated flame chart
+    flame_chart: FlameChart,
+    /// Next call UID for script events
+    next_call_uid: u64,
 }
 
 impl Default for PerformancePanel {
@@ -126,6 +260,10 @@ impl Default for PerformancePanel {
             max_entries: 1000,
             recording: false,
             current_frame: None,
+            paint_events: Vec::new(),
+            script_events: Vec::new(),
+            flame_chart: FlameChart::new(),
+            next_call_uid: 0,
         }
     }
 }
@@ -287,6 +425,166 @@ impl PerformancePanel {
             Some(n) => self.measures.retain(|m| m.name != n),
             None => self.measures.clear(),
         }
+    }
+    
+    // === Paint Events ===
+    
+    /// Record a paint event
+    pub fn record_paint(&mut self, layer_id: u32, clip: PaintClip, paint_type: PaintType, duration: f64) {
+        if self.recording {
+            self.paint_events.push(PaintEvent {
+                timestamp: current_time(),
+                duration,
+                layer_id,
+                clip,
+                paint_type,
+            });
+        }
+    }
+    
+    /// Get paint events
+    pub fn get_paint_events(&self) -> &[PaintEvent] {
+        &self.paint_events
+    }
+    
+    // === Script Execution ===
+    
+    /// Begin script execution tracking
+    pub fn begin_script_execution(
+        &mut self, 
+        function_name: &str, 
+        url: &str, 
+        line: u32, 
+        column: u32,
+        event_type: ScriptEventType,
+        parent_uid: Option<u64>,
+    ) -> u64 {
+        let uid = self.next_call_uid;
+        self.next_call_uid += 1;
+        
+        if self.recording {
+            self.script_events.push(ScriptExecutionEvent {
+                timestamp: current_time(),
+                duration: 0.0, // Will be updated on end
+                function_name: function_name.to_string(),
+                url: url.to_string(),
+                line,
+                column,
+                event_type,
+                call_uid: uid,
+                parent_uid,
+            });
+        }
+        
+        uid
+    }
+    
+    /// End script execution tracking
+    pub fn end_script_execution(&mut self, call_uid: u64) {
+        if let Some(event) = self.script_events.iter_mut()
+            .find(|e| e.call_uid == call_uid)
+        {
+            event.duration = current_time() - event.timestamp;
+        }
+    }
+    
+    /// Get script events
+    pub fn get_script_events(&self) -> &[ScriptExecutionEvent] {
+        &self.script_events
+    }
+    
+    // === Flame Chart ===
+    
+    /// Generate flame chart from recorded script events
+    pub fn generate_flame_chart(&mut self) -> &FlameChart {
+        self.flame_chart = FlameChart::new();
+        let mut next_id = 0u32;
+        
+        // Build flame chart nodes from script events
+        for event in &self.script_events {
+            let depth = self.calculate_depth(event.call_uid);
+            
+            let category = match event.event_type {
+                ScriptEventType::FunctionCall | ScriptEventType::Execute | 
+                ScriptEventType::EvaluateScript => FlameChartCategory::Scripting,
+                ScriptEventType::ParseHTML => FlameChartCategory::Loading,
+                ScriptEventType::GC => FlameChartCategory::System,
+                _ => FlameChartCategory::Scripting,
+            };
+            
+            let node = FlameChartNode {
+                id: next_id,
+                name: event.function_name.clone(),
+                category,
+                start_time: event.timestamp,
+                end_time: event.timestamp + event.duration,
+                depth,
+                self_time: event.duration, // Simplified - would subtract child time
+                total_time: event.duration,
+                url: Some(event.url.clone()),
+                line: Some(event.line),
+            };
+            
+            self.flame_chart.add_node(node);
+            next_id += 1;
+        }
+        
+        // Add paint events as rendering nodes
+        for event in &self.paint_events {
+            let node = FlameChartNode {
+                id: next_id,
+                name: format!("Paint ({:?})", event.paint_type),
+                category: FlameChartCategory::Painting,
+                start_time: event.timestamp,
+                end_time: event.timestamp + event.duration,
+                depth: 0,
+                self_time: event.duration,
+                total_time: event.duration,
+                url: None,
+                line: None,
+            };
+            
+            self.flame_chart.add_node(node);
+            next_id += 1;
+        }
+        
+        &self.flame_chart
+    }
+    
+    /// Calculate depth for a call in the call tree
+    fn calculate_depth(&self, call_uid: u64) -> u32 {
+        let mut depth = 0u32;
+        let mut current = self.script_events.iter()
+            .find(|e| e.call_uid == call_uid);
+        
+        while let Some(event) = current {
+            if let Some(parent_uid) = event.parent_uid {
+                depth += 1;
+                current = self.script_events.iter()
+                    .find(|e| e.call_uid == parent_uid);
+            } else {
+                break;
+            }
+        }
+        
+        depth
+    }
+    
+    /// Get the current flame chart
+    pub fn get_flame_chart(&self) -> &FlameChart {
+        &self.flame_chart
+    }
+    
+    /// Clear all performance data
+    pub fn clear_all(&mut self) {
+        self.entries.clear();
+        self.frames.clear();
+        self.memory_samples.clear();
+        self.marks.clear();
+        self.measures.clear();
+        self.paint_events.clear();
+        self.script_events.clear();
+        self.flame_chart = FlameChart::new();
     }
 }
 

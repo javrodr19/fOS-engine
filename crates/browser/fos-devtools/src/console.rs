@@ -91,12 +91,22 @@ pub struct StackFrame {
 }
 
 /// Console
+/// 
+/// Provides Chrome DevTools-compatible console functionality including:
+/// - `$_`: Last evaluated expression result
+/// - `$0`-`$4`: Element selection history (most recent to oldest)
 #[derive(Debug, Default)]
 pub struct Console {
     messages: VecDeque<ConsoleMessage>,
     max_messages: usize,
     timers: std::collections::HashMap<String, u64>,
     counters: std::collections::HashMap<String, u32>,
+    /// Last evaluated expression result ($_)
+    last_result: Option<ConsoleValue>,
+    /// Element selection history ($0-$4), $0 is most recent
+    element_history: [Option<u64>; 5],
+    /// Current group depth for indentation
+    group_depth: usize,
 }
 
 impl Console {
@@ -106,6 +116,9 @@ impl Console {
             max_messages: 1000,
             timers: std::collections::HashMap::new(),
             counters: std::collections::HashMap::new(),
+            last_result: None,
+            element_history: [None; 5],
+            group_depth: 0,
         }
     }
     
@@ -213,12 +226,21 @@ impl Console {
     
     /// console.group
     pub fn group(&mut self, label: &str) {
-        self.log(&format!("▶ {}", label), Vec::new());
+        let indent = "  ".repeat(self.group_depth);
+        self.log(&format!("{}▶ {}", indent, label), Vec::new());
+        self.group_depth += 1;
+    }
+    
+    /// console.groupCollapsed (same as group but collapsed by default)
+    pub fn group_collapsed(&mut self, label: &str) {
+        let indent = "  ".repeat(self.group_depth);
+        self.log(&format!("{}▷ {}", indent, label), Vec::new());
+        self.group_depth += 1;
     }
     
     /// console.groupEnd
     pub fn group_end(&mut self) {
-        // Would handle group nesting
+        self.group_depth = self.group_depth.saturating_sub(1);
     }
     
     /// console.table
@@ -234,6 +256,44 @@ impl Console {
     /// Get messages by level
     pub fn get_by_level(&self, level: LogLevel) -> Vec<&ConsoleMessage> {
         self.messages.iter().filter(|m| m.level == level).collect()
+    }
+    
+    // === Chrome DevTools $_ and $0-$4 references ===
+    
+    /// Get last evaluated result ($_)
+    pub fn get_last_result(&self) -> Option<&ConsoleValue> {
+        self.last_result.as_ref()
+    }
+    
+    /// Set last evaluated result ($_)
+    pub fn set_last_result(&mut self, value: ConsoleValue) {
+        self.last_result = Some(value);
+    }
+    
+    /// Get selected element reference ($0-$4)
+    /// $0 is most recently selected, $4 is oldest
+    pub fn get_element_ref(&self, index: usize) -> Option<u64> {
+        self.element_history.get(index).copied().flatten()
+    }
+    
+    /// Set selected element ($0), shifting history
+    /// Previous $0 becomes $1, $1 becomes $2, etc.
+    pub fn set_selected_element(&mut self, element_id: u64) {
+        // Shift history: $0 -> $1, $1 -> $2, etc.
+        for i in (1..5).rev() {
+            self.element_history[i] = self.element_history[i - 1];
+        }
+        self.element_history[0] = Some(element_id);
+    }
+    
+    /// Clear element selection history
+    pub fn clear_element_history(&mut self) {
+        self.element_history = [None; 5];
+    }
+    
+    /// Shorthand for $0 (most recently selected element)
+    pub fn selected_element(&self) -> Option<u64> {
+        self.element_history[0]
     }
 }
 

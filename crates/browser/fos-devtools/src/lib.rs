@@ -26,18 +26,20 @@ pub mod sources;
 pub mod elements;
 pub mod lighthouse;
 pub mod memory;
+pub mod cdp;
 
 pub use console::{Console, ConsoleMessage, ConsoleValue, LogLevel};
 pub use inspector::{Inspector, InspectedNode, NodeType};
-pub use network::{NetworkPanel, NetworkRequest, NetworkResponse};
+pub use network::{NetworkPanel, NetworkRequest, NetworkResponse, ResponsePreview, Cookie, NetworkThrottle};
 pub use debugger::{Debugger, Breakpoint, CallFrame, DebuggerState};
-pub use performance::{PerformancePanel, FrameTimingInfo, MemoryInfo};
+pub use performance::{PerformancePanel, FrameTimingInfo, MemoryInfo, FlameChart, FlameChartNode, PaintEvent, ScriptExecutionEvent};
 pub use storage::{StorageInspector, StoragePanel, StorageType, StorageEntry};
 pub use application::{ApplicationPanel, ServiceWorkerInfo, WebAppManifest, PwaStatus};
 pub use sources::{SourcesPanel, SourceFile, SourceMap, JsPrettyPrinter};
 pub use elements::{ElementsPanel, ElementNode, ComputedStyles, BoxModel, MatchedRule};
 pub use lighthouse::{LighthousePanel, LighthouseReport, AuditResult, CategoryScore};
 pub use memory::{MemoryPanel, HeapSnapshot, HeapNode, AllocationSample};
+pub use cdp::{CdpServer, CdpCommand, CdpResponse, CdpEvent, CdpError};
 
 /// DevTools error
 #[derive(Debug, thiserror::Error)]

@@ -59,14 +59,326 @@ pub struct NetworkResponse {
     pub content_length: Option<usize>,
 }
 
+/// Response preview type for DevTools display
+#[derive(Debug, Clone)]
+pub enum ResponsePreview {
+    /// JSON response with parsed structure
+    Json(String),
+    /// HTML response with formatted display
+    Html(String),
+    /// Image with base64 data and dimensions
+    Image { 
+        base64: String, 
+        width: u32, 
+        height: u32, 
+        format: String,
+    },
+    /// Plain text
+    Text(String),
+    /// Binary data (hex preview)
+    Binary { 
+        size: usize, 
+        hex_preview: String,
+    },
+    /// Font file
+    Font {
+        family: String,
+        format: String,
+    },
+    /// No preview available
+    None,
+}
+
+impl ResponsePreview {
+    /// Generate preview from response
+    pub fn from_response(response: &NetworkResponse) -> Self {
+        let content_type = response.content_type.as_deref().unwrap_or("");
+        let body = match &response.body {
+            Some(b) => b,
+            None => return Self::None,
+        };
+        
+        if content_type.contains("application/json") || content_type.contains("text/json") {
+            if let Ok(text) = std::str::from_utf8(body) {
+                return Self::Json(text.to_string());
+            }
+        }
+        
+        if content_type.contains("text/html") {
+            if let Ok(text) = std::str::from_utf8(body) {
+                return Self::Html(text.to_string());
+            }
+        }
+        
+        if content_type.starts_with("image/") {
+            let format = content_type.strip_prefix("image/").unwrap_or("unknown").to_string();
+            return Self::Image {
+                base64: base64_encode(body),
+                width: 0, // Would parse from image
+                height: 0,
+                format,
+            };
+        }
+        
+        if content_type.starts_with("text/") {
+            if let Ok(text) = std::str::from_utf8(body) {
+                return Self::Text(text.to_string());
+            }
+        }
+        
+        if content_type.contains("font") {
+            return Self::Font {
+                family: "unknown".to_string(),
+                format: content_type.to_string(),
+            };
+        }
+        
+        // Binary fallback
+        let hex_preview: String = body.iter()
+            .take(64)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        
+        Self::Binary {
+            size: body.len(),
+            hex_preview,
+        }
+    }
+}
+
+/// Simple base64 encoding
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    
+    result
+}
+
+/// HTTP Cookie
+#[derive(Debug, Clone)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub expires: Option<u64>,
+    pub size: usize,
+    pub http_only: bool,
+    pub secure: bool,
+    pub same_site: SameSite,
+    pub priority: CookiePriority,
+}
+
+/// SameSite attribute
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SameSite {
+    Strict,
+    Lax,
+    #[default]
+    None,
+}
+
+/// Cookie priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CookiePriority {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Cookie {
+    /// Parse Set-Cookie header
+    pub fn parse(header: &str, request_domain: &str) -> Option<Self> {
+        let mut parts = header.split(';');
+        let name_value = parts.next()?.trim();
+        let (name, value) = name_value.split_once('=')?;
+        
+        let mut cookie = Cookie {
+            name: name.trim().to_string(),
+            value: value.trim().to_string(),
+            domain: request_domain.to_string(),
+            path: "/".to_string(),
+            expires: None,
+            size: name.len() + value.len(),
+            http_only: false,
+            secure: false,
+            same_site: SameSite::None,
+            priority: CookiePriority::Medium,
+        };
+        
+        for attr in parts {
+            let attr = attr.trim().to_lowercase();
+            if attr == "httponly" {
+                cookie.http_only = true;
+            } else if attr == "secure" {
+                cookie.secure = true;
+            } else if attr.starts_with("samesite=") {
+                cookie.same_site = match attr.strip_prefix("samesite=") {
+                    Some("strict") => SameSite::Strict,
+                    Some("lax") => SameSite::Lax,
+                    _ => SameSite::None,
+                };
+            } else if attr.starts_with("domain=") {
+                if let Some(d) = attr.strip_prefix("domain=") {
+                    cookie.domain = d.to_string();
+                }
+            } else if attr.starts_with("path=") {
+                if let Some(p) = attr.strip_prefix("path=") {
+                    cookie.path = p.to_string();
+                }
+            }
+        }
+        
+        Some(cookie)
+    }
+}
+
+/// Network throttle configuration
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkThrottle {
+    /// Download speed in bytes per second
+    pub download_bps: u64,
+    /// Upload speed in bytes per second
+    pub upload_bps: u64,
+    /// Latency in milliseconds
+    pub latency_ms: u32,
+    /// Packet loss percentage (0-100)
+    pub packet_loss: u8,
+    /// Whether the connection is offline
+    pub offline: bool,
+}
+
+impl NetworkThrottle {
+    /// Slow 3G preset
+    pub const SLOW_3G: Self = Self {
+        download_bps: 50_000,
+        upload_bps: 25_000,
+        latency_ms: 400,
+        packet_loss: 0,
+        offline: false,
+    };
+    
+    /// Fast 3G preset
+    pub const FAST_3G: Self = Self {
+        download_bps: 150_000,
+        upload_bps: 75_000,
+        latency_ms: 150,
+        packet_loss: 0,
+        offline: false,
+    };
+    
+    /// Regular 4G preset
+    pub const REGULAR_4G: Self = Self {
+        download_bps: 4_000_000,
+        upload_bps: 1_000_000,
+        latency_ms: 50,
+        packet_loss: 0,
+        offline: false,
+    };
+    
+    /// DSL preset
+    pub const DSL: Self = Self {
+        download_bps: 2_000_000,
+        upload_bps: 500_000,
+        latency_ms: 50,
+        packet_loss: 0,
+        offline: false,
+    };
+    
+    /// Offline preset
+    pub const OFFLINE: Self = Self {
+        download_bps: 0,
+        upload_bps: 0,
+        latency_ms: 0,
+        packet_loss: 100,
+        offline: true,
+    };
+    
+    /// No throttling
+    pub const NONE: Self = Self {
+        download_bps: u64::MAX,
+        upload_bps: u64::MAX,
+        latency_ms: 0,
+        packet_loss: 0,
+        offline: false,
+    };
+    
+    /// Custom throttle
+    pub fn custom(download_bps: u64, upload_bps: u64, latency_ms: u32) -> Self {
+        Self {
+            download_bps,
+            upload_bps,
+            latency_ms,
+            packet_loss: 0,
+            offline: false,
+        }
+    }
+    
+    /// Calculate simulated delay for a given byte count
+    pub fn calculate_delay_ms(&self, bytes: usize, is_upload: bool) -> u64 {
+        if self.offline {
+            return u64::MAX;
+        }
+        
+        let bps = if is_upload { self.upload_bps } else { self.download_bps };
+        if bps == 0 || bps == u64::MAX {
+            return self.latency_ms as u64;
+        }
+        
+        let transfer_time_ms = (bytes as u64 * 1000) / bps;
+        self.latency_ms as u64 + transfer_time_ms
+    }
+}
+
 /// Network panel
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NetworkPanel {
     requests: Vec<NetworkRequest>,
     responses: HashMap<u64, NetworkResponse>,
     next_id: u64,
     recording: bool,
     preserve_log: bool,
+    /// Current throttle configuration
+    throttle: Option<NetworkThrottle>,
+    /// Cookies extracted from responses
+    cookies: Vec<Cookie>,
+}
+
+impl Default for NetworkPanel {
+    fn default() -> Self {
+        Self {
+            requests: Vec::new(),
+            responses: HashMap::new(),
+            next_id: 0,
+            recording: true,
+            preserve_log: false,
+            throttle: None,
+            cookies: Vec::new(),
+        }
+    }
 }
 
 impl NetworkPanel {
@@ -177,6 +489,100 @@ impl NetworkPanel {
         self.responses.values()
             .filter_map(|r| r.content_length)
             .sum()
+    }
+    
+    // === Preview ===
+    
+    /// Get response preview for display in DevTools
+    pub fn get_preview(&self, request_id: u64) -> ResponsePreview {
+        match self.responses.get(&request_id) {
+            Some(response) => ResponsePreview::from_response(response),
+            None => ResponsePreview::None,
+        }
+    }
+    
+    /// Set response body (for complete body capture)
+    pub fn set_response_body(&mut self, request_id: u64, body: Vec<u8>) {
+        if let Some(response) = self.responses.get_mut(&request_id) {
+            response.body = Some(body);
+        }
+    }
+    
+    // === Cookies ===
+    
+    /// Get all cookies
+    pub fn get_cookies(&self) -> &[Cookie] {
+        &self.cookies
+    }
+    
+    /// Get cookies for a specific domain
+    pub fn get_cookies_for_domain(&self, domain: &str) -> Vec<&Cookie> {
+        self.cookies.iter()
+            .filter(|c| domain.ends_with(&c.domain) || c.domain.ends_with(domain))
+            .collect()
+    }
+    
+    /// Extract cookies from Set-Cookie headers in a response
+    pub fn extract_cookies(&mut self, request_id: u64, domain: &str) {
+        if let Some(response) = self.responses.get(&request_id) {
+            if let Some(set_cookie) = response.headers.get("set-cookie") {
+                if let Some(cookie) = Cookie::parse(set_cookie, domain) {
+                    // Remove existing cookie with same name/domain if present
+                    self.cookies.retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
+                    self.cookies.push(cookie);
+                }
+            }
+        }
+    }
+    
+    /// Clear all cookies
+    pub fn clear_cookies(&mut self) {
+        self.cookies.clear();
+    }
+    
+    /// Delete a specific cookie
+    pub fn delete_cookie(&mut self, name: &str, domain: &str) {
+        self.cookies.retain(|c| !(c.name == name && c.domain == domain));
+    }
+    
+    // === Throttling ===
+    
+    /// Set network throttle
+    pub fn set_throttle(&mut self, throttle: NetworkThrottle) {
+        self.throttle = Some(throttle);
+    }
+    
+    /// Clear network throttle
+    pub fn clear_throttle(&mut self) {
+        self.throttle = None;
+    }
+    
+    /// Get current throttle configuration
+    pub fn get_throttle(&self) -> Option<&NetworkThrottle> {
+        self.throttle.as_ref()
+    }
+    
+    /// Check if network is offline
+    pub fn is_offline(&self) -> bool {
+        self.throttle.map(|t| t.offline).unwrap_or(false)
+    }
+    
+    /// Calculate delay for a request/response
+    pub fn calculate_delay(&self, bytes: usize, is_upload: bool) -> u64 {
+        match &self.throttle {
+            Some(t) => t.calculate_delay_ms(bytes, is_upload),
+            None => 0,
+        }
+    }
+    
+    /// Set preserve log (keep requests on page navigation)
+    pub fn set_preserve_log(&mut self, preserve: bool) {
+        self.preserve_log = preserve;
+    }
+    
+    /// Get preserve log setting
+    pub fn preserve_log(&self) -> bool {
+        self.preserve_log
     }
 }
 

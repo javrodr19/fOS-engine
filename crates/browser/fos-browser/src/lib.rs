@@ -154,6 +154,8 @@ pub mod sensors;
 pub mod network_info;
 #[cfg(feature = "device-apis")]
 pub mod geolocation;
+#[cfg(feature = "device-apis")]
+pub mod energy;
 
 // Extension support
 #[cfg(feature = "extensions")]
@@ -286,6 +288,19 @@ pub use sensors::{SensorsManager, Accelerometer, Gyroscope, DeviceOrientation};
 pub use network_info::{NetworkInfoManager, NetworkInformation, ConnectionType};
 #[cfg(feature = "device-apis")]
 pub use geolocation::{GeolocationManager, Position, Coordinates};
+#[cfg(feature = "device-apis")]
+pub use energy::{
+    EnergyManager, EnergyStats,
+    AdaptiveRenderer, BatteryStatus, ContentType,
+    GpuPowerManager, GpuPowerState,
+    TabThrottler, ThrottleLevel,
+    BackgroundNetworkPolicy, NetworkThrottler,
+    WorkloadType, WorkloadClassifier,
+    EnergyAwareScheduler, Urgency, CoreType,
+    WakeLockManager, WakeLockReason, WakeLockGuard,
+    IdleDetector, IdleState,
+    MediaPowerManager, DecoderType, QualityLevel,
+};
 
 #[cfg(feature = "extensions")]
 pub use extensions::{ExtensionManager, Extension, ExtensionManifest};

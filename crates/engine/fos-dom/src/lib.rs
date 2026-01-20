@@ -35,6 +35,9 @@ pub mod tree_walker;
 pub mod range;
 pub mod compressed_dom;
 pub mod rope;
+pub mod sanitizer;
+pub mod concurrent_dom;
+pub mod query_index;
 
 pub use node::{Node, NodeData, ElementData, TextData};
 pub use tree::DomTree;
@@ -75,6 +78,11 @@ pub use compressed_dom::{
     NodeInfo, DecompressedNode, DomDelta, DeltaOp, LazyDecompressor,
 };
 pub use rope::{Rope, RopeSlice, RopeBuilder, ChunkIter, LineIter};
+pub use sanitizer::{Sanitizer, SanitizerConfig, SanitizeResult, RemovedItem};
+pub use concurrent_dom::{ConcurrentDom, DomSnapshot, DomReader, DomWriter, DomMutation, SnapshotNode};
+pub use query_index::{QueryIndex, BitSet, QueryIndexStats, hash_string};
+pub use dom_events::TrustedEventDispatcher;
+pub use document::DocumentError;
 
 /// Node identifier - 4 bytes (vs 8 bytes for pointer on 64-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

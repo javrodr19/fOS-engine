@@ -27,6 +27,7 @@ pub mod layout_cache;
 pub mod constraint_cache;
 pub mod intrinsic_size_cache;
 pub mod parallel_layout;
+pub mod grid_cache;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};
@@ -37,11 +38,18 @@ pub use flex::{
     FlexContainerStyle, FlexItemStyle,
     FlexDirection, FlexWrap, FlexBasis,
     JustifyContent, AlignItems, AlignContent,
+    // Phase 1.1: Single-pass fast path
+    FlexContainer, FastFlexLayout, layout_flex_fast_path,
+    FlexFactorCache,
 };
 pub use grid::{
     TrackSize, GridTemplate, GridPlacement, GridLine, GridArea,
     GridLayoutContext, resolve_placement, layout_grid_children,
     GridArena,
+};
+pub use grid_cache::{
+    GridLayoutCache, TrackSizingKey, PlacementKey,
+    CachedTrackSizes, CachedPlacements, GridCacheStats,
 };
 pub use multicolumn::{
     MultiColumnStyle, MultiColumnContext, ColumnRule, ColumnRuleStyle,
@@ -56,6 +64,38 @@ pub use subgrid::{Subgrid, SubgridContext};
 pub use streaming_layout::{
     StreamingLayoutEngine, LayoutChunk, StreamBoxType, IncrementalContext,
     StreamLayoutBox, StreamLayoutStats, LayoutYield, ViewportPriority,
+};
+
+// Phase 3: New layout features
+pub mod masonry;
+pub mod container_queries;
+pub mod anchor_positioning;
+pub mod math_layout;
+
+// Phase 5: Memory optimization
+pub mod compact_layout;
+
+pub use masonry::{
+    MasonryItem, MasonryStyle, MasonryLayout, MasonryDirection,
+    layout_masonry, layout_masonry_balanced,
+};
+pub use container_queries::{
+    ContainerSize, ContainerType, ContainerCondition,
+    ContainerContext, ContainerInfo, Orientation, QueryComparison,
+};
+pub use anchor_positioning::{
+    AnchorRect, AnchorSide, AnchorReference, AnchorRegistry,
+    AnchoredElement, PositioningArea,
+};
+pub use compact_layout::{
+    CompactLayoutResult, FullLayoutResult, LayoutStorage,
+    BatchLayoutStorage,
+};
+pub use math_layout::{
+    MathElementType, MathBox, MathLayoutParams, MathTableStyle, ColumnAlign,
+    layout_math_row, layout_fraction, layout_radical,
+    layout_superscript, layout_subscript, layout_sub_superscript,
+    layout_underscript, layout_overscript, layout_math_table,
 };
 
 use fos_dom::{DomTree, NodeId, Document};

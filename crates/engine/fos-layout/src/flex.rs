@@ -410,6 +410,272 @@ pub enum FlexBasis {
     Content,
 }
 
+// ============================================================================
+// Single-Pass Flexbox Fast Path (Phase 1.1)
+// ============================================================================
+
+/// Flex container wrapper for fast path optimization
+#[derive(Debug)]
+pub struct FlexContainer<'a> {
+    /// Container style
+    pub style: &'a FlexContainerStyle,
+    /// Child items with styles
+    pub children: &'a [(LayoutBoxId, FlexItemStyle)],
+    /// Container main axis size
+    pub container_main: f32,
+    /// Container cross axis size
+    pub container_cross: f32,
+}
+
+impl<'a> FlexContainer<'a> {
+    /// Check if container can use the single-pass fast path
+    /// 
+    /// Fast path conditions:
+    /// - No flex-wrap (single line layout)
+    /// - No align-content variations (stretch only)
+    /// - No align-self overrides
+    /// - Simple flex-basis (Auto or Length)
+    #[inline]
+    pub fn can_use_fast_path(&self) -> bool {
+        // Must be nowrap for single-pass
+        if self.style.wrap != FlexWrap::Nowrap {
+            return false;
+        }
+        
+        // align-content must be stretch (default)
+        if self.style.align_content != AlignContent::Stretch {
+            return false;
+        }
+        
+        // Check all items for fast path compatibility
+        self.children.iter().all(|(_, item)| {
+            // No align-self overrides
+            item.align_self.is_none() &&
+            // Simple basis
+            matches!(item.basis, FlexBasis::Auto | FlexBasis::Length(_))
+        })
+    }
+    
+    /// Create a new flex container
+    pub fn new(
+        style: &'a FlexContainerStyle,
+        children: &'a [(LayoutBoxId, FlexItemStyle)],
+        container_main: f32,
+        container_cross: f32,
+    ) -> Self {
+        Self {
+            style,
+            children,
+            container_main,
+            container_cross,
+        }
+    }
+}
+
+/// Result of fast path layout
+#[derive(Debug)]
+pub struct FastFlexLayout {
+    /// Item positions and sizes (main_pos, main_size, cross_size)
+    pub items: Vec<(f32, f32, f32)>,
+    /// Total main axis size used
+    pub total_main: f32,
+    /// Max cross axis size
+    pub max_cross: f32,
+}
+
+/// Single-pass O(n) flexbox layout for simple cases
+/// 
+/// This is much faster than the full algorithm when applicable.
+/// Returns None if fast path cannot be used.
+pub fn layout_flex_fast_path(
+    tree: &LayoutTree,
+    container: &FlexContainer<'_>,
+) -> Option<FastFlexLayout> {
+    // Check fast path eligibility
+    if !container.can_use_fast_path() {
+        return None;
+    }
+    
+    let children = container.children;
+    if children.is_empty() {
+        return Some(FastFlexLayout {
+            items: Vec::new(),
+            total_main: 0.0,
+            max_cross: 0.0,
+        });
+    }
+    
+    let is_row = container.style.direction.is_row();
+    let gap = container.style.gap;
+    let total_gap = gap * (children.len().saturating_sub(1)) as f32;
+    let available = container.container_main - total_gap;
+    
+    // Phase 1: Compute base sizes (O(n))
+    let mut base_sizes: Vec<f32> = Vec::with_capacity(children.len());
+    let mut cross_sizes: Vec<f32> = Vec::with_capacity(children.len());
+    let mut total_grow: f32 = 0.0;
+    let mut total_shrink_factor: f32 = 0.0;
+    let mut base_total: f32 = 0.0;
+    
+    for (box_id, item_style) in children {
+        let layout_box = tree.get(*box_id);
+        let (base_main, base_cross) = match layout_box {
+            Some(b) => {
+                if is_row {
+                    (b.dimensions.content.width, b.dimensions.content.height)
+                } else {
+                    (b.dimensions.content.height, b.dimensions.content.width)
+                }
+            }
+            None => (0.0, 0.0),
+        };
+        
+        let flex_basis = match item_style.basis {
+            FlexBasis::Length(l) => l,
+            _ => base_main,
+        };
+        
+        base_sizes.push(flex_basis);
+        cross_sizes.push(base_cross);
+        total_grow += item_style.grow;
+        total_shrink_factor += item_style.shrink * flex_basis;
+        base_total += flex_basis;
+    }
+    
+    // Phase 2: Compute final sizes (O(n))
+    let free_space = available - base_total;
+    let mut final_sizes: Vec<f32> = Vec::with_capacity(children.len());
+    
+    if free_space > 0.0 && total_grow > 0.0 {
+        // Growing
+        for (i, (_, item_style)) in children.iter().enumerate() {
+            let grow_ratio = item_style.grow / total_grow;
+            final_sizes.push(base_sizes[i] + free_space * grow_ratio);
+        }
+    } else if free_space < 0.0 && total_shrink_factor > 0.0 {
+        // Shrinking
+        for (i, (_, item_style)) in children.iter().enumerate() {
+            let shrink_ratio = (item_style.shrink * base_sizes[i]) / total_shrink_factor;
+            final_sizes.push((base_sizes[i] + free_space * shrink_ratio).max(0.0));
+        }
+    } else {
+        // No adjustment needed
+        final_sizes = base_sizes;
+    }
+    
+    // Phase 3: Compute positions based on justify-content (O(n))
+    let used_space: f32 = final_sizes.iter().sum();
+    let remaining = container.container_main - used_space - total_gap;
+    
+    let (mut main_pos, spacing) = match container.style.justify_content {
+        JustifyContent::FlexStart => (0.0, 0.0),
+        JustifyContent::FlexEnd => (remaining, 0.0),
+        JustifyContent::Center => (remaining / 2.0, 0.0),
+        JustifyContent::SpaceBetween => {
+            if children.len() > 1 {
+                (0.0, remaining / (children.len() - 1) as f32)
+            } else {
+                (0.0, 0.0)
+            }
+        }
+        JustifyContent::SpaceAround => {
+            let per_item = remaining / (children.len() * 2) as f32;
+            (per_item, per_item * 2.0)
+        }
+        JustifyContent::SpaceEvenly => {
+            let per_slot = remaining / (children.len() + 1) as f32;
+            (per_slot, per_slot)
+        }
+    };
+    
+    // Build result
+    let mut items = Vec::with_capacity(children.len());
+    let mut max_cross: f32 = 0.0;
+    
+    for (i, _) in children.iter().enumerate() {
+        let size = final_sizes[i];
+        let cross = cross_sizes[i];
+        items.push((main_pos, size, cross));
+        max_cross = max_cross.max(cross);
+        main_pos += size + gap + spacing;
+    }
+    
+    Some(FastFlexLayout {
+        items,
+        total_main: main_pos - gap - spacing,
+        max_cross,
+    })
+}
+
+/// Cached flex factors for repeated layouts
+#[derive(Debug, Default)]
+pub struct FlexFactorCache {
+    /// Cached grow factors by container hash
+    grow_cache: std::collections::HashMap<u64, Vec<f32>>,
+    /// Cached shrink factors by container hash
+    shrink_cache: std::collections::HashMap<u64, Vec<f32>>,
+    /// Cache statistics
+    hits: usize,
+    misses: usize,
+}
+
+impl FlexFactorCache {
+    /// Create a new cache
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Get cached grow factors or compute and cache them
+    pub fn get_grow_factors(
+        &mut self,
+        key: u64,
+        compute: impl FnOnce() -> Vec<f32>,
+    ) -> &[f32] {
+        if self.grow_cache.contains_key(&key) {
+            self.hits += 1;
+            self.grow_cache.get(&key).unwrap()
+        } else {
+            self.misses += 1;
+            self.grow_cache.insert(key, compute());
+            self.grow_cache.get(&key).unwrap()
+        }
+    }
+    
+    /// Get cached shrink factors or compute and cache them
+    pub fn get_shrink_factors(
+        &mut self,
+        key: u64,
+        compute: impl FnOnce() -> Vec<f32>,
+    ) -> &[f32] {
+        if self.shrink_cache.contains_key(&key) {
+            self.hits += 1;
+            self.shrink_cache.get(&key).unwrap()
+        } else {
+            self.misses += 1;
+            self.shrink_cache.insert(key, compute());
+            self.shrink_cache.get(&key).unwrap()
+        }
+    }
+    
+    /// Cache hit rate
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+    
+    /// Clear the cache
+    pub fn clear(&mut self) {
+        self.grow_cache.clear();
+        self.shrink_cache.clear();
+        self.hits = 0;
+        self.misses = 0;
+    }
+}
+
 /// A flex line (for wrap)
 #[derive(Debug)]
 struct FlexLine {

@@ -6,9 +6,12 @@
 //! - HTMLVideoElement, HTMLAudioElement
 //! - Media Source Extensions
 //! - Web Audio API (with spatial audio)
-//! - WebRTC (with data channels)
-//! - Media codecs (H.264, H.265, VP8/VP9, AV1, AAC, MP3, Opus)
+//! - WebRTC (with data channels, ICE, STUN)
+//! - Media codecs (H.264, H.265, VP8/VP9, AV1, AAC, Opus, Vorbis)
 //! - Encrypted Media Extensions (EME)
+//! - Container formats (MP4, WebM, MKV, MPEG-TS, fMP4)
+//! - Streaming protocols (HLS, DASH, ABR)
+//! - SIMD optimizations
 
 pub mod element;
 pub mod tracks;
@@ -19,6 +22,11 @@ pub mod webrtc;
 pub mod codecs;
 pub mod eme;
 pub mod buffer_pool;
+pub mod decoders;
+pub mod containers;
+pub mod pipeline;
+pub mod streaming;
+pub mod simd;
 
 pub use element::{
     HTMLVideoElement, HTMLAudioElement, HTMLMediaElement,
@@ -34,9 +42,16 @@ pub use audio::{
 pub use webrtc::{
     RTCPeerConnection, MediaStream, MediaStreamTrack,
     RTCDataChannel, ScreenCapture,
+    ice::{IceAgent, IceCandidate, IceState},
+    stun::StunMessage,
+    sdp::SessionDescription,
 };
 pub use codecs::{CodecType, CodecRegistry, VideoDecoder, AudioDecoder, CodecConfig};
 pub use eme::{KeySystem, MediaKeys, MediaKeySession, ClearKey};
+pub use decoders::{VideoFrame, AudioSamples, EncodedPacket, VideoDecoderTrait, AudioDecoderTrait};
+pub use containers::{Demuxer, TrackInfo, Packet, CodecId, ContainerFormat, detect_format};
+pub use pipeline::{MediaPipeline, PipelineState};
+pub use streaming::{Manifest, Variant, Segment, QualityLevel};
 
 /// Media error
 #[derive(Debug, thiserror::Error)]

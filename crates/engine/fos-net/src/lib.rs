@@ -28,6 +28,17 @@ pub mod brotli_dict;
 pub mod request_dedup;
 pub mod predictive_cache;
 
+// New networking modules
+pub mod priority_signals;
+pub mod connection_predictor;
+pub mod shared_dict;
+pub mod zstd;
+pub mod dns_resolver;
+pub mod tiered_pool;
+pub mod request_fusion;
+pub mod delta_encoding;
+pub mod zero_copy;
+
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
 pub use websocket::{WebSocket, WebSocketState, WebSocketError, MessageData};
@@ -58,6 +69,18 @@ pub use brotli_dict::{BrotliSharedDict, DictId, DictionaryBuilder, BrotliDecompr
 pub use request_dedup::{RequestDeduplicator, RequestKey, DeduplicatedResponse, DeduplicationStats, SimpleDeduplicator};
 pub use predictive_cache::{PredictiveCache, PredictiveCacheStats, MarkovChain, NormalizedUrl, PrefetchRequest};
 pub use cache::{CacheResult, CacheValidators, CacheEntry, HttpCache, CacheStats, CachePartitionKey};
+
+// New module exports
+pub use priority_signals::{PrioritySignal, ResourcePriority, PriorityScheduler, ScheduledRequest, H3PriorityEncoder};
+pub use connection_predictor::{ConnectionPredictor, BloomFilter, NavigationModel, PreconnectHint, HintSource, DnsPrefetcher};
+pub use shared_dict::{SharedDictionary, Pattern, MatchScope, DictionaryCache, UseAsDictionary};
+pub use zstd::{ZstdCompressor, ZstdDecompressor, ZstdError, CompressionLevel};
+pub use dns_resolver::{DnsResolver, DnsQuery, DnsResponse, DnsRecord, RecordType, DohClient, DnsCache};
+pub use tiered_pool::{TieredConnectionPool, ConnectionKey, PooledConnection as TieredPooledConnection, PoolConfig as TieredPoolConfig, AcquireResult as TieredAcquireResult};
+pub use request_fusion::{RequestFusion, FusionRequest, FusedBatch, FusionStats};
+pub use delta_encoding::{DeltaEncoder, DeltaDecoder, DeltaPatch, DeltaOp};
+pub use zero_copy::{MmapBuffer, ScatterGatherWriter, ZeroCopyPipeline, IoVec};
+pub use quic::{Bbrv2Controller, BbrState, CongestionAlgorithm, SessionCache, SessionTicket, SessionCacheKey, EarlyDataBuffer};
 
 
 

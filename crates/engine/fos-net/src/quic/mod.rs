@@ -19,6 +19,8 @@ pub mod migration;
 pub mod h3_frame;
 pub mod altsvc;
 pub mod push;
+pub mod bbrv2;
+pub mod session_cache;
 
 // Core UDP layer
 pub use udp::{UdpSocket, Datagram, EcnMark};
@@ -49,3 +51,9 @@ pub use qpack::{QpackEncoder, QpackDecoder};
 pub use h3_frame::{Http3Frame, Http3Setting, Http3SettingId, UniStreamType, default_settings};
 pub use altsvc::{AltSvc, AltSvcEntry, AltSvcCache};
 pub use push::{PushManager, ServerPush, PushState, PushError};
+
+// BBRv2 congestion control
+pub use bbrv2::{Bbrv2Controller, BbrState, CongestionAlgorithm};
+
+// Session cache for 0-RTT
+pub use session_cache::{SessionCache, SessionTicket, SessionCacheKey, SessionCacheStats, EarlyDataBuffer};

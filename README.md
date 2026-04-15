@@ -1,5 +1,5 @@
 # fOS Engine Documentation
-
+At this time the project is deprecated + it doesn't work. It was too much work and too ambitious, but I plan to continue it in the future.
 This directory contains the development roadmaps and phase documentation for the fOS browser engine.
 
 ## Documents

@@ -76,8 +76,8 @@ fn main() {
     }
 }
 
-/// Save RGBA pixels to PNG
-fn save_png(pixels: &[u8], width: u32, height: u32, path: &str) {
+/// Save 0xAARRGGBB pixels as a PPM image
+fn save_png(pixels: &[u32], width: u32, height: u32, path: &str) {
     use std::io::Write;
     use std::fs::File;
     
@@ -93,9 +93,8 @@ fn save_png(pixels: &[u8], width: u32, height: u32, path: &str) {
     // Pixel data (RGB only, skip alpha)
     for y in 0..height {
         for x in 0..width {
-            let i = ((y * width + x) * 4) as usize;
-            if i + 2 < pixels.len() {
-                write!(file, "{} {} {} ", pixels[i], pixels[i+1], pixels[i+2]).unwrap();
+            if let Some(&p) = pixels.get((y * width + x) as usize) {
+                write!(file, "{} {} {} ", (p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF).unwrap();
             }
         }
         writeln!(file).unwrap();

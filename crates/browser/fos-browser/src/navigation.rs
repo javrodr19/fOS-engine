@@ -2,7 +2,7 @@
 //!
 //! URL handling, history, and navigation.
 
-use fos_engine::url::{Url, ParseError};
+use fos_engine::url::Url;
 use std::collections::VecDeque;
 
 /// Navigation history
@@ -88,6 +88,70 @@ impl History {
     pub fn current(&self) -> Option<&str> {
         self.current.as_deref()
     }
+
+    /// Replace the current entry without affecting back/forward (used when
+    /// a navigation is redirected)
+    pub fn replace_current(&mut self, url: &str) {
+        self.current = Some(url.to_string());
+    }
+}
+
+/// Turn text typed into the address bar into a URL.
+///
+/// Explicit URLs are kept as-is, host-like input (`example.com/path`,
+/// `localhost:8080`, `192.168.1.1`) gets a scheme, and anything else
+/// becomes a web search.
+pub fn omnibox_to_url(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return "about:blank".to_string();
+    }
+
+    let lower = input.to_ascii_lowercase();
+    if ["http://", "https://", "file://", "about:", "data:", "fos:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+    {
+        return input.to_string();
+    }
+
+    if !input.contains(char::is_whitespace) {
+        let host_port = input.split(['/', '?', '#']).next().unwrap_or("");
+        let host = match host_port.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+            _ => host_port,
+        };
+
+        let is_local = host.eq_ignore_ascii_case("localhost")
+            || host.parse::<std::net::Ipv4Addr>().is_ok()
+            || (host.starts_with('[') && host.ends_with(']'));
+        let is_domain = host.contains('.')
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && !host.contains("..");
+
+        if is_local {
+            return format!("http://{}", input);
+        }
+        if is_domain {
+            return format!("https://{}", input);
+        }
+    }
+
+    format!("https://duckduckgo.com/?q={}", encode_query_component(input))
+}
+
+/// Percent-encode a query component (`application/x-www-form-urlencoded`)
+fn encode_query_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 impl Default for History {
@@ -195,5 +259,30 @@ mod tests {
         
         let next = history.go_forward();
         assert_eq!(next, Some("https://c.com".to_string()));
+
+        // A redirect replaces the current entry without growing history
+        history.replace_current("https://www.c.com/");
+        assert_eq!(history.current(), Some("https://www.c.com/"));
+        assert_eq!(history.go_back(), Some("https://b.com".to_string()));
+    }
+
+    #[test]
+    fn test_omnibox_to_url() {
+        assert_eq!(omnibox_to_url("https://example.com/a"), "https://example.com/a");
+        assert_eq!(omnibox_to_url("HTTP://Example.com"), "HTTP://Example.com");
+        assert_eq!(omnibox_to_url("about:version"), "about:version");
+        assert_eq!(omnibox_to_url("example.com/path?q=1"), "https://example.com/path?q=1");
+        assert_eq!(omnibox_to_url("localhost:8080"), "http://localhost:8080");
+        assert_eq!(omnibox_to_url("192.168.1.1/admin"), "http://192.168.1.1/admin");
+        assert_eq!(omnibox_to_url("  "), "about:blank");
+
+        // Searches are percent-encoded
+        assert_eq!(omnibox_to_url("rust"), "https://duckduckgo.com/?q=rust");
+        assert_eq!(
+            omnibox_to_url("what is 1+1 & c#?"),
+            "https://duckduckgo.com/?q=what+is+1%2B1+%26+c%23%3F"
+        );
+        assert_eq!(omnibox_to_url("café"), "https://duckduckgo.com/?q=caf%C3%A9");
+        assert_eq!(omnibox_to_url("end."), "https://duckduckgo.com/?q=end.");
     }
 }

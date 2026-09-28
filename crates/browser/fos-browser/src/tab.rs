@@ -5,6 +5,7 @@
 use crate::navigation::History;
 use crate::page::Page;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Tab ID type
 pub type TabId = u32;
@@ -26,8 +27,9 @@ pub struct Tab {
     pub favicon: Option<Vec<u8>>,
     /// Navigation history
     pub history: History,
-    /// Cached HTML content (for instant tab switching)
-    pub cached_html: Option<String>,
+    /// Cached HTML content (for instant tab switching), shared with the
+    /// renderer instead of copied
+    pub cached_html: Option<Arc<str>>,
     /// Needs reload from network
     pub needs_network_load: bool,
 }
@@ -43,9 +45,9 @@ impl Tab {
         Self {
             id,
             url: url.to_string(),
-            title: "New Tab".to_string(),
+            title: if needs_load { "Loading...".to_string() } else { "New Tab".to_string() },
             page: None,
-            loading: false,
+            loading: needs_load,
             favicon: None,
             history,
             cached_html: None,
@@ -108,12 +110,24 @@ impl Tab {
         self.loading = false;
     }
     
-    /// Get display title (truncated)
+    /// Get display title (truncated to `max_chars` characters)
     pub fn display_title(&self, max_chars: usize) -> String {
-        if self.title.len() > max_chars {
-            format!("{}...", &self.title[..max_chars.saturating_sub(3)])
+        // Count characters, not bytes: slicing a byte index inside a
+        // multi-byte character (e.g. a Cyrillic or CJK title) would panic
+        if self.title.chars().count() > max_chars {
+            let mut truncated: String = self.title.chars().take(max_chars.saturating_sub(3)).collect();
+            truncated.push_str("...");
+            truncated
         } else {
             self.title.clone()
+        }
+    }
+
+    /// Record the final URL after redirects without adding a history entry
+    pub fn set_final_url(&mut self, url: &str) {
+        if self.url != url {
+            self.history.replace_current(url);
+            self.url = url.to_string();
         }
     }
 }
@@ -147,11 +161,9 @@ impl TabManager {
         let id = self.next_id;
         self.next_id += 1;
         
-        let mut tab = Tab::new(id, url);
-        if url != "about:blank" {
-            tab.navigate(url);
-        }
-        
+        // Tab::new already records the URL in history and schedules the load
+        let tab = Tab::new(id, url);
+
         self.tabs.insert(id, tab);
         self.order.push(id);
         self.active = Some(id);

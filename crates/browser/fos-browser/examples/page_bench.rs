@@ -50,6 +50,8 @@ fn main() {
         (page.html, page.url)
     };
 
+    println!("input:        {} bytes of HTML  (RSS {})", html.len(), rss());
+
     // Parse once into the page's DOM, as the browser does
     let start = Instant::now();
     let page = Page::from_html(&url, html);

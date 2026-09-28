@@ -16,7 +16,7 @@ pub mod glyph_atlas;
 pub mod ruby;
 pub mod mmap_resources;
 
-pub use font::{FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery, FontParser};
+pub use font::{FaceData, FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery, FontParser};
 pub use shaping::{TextShaper, ShapedGlyph, ShapedRun};
 pub use layout::{TextLayout, LineBreaker, ParagraphLayout};
 pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph};

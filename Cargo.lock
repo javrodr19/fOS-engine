@@ -1053,6 +1053,7 @@ dependencies = [
 name = "fos-text"
 version = "0.1.0"
 dependencies = [
+ "memmap2",
  "rustc-hash",
  "thiserror 2.0.17",
  "tiny-skia",

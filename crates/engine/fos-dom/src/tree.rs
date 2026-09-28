@@ -120,6 +120,16 @@ impl DomTree {
         id
     }
     
+    /// Create a detached node with the given data
+    pub fn create_node(&mut self, data: NodeData) -> NodeId {
+        self.mark_mutated();
+        let id = NodeId(self.nodes.len() as u32);
+        let mut node = Node::document();
+        node.data = data;
+        self.nodes.push(node);
+        id
+    }
+
     /// Create a new text node
     pub fn create_text(&mut self, content: &str) -> NodeId {
         self.mark_mutated();
@@ -143,8 +153,14 @@ impl DomTree {
         id
     }
     
-    /// Append a child to a parent node
+    /// Append a child to a parent node (moving it if it already has a parent)
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        if parent_id == child_id {
+            return;
+        }
+        if self.nodes.get(child_id.index()).is_some_and(|c| c.parent.is_valid()) {
+            self.remove(child_id);
+        }
         self.mark_mutated();
         // Update child's parent
         if let Some(child) = self.nodes.get_mut(child_id.index()) {
@@ -177,6 +193,93 @@ impl DomTree {
         }
     }
     
+    /// Insert `child_id` into `parent_id` before `reference` (a child of
+    /// `parent_id`), or at the end if `reference` is `NodeId::NONE`. The
+    /// child is moved if it already has a parent.
+    pub fn insert_before(&mut self, parent_id: NodeId, child_id: NodeId, reference: NodeId) {
+        if !reference.is_valid() {
+            return self.append_child(parent_id, child_id);
+        }
+        if parent_id == child_id || child_id == reference {
+            return;
+        }
+        if self.nodes.get(child_id.index()).is_some_and(|c| c.parent.is_valid()) {
+            self.remove(child_id);
+        }
+        let Some(prev) = self.nodes.get(reference.index()).map(|r| r.prev_sibling) else { return };
+        self.mark_mutated();
+
+        {
+            let child = &mut self.nodes[child_id.index()];
+            child.parent = parent_id;
+            child.prev_sibling = prev;
+            child.next_sibling = reference;
+        }
+        self.nodes[reference.index()].prev_sibling = child_id;
+        if prev.is_valid() {
+            self.nodes[prev.index()].next_sibling = child_id;
+        } else if let Some(parent) = self.nodes.get_mut(parent_id.index()) {
+            parent.first_child = child_id;
+        }
+    }
+
+    /// Rebuild the arena with only the nodes reachable from the root, minus
+    /// those `keep` rejects (each dropped with its subtree), stored in
+    /// document order. Node IDs change, so this is meant for right after
+    /// building a tree (e.g. by the parser), before IDs are handed out.
+    ///
+    /// Besides freeing unreachable nodes, document order makes tree walks
+    /// (style, layout) move through memory sequentially.
+    pub fn compact(&mut self, mut keep: impl FnMut(&Node) -> bool) {
+        self.mark_mutated();
+        let mut old = std::mem::take(&mut self.nodes);
+        let mut nodes: Vec<Node> = Vec::with_capacity(old.len());
+
+        let mut root = Node::document();
+        root.data = std::mem::replace(&mut old[0].data, NodeData::Document);
+        nodes.push(root);
+
+        // Depth-first, pre-order: (old id, new parent id)
+        let mut stack: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut children: Vec<NodeId> = Vec::new();
+        let push_children = |old: &[Node], id: NodeId, new_parent: NodeId, stack: &mut Vec<(NodeId, NodeId)>, children: &mut Vec<NodeId>| {
+            children.clear();
+            let mut child = old[id.index()].first_child;
+            while child.is_valid() {
+                children.push(child);
+                child = old[child.index()].next_sibling;
+            }
+            stack.extend(children.iter().rev().map(|&c| (c, new_parent)));
+        };
+        push_children(&old, NodeId::ROOT, NodeId::ROOT, &mut stack, &mut children);
+
+        while let Some((old_id, parent)) = stack.pop() {
+            if !keep(&old[old_id.index()]) {
+                continue;
+            }
+            let id = NodeId(nodes.len() as u32);
+            let mut node = Node::document();
+            node.data = std::mem::replace(&mut old[old_id.index()].data, NodeData::Document);
+            node.parent = parent;
+
+            // Link as the parent's last child
+            let last = nodes[parent.index()].last_child;
+            node.prev_sibling = last;
+            if last.is_valid() {
+                nodes[last.index()].next_sibling = id;
+            } else {
+                nodes[parent.index()].first_child = id;
+            }
+            nodes[parent.index()].last_child = id;
+            nodes.push(node);
+
+            push_children(&old, old_id, id, &mut stack, &mut children);
+        }
+
+        nodes.shrink_to_fit();
+        self.nodes = nodes;
+    }
+
     /// Remove a node from its parent
     pub fn remove(&mut self, node_id: NodeId) {
         self.mark_mutated();
@@ -310,6 +413,76 @@ mod tests {
         assert_eq!(tree.len(), 4);
     }
     
+    fn child_names(tree: &DomTree, parent: NodeId) -> Vec<String> {
+        tree.children(parent)
+            .map(|(_, node)| match &node.data {
+                NodeData::Element(e) => tree.resolve(e.name.local).to_string(),
+                NodeData::Text(t) => format!("'{}'", t.content),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_insert_before_and_move() {
+        let mut tree = DomTree::new();
+        let root = tree.root();
+        let a = tree.create_element("a");
+        let c = tree.create_element("c");
+        tree.append_child(root, a);
+        tree.append_child(root, c);
+
+        let b = tree.create_element("b");
+        tree.insert_before(root, b, c);
+        let first = tree.create_element("first");
+        tree.insert_before(root, first, a);
+        assert_eq!(child_names(&tree, root), ["first", "a", "b", "c"]);
+
+        // Appending a node that has a parent moves it
+        tree.append_child(root, first);
+        assert_eq!(child_names(&tree, root), ["a", "b", "c", "first"]);
+        tree.append_child(a, b);
+        assert_eq!(child_names(&tree, root), ["a", "c", "first"]);
+        assert_eq!(child_names(&tree, a), ["b"]);
+        assert_eq!(tree.get(b).unwrap().parent, a);
+    }
+
+    #[test]
+    fn test_compact_keeps_order_and_drops_nodes() {
+        let mut tree = DomTree::new();
+        let root = tree.root();
+        let body = tree.create_element("body");
+        let detached = tree.create_element("detached");
+        let p = tree.create_element("p");
+        let space = tree.create_text("  ");
+        let text = tree.create_text("hi");
+        let span = tree.create_element("span");
+        tree.append_child(root, body);
+        tree.append_child(body, p);
+        tree.append_child(body, space);
+        tree.append_child(body, span);
+        tree.append_child(p, text);
+        let lost = tree.create_element("lost");
+        tree.append_child(detached, lost);
+        let removed = tree.create_element("removed");
+        tree.append_child(body, removed);
+        tree.remove(removed);
+        assert_eq!(tree.len(), 9);
+
+        let before = tree.revision();
+        tree.compact(|node| !matches!(&node.data, NodeData::Text(t) if t.content.trim().is_empty()));
+        assert_ne!(tree.revision(), before);
+
+        // root, body, p, "hi", span: in document order
+        assert_eq!(tree.len(), 5);
+        let body = NodeId(1);
+        assert_eq!(child_names(&tree, tree.root()), ["body"]);
+        assert_eq!(child_names(&tree, body), ["p", "span"]);
+        assert_eq!(child_names(&tree, NodeId(2)), ["'hi'"]);
+        assert_eq!(tree.get(NodeId(4)).unwrap().prev_sibling, NodeId(2));
+        assert_eq!(tree.get(NodeId(3)).unwrap().parent, NodeId(2));
+    }
+
     #[test]
     fn test_revision_tracks_mutations() {
         let mut tree = DomTree::new();

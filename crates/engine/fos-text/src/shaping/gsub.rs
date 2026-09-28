@@ -241,7 +241,7 @@ impl SingleSubst {
         let mut reader = FontReader::new(data);
         let format = reader.read_u16().ok()?;
         let coverage_offset = reader.read_u16().ok()?;
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let subst_data = match format {
             1 => {
@@ -301,7 +301,7 @@ impl MultipleSubst {
         }
         
         let coverage_offset = reader.read_u16().ok()?;
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let sequence_count = reader.read_u16().ok()?;
         let mut sequence_offsets = Vec::with_capacity(sequence_count as usize);
@@ -311,7 +311,7 @@ impl MultipleSubst {
         
         let mut sequences = Vec::with_capacity(sequence_count as usize);
         for offset in sequence_offsets {
-            let mut seq_reader = FontReader::new(&data[offset as usize..]);
+            let mut seq_reader = FontReader::new(data.get(offset as usize..)?);
             let glyph_count = seq_reader.read_u16().ok()?;
             let mut glyphs = Vec::with_capacity(glyph_count as usize);
             for _ in 0..glyph_count {
@@ -354,7 +354,7 @@ impl AlternateSubst {
         }
         
         let coverage_offset = reader.read_u16().ok()?;
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let set_count = reader.read_u16().ok()?;
         let mut set_offsets = Vec::with_capacity(set_count as usize);
@@ -364,7 +364,7 @@ impl AlternateSubst {
         
         let mut alternate_sets = Vec::with_capacity(set_count as usize);
         for offset in set_offsets {
-            let mut set_reader = FontReader::new(&data[offset as usize..]);
+            let mut set_reader = FontReader::new(data.get(offset as usize..)?);
             let glyph_count = set_reader.read_u16().ok()?;
             let mut glyphs = Vec::with_capacity(glyph_count as usize);
             for _ in 0..glyph_count {
@@ -418,7 +418,7 @@ impl LigatureSubst {
         }
         
         let coverage_offset = reader.read_u16().ok()?;
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let set_count = reader.read_u16().ok()?;
         let mut set_offsets = Vec::with_capacity(set_count as usize);
@@ -428,7 +428,7 @@ impl LigatureSubst {
         
         let mut ligature_sets = Vec::with_capacity(set_count as usize);
         for offset in set_offsets {
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let lig_count = set_reader.read_u16().ok()?;
             
@@ -556,7 +556,7 @@ impl ContextSubst {
         let coverage_offset = reader.read_u16().ok()?;
         let rule_set_count = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let mut rule_set_offsets = Vec::with_capacity(rule_set_count as usize);
         for _ in 0..rule_set_count {
@@ -570,7 +570,7 @@ impl ContextSubst {
                 continue;
             }
             
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let rule_count = set_reader.read_u16().ok()?;
             
@@ -614,8 +614,8 @@ impl ContextSubst {
         let class_def_offset = reader.read_u16().ok()?;
         let rule_set_count = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
-        let class_def = ClassDef::parse(&data[class_def_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
+        let class_def = ClassDef::parse(data.get(class_def_offset as usize..)?)?;
         
         let mut rule_set_offsets = Vec::with_capacity(rule_set_count as usize);
         for _ in 0..rule_set_count {
@@ -629,7 +629,7 @@ impl ContextSubst {
                 continue;
             }
             
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let rule_count = set_reader.read_u16().ok()?;
             
@@ -687,7 +687,7 @@ impl ContextSubst {
         
         let mut coverages = Vec::with_capacity(glyph_count as usize);
         for offset in coverage_offsets {
-            coverages.push(Coverage::parse(&data[offset as usize..])?);
+            coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         Some(ContextSubstData::Format3 { coverages, lookup_records })
@@ -763,7 +763,7 @@ impl ChainedContextSubst {
         let coverage_offset = reader.read_u16().ok()?;
         let rule_set_count = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let mut rule_set_offsets = Vec::with_capacity(rule_set_count as usize);
         for _ in 0..rule_set_count {
@@ -777,7 +777,7 @@ impl ChainedContextSubst {
                 continue;
             }
             
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let rule_count = set_reader.read_u16().ok()?;
             
@@ -839,10 +839,10 @@ impl ChainedContextSubst {
         let lookahead_class_def_offset = reader.read_u16().ok()?;
         let rule_set_count = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
-        let backtrack_class_def = ClassDef::parse(&data[backtrack_class_def_offset as usize..])?;
-        let input_class_def = ClassDef::parse(&data[input_class_def_offset as usize..])?;
-        let lookahead_class_def = ClassDef::parse(&data[lookahead_class_def_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
+        let backtrack_class_def = ClassDef::parse(data.get(backtrack_class_def_offset as usize..)?)?;
+        let input_class_def = ClassDef::parse(data.get(input_class_def_offset as usize..)?)?;
+        let lookahead_class_def = ClassDef::parse(data.get(lookahead_class_def_offset as usize..)?)?;
         
         let mut rule_set_offsets = Vec::with_capacity(rule_set_count as usize);
         for _ in 0..rule_set_count {
@@ -856,7 +856,7 @@ impl ChainedContextSubst {
                 continue;
             }
             
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let rule_count = set_reader.read_u16().ok()?;
             
@@ -954,17 +954,17 @@ impl ChainedContextSubst {
         // Parse coverages
         let mut backtrack_coverages = Vec::with_capacity(backtrack_count as usize);
         for offset in backtrack_offsets {
-            backtrack_coverages.push(Coverage::parse(&data[offset as usize..])?);
+            backtrack_coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         let mut input_coverages = Vec::with_capacity(input_count as usize);
         for offset in input_offsets {
-            input_coverages.push(Coverage::parse(&data[offset as usize..])?);
+            input_coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         let mut lookahead_coverages = Vec::with_capacity(lookahead_count as usize);
         for offset in lookahead_offsets {
-            lookahead_coverages.push(Coverage::parse(&data[offset as usize..])?);
+            lookahead_coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         Some(ChainedContextData::Format3 {
@@ -995,7 +995,7 @@ impl ReverseChainSingleSubst {
         }
         
         let coverage_offset = reader.read_u16().ok()?;
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         // Backtrack coverages
         let backtrack_count = reader.read_u16().ok()?;
@@ -1021,12 +1021,12 @@ impl ReverseChainSingleSubst {
         // Parse coverages
         let mut backtrack_coverages = Vec::with_capacity(backtrack_count as usize);
         for offset in backtrack_offsets {
-            backtrack_coverages.push(Coverage::parse(&data[offset as usize..])?);
+            backtrack_coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         let mut lookahead_coverages = Vec::with_capacity(lookahead_count as usize);
         for offset in lookahead_offsets {
-            lookahead_coverages.push(Coverage::parse(&data[offset as usize..])?);
+            lookahead_coverages.push(Coverage::parse(data.get(offset as usize..)?)?);
         }
         
         Some(Self {
@@ -1124,7 +1124,7 @@ impl<'a> GsubTable<'a> {
     
     /// Get lookup by index
     pub fn get_lookup(&self, index: u16) -> Option<GsubLookup> {
-        let lookup_list_data = &self.data[self.lookup_list_offset as usize..];
+        let lookup_list_data = self.data.get(self.lookup_list_offset as usize..)?;
         let mut reader = FontReader::new(lookup_list_data);
         
         let lookup_count = reader.read_u16().ok()?;
@@ -1136,9 +1136,14 @@ impl<'a> GsubTable<'a> {
         reader.skip((index as usize) * 2).ok()?;
         let lookup_offset = reader.read_u16().ok()?;
         
-        Self::parse_lookup(&lookup_list_data[lookup_offset as usize..])
+        Self::parse_lookup(lookup_list_data.get(lookup_offset as usize..)?)
     }
-    
+
+    /// Indices of the lookups used by features with the given tags
+    pub fn feature_lookup_indices(&self, tags: &[[u8; 4]]) -> Vec<u16> {
+        feature_lookup_indices(self.data, self.feature_list_offset, tags)
+    }
+
     fn parse_lookup(data: &[u8]) -> Option<GsubLookup> {
         let mut reader = FontReader::new(data);
         
@@ -1159,8 +1164,10 @@ impl<'a> GsubTable<'a> {
         };
         
         let mut subtables = Vec::with_capacity(subtable_count as usize);
+        // Extension lookups (type 7) take the type of their wrapped subtables
+        let mut resolved_type = lookup_type;
         for offset in subtable_offsets {
-            let subtable_data = &data[offset as usize..];
+            let Some(subtable_data) = data.get(offset as usize..) else { continue };
             
             // Handle extension lookups
             let (actual_type, actual_data) = if lookup_type == 7 {
@@ -1169,7 +1176,9 @@ impl<'a> GsubTable<'a> {
                 let _format = ext_reader.read_u16().ok()?;
                 let extension_type = ext_reader.read_u16().ok()?;
                 let extension_offset = ext_reader.read_u32().ok()?;
-                (extension_type, &subtable_data[extension_offset as usize..])
+                let Some(extension_data) = subtable_data.get(extension_offset as usize..) else { continue };
+                resolved_type = extension_type;
+                (extension_type, extension_data)
             } else {
                 (lookup_type, subtable_data)
             };
@@ -1188,7 +1197,7 @@ impl<'a> GsubTable<'a> {
             subtables.push(subtable);
         }
         
-        let lookup_type = LookupType::try_from(if lookup_type == 7 { 1 } else { lookup_type }).ok()?;
+        let lookup_type = LookupType::try_from(resolved_type).ok()?;
         
         Some(GsubLookup {
             lookup_type,
@@ -1200,10 +1209,45 @@ impl<'a> GsubTable<'a> {
     
     /// Get number of lookups
     pub fn lookup_count(&self) -> u16 {
-        let lookup_list_data = &self.data[self.lookup_list_offset as usize..];
+        let lookup_list_data = self.data.get(self.lookup_list_offset as usize..).unwrap_or(&[]);
         let mut reader = FontReader::new(lookup_list_data);
         reader.read_u16().unwrap_or(0)
     }
+}
+
+/// Indices of the lookups referenced by features with the given tags, read
+/// from a GSUB/GPOS FeatureList (sorted, deduplicated: lookups must be
+/// applied in LookupList order).
+///
+/// Features are collected across all scripts and languages. Lookups from a
+/// feature registered for another script only cover that script's glyphs,
+/// so applying them to other text has no effect.
+pub fn feature_lookup_indices(table: &[u8], feature_list_offset: u16, tags: &[[u8; 4]]) -> Vec<u16> {
+    let mut indices = Vec::new();
+    let Some(list) = table.get(feature_list_offset as usize..) else { return indices };
+    let mut reader = FontReader::new(list);
+    let Ok(count) = reader.read_u16() else { return indices };
+
+    for _ in 0..count {
+        let (Ok(tag), Ok(offset)) = (reader.read_tag(), reader.read_u16()) else { break };
+        if !tags.contains(&tag) {
+            continue;
+        }
+        let Some(feature) = list.get(offset as usize..) else { continue };
+        let mut feature_reader = FontReader::new(feature);
+        let _feature_params = feature_reader.read_u16();
+        let Ok(lookup_count) = feature_reader.read_u16() else { continue };
+        for _ in 0..lookup_count {
+            match feature_reader.read_u16() {
+                Ok(index) => indices.push(index),
+                Err(_) => break,
+            }
+        }
+    }
+
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 #[cfg(test)]

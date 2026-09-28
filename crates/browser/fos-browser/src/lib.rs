@@ -41,6 +41,8 @@ pub mod renderer;
 pub mod js_runtime;
 /// Network requests with HTTP cache
 pub mod network;
+/// Character encoding detection and decoding
+pub mod charset;
 /// Developer tools
 pub mod devtools;
 /// Accessibility tree and focus management

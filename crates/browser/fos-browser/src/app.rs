@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -28,6 +28,17 @@ use crate::advanced_net::AdvancedNetworking;
 use crate::security::SecurityManager;
 use crate::memory::MemoryIntegration;
 
+/// Height of the rendered page buffer, in viewports. One viewport above and
+/// one below the visible area keeps most scrolling a plain memory copy
+/// while bounding the buffer's memory.
+const RENDER_BUFFER_VIEWPORTS: f32 = 3.0;
+
+/// Interval for running JavaScript timers while any are pending
+const TIMER_TICK: Duration = Duration::from_millis(16);
+
+/// Background color outside the page (0xAARRGGBB)
+const WINDOW_BACKGROUND: u32 = 0xFF0D0D0D;
+
 /// Browser application
 pub struct Browser {
     /// Initial URL to load
@@ -41,17 +52,17 @@ impl Browser {
             initial_url: String::new(),
         })
     }
-    
+
     /// Run the browser with an initial URL
     pub fn run(mut self, initial_url: String) -> Result<(), Box<dyn Error>> {
         self.initial_url = initial_url;
-        
+
         let event_loop = EventLoop::new()?;
         event_loop.set_control_flow(ControlFlow::Wait);
-        
+
         let mut app = BrowserApp::new(self.initial_url.clone());
         event_loop.run_app(&mut app)?;
-        
+
         Ok(())
     }
 }
@@ -81,18 +92,14 @@ struct BrowserApp {
     modifiers: winit::keyboard::ModifiersState,
     /// Needs page reload
     needs_reload: bool,
-    /// Scroll offset (vertical)
+    /// Scroll offset (vertical, document coordinates)
     scroll_offset: f32,
     /// Y position where rendered buffer starts in document (for sliding window)
     render_start_y: f32,
-    /// Current page HTML (for scroll re-rendering)
-    current_html: String,
-    /// Current page URL
+    /// Current page HTML (shared with the tab's cache, for re-rendering)
+    current_html: Arc<str>,
+    /// Current page URL (final URL after redirects)
     current_url: String,
-    /// Background render result receiver (for async scroll rendering)
-    bg_render_rx: Option<Receiver<(RenderedPage, f32)>>,
-    /// Pending render start Y (waiting for background render to complete)
-    pending_render_start: Option<f32>,
     /// Mouse position
     mouse_x: i32,
     mouse_y: i32,
@@ -103,7 +110,7 @@ struct BrowserApp {
     /// Current page with JavaScript runtime
     current_page: Option<Page>,
     /// Last timer check time
-    last_timer_check: std::time::Instant,
+    last_timer_check: Instant,
     /// Developer tools
     devtools: DevTools,
     /// Accessibility manager
@@ -137,16 +144,14 @@ impl BrowserApp {
             needs_reload: true,
             scroll_offset: 0.0,
             render_start_y: 0.0,
-            current_html: String::new(),
+            current_html: Arc::from(""),
             current_url: String::new(),
-            bg_render_rx: None,
-            pending_render_start: None,
             mouse_x: 0,
             mouse_y: 0,
             resize_pending: false,
             network: NetworkManager::new(),
             current_page: None,
-            last_timer_check: std::time::Instant::now(),
+            last_timer_check: Instant::now(),
             devtools: DevTools::new(),
             a11y: AccessibilityManager::new(),
             media: MediaManager::new(),
@@ -156,7 +161,17 @@ impl BrowserApp {
             _memory: MemoryIntegration::new(),
         }
     }
-    
+
+    /// Width of the page area
+    fn content_width(&self) -> u32 {
+        self.width.saturating_sub(TAB_BAR_WIDTH)
+    }
+
+    /// Height of the visible page area
+    fn viewport_height(&self) -> f32 {
+        self.height.saturating_sub(URL_BAR_HEIGHT) as f32
+    }
+
     /// Load the current tab's page
     fn load_current_page(&mut self) {
         // Get tab info
@@ -164,11 +179,9 @@ impl BrowserApp {
             Some(tab) => (tab.url.clone(), tab.needs_network_load, tab.cached_html.clone()),
             None => return,
         };
-        
-        log::info!("Loading: {} (network: {})", url, needs_network);
-        
+
         // If we have cached HTML and don't need network, just re-render
-        if let Some(ref html) = cached_html {
+        if let Some(html) = cached_html {
             if !needs_network {
                 log::info!("Using cached HTML ({} bytes)", html.len());
                 // Reset scroll only if URL changed (not resize)
@@ -178,70 +191,93 @@ impl BrowserApp {
                 return;
             }
         }
-        
-        // Try network cache first, then fetch
-        // Log to DevTools network panel
+
+        log::info!("Loading: {}", url);
         let request_id = self.devtools.log_request(&url, "GET");
-        let fetch_result = self.network.fetch_html(&url);
-        
-        match fetch_result {
-            Ok(html) => {
-                // Log successful response
-                self.devtools.log_response(request_id, 200, "OK");
-                
+
+        // about: and file: pages never touch the network
+        let loaded = if Loader::is_local_url(&url) {
+            self.loader.load_sync(&url)
+                .map(|page| (page.html, url.clone(), 200))
+                .map_err(|e| e.to_string())
+        } else {
+            self.network.fetch_page(&url)
+                .map(|page| (page.html, page.url, page.status))
+                .map_err(|e| e.to_string())
+        };
+
+        match loaded {
+            Ok((html, final_url, status)) => {
+                self.devtools.log_response(request_id, status, if status < 400 { "OK" } else { "Error" });
+
+                if final_url != url {
+                    log::info!("Redirected to {}", final_url);
+                    self.chrome.url_bar.set_url(&final_url);
+                }
+
                 // Create page with JavaScript runtime
-                let mut page = Page::from_html(&url, html.clone());
-                
+                let html: Arc<str> = Arc::from(html);
+                let mut page = Page::from_html(&final_url, html.to_string());
+
                 // Update tab with loaded content and cache the HTML
                 if let Some(tab) = self.tabs.active_tab_mut() {
-                    tab.title = page.title.clone().unwrap_or_else(|| url.clone());
+                    tab.set_final_url(&final_url);
+                    tab.title = page.title.clone().unwrap_or_else(|| final_url.clone());
                     tab.loading = false;
                     tab.cached_html = Some(html.clone());
                     tab.needs_network_load = false;
                 }
-                
+
                 // Initialize JavaScript (if scripts exist)
                 if let Err(e) = page.initialize_javascript() {
                     log::warn!("Failed to initialize JavaScript: {}", e);
                     self.devtools.warn(&format!("JS init failed: {}", e));
                 }
-                
+
                 // Store the page
                 self.current_page = Some(page);
-                
+
                 // Reset scroll for new page loads
-                self.render_page(&html, &url, true);
-                
+                self.render_page(html, &final_url, true);
+
+                // Jump to the fragment, if the URL has one
+                if let Some((_, fragment)) = final_url.split_once('#') {
+                    self.scroll_to_anchor(fragment);
+                }
+
                 // Execute scripts after initial render
                 if let Some(ref mut page) = self.current_page {
                     if let Err(e) = page.execute_scripts() {
                         log::warn!("Failed to execute scripts: {}", e);
                         self.devtools.error(&format!("Script error: {}", e));
                     }
-                    
+
                     // Build accessibility tree and extract media/canvas from DOM
                     if let Some(doc) = page.document() {
-                        let doc_guard = doc.lock().unwrap();
-                        
+                        let doc_guard = match doc.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+
                         // Accessibility tree
                         self.a11y.build_from_document(&doc_guard);
                         let a11y_stats = self.a11y.stats();
-                        log::info!("Built a11y tree: {} focusable elements, {} links", 
+                        log::info!("Built a11y tree: {} focusable elements, {} links",
                             a11y_stats.focusable_count, a11y_stats.link_count);
-                        
+
                         // Media elements
                         self.media.extract_from_document(&doc_guard);
                         let media_stats = self.media.stats();
                         if media_stats.video_count > 0 || media_stats.audio_count > 0 {
-                            log::info!("Found media: {} videos, {} audios", 
+                            log::info!("Found media: {} videos, {} audios",
                                 media_stats.video_count, media_stats.audio_count);
                         }
-                        
+
                         // Canvas elements
                         self.canvas.extract_from_document(&doc_guard);
                         let canvas_stats = self.canvas.stats();
                         if canvas_stats.canvas_count > 0 {
-                            log::info!("Found {} canvas elements ({} total pixels)", 
+                            log::info!("Found {} canvas elements ({} total pixels)",
                                 canvas_stats.canvas_count, canvas_stats.total_pixels);
                         }
                     }
@@ -249,230 +285,209 @@ impl BrowserApp {
             }
             Err(e) => {
                 // Log failed request
-                self.devtools.log_network_error(request_id, &e.to_string());
-                // Network cache failed, try loader as fallback
-                log::warn!("Network fetch failed, trying loader: {}", e);
-                match self.loader.load_sync(&url) {
-                    Ok(page) => {
-                        // Update tab with loaded content and cache the HTML
-                        if let Some(tab) = self.tabs.active_tab_mut() {
-                            tab.title = page.title.clone().unwrap_or_else(|| url.clone());
-                            tab.loading = false;
-                            tab.cached_html = Some(page.html.clone());
-                            tab.needs_network_load = false;
-                        }
-                        
-                        // Reset scroll for new page loads
-                        self.render_page(&page.html, &url, true);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load {}: {}", url, e);
-                        // Show error page
-                        let error_html = format!(r#"
-                            <!DOCTYPE html>
-                            <html>
-                            <head><title>Error</title></head>
-                            <body style="background: #1a1a1a; color: #ff6b6b; padding: 20px; font-family: sans-serif;">
-                                <h1>Failed to load page</h1>
-                                <p>URL: {}</p>
-                                <p>Error: {}</p>
-                            </body>
-                            </html>
-                        "#, url, e);
-                        
-                        let content_width = self.width.saturating_sub(TAB_BAR_WIDTH);
-                        let content_height = self.height.saturating_sub(URL_BAR_HEIGHT);
-                        self.renderer.set_viewport(content_width, content_height);
-                        self.rendered_page = self.renderer.render_html(&error_html, &url, 0.0);
-                    }
+                self.devtools.log_network_error(request_id, &e);
+                log::error!("Failed to load {}: {}", url, e);
+
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.loading = false;
+                    tab.title = "Error".to_string();
                 }
+
+                // Show error page
+                let error_html = format!(r#"
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Error</title></head>
+                    <body style="background: #1a1a1a; color: #ff6b6b; padding: 20px; font-family: sans-serif;">
+                        <h1>Failed to load page</h1>
+                        <p>URL: {}</p>
+                        <p>Error: {}</p>
+                    </body>
+                    </html>
+                "#, escape_html(&url), escape_html(&e));
+
+                self.current_page = None;
+                self.render_page(Arc::from(error_html), &url, true);
             }
         }
-        
+
         self.needs_reload = false;
     }
-    
+
     /// Render a page from HTML (helper for caching)
     /// If reset_scroll is false, keeps current scroll position (for resize)
-    fn render_page(&mut self, html: &str, url: &str, reset_scroll: bool) {
-        let content_width = self.width.saturating_sub(TAB_BAR_WIDTH);
-        let content_height = self.height.saturating_sub(URL_BAR_HEIGHT);
-        
-        // Render to a buffer for scrolling (5x viewport height)
-        // Links will be re-captured during scroll when re-rendering is triggered
-        let render_height = content_height * 5;
-        self.renderer.set_viewport(content_width, render_height);
-        
+    fn render_page(&mut self, html: Arc<str>, url: &str, reset_scroll: bool) {
         log::info!("Rendering {} bytes of HTML...", html.len());
-        self.current_html = html.to_string();
+        self.current_html = html;
         self.current_url = url.to_string();
-        
+
         if reset_scroll {
             self.scroll_offset = 0.0;
             self.render_start_y = 0.0;
         }
-        
-        self.rendered_page = self.renderer.render_html(html, url, self.render_start_y);
-        
+
+        self.rerender_at(self.render_start_y);
+
         if let Some(ref rendered) = self.rendered_page {
             log::info!("Rendered: {}x{} pixels", rendered.width, rendered.height);
         }
     }
-    
+
+    /// Render the page buffer starting at document position `start_y`.
+    ///
+    /// Parsing and styles are cached by the renderer, so this only repaints.
+    fn rerender_at(&mut self, start_y: f32) {
+        let render_height = (self.viewport_height() * RENDER_BUFFER_VIEWPORTS) as u32;
+        self.renderer.set_viewport(self.content_width(), render_height.max(1));
+
+        if let Some(rendered) = self.renderer.render_html(&self.current_html, &self.current_url, start_y) {
+            self.rendered_page = Some(rendered);
+            self.render_start_y = start_y;
+        }
+    }
+
+    /// Clamp the scroll position to the document and re-render the buffer
+    /// when the viewport gets close to its edge
+    fn ensure_render_covers_scroll(&mut self) {
+        let viewport_height = self.viewport_height();
+        let Some(rendered) = self.rendered_page.as_ref() else { return };
+
+        let max_scroll = (rendered.content_height - viewport_height).max(0.0);
+        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
+
+        let buffer_height = rendered.height as f32;
+        let in_buffer = self.scroll_offset - self.render_start_y;
+        let margin = viewport_height * 0.25;
+
+        let covers_end = self.render_start_y + buffer_height >= rendered.content_height;
+        let near_top = self.render_start_y > 0.0 && in_buffer < margin;
+        let near_bottom = !covers_end && in_buffer + viewport_height > buffer_height - margin;
+
+        if near_top || near_bottom {
+            // Center the viewport in the new buffer
+            let new_start = (self.scroll_offset - viewport_height).max(0.0);
+            self.rerender_at(new_start);
+        }
+    }
+
+    /// Scroll by `delta` pixels (positive is down)
+    fn scroll_by(&mut self, delta: f32) {
+        self.scroll_offset += delta;
+        self.ensure_render_covers_scroll();
+        self.request_redraw();
+    }
+
+    /// Scroll to the element with the given id
+    fn scroll_to_anchor(&mut self, id: &str) {
+        let Some(rendered) = self.rendered_page.as_ref() else { return };
+        if let Some(anchor) = rendered.anchors.iter().find(|a| a.id == id) {
+            log::info!("Scrolling to anchor: #{}", id);
+            // Small margin at the top
+            self.scroll_offset = (anchor.y + self.render_start_y - 10.0).max(0.0);
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+    }
+
     /// Process JavaScript timers (call periodically)
     fn process_js_timers(&mut self) {
-        // Check every 16ms (60fps)
-        if self.last_timer_check.elapsed() < std::time::Duration::from_millis(16) {
+        if self.last_timer_check.elapsed() < TIMER_TICK {
             return;
         }
-        self.last_timer_check = std::time::Instant::now();
-        
+        self.last_timer_check = Instant::now();
+
         if let Some(ref mut page) = self.current_page {
             if page.has_pending_timers() {
                 if let Err(e) = page.process_timers() {
                     log::warn!("Timer processing error: {}", e);
                 }
-                // Request redraw if timers ran (DOM might have changed)
-                self.request_redraw();
             }
         }
     }
-    
+
     /// Render the browser UI and content
     fn render(&mut self) {
-        // Check for completed background render
-        if let Some(ref rx) = self.bg_render_rx {
-            match rx.try_recv() {
-                Ok((rendered, new_start)) => {
-                    // Background render completed - swap in new buffer
-                    self.rendered_page = Some(rendered);
-                    self.render_start_y = new_start;
-                    self.pending_render_start = None;
-                    self.bg_render_rx = None;
-                }
-                Err(TryRecvError::Empty) => {
-                    // Still rendering - keep current buffer
-                }
-                Err(TryRecvError::Disconnected) => {
-                    // Thread died - clear pending state
-                    self.pending_render_start = None;
-                    self.bg_render_rx = None;
-                }
-            }
-        }
-        
-        // Load page if needed
-        if self.needs_reload {
-            self.load_current_page();
-        }
-        
-        let Some(window) = &self.window else { return };
-        
-        let size = window.inner_size();
+        let Some(size) = self.window.as_ref().map(|w| w.inner_size()) else { return };
         if size.width == 0 || size.height == 0 {
             return;
         }
-        
-        // Check if viewport changed - debounce by marking pending instead of immediate re-render
+
+        // Track the window size before loading, so a page is rendered once
+        // at the right size
         if size.width != self.width || size.height != self.height {
             self.width = size.width;
             self.height = size.height;
             self.resize_pending = true;
-            // Don't re-render immediately - wait for resize to stabilize
         }
-        
-        // If resize is pending and no background render is active, do the re-render now
-        // This allows rapid resizes to batch together
-        if self.resize_pending && self.bg_render_rx.is_none() {
-            self.resize_pending = false;
-            self.needs_reload = true;
+
+        if self.needs_reload {
+            // Load page if needed (renders at the current size)
             self.load_current_page();
+            self.resize_pending = false;
+        } else if self.resize_pending {
+            // Re-render at the new size (the parsed page is reused)
+            self.resize_pending = false;
+            if !self.current_html.is_empty() {
+                let start = self.render_start_y;
+                self.rerender_at(start);
+                self.ensure_render_covers_scroll();
+            }
         }
-        
+
         let Some(surface) = &mut self.surface else { return };
-        
+
         // Resize surface if needed
-        let _ = surface.resize(
-            NonZeroU32::new(size.width).unwrap(),
-            NonZeroU32::new(size.height).unwrap(),
-        );
-        
+        let (Some(surface_width), Some(surface_height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        if surface.resize(surface_width, surface_height).is_err() {
+            return;
+        }
+
         // Get buffer
         let mut buffer = match surface.buffer_mut() {
             Ok(b) => b,
             Err(_) => return,
         };
-        
+
         let buffer_width = size.width as usize;
         let buffer_height = size.height as usize;
-        
+
         // Clear to background color
-        let bg_color = 0xFF0D0D0D; // Dark gray ARGB (softbuffer uses 0xAARRGGBB)
-        buffer.fill(bg_color);
-        
-        // Render page content in content area (inline to avoid borrow issues)
-        let content_x = TAB_BAR_WIDTH as usize;
+        buffer.fill(WINDOW_BACKGROUND);
+
+        // Render page content in content area
+        let content_x = (TAB_BAR_WIDTH as usize).min(buffer_width);
         let content_height = buffer_height.saturating_sub(URL_BAR_HEIGHT as usize);
-        
+
         if let Some(ref rendered) = self.rendered_page {
-            // Log first time we render
-            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
-                LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
-                log::info!("Copying {}x{} pixels to buffer at x={}", rendered.width, rendered.height, content_x);
-            }
-            
-            // Apply scroll offset when copying pixels (much more efficient than re-rendering)
-            // scroll_offset is in document coordinates, render_start_y is where buffer starts
-            let scroll_y = (self.scroll_offset - self.render_start_y).max(0.0) as u32;
-            
-            // Copy rendered pixels to buffer with scroll offset
-            // rendered.pixels is RGBA bytes, buffer is ARGB u32
-            for y in 0..content_height.min(buffer_height) as u32 {
-                // Source y includes scroll offset relative to rendered buffer
+            // scroll_offset is in document coordinates, render_start_y is where the buffer starts
+            let scroll_y = (self.scroll_offset - self.render_start_y).max(0.0) as usize;
+            let src_width = rendered.width as usize;
+            let copy_width = src_width.min(buffer_width - content_x);
+
+            // Both buffers use 0xAARRGGBB, so each visible row is one copy
+            for y in 0..content_height {
+                let dst_start = y * buffer_width + content_x;
+                let dst = &mut buffer[dst_start..dst_start + copy_width];
                 let src_y = y + scroll_y;
-                
-                if src_y >= rendered.height {
-                    // Past end of content - fill with white
-                    for x in 0..rendered.width.min((buffer_width - content_x) as u32) {
-                        let dst_x = content_x + x as usize;
-                        let dst_y = y as usize;
-                        if dst_y < buffer_height && dst_x < buffer_width {
-                            buffer[dst_y * buffer_width + dst_x] = 0xFFFFFFFF; // White
-                        }
-                    }
-                    continue;
-                }
-                
-                for x in 0..rendered.width.min((buffer_width - content_x) as u32) {
-                    let src_idx = ((src_y * rendered.width + x) * 4) as usize;
-                    let dst_x = content_x + x as usize;
-                    let dst_y = y as usize;
-                    
-                    if src_idx + 3 < rendered.pixels.len() && dst_y < buffer_height && dst_x < buffer_width {
-                        let r = rendered.pixels[src_idx] as u32;
-                        let g = rendered.pixels[src_idx + 1] as u32;
-                        let b = rendered.pixels[src_idx + 2] as u32;
-                        let a = rendered.pixels[src_idx + 3] as u32;
-                        
-                        // Convert RGBA to ARGB (softbuffer format: 0xAARRGGBB)
-                        let pixel = (a << 24) | (r << 16) | (g << 8) | b;
-                        buffer[dst_y * buffer_width + dst_x] = pixel;
-                    }
+                if src_y < rendered.height as usize {
+                    let src_start = src_y * src_width;
+                    dst.copy_from_slice(&rendered.pixels[src_start..src_start + copy_width]);
+                } else {
+                    // Past end of content
+                    dst.fill(0xFFFFFFFF);
                 }
             }
         } else {
             // No rendered page - draw a placeholder rectangle
             let placeholder_color = 0xFF1A3A5A; // Dark blue
             for y in 50..150.min(content_height) {
-                for x in content_x..content_x + 200 {
-                    if x < buffer_width && y < buffer_height {
-                        buffer[y * buffer_width + x] = placeholder_color;
-                    }
-                }
+                let start = y * buffer_width + content_x;
+                let end = (start + 200).min((y + 1) * buffer_width);
+                buffer[start..end].fill(placeholder_color);
             }
         }
-        
+
         // Render UI chrome on top
         self.chrome.render(
             &mut buffer,
@@ -480,19 +495,19 @@ impl BrowserApp {
             buffer_height,
             &self.tabs,
         );
-        
+
         // Present
         let _ = buffer.present();
     }
-    
+
     /// Handle keyboard input
     fn handle_key(&mut self, event: KeyEvent, modifiers: &winit::keyboard::ModifiersState) {
         if event.state != ElementState::Pressed {
             return;
         }
-        
+
         let ctrl = modifiers.control_key();
-        
+
         // If URL bar is focused, handle text input
         if self.chrome.is_url_bar_focused() {
             match event.physical_key {
@@ -539,10 +554,10 @@ impl BrowserApp {
                     return;
                 }
                 _ => {
-                    // Handle text input
+                    // Handle text input (any printable character, not just ASCII)
                     if let Some(text) = &event.text {
                         for c in text.chars() {
-                            if c.is_ascii_graphic() || c == ' ' {
+                            if !c.is_control() {
                                 self.chrome.handle_char(c);
                             }
                         }
@@ -552,7 +567,9 @@ impl BrowserApp {
                 }
             }
         }
-        
+
+        let viewport_height = self.viewport_height();
+
         // Global shortcuts (keyboard-only UI)
         match event.physical_key {
             // Tab management
@@ -580,17 +597,16 @@ impl BrowserApp {
                 self.needs_reload = true;
                 self.request_redraw();
             }
-            
+
             // URL bar
             PhysicalKey::Code(KeyCode::KeyI) if ctrl => {
                 // Ctrl+I: Focus URL bar
                 self.chrome.focus_url_bar();
                 self.request_redraw();
             }
-            
-            // Navigation (history)
-            PhysicalKey::Code(KeyCode::KeyK) if ctrl => {
-                // Ctrl+K: Go back in history
+
+            // Navigation (history): Ctrl+K / Ctrl+[ back, Ctrl+; (Ñ on Spanish keyboard) / Ctrl+] forward
+            PhysicalKey::Code(KeyCode::KeyK) | PhysicalKey::Code(KeyCode::BracketLeft) if ctrl => {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     if tab.go_back().is_some() {
                         self.needs_reload = true;
@@ -598,8 +614,7 @@ impl BrowserApp {
                 }
                 self.request_redraw();
             }
-            PhysicalKey::Code(KeyCode::Semicolon) if ctrl => {
-                // Ctrl+; (Ñ on Spanish keyboard): Go forward in history
+            PhysicalKey::Code(KeyCode::Semicolon) | PhysicalKey::Code(KeyCode::BracketRight) if ctrl => {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     if tab.go_forward().is_some() {
                         self.needs_reload = true;
@@ -607,35 +622,15 @@ impl BrowserApp {
                 }
                 self.request_redraw();
             }
-            PhysicalKey::Code(KeyCode::BracketLeft) if ctrl => {
-                // Ctrl+[: Alternative go back
-                if let Some(tab) = self.tabs.active_tab_mut() {
-                    if tab.go_back().is_some() {
-                        self.needs_reload = true;
-                    }
-                }
-                self.request_redraw();
-            }
-            PhysicalKey::Code(KeyCode::BracketRight) if ctrl => {
-                // Ctrl+]: Alternative go forward
-                if let Some(tab) = self.tabs.active_tab_mut() {
-                    if tab.go_forward().is_some() {
-                        self.needs_reload = true;
-                    }
-                }
-                self.request_redraw();
-            }
-            
+
             // Page actions
             PhysicalKey::Code(KeyCode::KeyR) if ctrl => {
                 // Ctrl+R: Reload
-                self.needs_reload = true;
-                self.request_redraw();
+                self.reload();
             }
             PhysicalKey::Code(KeyCode::F5) => {
                 // F5: Reload
-                self.needs_reload = true;
-                self.request_redraw();
+                self.reload();
             }
             PhysicalKey::Code(KeyCode::F12) => {
                 // F12: Toggle DevTools
@@ -646,7 +641,10 @@ impl BrowserApp {
                     // Inspect current page DOM
                     if let Some(ref page) = self.current_page {
                         if let Some(doc) = page.document() {
-                            let doc_guard = doc.lock().unwrap();
+                            let doc_guard = match doc.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
                             self.devtools.inspect_document(&doc_guard);
                         }
                     }
@@ -658,45 +656,25 @@ impl BrowserApp {
                 self.chrome.url_bar.unfocus();
                 self.request_redraw();
             }
-            
+
             // Scrolling (when URL bar not focused)
-            PhysicalKey::Code(KeyCode::ArrowDown) => {
-                self.scroll_offset += 40.0;
-                self.request_redraw();
-            }
-            PhysicalKey::Code(KeyCode::ArrowUp) => {
-                self.scroll_offset = (self.scroll_offset - 40.0).max(0.0);
-                self.request_redraw();
-            }
-            PhysicalKey::Code(KeyCode::PageDown) => {
-                let viewport_height = self.height.saturating_sub(URL_BAR_HEIGHT) as f32;
-                self.scroll_offset += viewport_height * 0.9;
-                self.request_redraw();
-            }
-            PhysicalKey::Code(KeyCode::PageUp) => {
-                let viewport_height = self.height.saturating_sub(URL_BAR_HEIGHT) as f32;
-                self.scroll_offset = (self.scroll_offset - viewport_height * 0.9).max(0.0);
-                self.request_redraw();
-            }
+            PhysicalKey::Code(KeyCode::ArrowDown) => self.scroll_by(40.0),
+            PhysicalKey::Code(KeyCode::ArrowUp) => self.scroll_by(-40.0),
+            PhysicalKey::Code(KeyCode::PageDown) => self.scroll_by(viewport_height * 0.9),
+            PhysicalKey::Code(KeyCode::PageUp) => self.scroll_by(-viewport_height * 0.9),
+            PhysicalKey::Code(KeyCode::Space) if modifiers.shift_key() => self.scroll_by(-viewport_height * 0.9),
+            PhysicalKey::Code(KeyCode::Space) => self.scroll_by(viewport_height * 0.9),
             PhysicalKey::Code(KeyCode::Home) if ctrl => {
                 // Ctrl+Home: Go to top of page
                 self.scroll_offset = 0.0;
-                self.request_redraw();
+                self.scroll_by(0.0);
             }
             PhysicalKey::Code(KeyCode::End) if ctrl => {
-                // Ctrl+End: Go to bottom of page
-                if let Some(ref rendered) = self.rendered_page {
-                    let viewport_height = self.height.saturating_sub(URL_BAR_HEIGHT) as f32;
-                    self.scroll_offset = (rendered.content_height - viewport_height).max(0.0);
-                }
-                self.request_redraw();
+                // Ctrl+End: Go to bottom of page (clamped to the content)
+                self.scroll_offset = f32::MAX / 2.0;
+                self.scroll_by(0.0);
             }
-            PhysicalKey::Code(KeyCode::Space) => {
-                // Space: Scroll down (when not in URL bar)
-                self.scroll_offset += 200.0;
-                self.request_redraw();
-            }
-            
+
             // Accessibility: Tab navigation
             PhysicalKey::Code(KeyCode::Tab) => {
                 if modifiers.shift_key() {
@@ -715,39 +693,103 @@ impl BrowserApp {
             }
             PhysicalKey::Code(KeyCode::Enter) if !self.chrome.is_url_bar_focused() => {
                 // Enter: Activate focused link
-                if let Some(url) = self.a11y.get_focused_link_url().map(String::from) {
-                    self.navigate_to(&url);
+                if let Some(href) = self.a11y.get_focused_link_url().map(String::from) {
+                    self.follow_link(&href);
                 }
             }
-            
+
             _ => {}
         }
     }
-    
-    /// Navigate to a URL
-    fn navigate_to(&mut self, url: &str) {
-        // Normalize URL
-        let normalized = if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("about:") {
-            url.to_string()
-        } else if url.contains('.') {
-            format!("https://{}", url)
-        } else {
-            // Treat as search query (could be made configurable)
-            format!("https://duckduckgo.com/?q={}", url.replace(' ', "+"))
-        };
-        
+
+    /// Reload the current page from the network
+    fn reload(&mut self) {
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.needs_network_load = true;
+        }
+        self.needs_reload = true;
+        self.request_redraw();
+    }
+
+    /// Navigate to a URL or search typed by the user
+    fn navigate_to(&mut self, input: &str) {
+        let normalized = crate::navigation::omnibox_to_url(input);
+
         // Update URL bar to show the URL we're navigating to
         self.chrome.url_bar.set_url(&normalized);
-        
+
         // Use tab.navigate() to properly set needs_network_load and record history
         if let Some(tab) = self.tabs.active_tab_mut() {
             tab.navigate(&normalized);
         }
-        
+
         self.needs_reload = true;
         self.request_redraw();
     }
-    
+
+    /// Follow a link from the current page
+    fn follow_link(&mut self, href: &str) {
+        let href = href.trim();
+        let lower = href.to_ascii_lowercase();
+
+        if lower.starts_with("javascript:") {
+            log::debug!("Ignoring javascript: link");
+            return;
+        }
+        if lower.starts_with("mailto:") || lower.starts_with("tel:") {
+            log::info!("External link not supported: {}", href);
+            return;
+        }
+
+        // Resolve against the page's final URL (RFC 3986)
+        let target = fos_net::url_util::resolve(&self.current_url, href);
+
+        // Same-document fragment links only scroll
+        let (target_doc, fragment) = match target.split_once('#') {
+            Some((doc, fragment)) => (doc, Some(fragment)),
+            None => (target.as_str(), None),
+        };
+        let current_doc = self.current_url.split('#').next().unwrap_or("");
+        if let Some(fragment) = fragment {
+            if target_doc == current_doc {
+                let fragment = fragment.to_string();
+                self.scroll_to_anchor(&fragment);
+                return;
+            }
+        }
+
+        log::info!("Navigating to: {}", target);
+        self.navigate_to(&target);
+    }
+
+    /// Handle a click inside the page area
+    fn handle_content_click(&mut self) {
+        // Content starts after tab bar
+        let content_x = self.mouse_x - TAB_BAR_WIDTH as i32;
+        let content_y = self.mouse_y;
+        if content_x < 0 || content_y < 0 {
+            return;
+        }
+
+        // Links are stored in render buffer coordinates; convert from the screen
+        let scroll_y = (self.scroll_offset - self.render_start_y).max(0.0);
+        let hit_x = content_x as f32;
+        let hit_y = content_y as f32 + scroll_y;
+
+        let href = self.rendered_page.as_ref().and_then(|rendered| {
+            rendered.links.iter()
+                .find(|link| {
+                    hit_x >= link.x && hit_x <= link.x + link.width &&
+                    hit_y >= link.y && hit_y <= link.y + link.height
+                })
+                .map(|link| link.href.clone())
+        });
+
+        if let Some(href) = href {
+            self.follow_link(&href);
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -755,37 +797,65 @@ impl BrowserApp {
     }
 }
 
+/// Escape text for inclusion in HTML
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 impl ApplicationHandler for BrowserApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
-        
+
         // Create window
         let attrs = Window::default_attributes()
             .with_title("fOS Browser")
             .with_inner_size(winit::dpi::LogicalSize::new(1024, 768));
-        
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        
+
+        let window = match event_loop.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(e) => {
+                log::error!("Failed to create window: {}", e);
+                event_loop.exit();
+                return;
+            }
+        };
+
         // Create software rendering surface
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
-        
+        let surface = softbuffer::Context::new(window.clone())
+            .and_then(|context| softbuffer::Surface::new(&context, window.clone()));
+        let surface = match surface {
+            Ok(surface) => surface,
+            Err(e) => {
+                log::error!("Failed to create rendering surface: {}", e);
+                event_loop.exit();
+                return;
+            }
+        };
+
         self.window = Some(window);
         self.surface = Some(surface);
-        
-        // Create initial tab
+
+        // Create initial tab (a local file path on the command line opens as file:)
         if !self.initial_url.is_empty() {
-            self.tabs.new_tab(&self.initial_url);
+            let local_path = std::path::Path::new(&self.initial_url);
+            let url = match local_path.canonicalize() {
+                Ok(path) if local_path.exists() && !self.initial_url.contains("://") => {
+                    format!("file://{}", path.display())
+                }
+                _ => crate::navigation::omnibox_to_url(&self.initial_url),
+            };
+            self.chrome.url_bar.set_url(&url);
+            self.tabs.new_tab(&url);
         } else {
             self.tabs.new_tab("about:blank");
         }
-        
+
         self.needs_reload = true;
         self.request_redraw();
     }
-    
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -806,79 +876,11 @@ impl ApplicationHandler for BrowserApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
-                    // First check chrome (tabs, url bar)
+                    // First check chrome (tabs, url bar), then links in the page
                     if let Some(url) = self.chrome.handle_click(button, &mut self.tabs) {
                         self.navigate_to(&url);
                     } else {
-                        // Check for link clicks in content area
-                        // Content starts after tab bar
-                        let content_x = self.mouse_x - TAB_BAR_WIDTH as i32;
-                        let content_y = self.mouse_y;
-                        
-                        if content_x >= 0 && content_y >= 0 {
-                            // Links are stored in render buffer coordinates
-                            // Display applies scroll_y shift (scroll_offset - render_start_y)
-                            // To match, convert screen y to buffer y by adding the scroll shift
-                            let scroll_y = (self.scroll_offset - self.render_start_y).max(0.0);
-                            let hit_x = content_x as f32;
-                            let hit_y = content_y as f32 + scroll_y;  // Screen to buffer coords
-                            
-                            // Check link regions
-                            if let Some(ref rendered) = self.rendered_page {
-                                for link in &rendered.links {
-                                    if hit_x >= link.x && hit_x <= link.x + link.width &&
-                                       hit_y >= link.y && hit_y <= link.y + link.height {
-                                        // Found a link click!
-                                        let href = link.href.clone();
-                                        
-                                        // Handle anchor links (in-page navigation)
-                                        if href.starts_with("#") {
-                                            let anchor_id = &href[1..]; // Remove # prefix
-                                            if let Some(ref rendered) = self.rendered_page {
-                                                // Find anchor with matching ID
-                                                for anchor in &rendered.anchors {
-                                                    if anchor.id == anchor_id {
-                                                        log::info!("Scrolling to anchor: #{}", anchor_id);
-                                                        // Scroll to anchor position (with small margin at top)
-                                                        self.scroll_offset = (anchor.y + self.render_start_y - 10.0).max(0.0);
-                                                        self.request_redraw();
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        
-                                        // Handle relative URLs
-                                        let full_url = if href.starts_with("http://") || href.starts_with("https://") {
-                                            href
-                                        } else if href.starts_with("/") {
-                                            // Absolute path - prepend origin
-                                            if let Ok(base) = fos_engine::url::Url::parse(&self.current_url) {
-                                                format!("{}://{}{}", base.scheme(), base.host_str().unwrap_or(""), href)
-                                            } else {
-                                                href
-                                            }
-                                        } else {
-                                            // Relative path
-                                            if let Ok(base) = fos_engine::url::Url::parse(&self.current_url) {
-                                                if let Ok(joined) = base.join(&href) {
-                                                    joined.to_string()
-                                                } else {
-                                                    href
-                                                }
-                                            } else {
-                                                href
-                                            }
-                                        };
-                                        
-                                        log::info!("Navigating to: {}", full_url);
-                                        self.navigate_to(&full_url);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        self.handle_content_click();
                     }
                     self.request_redraw();
                 }
@@ -889,63 +891,37 @@ impl ApplicationHandler for BrowserApp {
                 self.chrome.handle_mouse_move(self.mouse_x, self.mouse_y);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Handle scroll with sliding window buffer
                 let scroll_amount = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                self.scroll_offset = (self.scroll_offset - scroll_amount).max(0.0);
-                
-                // Sliding window: check if scroll is outside the rendered buffer
-                // Buffer covers [render_start_y, render_start_y + buffer_height]
-                // If scroll goes outside, re-center the buffer
-                if let Some(ref rendered) = self.rendered_page {
-                    let viewport_height = self.height.saturating_sub(URL_BAR_HEIGHT) as f32;
-                    let buffer_height = rendered.height as f32;
-                    
-                    // Calculate position relative to rendered buffer
-                    let scroll_in_buffer = self.scroll_offset - self.render_start_y;
-                    // Trigger re-render when scrolling past 60% of buffer to capture links ahead of time
-                    let buffer_threshold = buffer_height * 0.4; // 40% remaining = 60% scrolled
-                    
-                    let needs_recenter = 
-                        // Scrolling up past buffer start (with some margin)
-                        scroll_in_buffer < viewport_height && self.render_start_y > 0.0 ||
-                        // Scrolling down - trigger when 60% through buffer
-                        scroll_in_buffer + viewport_height > buffer_height - buffer_threshold;
-                    
-                    // Only trigger background render if not already pending
-                    if needs_recenter && !self.current_html.is_empty() && self.pending_render_start.is_none() {
-                        // New render_start_y centers scroll in buffer
-                        let new_start = (self.scroll_offset - viewport_height * 2.0).max(0.0);
-                        self.pending_render_start = Some(new_start);
-                        
-                        // Spawn background render thread
-                        let (tx, rx) = channel();
-                        self.bg_render_rx = Some(rx);
-                        
-                        let html = self.current_html.clone();
-                        let url = self.current_url.clone();
-                        let content_width = self.width.saturating_sub(TAB_BAR_WIDTH);
-                        let render_height = (viewport_height * 5.0) as u32;
-                        
-                        std::thread::spawn(move || {
-                            let mut renderer = PageRenderer::new(content_width, render_height);
-                            if let Some(rendered) = renderer.render_html(&html, &url, new_start) {
-                                let _ = tx.send((rendered, new_start));
-                            }
-                        });
-                    }
-                }
-                
-                self.request_redraw();
+                self.scroll_by(-scroll_amount);
             }
             _ => {}
         }
     }
-    
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Process JavaScript timers during idle time
         self.process_js_timers();
+
+        // Wake up for the next timer tick only while timers are pending;
+        // otherwise sleep until the next input event (zero idle CPU)
+        let timers_pending = self.current_page.as_ref().is_some_and(|p| p.has_pending_timers());
+        if timers_pending {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TIMER_TICK));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_html() {
+        assert_eq!(escape_html("<script>&\""), "&lt;script&gt;&amp;&quot;");
     }
 }

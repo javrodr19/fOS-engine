@@ -241,6 +241,28 @@ impl Canvas {
             .collect()
     }
     
+    /// Get pixels as `0xAARRGGBB` words (unpremultiplied), the layout used
+    /// by window framebuffers such as softbuffer, so presenting a frame is
+    /// a plain row copy.
+    pub fn to_argb32(&self) -> Vec<u32> {
+        self.pixmap.pixels()
+            .iter()
+            .map(|p| {
+                let a = p.alpha() as u32;
+                let (r, g, b) = match a {
+                    0 => (0, 0, 0),
+                    255 => (p.red() as u32, p.green() as u32, p.blue() as u32),
+                    _ => (
+                        (p.red() as u32 * 255 + a / 2) / a,
+                        (p.green() as u32 * 255 + a / 2) / a,
+                        (p.blue() as u32 * 255 + a / 2) / a,
+                    ),
+                };
+                (a << 24) | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
+            })
+            .collect()
+    }
+
     /// Get the underlying pixmap for advanced operations
     pub fn pixmap(&self) -> &Pixmap {
         &self.pixmap

@@ -73,16 +73,19 @@ impl UrlBar {
     /// Handle character input
     pub fn handle_char(&mut self, c: char) {
         if self.focused {
+            // `cursor` is a byte offset that always sits on a char boundary
             self.input.insert(self.cursor, c);
-            self.cursor += 1;
+            self.cursor += c.len_utf8();
         }
     }
     
     /// Handle backspace
     pub fn handle_backspace(&mut self) {
-        if self.focused && self.cursor > 0 {
-            self.cursor -= 1;
-            self.input.remove(self.cursor);
+        if self.focused {
+            if let Some(c) = self.input[..self.cursor].chars().next_back() {
+                self.cursor -= c.len_utf8();
+                self.input.remove(self.cursor);
+            }
         }
     }
     
@@ -95,15 +98,15 @@ impl UrlBar {
     
     /// Move cursor left
     pub fn cursor_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
+        if let Some(c) = self.input[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
         }
     }
     
     /// Move cursor right
     pub fn cursor_right(&mut self) {
-        if self.cursor < self.input.len() {
-            self.cursor += 1;
+        if let Some(c) = self.input[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
         }
     }
     
@@ -148,7 +151,7 @@ impl UrlBar {
         x_start: usize,
     ) {
         let height = URL_BAR_HEIGHT as usize;
-        let width = buffer_width - x_start;
+        let width = buffer_width.saturating_sub(x_start);
         
         // Fill background with dark teal to match tab bar
         let bg_color = 0xFF1A3A3A; // Dark teal
@@ -169,8 +172,11 @@ impl UrlBar {
         let available_width = width.saturating_sub(16);
         let max_chars = available_width / 7;
         
-        let display_url: String = if self.input.len() > max_chars {
-            format!("{}…", &self.input[..max_chars.saturating_sub(1)])
+        // Truncate by characters (byte slicing could split a character)
+        let display_url: String = if self.input.chars().count() > max_chars {
+            let mut shown: String = self.input.chars().take(max_chars.saturating_sub(1)).collect();
+            shown.push('…');
+            shown
         } else {
             self.input.clone()
         };
@@ -184,7 +190,7 @@ impl UrlBar {
         
         // Draw cursor if focused
         if self.focused {
-            let visible_cursor = self.cursor.min(max_chars);
+            let visible_cursor = self.input[..self.cursor].chars().count().min(max_chars);
             let cursor_x = x_start + 8 + visible_cursor * 7;
             for dy in 4..height - 4 {
                 let py = y_start + dy;
@@ -339,7 +345,9 @@ impl UrlBar {
             self.focus();
             // Approximate cursor position from click
             let char_offset = ((local_x - input_start - 8) / 7).max(0) as usize;
-            self.cursor = char_offset.min(self.input.len());
+            self.cursor = self.input.char_indices()
+                .nth(char_offset)
+                .map_or(self.input.len(), |(i, _)| i);
             return Some(UrlBarAction::Focus);
         } else {
             self.focused = false;

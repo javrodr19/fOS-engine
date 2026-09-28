@@ -9,6 +9,7 @@ pub mod websocket;
 pub mod sse;
 pub mod beacon;
 pub mod http2;
+pub mod hpack_huffman;
 pub mod xhr;
 pub mod http3;
 pub mod quic;
@@ -38,6 +39,7 @@ pub mod tiered_pool;
 pub mod request_fusion;
 pub mod delta_encoding;
 pub mod zero_copy;
+pub mod url_util;
 
 pub use loader::{ResourceLoader, Request, Method};
 pub use fetch::{fetch, fetch_with_options, FetchOptions, FetchResponse};
@@ -85,19 +87,29 @@ pub use quic::{Bbrv2Controller, BbrState, CongestionAlgorithm, SessionCache, Ses
 
 
 /// HTTP Response
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Final URL after following redirects (empty if unknown). Relative
+    /// URLs in the body must be resolved against this, not the request URL.
+    pub url: String,
 }
 
 impl Response {
-    /// Get body as text
+    /// Get body as text (None if the body is not valid UTF-8)
     pub fn text(&self) -> Option<String> {
-        String::from_utf8(self.body.clone()).ok()
+        std::str::from_utf8(&self.body).ok().map(str::to_owned)
     }
-    
+
+    /// Get a header value (case-insensitive)
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Check if response is successful
     pub fn is_success(&self) -> bool {
         self.status >= 200 && self.status < 300
@@ -125,15 +137,13 @@ mod tests {
     fn test_response_is_success() {
         let resp = Response {
             status: 200,
-            headers: vec![],
-            body: vec![],
+            ..Default::default()
         };
         assert!(resp.is_success());
-        
+
         let resp = Response {
             status: 404,
-            headers: vec![],
-            body: vec![],
+            ..Default::default()
         };
         assert!(!resp.is_success());
     }

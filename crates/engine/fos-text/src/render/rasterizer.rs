@@ -4,6 +4,9 @@
 
 use crate::font::parser::{FontParser, GlyphId, OutlineBuilder};
 
+/// Largest glyph bitmap side we rasterize, in pixels
+const MAX_GLYPH_DIMENSION: u32 = 2048;
+
 /// A rasterized glyph
 #[derive(Debug, Clone)]
 pub struct RasterizedGlyph {
@@ -72,18 +75,25 @@ impl GlyphRasterizer {
         let bbox = parser.glyph_bounding_box(glyph)?;
         
         // Scale factor
-        let scale = font_size / parser.units_per_em() as f32;
-        
-        // Calculate dimensions
-        let width = ((bbox.x_max - bbox.x_min) as f32 * scale).ceil() as u32;
-        let height = ((bbox.y_max - bbox.y_min) as f32 * scale).ceil() as u32;
-        
-        if width == 0 || height == 0 {
+        let scale = font_size / parser.units_per_em().max(1) as f32;
+
+        // Pixel-aligned bounds that fully contain the anti-aliased outline
+        let left = (bbox.x_min as f32 * scale).floor();
+        let right = (bbox.x_max as f32 * scale).ceil();
+        let top = (bbox.y_max as f32 * scale).ceil();
+        let bottom = (bbox.y_min as f32 * scale).floor();
+
+        let width = (right - left).max(0.0) as u32;
+        let height = (top - bottom).max(0.0) as u32;
+
+        // Also rejects absurd bounding boxes from malformed fonts
+        if width == 0 || height == 0 || width > MAX_GLYPH_DIMENSION || height > MAX_GLYPH_DIMENSION {
             return Some(RasterizedGlyph::empty(glyph_id));
         }
-        
-        // Create outline builder for tiny-skia
-        let mut builder = PathBuilder::new(scale, bbox.x_min as f32, bbox.y_max as f32);
+
+        // Create outline builder for tiny-skia; the offsets place the
+        // pixel-aligned origin (left, top) at (0, 0)
+        let mut builder = PathBuilder::new(scale, left / scale, top / scale);
         parser.outline_glyph(glyph, &mut builder)?;
         let path = builder.finish()?;
         
@@ -113,8 +123,8 @@ impl GlyphRasterizer {
             glyph_id,
             width,
             height,
-            bearing_x: (bbox.x_min as f32 * scale) as i32,
-            bearing_y: (bbox.y_max as f32 * scale) as i32,
+            bearing_x: left as i32,
+            bearing_y: top as i32,
             bitmap,
         })
     }

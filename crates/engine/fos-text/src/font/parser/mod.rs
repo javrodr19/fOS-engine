@@ -43,6 +43,8 @@ pub struct FontParser<'a> {
     descender: i16,
     /// Line gap
     line_gap: i16,
+    /// Number of long horizontal metrics in `hmtx`
+    num_h_metrics: u16,
 }
 
 /// Table directory record
@@ -87,7 +89,8 @@ impl<'a> FontParser<'a> {
         // Validate magic
         match sfnt_version {
             0x00010000 | // TrueType
-            0x4F54544F   // 'OTTO' OpenType with CFF
+            0x4F54544F | // 'OTTO' OpenType with CFF
+            0x74727565   // 'true' legacy Apple TrueType
             => {}
             _ => return Err(ParseError::InvalidMagic),
         }
@@ -115,7 +118,7 @@ impl<'a> FontParser<'a> {
         // Parse required tables
         let head = Self::find_table(&tables, b"head")
             .ok_or(ParseError::TableNotFound("head"))?;
-        let mut head_reader = FontReader::new(&data[head.offset as usize..]);
+        let mut head_reader = FontReader::new(Self::slice_table(data, &head)?);
         let _version = head_reader.read_u32()?;
         let _font_revision = head_reader.read_u32()?;
         let _checksum_adjust = head_reader.read_u32()?;
@@ -135,19 +138,22 @@ impl<'a> FontParser<'a> {
         // Parse maxp
         let maxp = Self::find_table(&tables, b"maxp")
             .ok_or(ParseError::TableNotFound("maxp"))?;
-        let mut maxp_reader = FontReader::new(&data[maxp.offset as usize..]);
+        let mut maxp_reader = FontReader::new(Self::slice_table(data, &maxp)?);
         let _version = maxp_reader.read_u32()?;
         let num_glyphs = maxp_reader.read_u16()?;
         
         // Parse hhea
         let hhea = Self::find_table(&tables, b"hhea")
             .ok_or(ParseError::TableNotFound("hhea"))?;
-        let mut hhea_reader = FontReader::new(&data[hhea.offset as usize..]);
+        let mut hhea_reader = FontReader::new(Self::slice_table(data, &hhea)?);
         let _version = hhea_reader.read_u32()?;
         let ascender = hhea_reader.read_i16()?;
         let descender = hhea_reader.read_i16()?;
         let line_gap = hhea_reader.read_i16()?;
-        
+        // advanceWidthMax .. metricDataFormat, then numberOfHMetrics at offset 34
+        hhea_reader.skip(24)?;
+        let num_h_metrics = hhea_reader.read_u16()?;
+
         Ok(Self {
             data,
             tables,
@@ -157,18 +163,27 @@ impl<'a> FontParser<'a> {
             ascender,
             descender,
             line_gap,
+            num_h_metrics,
         })
     }
-    
+
     fn find_table(tables: &[TableRecord], tag: &[u8; 4]) -> Option<TableRecord> {
         tables.iter().find(|t| &t.tag == tag).copied()
     }
-    
+
+    /// Bounds-checked table slice. Malformed offsets yield an error instead
+    /// of panicking, so one corrupt font file cannot crash the browser.
+    fn slice_table(data: &'a [u8], table: &TableRecord) -> Result<&'a [u8], ParseError> {
+        let start = table.offset as usize;
+        let end = start.checked_add(table.length as usize).ok_or(ParseError::InvalidData)?;
+        // Some fonts declare lengths running slightly past the end of file
+        data.get(start..end.min(data.len())).ok_or(ParseError::InvalidData)
+    }
+
     /// Get raw table data
     pub fn table_data(&self, tag: &[u8; 4]) -> Option<&'a [u8]> {
-        Self::find_table(&self.tables, tag).map(|t| {
-            &self.data[t.offset as usize..(t.offset + t.length) as usize]
-        })
+        let table = Self::find_table(&self.tables, tag)?;
+        Self::slice_table(self.data, &table).ok()
     }
     
     /// Units per em
@@ -205,11 +220,8 @@ impl<'a> FontParser<'a> {
     /// Get glyph horizontal advance
     pub fn glyph_hor_advance(&self, glyph_id: GlyphId) -> Option<u16> {
         let hmtx = self.table_data(b"hmtx")?;
-        let hhea = Self::find_table(&self.tables, b"hhea")?;
-        let mut hhea_reader = FontReader::new(&self.data[hhea.offset as usize..]);
-        hhea_reader.skip(34).ok()?;
-        let num_h_metrics = hhea_reader.read_u16().ok()?;
-        
+        let num_h_metrics = self.num_h_metrics;
+
         let mut reader = FontReader::new(hmtx);
         if glyph_id.0 < num_h_metrics {
             reader.skip((glyph_id.0 as usize) * 4).ok()?;
@@ -234,7 +246,7 @@ impl<'a> FontParser<'a> {
             return None;
         }
         
-        let mut reader = FontReader::new(&glyf_data[offset as usize..]);
+        let mut reader = FontReader::new(glyf_data.get(offset as usize..)?);
         let _num_contours = reader.read_i16().ok()?;
         let x_min = reader.read_i16().ok()?;
         let y_min = reader.read_i16().ok()?;

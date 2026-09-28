@@ -64,8 +64,16 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-opt-level = "z"  # Optimize for size
+# Optimize for speed: rendering is 1.5-1.8x faster than with opt-level "z"
+# for about 1 MB more resident memory (see examples/page_bench.rs)
+opt-level = 3
 debug = false    # No debug info in release builds
+
+# Smallest binary, for storage-constrained targets:
+#   cargo build --profile release-small
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
 
 [profile.dev]
 opt-level = 1

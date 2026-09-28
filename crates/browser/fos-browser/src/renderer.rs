@@ -1,14 +1,23 @@
 //! Rendering Pipeline
 //!
 //! Integrates fos-engine components for rendering web pages.
+//!
+//! Rendering is split in two phases:
+//! 1. **Layout** walks the DOM once per page and viewport width, producing
+//!    positioned lines of text (a display list).
+//! 2. **Paint** draws only the lines that intersect the requested region.
+//!
+//! The layout is cached, so scrolling and re-rendering the same page only
+//! repaint the visible lines. The cache keeps just the compact display list,
+//! not the parsed DOM and per-node styles it was built from.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use fos_dom::{Document, NodeId, DomTree};
 use fos_css::computed::{ComputedStyle, Display, SizeValue, EdgeSizes};
 use fos_css::properties::LengthUnit;
 use fos_css::{Stylesheet, Selector, SelectorPart, parse_stylesheet, StyleResolver};
-use fos_layout::{LayoutTree, LayoutBoxId, layout_document};
-use fos_render::{Canvas, Color, TextRenderer, css_color_to_render};
+use fos_render::{Canvas, Color, TextRenderer};
 use fos_text::{FontId, LineBreaker};
 
 /// A clickable link region in the rendered page
@@ -16,7 +25,7 @@ use fos_text::{FontId, LineBreaker};
 pub struct LinkRegion {
     /// Bounding box x
     pub x: f32,
-    /// Bounding box y  
+    /// Bounding box y
     pub y: f32,
     /// Width
     pub width: f32,
@@ -37,18 +46,70 @@ pub struct AnchorPosition {
 
 /// Rendered page with pixel buffer
 pub struct RenderedPage {
-    /// Pixel buffer (RGBA)
-    pub pixels: Vec<u8>,
+    /// Pixel buffer, one `0xAARRGGBB` word per pixel (window framebuffer format)
+    pub pixels: Vec<u32>,
     /// Width in pixels
     pub width: u32,
     /// Height in pixels
     pub height: u32,
     /// Content height (for scroll)
     pub content_height: f32,
-    /// Clickable link regions
+    /// Clickable link regions (buffer coordinates)
     pub links: Vec<LinkRegion>,
-    /// Anchor positions for in-page navigation
+    /// Anchor positions for in-page navigation (buffer coordinates)
     pub anchors: Vec<AnchorPosition>,
+}
+
+/// A run of text with uniform style within a line
+#[derive(Debug, Clone)]
+struct TextSegment {
+    text: String,
+    font_size: f32,
+    color: Color,
+    /// Link href if this is a link
+    href: Option<String>,
+}
+
+/// A laid-out line of text, in document coordinates
+#[derive(Debug, Clone)]
+struct LaidOutLine {
+    /// Baseline y
+    y: f32,
+    /// Start x
+    x: f32,
+    segments: Vec<TextSegment>,
+}
+
+/// A horizontal rule (`<hr>`), in document coordinates
+#[derive(Debug, Clone, Copy)]
+struct Rule {
+    x: f32,
+    y: f32,
+    width: f32,
+}
+
+/// Display list for a page at one viewport width
+#[derive(Debug, Default)]
+struct PageLayout {
+    /// Lines in document order (ascending `y`)
+    lines: Vec<LaidOutLine>,
+    /// Horizontal rules in document order
+    rules: Vec<Rule>,
+    /// Element ids and their document y positions
+    anchors: Vec<AnchorPosition>,
+    /// Height of the laid-out document
+    content_height: f32,
+    /// Largest font size used (bounds how far glyphs reach above a baseline)
+    max_font_size: f32,
+}
+
+/// Cached layout for the most recently rendered page
+struct CachedLayout {
+    /// Hash of the page HTML and base URL
+    key: u64,
+    /// Viewport width the layout was built for
+    width: u32,
+    layout: PageLayout,
 }
 
 /// Page renderer - integrates HTML, CSS, layout, and painting
@@ -61,6 +122,8 @@ pub struct PageRenderer {
     text_renderer: TextRenderer,
     /// Default font ID for text rendering
     default_font: Option<FontId>,
+    /// Layout of the most recently rendered page
+    cached: Option<CachedLayout>,
 }
 
 impl PageRenderer {
@@ -68,27 +131,34 @@ impl PageRenderer {
         let text_renderer = TextRenderer::new();
         // Find a default font (prefer sans-serif fonts)
         let default_font = text_renderer.find_font(&["DejaVu Sans", "Liberation Sans", "Arial", "Helvetica", "sans-serif"]);
-        
+
         if default_font.is_some() {
             log::info!("Font loaded for text rendering");
         } else {
             log::warn!("No system font found, text rendering may fail");
         }
-        
+
         Self {
             viewport_width,
             viewport_height,
             text_renderer,
             default_font,
+            cached: None,
         }
     }
-    
+
     /// Set viewport size
     pub fn set_viewport(&mut self, width: u32, height: u32) {
         self.viewport_width = width;
         self.viewport_height = height;
     }
-    
+
+    /// Drop the cached layout and glyphs (e.g. on memory pressure)
+    pub fn clear_cache(&mut self) {
+        self.cached = None;
+        self.text_renderer.clear_glyph_cache();
+    }
+
     /// Measure text width using the text renderer
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
         if let Some(font_id) = self.default_font {
@@ -99,33 +169,34 @@ impl PageRenderer {
             text.chars().count() as f32 * char_width
         }
     }
-    
+
     /// Render HTML to pixels with scroll offset
     pub fn render_html(&mut self, html: &str, base_url: &str, scroll_offset: f32) -> Option<RenderedPage> {
-        // 1. Parse HTML into DOM
-        let document = fos_html::parse_with_url(html, base_url);
-        
-        // 2. Compute styles for all elements
-        let styles = self.compute_styles(&document);
-        
-        // 3. Layout the document
-        let layout_tree = layout_document(
-            &document,
-            &styles,
-            self.viewport_width as f32,
-            self.viewport_height as f32,
-        );
-        
-        // 4. Paint to canvas with scroll offset, collecting link regions and anchors
+        // 1. Lay out the page, unless this page is already laid out at this width
+        let key = page_key(html, base_url);
+        let width = self.viewport_width;
+        let cached = match self.cached.take() {
+            Some(cached) if cached.key == key && cached.width == width => cached,
+            _ => {
+                let document = fos_html::parse_with_url(html, base_url);
+                let styles = self.compute_styles(&document);
+                let layout = build_layout(&document, &styles, width);
+                // The document and styles are dropped here; only the display list is kept
+                CachedLayout { key, width, layout }
+            }
+        };
+
+        // 2. Paint the visible region
         let mut links = Vec::new();
-        let mut anchors = Vec::new();
-        let pixels = self.paint(&document, &styles, &layout_tree, scroll_offset, &mut links, &mut anchors)?;
-        
-        // Calculate content height
-        let content_height = self.calculate_content_height(&layout_tree);
-        
+        let painted = self.paint(&cached.layout, scroll_offset, &mut links);
+        let content_height = cached.layout.content_height;
+        let anchors = cached.layout.anchors.iter()
+            .map(|a| AnchorPosition { id: a.id.clone(), y: a.y - scroll_offset })
+            .collect();
+        self.cached = Some(cached);
+
         Some(RenderedPage {
-            pixels,
+            pixels: painted?,
             width: self.viewport_width,
             height: self.viewport_height,
             content_height,
@@ -133,15 +204,15 @@ impl PageRenderer {
             anchors,
         })
     }
-    
+
     /// Compute styles for all elements using CSS from document
     fn compute_styles(&self, document: &Document) -> HashMap<NodeId, ComputedStyle> {
         let mut styles = HashMap::new();
         let tree = document.tree();
-        
+
         // 1. Extract CSS from <style> tags in <head>
         let css_text = self.extract_css_from_document(document);
-        
+
         // 2. Parse CSS into stylesheet
         let stylesheet = if !css_text.is_empty() {
             match parse_stylesheet(&css_text) {
@@ -157,23 +228,23 @@ impl PageRenderer {
         } else {
             None
         };
-        
+
         // 3. Compute styles for all nodes (using old method that works)
         self.compute_styles_recursive(tree, tree.root(), &mut styles, stylesheet.as_ref());
-        
+
         styles
     }
-    
+
     /// Extract CSS text from <style> tags in document
     fn extract_css_from_document(&self, document: &Document) -> String {
         let mut css = String::new();
         let tree = document.tree();
         let head = document.head();
-        
+
         if !head.is_valid() {
             return css;
         }
-        
+
         // Find all <style> tags in <head>
         for (style_id, style_node) in tree.children(head) {
             if let Some(element) = style_node.as_element() {
@@ -189,19 +260,19 @@ impl PageRenderer {
                 }
             }
         }
-        
+
         // Also look for style tags in body (non-standard but common)
         self.collect_style_text(tree, document.body(), &mut css);
-        
+
         css
     }
-    
+
     /// Recursively collect style tag text (for style tags in body)
     fn collect_style_text(&self, tree: &DomTree, node_id: NodeId, css: &mut String) {
         if !node_id.is_valid() {
             return;
         }
-        
+
         for (child_id, child_node) in tree.children(node_id) {
             if let Some(element) = child_node.as_element() {
                 let tag = tree.resolve(element.name.local);
@@ -218,7 +289,7 @@ impl PageRenderer {
             self.collect_style_text(tree, child_id, css);
         }
     }
-    
+
     /// Compute styles using the StyleResolver (proper CSS cascade)
     #[allow(dead_code)]
     fn compute_styles_with_resolver(
@@ -231,47 +302,47 @@ impl PageRenderer {
         if !node_id.is_valid() {
             return;
         }
-        
+
         // Compute style for this node using the resolver
         let style = resolver.compute_style(tree, node_id);
         styles.insert(node_id, style);
-        
+
         // Recurse to children
         for (child_id, _) in tree.children(node_id) {
             self.compute_styles_with_resolver(tree, child_id, styles, resolver);
         }
     }
-    
+
     /// Recursively compute styles with CSS matching
     fn compute_styles_recursive(
-        &self, 
-        tree: &DomTree, 
-        node_id: NodeId, 
+        &self,
+        tree: &DomTree,
+        node_id: NodeId,
         styles: &mut HashMap<NodeId, ComputedStyle>,
         stylesheet: Option<&Stylesheet>,
     ) {
         if !node_id.is_valid() {
             return;
         }
-        
+
         // Create default computed style
         let mut style = ComputedStyle::default();
-        
+
         // Get node to check for element type and attributes
         if let Some(node) = tree.get(node_id) {
             if let Some(element) = node.as_element() {
                 // Get tag name
                 let tag_name = tree.resolve(element.name.local);
-                
+
                 // 1. Apply default browser styles based on element type
                 apply_default_styles(&mut style, tag_name);
-                
+
                 // 2. Apply matching CSS rules from stylesheet
                 if let Some(ss) = stylesheet {
                     self.apply_matching_rules(tree, node_id, element, tag_name, ss, &mut style);
                 }
-                
-                // 3. Apply inline style attribute  
+
+                // 3. Apply inline style attribute
                 for attr in element.attrs.iter() {
                     let attr_name = tree.resolve(attr.name.local);
                     if attr_name == "style" {
@@ -281,15 +352,15 @@ impl PageRenderer {
                 }
             }
         }
-        
+
         styles.insert(node_id, style);
-        
+
         // Process children
         for (child_id, _) in tree.children(node_id) {
             self.compute_styles_recursive(tree, child_id, styles, stylesheet);
         }
     }
-    
+
     /// Apply matching CSS rules to element style
     fn apply_matching_rules(
         &self,
@@ -305,7 +376,7 @@ impl PageRenderer {
         let element_classes: Vec<&str> = element.classes.iter()
             .map(|c| tree.resolve(*c))
             .collect();
-        
+
         // Check each rule in stylesheet
         for rule in &stylesheet.rules {
             for selector in &rule.selectors {
@@ -318,7 +389,7 @@ impl PageRenderer {
             }
         }
     }
-    
+
     /// Check if a selector matches an element
     fn selector_matches(
         &self,
@@ -331,10 +402,10 @@ impl PageRenderer {
         if selector.parts.is_empty() {
             return false;
         }
-        
+
         // Track if we've matched at least one meaningful part
         let mut has_match = false;
-        
+
         // Simple matching: check selector parts
         for part in &selector.parts {
             match part {
@@ -372,10 +443,10 @@ impl PageRenderer {
                 }
             }
         }
-        
+
         has_match
     }
-    
+
     /// Apply inline style declarations
     fn apply_inline_style(&self, style_text: &str, style: &mut ComputedStyle) {
         // Parse inline CSS as if it were a rule body
@@ -388,301 +459,393 @@ impl PageRenderer {
             }
         }
     }
-    
-    /// Paint the layout tree with scroll offset
-    fn paint(
-        &mut self,
-        document: &Document,
-        styles: &HashMap<NodeId, ComputedStyle>,
-        _layout_tree: &LayoutTree,
-        scroll_offset: f32,
-        links: &mut Vec<LinkRegion>,
-        anchors: &mut Vec<AnchorPosition>,
-    ) -> Option<Vec<u8>> {
-        // Create canvas
+
+    /// Paint the part of `layout` starting at document y `scroll_offset`.
+    ///
+    /// Only lines intersecting the canvas are shaped and drawn.
+    fn paint(&mut self, layout: &PageLayout, scroll_offset: f32, links: &mut Vec<LinkRegion>) -> Option<Vec<u32>> {
         let mut canvas = Canvas::new(self.viewport_width, self.viewport_height)?;
-        
-        // Fill with white background
         canvas.clear(Color::WHITE);
-        
-        // Paint using a simple DOM-based approach
-        // Walk the DOM tree and paint text directly
-        let tree = document.tree();
-        let body = document.body();
-        
-        log::info!("DOM tree size: {}, body valid: {}", tree.len(), body.is_valid());
-        
-        if body.is_valid() {
-            // Apply scroll offset to starting position
-            let mut y_cursor = 20.0f32 - scroll_offset;
-            self.paint_dom_node(&mut canvas, tree, body, styles, 8.0, &mut y_cursor, links, anchors);
-            
-            // If no content was painted (taking scroll into account), show a message
-            if y_cursor < 30.0 - scroll_offset {
-                log::warn!("No text found in DOM, drawing fallback");
-                self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0, Color::rgb(100, 100, 100), 16.0);
+
+        if layout.lines.is_empty() && layout.rules.is_empty() {
+            if scroll_offset < self.viewport_height as f32 {
+                self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0 - scroll_offset, Color::rgb(100, 100, 100), 16.0);
             }
-        } else {
-            // Body not valid - paint error message
-            log::error!("Body element not valid!");
-            self.paint_text(&mut canvas, "Error: Could not find body element", 20.0, 50.0, Color::rgb(200, 50, 50), 16.0);
+            return Some(canvas.to_argb32());
         }
-        
-        // Get pixels as RGBA bytes
-        Some(canvas.as_rgba_bytes())
+
+        let canvas_height = canvas.height() as f32;
+        // Glyphs extend at most ~2 font sizes above and below a baseline
+        let reach = layout.max_font_size.max(16.0) * 2.0;
+        let top = scroll_offset - reach;
+        let bottom = scroll_offset + canvas_height + reach;
+
+        let first = layout.lines.partition_point(|line| line.y < top);
+        for line in &layout.lines[first..] {
+            if line.y > bottom {
+                break;
+            }
+            let y = line.y - scroll_offset;
+            let mut x = line.x;
+            for segment in &line.segments {
+                // Painting returns the advance, so the text is shaped only once
+                let width = self.paint_text(&mut canvas, &segment.text, x, y, segment.color, segment.font_size);
+
+                if let Some(ref href) = segment.href {
+                    // Text is drawn with its baseline at y, so the region spans the line above it
+                    let height = segment.font_size * 1.2;
+                    links.push(LinkRegion {
+                        x,
+                        y: y - height,
+                        width,
+                        height,
+                        href: href.clone(),
+                    });
+                }
+
+                x += width;
+            }
+        }
+
+        let first_rule = layout.rules.partition_point(|rule| rule.y < top);
+        for rule in layout.rules[first_rule..].iter().take_while(|rule| rule.y <= bottom) {
+            canvas.fill_rect(rule.x, rule.y - scroll_offset, rule.width, 1.0, Color::rgb(128, 128, 128));
+        }
+
+        Some(canvas.to_argb32())
     }
-    
-    /// Paint a DOM node and its children with proper inline/block handling
-    fn paint_dom_node(
+
+    /// Text painting using TextRenderer with proper fonts.
+    ///
+    /// Returns the advance width of the painted text.
+    fn paint_text(
         &mut self,
         canvas: &mut Canvas,
-        tree: &DomTree,
-        node_id: NodeId,
-        styles: &HashMap<NodeId, ComputedStyle>,
-        x_offset: f32,
-        y_cursor: &mut f32,
-        links: &mut Vec<LinkRegion>,
-        anchors: &mut Vec<AnchorPosition>,
-    ) {
-        // Use a line buffer for text accumulation (leave margin for right edge)
-        let max_width = canvas.width() as f32 - 30.0;
-        let mut line_buffer = LineBuffer::new(x_offset, max_width, 16.0);
-        self.paint_node_recursive(canvas, tree, node_id, styles, &mut line_buffer, y_cursor, links, anchors);
-        
-        // Flush any remaining text
-        if !line_buffer.is_empty() {
-            line_buffer.flush(canvas, y_cursor, self, links);
+        text: &str,
+        x: f32,
+        y: f32,
+        color: Color,
+        font_size: f32,
+    ) -> f32 {
+        // Use TextRenderer if we have a font
+        if let Some(font_id) = self.default_font {
+            // Use the proper font rendering
+            return self.text_renderer.draw_text(canvas, text, x, y, font_id, font_size, color);
         }
+
+        // No font available - use bitmap fallback
+        let scale = (font_size / 8.0).max(1.0);
+        let char_width = 6.0 * scale;
+        let char_height = 8.0 * scale;
+
+        let mut x_pos = x;
+
+        for c in text.chars() {
+            if c == '\n' {
+                continue;
+            }
+            if c == ' ' {
+                x_pos += char_width * 0.8;
+                continue;
+            }
+            if x_pos > canvas.width() as f32 {
+                break;
+            }
+
+            let pattern = get_char_pattern(c);
+
+            for (row, &bits) in pattern.iter().enumerate() {
+                for col in 0..8 {
+                    if (bits >> (7 - col)) & 1 == 1 {
+                        let px = x_pos + col as f32 * scale;
+                        let py = y - char_height + row as f32 * scale;
+                        let rect_size = scale.max(1.0);
+                        canvas.fill_rect(px, py, rect_size, rect_size, color);
+                    }
+                }
+            }
+
+            x_pos += char_width;
+        }
+
+        x_pos - x
     }
-    
-    /// Recursive painting with line buffer for text accumulation
-    fn paint_node_recursive(
-        &mut self,
-        canvas: &mut Canvas,
-        tree: &DomTree,
-        node_id: NodeId,
-        styles: &HashMap<NodeId, ComputedStyle>,
-        line_buffer: &mut LineBuffer,
-        y_cursor: &mut f32,
-        links: &mut Vec<LinkRegion>,
-        anchors: &mut Vec<AnchorPosition>,
-    ) {
+}
+
+/// Cache key identifying a page's HTML and base URL
+fn page_key(html: &str, base_url: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    html.len().hash(&mut hasher);
+    html.hash(&mut hasher);
+    base_url.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Lay out the document body into lines for a viewport of `width` pixels
+fn build_layout(document: &Document, styles: &HashMap<NodeId, ComputedStyle>, width: u32) -> PageLayout {
+    let tree = document.tree();
+    let body = document.body();
+
+    log::debug!("DOM tree size: {}, body valid: {}", tree.len(), body.is_valid());
+
+    let mut builder = LayoutBuilder {
+        tree,
+        styles,
+        // Leave margin for the right edge
+        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, 16.0),
+        // Document y of the first line
+        y: 20.0,
+        layout: PageLayout::default(),
+    };
+
+    if body.is_valid() {
+        builder.layout_node(body);
+        builder.flush();
+    } else {
+        log::error!("Body element not valid!");
+    }
+
+    let mut layout = builder.layout;
+    layout.content_height = builder.y.max(0.0);
+    layout
+}
+
+/// Walks the DOM, accumulating inline text into lines
+struct LayoutBuilder<'a> {
+    tree: &'a DomTree,
+    styles: &'a HashMap<NodeId, ComputedStyle>,
+    line_buffer: LineBuffer,
+    /// Current document y (baseline of the next line)
+    y: f32,
+    layout: PageLayout,
+}
+
+impl LayoutBuilder<'_> {
+    /// Move buffered text into laid-out lines
+    fn flush(&mut self) {
+        self.line_buffer.flush(&mut self.y, &mut self.layout);
+    }
+
+    /// Lay out a node and its children with inline/block handling
+    fn layout_node(&mut self, node_id: NodeId) {
+        let tree = self.tree;
         let node = match tree.get(node_id) {
             Some(n) => n,
             None => return,
         };
-        
+
         // Get style
+        let styles = self.styles;
         let style = styles.get(&node_id);
-        
+
         // Check if hidden
         if let Some(s) = style {
             if matches!(s.display, Display::None) {
                 return;
             }
         }
-        
-        // If text node, add to line buffer
+
+        // If text node, add to line buffer (collapsing whitespace)
         if let Some(text) = node.as_text() {
-            let text_str = text.replace('\n', " ");
-            let trimmed = text_str.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !trimmed.is_empty() {
-                let font_size = line_buffer.current_font_size.max(14.0);
-                let text_color = line_buffer.current_color;
-                
-                line_buffer.add_text(&trimmed, font_size, text_color);
+            let mut words = text.split_whitespace();
+            if let Some(first) = words.next() {
+                let mut collapsed = String::with_capacity(text.len());
+                collapsed.push_str(first);
+                for word in words {
+                    collapsed.push(' ');
+                    collapsed.push_str(word);
+                }
+
+                let font_size = self.line_buffer.current_font_size.max(14.0);
+                let text_color = self.line_buffer.current_color;
+                self.line_buffer.add_text(&collapsed, font_size, text_color);
             }
             return;
         }
-        
+
         // If element, handle block vs inline
-        if let Some(element) = node.as_element() {
-            let tag = tree.resolve(element.name.local).to_lowercase();
-            let is_block = matches!(tag.as_str(), 
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | 
-                "ul" | "ol" | "li" | "section" | "article" | "header" | "footer" | 
-                "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
-                "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
-            
-            let font_size = style.map(|s| s.font_size).unwrap_or(line_buffer.current_font_size);
-            
-            // Block elements flush the line buffer and add vertical space
-            if is_block {
-                if !line_buffer.is_empty() {
-                    line_buffer.flush(canvas, y_cursor, self, links);
-                }
-                // Better spacing based on element type
-                let margin_before = match tag.as_str() {
-                    "h1" => 20.0,
-                    "h2" => 16.0,
-                    "h3" | "h4" => 12.0,
-                    "p" => 8.0,
-                    "ul" | "ol" => 6.0,
-                    "li" => 2.0,
-                    "td" | "th" | "tr" => 2.0,
-                    _ => font_size * 0.3,
-                };
-                *y_cursor += margin_before;
-            }
-            
-            // Handle special elements
-            if tag == "br" {
-                line_buffer.flush(canvas, y_cursor, self, links);
-                return;
-            }
-            
-            if tag == "hr" {
-                line_buffer.flush(canvas, y_cursor, self, links);
-                canvas.fill_rect(line_buffer.start_x, *y_cursor, line_buffer.max_width - line_buffer.start_x - 20.0, 1.0, Color::rgb(128, 128, 128));
-                *y_cursor += 10.0;
-                return;
-            }
-            
-            // Skip hidden elements
-            if tag == "script" || tag == "style" || tag == "noscript" || tag == "template" {
-                return;
-            }
-            
-            // Save current state for restoration
-            let saved_font_size = line_buffer.current_font_size;
-            let saved_color = line_buffer.current_color;
-            let saved_indent = line_buffer.indent_level;
-            let saved_href = line_buffer.current_href.clone();
-            let saved_list_counter = line_buffer.list_counter;
-            
-            // Increment indent for lists and blockquotes
-            if tag == "ul" || tag == "ol" || tag == "blockquote" {
-                line_buffer.indent_level += 1;
-                line_buffer.current_x = line_buffer.effective_start_x();
-            }
-            
-            // Ordered lists start a counter at 1
-            if tag == "ol" {
-                line_buffer.list_counter = 1;
-            }
-            // Unordered lists reset counter to 0 (signals bullet mode)
-            if tag == "ul" {
-                line_buffer.list_counter = 0;
-            }
-            
-            // Table cell handling - simple approach: cells are separated by |
-            if tag == "td" || tag == "th" {
-                // Add cell separator if not first in row
-                if line_buffer.current_x > line_buffer.effective_start_x() + 5.0 {
-                    let font_size = line_buffer.current_font_size;
-                    let color = Color::rgb(180, 180, 180);
-                    line_buffer.add_text(" | ", font_size, color);
-                }
-            }
-            
-            // Table headers get slightly bold look (darker color)
-            if tag == "th" {
-                line_buffer.current_color = Color::rgb(40, 40, 40);
-            }
-            
-            // List items get a bullet or number marker
-            if tag == "li" {
-                if !line_buffer.is_empty() {
-                    line_buffer.flush(canvas, y_cursor, self, links);
-                }
-                // Add marker based on list type
-                let font_size = line_buffer.current_font_size;
-                let color = line_buffer.current_color;
-                if line_buffer.list_counter > 0 {
-                    // Ordered list - show number
-                    let marker = format!("{}. ", line_buffer.list_counter);
-                    line_buffer.add_text(&marker, font_size, color);
-                    line_buffer.list_counter += 1;
-                } else {
-                    // Unordered list - show bullet
-                    line_buffer.add_text("• ", font_size, color);
-                }
-            }
-            
-            // Set font size based on heading
-            match tag.as_str() {
-                "h1" => line_buffer.current_font_size = 28.0,
-                "h2" => line_buffer.current_font_size = 24.0,
-                "h3" => line_buffer.current_font_size = 20.0,
-                "h4" => line_buffer.current_font_size = 18.0,
-                "h5" => line_buffer.current_font_size = 16.0,
-                "h6" => line_buffer.current_font_size = 14.0,
-                "small" => line_buffer.current_font_size = (saved_font_size * 0.8).max(12.0),
-                _ => {}
+        let Some(element) = node.as_element() else { return };
+
+        // HTML tag names are already lowercase after parsing
+        let tag_name = tree.resolve(element.name.local);
+        let lowered;
+        let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = tag_name.to_ascii_lowercase();
+            &lowered
+        } else {
+            tag_name
+        };
+
+        // Skip elements that never render
+        if matches!(tag, "script" | "style" | "noscript" | "template" | "head") {
+            return;
+        }
+
+        let is_block = matches!(tag,
+            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
+            "ul" | "ol" | "li" | "section" | "article" | "header" | "footer" |
+            "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
+            "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
+
+        let font_size = style.map(|s| s.font_size).unwrap_or(self.line_buffer.current_font_size);
+
+        // Block elements flush the line buffer and add vertical space
+        if is_block {
+            self.flush();
+            // Better spacing based on element type
+            let margin_before = match tag {
+                "h1" => 20.0,
+                "h2" => 16.0,
+                "h3" | "h4" => 12.0,
+                "p" => 8.0,
+                "ul" | "ol" => 6.0,
+                "li" => 2.0,
+                "td" | "th" | "tr" => 2.0,
+                _ => font_size * 0.3,
             };
-            
-            // Links get blue color and save href
-            if tag == "a" {
-                line_buffer.current_color = Color::rgb(51, 102, 204); // Wikipedia link blue
-                // Extract href attribute
-                for attr in element.attrs.iter() {
-                    let attr_name = tree.resolve(attr.name.local);
-                    if attr_name == "href" {
-                        line_buffer.current_href = Some(attr.value.to_string());
-                        break;
-                    }
+            self.y += margin_before;
+        }
+
+        // Handle special elements
+        if tag == "br" {
+            self.flush();
+            return;
+        }
+
+        if tag == "hr" {
+            self.flush();
+            let line_buffer = &self.line_buffer;
+            self.layout.rules.push(Rule {
+                x: line_buffer.start_x,
+                y: self.y,
+                width: line_buffer.max_width - line_buffer.start_x - 20.0,
+            });
+            self.y += 10.0;
+            return;
+        }
+
+        let line_buffer = &mut self.line_buffer;
+
+        // Save current state for restoration
+        let saved_font_size = line_buffer.current_font_size;
+        let saved_color = line_buffer.current_color;
+        let saved_indent = line_buffer.indent_level;
+        let saved_href = line_buffer.current_href.clone();
+        let saved_list_counter = line_buffer.list_counter;
+
+        // Increment indent for lists and blockquotes
+        if tag == "ul" || tag == "ol" || tag == "blockquote" {
+            line_buffer.indent_level += 1;
+            line_buffer.current_x = line_buffer.effective_start_x();
+        }
+
+        // Ordered lists start a counter at 1
+        if tag == "ol" {
+            line_buffer.list_counter = 1;
+        }
+        // Unordered lists reset counter to 0 (signals bullet mode)
+        if tag == "ul" {
+            line_buffer.list_counter = 0;
+        }
+
+        // Table cell handling - simple approach: cells are separated by |
+        if (tag == "td" || tag == "th") && line_buffer.current_x > line_buffer.effective_start_x() + 5.0 {
+            // Add cell separator if not first in row
+            let font_size = line_buffer.current_font_size;
+            line_buffer.add_text(" | ", font_size, Color::rgb(180, 180, 180));
+        }
+
+        // Table headers get slightly bold look (darker color)
+        if tag == "th" {
+            line_buffer.current_color = Color::rgb(40, 40, 40);
+        }
+
+        // List items get a bullet or number marker
+        if tag == "li" {
+            self.flush();
+            let line_buffer = &mut self.line_buffer;
+            // Add marker based on list type
+            let font_size = line_buffer.current_font_size;
+            let color = line_buffer.current_color;
+            if line_buffer.list_counter > 0 {
+                // Ordered list - show number
+                let marker = format!("{}. ", line_buffer.list_counter);
+                line_buffer.add_text(&marker, font_size, color);
+                line_buffer.list_counter += 1;
+            } else {
+                // Unordered list - show bullet
+                line_buffer.add_text("• ", font_size, color);
+            }
+        }
+
+        let line_buffer = &mut self.line_buffer;
+
+        // Set font size based on heading
+        match tag {
+            "h1" => line_buffer.current_font_size = 28.0,
+            "h2" => line_buffer.current_font_size = 24.0,
+            "h3" => line_buffer.current_font_size = 20.0,
+            "h4" => line_buffer.current_font_size = 18.0,
+            "h5" => line_buffer.current_font_size = 16.0,
+            "h6" => line_buffer.current_font_size = 14.0,
+            "small" => line_buffer.current_font_size = (saved_font_size * 0.8).max(12.0),
+            _ => {}
+        };
+
+        // Single pass over attributes: link target, anchor id, inline color
+        for attr in element.attrs.iter() {
+            match tree.resolve(attr.name.local) {
+                "href" if tag == "a" => {
+                    line_buffer.current_href = Some(attr.value.to_string());
                 }
-            }
-            
-            // Record element ID for anchor navigation
-            for attr in element.attrs.iter() {
-                let attr_name = tree.resolve(attr.name.local);
-                if attr_name == "id" {
-                    let id = attr.value.to_string();
-                    if !id.is_empty() {
-                        anchors.push(AnchorPosition {
-                            id,
-                            y: *y_cursor,
-                        });
-                    }
-                    break;
+                "id" if !attr.value.is_empty() => {
+                    // Record element ID for anchor navigation
+                    self.layout.anchors.push(AnchorPosition {
+                        id: attr.value.to_string(),
+                        y: self.y,
+                    });
                 }
-            }
-            
-            // Bold text
-            if tag == "b" || tag == "strong" {
-                // Just use same color for now - we don't have bold font
-            }
-            
-            // Parse inline style attribute for colors
-            for attr in element.attrs.iter() {
-                let attr_name = tree.resolve(attr.name.local);
-                if attr_name == "style" {
+                "style" => {
                     if let Some(color) = parse_color_from_style(&attr.value) {
                         line_buffer.current_color = color;
                     }
-                    break;
                 }
+                _ => {}
             }
-            // Recurse into children
-            for (child_id, _) in tree.children(node_id) {
-                self.paint_node_recursive(canvas, tree, child_id, styles, line_buffer, y_cursor, links, anchors);
-            }
-            
-            // Restore state
-            line_buffer.current_font_size = saved_font_size;
-            line_buffer.current_color = saved_color;
-            line_buffer.indent_level = saved_indent;
-            line_buffer.current_href = saved_href;
-            line_buffer.list_counter = saved_list_counter;
-            line_buffer.current_x = line_buffer.effective_start_x();
-            
-            // Block elements flush after and add space
-            if is_block {
-                if !line_buffer.is_empty() {
-                    line_buffer.flush(canvas, y_cursor, self, links);
-                }
-                // Better spacing based on element type
-                let margin_after = match tag.as_str() {
-                    "h1" => 12.0,
-                    "h2" => 10.0,
-                    "h3" | "h4" => 8.0,
-                    "p" => 12.0,  // Paragraphs need good separation
-                    "li" => 2.0,
-                    _ => 4.0,
-                };
-                *y_cursor += margin_after;
-            }
+        }
+
+        // Links get blue color (unless styled inline)
+        if tag == "a" && line_buffer.current_color == saved_color {
+            line_buffer.current_color = Color::rgb(51, 102, 204); // Wikipedia link blue
+        }
+
+        // Recurse into children
+        for (child_id, _) in tree.children(node_id) {
+            self.layout_node(child_id);
+        }
+
+        // Restore state
+        let line_buffer = &mut self.line_buffer;
+        line_buffer.current_font_size = saved_font_size;
+        line_buffer.current_color = saved_color;
+        line_buffer.indent_level = saved_indent;
+        line_buffer.current_href = saved_href;
+        line_buffer.list_counter = saved_list_counter;
+        line_buffer.current_x = line_buffer.effective_start_x();
+
+        // Block elements flush after and add space
+        if is_block {
+            self.flush();
+            // Better spacing based on element type
+            let margin_after = match tag {
+                "h1" => 12.0,
+                "h2" => 10.0,
+                "h3" | "h4" => 8.0,
+                "p" => 12.0,  // Paragraphs need good separation
+                "li" => 2.0,
+                _ => 4.0,
+            };
+            self.y += margin_after;
         }
     }
 }
@@ -690,8 +853,8 @@ impl PageRenderer {
 /// Parse color from inline style attribute
 fn parse_color_from_style(style: &str) -> Option<Color> {
     for part in style.split(';') {
-        let part = part.trim();
-        if let Some(value) = part.strip_prefix("color:") {
+        let Some((name, value)) = part.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("color") {
             return parse_css_color(value.trim());
         }
     }
@@ -714,8 +877,8 @@ fn parse_background_from_style(style: &str) -> Option<Color> {
 
 /// Parse a CSS color value
 fn parse_css_color(value: &str) -> Option<Color> {
-    let value = value.trim().to_lowercase();
-    
+    let value = value.trim().trim_end_matches("!important").trim().to_ascii_lowercase();
+
     // Named colors (common web colors)
     match value.as_str() {
         "black" => return Some(Color::rgb(0, 0, 0)),
@@ -737,9 +900,12 @@ fn parse_css_color(value: &str) -> Option<Color> {
         "transparent" => return None, // Skip transparent
         _ => {}
     }
-    
+
     // Hex colors #rgb or #rrggbb
     if let Some(hex) = value.strip_prefix('#') {
+        if !hex.is_ascii() {
+            return None;
+        }
         if hex.len() == 3 {
             let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
             let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
@@ -752,7 +918,7 @@ fn parse_css_color(value: &str) -> Option<Color> {
             return Some(Color::rgb(r, g, b));
         }
     }
-    
+
     // rgb(r, g, b)
     if let Some(rgb) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
         let parts: Vec<&str> = rgb.split(',').collect();
@@ -763,13 +929,14 @@ fn parse_css_color(value: &str) -> Option<Color> {
             return Some(Color::rgb(r, g, b));
         }
     }
-    
+
     None
 }
 
 /// Line buffer for accumulating inline text
 struct LineBuffer {
-    segments: Vec<TextSegment>,
+    /// Pending segments; `None` marks a line break
+    segments: Vec<Option<TextSegment>>,
     start_x: f32,
     current_x: f32,
     max_width: f32,
@@ -781,17 +948,6 @@ struct LineBuffer {
     current_href: Option<String>,
     /// Current list counter for <ol> (0 means unordered list or not in list)
     list_counter: u32,
-}
-
-
-#[allow(dead_code)]
-struct TextSegment {
-    text: String,
-    font_size: f32,
-    color: Color,
-    x: f32,
-    /// Link href if this is a link
-    href: Option<String>,
 }
 
 impl LineBuffer {
@@ -808,299 +964,122 @@ impl LineBuffer {
             list_counter: 0,
         }
     }
-    
+
     /// Get effective start x (including indentation)
     fn effective_start_x(&self) -> f32 {
         self.start_x + (self.indent_level as f32 * 20.0)
     }
-    
-    fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-    
+
     fn add_text_with_measure<F: Fn(&str, f32) -> f32>(&mut self, text: &str, font_size: f32, color: Color, measure: F) {
         let effective_start = self.effective_start_x();
         let right_margin = 15.0;
         let wrap_width = self.max_width - right_margin;
-        
+
         // Use proper text measurement for space width
         let space_width = measure(" ", font_size);
-        
+
         // Initialize current_x if needed
         if self.current_x < effective_start {
             self.current_x = effective_start;
         }
-        
+
         // Use LineBreaker for proper Unicode-aware line breaking
         let available_width = wrap_width - self.current_x;
         let lines = LineBreaker::break_lines(text, available_width.max(wrap_width * 0.5), |s| measure(s, font_size));
-        
+
         for (i, &(start, end)) in lines.iter().enumerate() {
             let line_text = &text[start..end];
             let trimmed = line_text.trim_end();
-            
+
             if trimmed.is_empty() {
                 continue;
             }
-            
+
             // Check if this line needs wrapping from current position
             let line_width = measure(trimmed, font_size);
-            
+
             if i > 0 || (self.current_x + line_width > wrap_width && self.current_x > effective_start) {
                 // Need to wrap - start new line
                 if !self.segments.is_empty() {
-                    self.segments.push(TextSegment {
-                        text: "\n".to_string(),
-                        font_size,
-                        color,
-                        x: self.current_x,
-                        href: None,
-                    });
+                    self.segments.push(None);
                 }
                 self.current_x = effective_start;
             }
-            
+
             // Add the text segment
-            self.segments.push(TextSegment {
-                text: format!("{} ", trimmed),
+            let mut segment_text = String::with_capacity(trimmed.len() + 1);
+            segment_text.push_str(trimmed);
+            segment_text.push(' ');
+            self.segments.push(Some(TextSegment {
+                text: segment_text,
                 font_size,
                 color,
-                x: self.current_x,
                 href: self.current_href.clone(),
-            });
-            
+            }));
+
             self.current_x += line_width + space_width;
         }
     }
-    
+
     // Keep fallback without measure function for backwards compatibility
     fn add_text(&mut self, text: &str, font_size: f32, color: Color) {
         // Fallback using approximate character width
         let char_width = font_size * 0.5;
         self.add_text_with_measure(text, font_size, color, |s, _| s.chars().count() as f32 * char_width);
     }
-    
-    fn flush(&mut self, canvas: &mut Canvas, y_cursor: &mut f32, renderer: &mut PageRenderer, links: &mut Vec<LinkRegion>) {
+
+    /// Emit the buffered text as lines starting at `y_cursor`
+    fn flush(&mut self, y_cursor: &mut f32, layout: &mut PageLayout) {
         if self.segments.is_empty() {
             return;
         }
-        
-        let effective_start = self.effective_start_x();
-        let mut x = effective_start;
-        let line_height = self.current_font_size * 1.3;
-        
-        for segment in &self.segments {
-            if segment.text == "\n" {
-                *y_cursor += line_height;
-                x = effective_start;
-                continue;
-            }
-            
-            renderer.paint_text(canvas, &segment.text, x, *y_cursor, segment.color, segment.font_size);
-            
-            // Use proper text measurement instead of character counting
-            let text_width = renderer.measure_text(&segment.text, segment.font_size);
-            
-            // Record link region if this is a link
-            if let Some(ref href) = segment.href {
-                // Text is drawn at y - char_height (baseline), so link region should match
-                let char_height = segment.font_size * 1.2; // Approximate line height
-                links.push(LinkRegion {
-                    x,
-                    y: *y_cursor - char_height,  // Match where text is actually drawn
-                    width: text_width,
-                    height: char_height,
-                    href: href.clone(),
-                });
-            }
-            
-            x += text_width;
-        }
-        
-        *y_cursor += line_height;
-        self.segments.clear();
-        self.current_x = effective_start;
-    }
-}
 
-impl PageRenderer {
-    /// Paint a single layout box and its children
-    fn paint_box(
-        &mut self,
-        canvas: &mut Canvas,
-        layout_tree: &LayoutTree,
-        box_id: LayoutBoxId,
-        document: &Document,
-        styles: &HashMap<NodeId, ComputedStyle>,
-    ) {
-        let layout_box = match layout_tree.get(box_id) {
-            Some(b) => b,
-            None => return,
-        };
-        
-        let dims = &layout_box.dimensions;
-        
-        // Get style for this box
-        let style = layout_box.dom_node
-            .and_then(|id| styles.get(&id));
-        
-        // Get background color
-        let bg_color = style
-            .map(|s| css_color_to_render(&s.background_color))
-            .unwrap_or(Color::TRANSPARENT);
-        
-        // Paint background if not transparent
-        if bg_color.a > 0 {
-            canvas.fill_rect(
-                dims.content.x,
-                dims.content.y,
-                dims.content.width,
-                dims.content.height,
-                bg_color,
-            );
-        }
-        
-        // Paint text content
-        // Iterate through DOM children of this node to find text nodes
-        if let Some(node_id) = layout_box.dom_node {
-            let text_color = style
-                .map(|s| css_color_to_render(&s.color))
-                .unwrap_or(Color::BLACK);
-            let font_size = style.map(|s| s.font_size).unwrap_or(16.0);
-            
-            let y_offset = dims.content.y + font_size;
-            
-            // Collect all text from this element and its children
-            let text = self.collect_text_content(document, node_id);
-            if !text.is_empty() {
-                // Debug: log text being painted
-                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !LOGGED.load(std::sync::atomic::Ordering::Relaxed) {
-                    LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    log::info!("Painting text: '{}' at ({}, {})", 
-                        if text.len() > 50 { &text[..50] } else { &text }, 
-                        dims.content.x, y_offset);
+        let effective_start = self.effective_start_x();
+        let line_height = self.current_font_size * 1.3;
+
+        let mut line = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
+        for segment in self.segments.drain(..) {
+            match segment {
+                Some(segment) => {
+                    layout.max_font_size = layout.max_font_size.max(segment.font_size);
+                    line.segments.push(segment);
                 }
-                
-                self.paint_text(
-                    canvas,
-                    &text,
-                    dims.content.x,
-                    y_offset,
-                    text_color,
-                    font_size,
-                );
-            }
-        }
-        
-        // Paint layout children
-        for (child_id, _) in layout_tree.children(box_id) {
-            self.paint_box(canvas, layout_tree, child_id, document, styles);
-        }
-    }
-    
-    /// Collect text content from a DOM node and its children
-    fn collect_text_content(&self, document: &Document, node_id: NodeId) -> String {
-        let tree = document.tree();
-        let mut result = String::new();
-        
-        if let Some(node) = tree.get(node_id) {
-            // If this is a text node, return its content
-            if let Some(text) = node.as_text() {
-                return text.to_string();
-            }
-            
-            // If this is an element, collect text from children
-            for (child_id, _) in tree.children(node_id) {
-                if let Some(child) = tree.get(child_id) {
-                    if let Some(text) = child.as_text() {
-                        result.push_str(text);
+                None => {
+                    *y_cursor += line_height;
+                    let next = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
+                    let done = std::mem::replace(&mut line, next);
+                    if !done.segments.is_empty() {
+                        layout.lines.push(done);
                     }
                 }
             }
         }
-        
-        result
-    }
-    
-    /// Text painting using TextRenderer with proper fonts
-    fn paint_text(
-        &mut self,
-        canvas: &mut Canvas,
-        text: &str,
-        x: f32,
-        y: f32,
-        color: Color,
-        font_size: f32,
-    ) {
-        // Use TextRenderer if we have a font
-        if let Some(font_id) = self.default_font {
-            // Use the proper font rendering
-            self.text_renderer.draw_text(canvas, text, x, y, font_id, font_size, color);
-        } else {
-            // No font available - use bitmap fallback
-            let scale = (font_size / 8.0).max(1.0);
-            let char_width = 6.0 * scale;
-            let char_height = 8.0 * scale;
-            
-            let mut x_pos = x;
-            
-            for c in text.chars() {
-                if c == '\n' {
-                    continue;
-                }
-                if c == ' ' {
-                    x_pos += char_width * 0.8;
-                    continue;
-                }
-                if x_pos > canvas.width() as f32 {
-                    break;
-                }
-                
-                let pattern = get_char_pattern(c);
-                
-                for (row, &bits) in pattern.iter().enumerate() {
-                    for col in 0..8 {
-                        if (bits >> (7 - col)) & 1 == 1 {
-                            let px = x_pos + col as f32 * scale;
-                            let py = y - char_height + row as f32 * scale;
-                            let rect_size = scale.max(1.0);
-                            canvas.fill_rect(px, py, rect_size, rect_size, color);
-                        }
-                    }
-                }
-                
-                x_pos += char_width;
-            }
+        if !line.segments.is_empty() {
+            layout.lines.push(line);
         }
-    }
-    
-    /// Calculate total content height
-    fn calculate_content_height(&self, layout_tree: &LayoutTree) -> f32 {
-        layout_tree.root()
-            .and_then(|root| layout_tree.get(root))
-            .map(|root_box| {
-                root_box.dimensions.content.height
-                    + root_box.dimensions.padding.top
-                    + root_box.dimensions.padding.bottom
-                    + root_box.dimensions.border.top
-                    + root_box.dimensions.border.bottom
-                    + root_box.dimensions.margin.top
-                    + root_box.dimensions.margin.bottom
-            })
-            .unwrap_or(self.viewport_height as f32)
+
+        *y_cursor += line_height;
+        self.current_x = effective_start;
     }
 }
 
 /// Apply default user-agent styles based on element type
 fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
-    match tag_name.to_lowercase().as_str() {
+    let lowered;
+    let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
+        lowered = tag_name.to_ascii_lowercase();
+        &lowered
+    } else {
+        tag_name
+    };
+
+    match tag {
         // Block elements
         "div" | "p" | "article" | "section" | "main" | "header" | "footer" | "nav" |
         "aside" | "figure" | "figcaption" | "address" | "blockquote" | "pre" => {
             style.display = Display::Block;
         }
-        
+
         // Headings
         "h1" => {
             style.display = Display::Block;
@@ -1144,18 +1123,18 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
             style.font_size = 10.72;
             style.font_weight = 700;
         }
-        
-        // Inline elements  
+
+        // Inline elements
         "span" | "a" | "em" | "i" | "u" | "code" | "kbd" | "samp" => {
             style.display = Display::Inline;
         }
-        
+
         // Bold
         "strong" | "b" => {
             style.display = Display::Inline;
             style.font_weight = 700;
         }
-        
+
         // Lists
         "ul" | "ol" => {
             style.display = Display::Block;
@@ -1169,7 +1148,7 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
         "li" => {
             style.display = Display::Block;
         }
-        
+
         // Table
         "table" => {
             style.display = Display::Block;
@@ -1180,12 +1159,12 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
         "td" | "th" => {
             style.display = Display::Inline;
         }
-        
+
         // Images
         "img" => {
             style.display = Display::Inline;
         }
-        
+
         // Body
         "body" => {
             style.display = Display::Block;
@@ -1196,17 +1175,17 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
                 left: SizeValue::Length(8.0, LengthUnit::Px),
             };
         }
-        
+
         // HTML
         "html" => {
             style.display = Display::Block;
         }
-        
+
         // Head - hidden
         "head" | "title" | "script" | "style" | "meta" | "link" => {
             style.display = Display::None;
         }
-        
+
         _ => {
             style.display = Display::Inline;
         }
@@ -1260,5 +1239,98 @@ fn get_char_pattern(c: char) -> [u8; 8] {
         // Bullet for lists (small filled circle)
         '•' => [0b00000000, 0b00000000, 0b00011000, 0b00111100, 0b00111100, 0b00011000, 0b00000000, 0b00000000],
         _ => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGE: &str = r#"<!DOCTYPE html><html><head><title>T</title></head><body>
+        <h1 id="top">Heading</h1>
+        <p>First paragraph with <a href="/next">a link</a>.</p>
+        <hr>
+        <ul><li>One</li><li>Two</li></ul>
+        <p id="end">Last paragraph.</p>
+    </body></html>"#;
+
+    #[test]
+    fn test_render_produces_viewport_sized_buffer() {
+        let mut renderer = PageRenderer::new(320, 240);
+        let page = renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
+        assert_eq!(page.pixels.len(), 320 * 240);
+        assert_eq!((page.width, page.height), (320, 240));
+        assert!(page.anchors.iter().any(|a| a.id == "top"));
+        assert!(page.content_height > 0.0);
+        assert!(page.links.iter().any(|l| l.href == "/next"));
+    }
+
+    #[test]
+    fn test_layout_is_cached_between_renders() {
+        let mut renderer = PageRenderer::new(320, 240);
+        renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
+        let key = renderer.cached.as_ref().unwrap().key;
+
+        // Scrolling reuses the layout
+        renderer.render_html(PAGE, "https://example.com/", 100.0).unwrap();
+        assert_eq!(renderer.cached.as_ref().unwrap().key, key);
+
+        // A new width re-lays out the same page
+        renderer.set_viewport(200, 240);
+        renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
+        assert_eq!(renderer.cached.as_ref().unwrap().width, 200);
+
+        // A different page replaces it
+        renderer.render_html("<p>other</p>", "https://example.com/", 0.0).unwrap();
+        assert_ne!(renderer.cached.as_ref().unwrap().key, key);
+
+        renderer.clear_cache();
+        assert!(renderer.cached.is_none());
+    }
+
+    #[test]
+    fn test_anchors_and_links_use_buffer_coordinates() {
+        let mut renderer = PageRenderer::new(320, 240);
+        let at_top = renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
+        let scrolled = renderer.render_html(PAGE, "https://example.com/", 30.0).unwrap();
+
+        let y = |page: &RenderedPage, id: &str| page.anchors.iter().find(|a| a.id == id).unwrap().y;
+        assert_eq!(y(&at_top, "end") - y(&scrolled, "end"), 30.0);
+
+        let link_y = |page: &RenderedPage| page.links.iter().find(|l| l.href == "/next").unwrap().y;
+        assert_eq!(link_y(&at_top) - link_y(&scrolled), 30.0);
+
+        // Scrolled far below the content: nothing is visible or clickable
+        let past_end = renderer.render_html(PAGE, "https://example.com/", 10_000.0).unwrap();
+        assert!(past_end.links.is_empty());
+    }
+
+    #[test]
+    fn test_layout_lines_are_ordered() {
+        let document = fos_html::parse_with_url(PAGE, "https://example.com/");
+        let renderer = PageRenderer::new(320, 240);
+        let styles = renderer.compute_styles(&document);
+        let layout = build_layout(&document, &styles, 320);
+
+        assert!(!layout.lines.is_empty());
+        assert!(layout.lines.windows(2).all(|w| w[0].y <= w[1].y));
+        assert_eq!(layout.rules.len(), 1);
+        assert!(layout.content_height >= layout.lines.last().unwrap().y);
+    }
+
+    #[test]
+    fn test_empty_page_does_not_panic() {
+        let mut renderer = PageRenderer::new(320, 240);
+        let page = renderer.render_html("<html><body></body></html>", "about:blank", 0.0).unwrap();
+        assert_eq!(page.pixels.len(), 320 * 240);
+    }
+
+    #[test]
+    fn test_parse_color_from_style() {
+        assert_eq!(parse_color_from_style("color: red"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color_from_style("font-weight:bold; COLOR:#00f"), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(parse_color_from_style("background-color: red"), None);
+        assert_eq!(parse_color_from_style("color: #ff0000 !important"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color_from_style("color: #é1"), None);
     }
 }

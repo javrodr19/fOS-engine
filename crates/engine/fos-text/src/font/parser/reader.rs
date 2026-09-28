@@ -111,8 +111,14 @@ impl<'a> FontReader<'a> {
     
     /// Get slice at current position
     pub fn slice_from_here(&self) -> &'a [u8] {
-        &self.data[self.pos..]
+        tail(self.data, self.pos)
     }
+}
+
+/// `&data[start..]`, or an empty slice when `start` is out of range, so that
+/// malformed offsets in font files fail gracefully instead of panicking
+pub fn tail(data: &[u8], start: usize) -> &[u8] {
+    data.get(start..).unwrap_or(&[])
 }
 
 #[cfg(test)]

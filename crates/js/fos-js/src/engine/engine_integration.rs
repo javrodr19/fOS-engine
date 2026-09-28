@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use super::preparser::{PreParser, FunctionInfo};
 use super::inline_cache::{InlineCacheManager, ShapeId};
 use super::direct_dispatch::{DirectDispatch, SuperInstructionTransformer};
-use super::tiered_compiler::{TieredCompiler, CompileTier, CompilationPolicy};
+use super::tiered_compiler::{TieredCompiler, CompileTier, CompilationPolicy, CompileRequest, BaselineCode, OptimizedCode};
 use super::ssa::{SsaFunction, SsaBuilder};
 use super::generational_gc::{GenerationalGC, GcConfig, RootSet};
 use super::es2024::{ResizableArrayBuffer, AtomicsManager, DeferredPromise};
@@ -34,6 +34,8 @@ use super::wasm_extensions::{SharedMemory, ThreadManager, ExceptionRuntime, V128
 pub struct IntegratedEngine {
     // Compilation
     tiered_compiler: TieredCompiler,
+    /// Compilations requested by the tiering policy, awaiting a compiler
+    pending_compiles: Vec<CompileRequest>,
     ssa_cache: HashMap<u32, SsaFunction>,
     compilation_policy: CompilationPolicy,
     
@@ -86,6 +88,7 @@ impl IntegratedEngine {
     pub fn new() -> Self {
         Self {
             tiered_compiler: TieredCompiler::new(),
+            pending_compiles: Vec::new(),
             ssa_cache: HashMap::new(),
             compilation_policy: CompilationPolicy::default(),
             inline_caches: InlineCacheManager::new(),
@@ -136,10 +139,33 @@ impl IntegratedEngine {
     }
 
     /// Record function call for tiered compilation
+    ///
+    /// When the function becomes hot enough for the next tier, a compile
+    /// request is queued (see [`Self::take_compile_requests`]). The function
+    /// stays at its current tier until the compiled code is registered.
     pub fn record_function_call(&mut self, func_id: u32) {
-        self.tiered_compiler.record_call(func_id);
+        if let Some(request) = self.tiered_compiler.record_call(func_id) {
+            // The tiering policy marks the function as compiling and will not
+            // ask again, so dropping the request would pin it to its tier
+            self.pending_compiles.push(request);
+        }
         self.pgo.record_call(func_id);
         self.predictive_jit.enter_function(func_id);
+    }
+    
+    /// Take the compilations requested so far
+    pub fn take_compile_requests(&mut self) -> Vec<CompileRequest> {
+        std::mem::take(&mut self.pending_compiles)
+    }
+    
+    /// Install baseline code, moving the function to the baseline tier
+    pub fn install_baseline(&mut self, code: BaselineCode) {
+        self.tiered_compiler.register_baseline(code.func_id, code);
+    }
+    
+    /// Install optimized code, moving the function to the optimized tier
+    pub fn install_optimized(&mut self, func_id: u32, code: OptimizedCode) {
+        self.tiered_compiler.register_optimized(func_id, code);
     }
 
     /// Record function return
@@ -381,13 +407,22 @@ mod tests {
     fn test_function_call_recording() {
         let mut engine = IntegratedEngine::new();
         
-        for _ in 0..100 {
+        for _ in 0..99 {
             engine.record_function_call(0);
         }
+        assert!(engine.take_compile_requests().is_empty());
         
-        // After 100 calls, function should be baseline tier
-        let tier = engine.get_compile_tier(0);
-        assert!(matches!(tier, CompileTier::Baseline | CompileTier::Optimized));
+        // The 100th call makes the function hot: exactly one baseline
+        // compilation is requested, and the tier changes once it is installed
+        engine.record_function_call(0);
+        engine.record_function_call(0);
+        let requests = engine.take_compile_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target_tier, CompileTier::Baseline);
+        assert_eq!(engine.get_compile_tier(0), CompileTier::Interpreter);
+        
+        engine.install_baseline(BaselineCode::new(0, vec![0xC3]));
+        assert_eq!(engine.get_compile_tier(0), CompileTier::Baseline);
     }
 
     #[test]

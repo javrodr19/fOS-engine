@@ -38,6 +38,8 @@ pub struct IntegrityValue {
 
 impl IntegrityValue {
     pub fn parse(value: &str) -> Option<Self> {
+        // hash-expression = algorithm "-" base64-value ["?" option-expression]
+        let value = value.split('?').next().unwrap_or(value);
         let (algo, hash) = value.split_once('-')?;
         let algorithm = IntegrityAlgorithm::parse(algo)?;
         let hash = base64_decode(hash)?;
@@ -96,12 +98,12 @@ impl SriValidator {
     }
     
     fn compute_hash(&self, content: &[u8], algorithm: IntegrityAlgorithm) -> Vec<u8> {
-        // Simple hash computation placeholder
-        match algorithm {
-            IntegrityAlgorithm::Sha256 => sha256(content),
-            IntegrityAlgorithm::Sha384 => sha384(content),
-            IntegrityAlgorithm::Sha512 => sha512(content),
-        }
+        let algorithm = match algorithm {
+            IntegrityAlgorithm::Sha256 => &ring::digest::SHA256,
+            IntegrityAlgorithm::Sha384 => &ring::digest::SHA384,
+            IntegrityAlgorithm::Sha512 => &ring::digest::SHA512,
+        };
+        ring::digest::digest(algorithm, content).as_ref().to_vec()
     }
 }
 
@@ -113,40 +115,26 @@ pub enum SriResult {
     Skipped,
 }
 
-// Simple hash implementations (placeholder - would use crypto library)
-fn sha256(data: &[u8]) -> Vec<u8> {
-    let mut hash = vec![0u8; 32];
-    let mut state = 0u64;
-    for (i, b) in data.iter().enumerate() {
-        state = state.wrapping_add(*b as u64).wrapping_mul(0x517cc1b727220a95);
-        hash[i % 32] ^= (state >> ((i % 8) * 8)) as u8;
-    }
-    hash
-}
-
-fn sha384(data: &[u8]) -> Vec<u8> {
-    let mut hash = vec![0u8; 48];
-    for (i, b) in data.iter().enumerate() { hash[i % 48] ^= b.wrapping_add(i as u8); }
-    hash
-}
-
-fn sha512(data: &[u8]) -> Vec<u8> {
-    let mut hash = vec![0u8; 64];
-    for (i, b) in data.iter().enumerate() { hash[i % 64] ^= b.wrapping_add(i as u8); }
-    hash
-}
-
+/// Decode base64 or base64url (padding optional); `None` on invalid input
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(s.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0;
-    for c in s.bytes() {
-        if c == b'=' { break; }
-        let val = TABLE.iter().position(|&x| x == c)? as u32;
+    for c in s.trim_end_matches('=').bytes() {
+        let val = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32;
         buf = (buf << 6) | val;
         bits += 6;
-        if bits >= 8 { bits -= 8; result.push((buf >> bits) as u8); }
+        if bits >= 8 {
+            bits -= 8;
+            result.push((buf >> bits) as u8);
+        }
     }
     Some(result)
 }
@@ -159,10 +147,47 @@ fn hex_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     
+    /// Example from the SRI specification
+    const SCRIPT: &[u8] = b"alert('Hello, world.');";
+    const SCRIPT_SHA384: &str = "sha384-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
+    const SCRIPT_SHA256: &str = "sha256-qznLcsROx4GACP2dm0UCKCzCG+HiZ1guq6ZZDob/Tng=";
+    
     #[test]
     fn test_integrity_parse() {
-        let meta = IntegrityMetadata::parse("sha256-abc123 sha384-def456");
-        assert!(!meta.is_empty());
+        let meta = IntegrityMetadata::parse(&format!("{} {}", SCRIPT_SHA256, SCRIPT_SHA384));
+        assert_eq!(meta.values.len(), 2);
+        assert_eq!(meta.strongest_algorithm(), Some(IntegrityAlgorithm::Sha384));
+        
+        // Options after '?' are ignored
+        assert_eq!(IntegrityMetadata::parse(&format!("{}?ct=text/js", SCRIPT_SHA384)).values.len(), 1);
+        
+        // Wrong digest length, invalid base64 and unknown algorithms are dropped
+        assert!(IntegrityMetadata::parse("sha256-abc123 sha384-de!f md5-AAAA").is_empty());
+    }
+    
+    #[test]
+    fn test_validate_with_real_digests() {
+        let validator = SriValidator::new();
+        
+        let meta = IntegrityMetadata::parse(SCRIPT_SHA384);
+        assert_eq!(validator.validate(SCRIPT, &meta), SriResult::Valid);
+        assert!(matches!(validator.validate(b"alert('tampered');", &meta), SriResult::Invalid { .. }));
+        
+        // Only the strongest algorithm is checked
+        let meta = IntegrityMetadata::parse(&format!("{} sha384-{}", SCRIPT_SHA256, "A".repeat(64)));
+        assert!(matches!(validator.validate(SCRIPT, &meta), SriResult::Invalid { .. }));
+        
+        let sha512 = "sha512-Q2bFTOhEALkN8hOms2FKTDLy7eugP2zFZ1T8LCvX42Fp3WoNr3bjZSAHeOsHrbV1Fu9/A0EzCinRE7Af1ofPrw==";
+        assert_eq!(validator.validate(SCRIPT, &IntegrityMetadata::parse(sha512)), SriResult::Valid);
+        
+        // No usable metadata: the resource is not blocked
+        assert_eq!(validator.validate(SCRIPT, &IntegrityMetadata::parse("md5-xyz")), SriResult::Skipped);
+    }
+    
+    #[test]
+    fn test_base64url_is_accepted() {
+        let url_safe = SCRIPT_SHA256.replace('+', "-").replace('/', "_");
+        assert_eq!(SriValidator::new().validate(SCRIPT, &IntegrityMetadata::parse(&url_safe)), SriResult::Valid);
     }
     
     #[test]

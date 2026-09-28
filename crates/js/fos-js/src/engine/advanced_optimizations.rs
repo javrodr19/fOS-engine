@@ -541,7 +541,7 @@ impl ZeroCopyDom {
 
     /// Invalidate node (e.g., removed from DOM)
     pub fn invalidate_node(&mut self, node_id: u32) {
-        if let Some(node) = self.nodes.get_mut(&node_id) {
+        if self.nodes.remove(&node_id).is_some() {
             self.invalidated.push(node_id);
         }
     }
@@ -562,10 +562,12 @@ impl ZeroCopyDom {
         self.strings.get(&hash).copied()
     }
 
-    /// Check if reference is still valid
+    /// Check if reference is still valid: the node is still registered and
+    /// the reference was taken in the current generation
     pub fn is_valid(&self, node_ref: DomNodeRef) -> bool {
-        self.nodes.get(&node_ref.node_id)
-            .is_some_and(|n| n.generation == node_ref.generation)
+        node_ref.generation == self.generation
+            && self.nodes.get(&node_ref.node_id)
+                .is_some_and(|n| n.generation == node_ref.generation)
     }
 }
 
@@ -654,5 +656,15 @@ mod tests {
         
         dom.increment_generation();
         assert!(!dom.is_valid(node_ref));
+        assert!(dom.get_node(1).is_none());
+        
+        // Re-registering in the new generation gives a valid reference
+        let node_ref = dom.register_node(1, DomNodeType::Element);
+        assert!(dom.is_valid(node_ref));
+        
+        // Removing a node invalidates references to it
+        dom.invalidate_node(1);
+        assert!(!dom.is_valid(node_ref));
+        assert!(dom.get_node(1).is_none());
     }
 }

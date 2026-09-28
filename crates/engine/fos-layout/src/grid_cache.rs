@@ -17,20 +17,22 @@ pub struct TrackSizingKey {
     column_template_hash: u64,
     /// Hash of row template
     row_template_hash: u64,
-    /// Container width (quantized to reduce cache misses)
+    /// Container width (exact `f32` bits)
     container_width: u32,
-    /// Container height (quantized)
+    /// Container height (exact `f32` bits)
     container_height: u32,
-    /// Column gap
+    /// Column gap (exact `f32` bits)
     column_gap: u32,
-    /// Row gap
+    /// Row gap (exact `f32` bits)
     row_gap: u32,
 }
 
 impl TrackSizingKey {
     /// Create a new track sizing key
-    /// 
-    /// Sizes are quantized to nearest 8px to improve cache hit rate
+    ///
+    /// Sizes are compared exactly: track sizes depend on every pixel of the
+    /// container (e.g. `fr` tracks), so reusing a result computed for a
+    /// slightly different size would lay the grid out incorrectly.
     pub fn new(
         column_template_hash: u64,
         row_template_hash: u64,
@@ -42,13 +44,17 @@ impl TrackSizingKey {
         Self {
             column_template_hash,
             row_template_hash,
-            // Quantize to nearest 8px
-            container_width: (container_width / 8.0).round() as u32,
-            container_height: (container_height / 8.0).round() as u32,
-            column_gap: (column_gap * 10.0) as u32,
-            row_gap: (row_gap * 10.0) as u32,
+            container_width: exact_bits(container_width),
+            container_height: exact_bits(container_height),
+            column_gap: exact_bits(column_gap),
+            row_gap: exact_bits(row_gap),
         }
     }
+}
+
+/// Bit pattern of a size, treating -0.0 and 0.0 as the same value
+fn exact_bits(value: f32) -> u32 {
+    if value == 0.0 { 0 } else { value.to_bits() }
 }
 
 impl PartialEq for TrackSizingKey {
@@ -346,11 +352,18 @@ mod tests {
     }
     
     #[test]
-    fn test_track_sizing_key_quantization() {
-        // Keys with slightly different sizes should still match (within 8px)
-        let key1 = TrackSizingKey::new(123, 456, 800.0, 600.0, 10.0, 10.0);
-        let key2 = TrackSizingKey::new(123, 456, 804.0, 603.0, 10.0, 10.0);
-        assert_eq!(key1, key2);
+    fn test_track_sizing_key_is_exact() {
+        let key = TrackSizingKey::new(123, 456, 800.0, 600.0, 10.0, 10.0);
+        assert_eq!(key, TrackSizingKey::new(123, 456, 800.0, 600.0, 10.0, 10.0));
+        assert_eq!(
+            TrackSizingKey::new(1, 2, 0.0, 0.0, 0.0, 0.0),
+            TrackSizingKey::new(1, 2, -0.0, 0.0, -0.0, 0.0)
+        );
+        
+        // Track sizes computed for another container size must not be reused
+        assert_ne!(key, TrackSizingKey::new(123, 456, 804.0, 600.0, 10.0, 10.0));
+        assert_ne!(key, TrackSizingKey::new(123, 456, 800.0, 600.5, 10.0, 10.0));
+        assert_ne!(key, TrackSizingKey::new(123, 456, 800.0, 600.0, 10.05, 10.0));
     }
     
     #[test]

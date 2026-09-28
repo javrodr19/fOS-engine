@@ -13,6 +13,7 @@ fos-text = { path = "../fos-text" }
 tiny-skia.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+bytemuck = "1"
 
 # Custom image decoders - no external dependencies needed
 

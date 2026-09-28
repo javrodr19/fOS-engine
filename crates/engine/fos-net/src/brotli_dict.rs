@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use crate::content_encoding::DecodeError;
+
 /// Brotli shared dictionary
 #[derive(Debug)]
 pub struct BrotliSharedDict {
@@ -132,27 +134,33 @@ impl BrotliDecompressor {
     
     pub fn set_dict(&mut self, dict: BrotliSharedDict) { self.dict = Some(dict); }
     
-    /// Decompress data
+    /// Decompress a Brotli stream. A non-empty dictionary is attached as a
+    /// raw LZ77 prefix, as in Compression Dictionary Transport (`dcb`).
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, DecompressError> {
-        // Simplified: actual brotli would use the dictionary
-        // This is a placeholder for the decompression logic
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        
-        // In reality, we'd call brotli decoder with dictionary
-        // For now, just return the data as-is (placeholder)
-        Ok(data.to_vec())
+        let dict = self.dict.as_ref().map(|d| d.data()).filter(|d| !d.is_empty());
+        crate::content_encoding::brotli(data, dict, crate::content_encoding::DEFAULT_MAX_DECODED_SIZE)
+            .map_err(|e| match e {
+                DecodeError::TooLarge(_) => DecompressError::TooLarge,
+                _ if dict.is_some() => DecompressError::DictMismatch,
+                _ => DecompressError::InvalidData,
+            })
     }
     
     pub fn has_dict(&self) -> bool { self.dict.is_some() }
 }
 
 /// Decompression error
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DecompressError {
+    /// Not a valid Brotli stream
     InvalidData,
+    /// Invalid with the attached dictionary (possibly the wrong one)
     DictMismatch,
+    /// Decompressed output exceeds the size cap
+    TooLarge,
 }
 
 /// Dictionary cache
@@ -213,6 +221,18 @@ mod tests {
         assert!(dict.patterns.iter().any(|p| p.contains("div")));
     }
     
+    #[test]
+    fn test_decompress() {
+        let sample = include_bytes!("../tests/data/sample.html");
+        let br = include_bytes!("../tests/data/sample.html.br");
+        assert_eq!(BrotliDecompressor::new().decompress(br).unwrap(), sample);
+        assert_eq!(BrotliDecompressor::new().decompress(b"").unwrap(), b"");
+        assert_eq!(
+            BrotliDecompressor::new().decompress(&br[..br.len() / 2]),
+            Err(DecompressError::InvalidData)
+        );
+    }
+
     #[test]
     fn test_cache() {
         let mut cache = DictCache::new();

@@ -461,31 +461,26 @@ impl LigatureSubst {
     /// Try to apply ligature substitution
     /// Returns (ligature glyph, number of glyphs consumed) if match found
     pub fn apply(&self, glyphs: &[GlyphId]) -> Option<(GlyphId, usize)> {
-        if glyphs.is_empty() {
+        self.apply_with(glyphs.len(), |i| glyphs[i])
+    }
+
+    /// Like [`Self::apply`], for a glyph sequence of `len` glyphs read
+    /// through `glyph_at`, so callers need not copy their glyphs out
+    pub fn apply_with(&self, len: usize, glyph_at: impl Fn(usize) -> GlyphId) -> Option<(GlyphId, usize)> {
+        if len == 0 {
             return None;
         }
-        
-        let first = glyphs[0];
-        let coverage_idx = self.coverage.get(first.0)?;
+
+        let coverage_idx = self.coverage.get(glyph_at(0).0)?;
         let ligature_set = self.ligature_sets.get(coverage_idx as usize)?;
-        
-        // Try each ligature in the set (longer matches first typically)
-        for ligature in ligature_set {
-            if ligature.components.len() + 1 <= glyphs.len() {
-                let matches = ligature.components.iter().enumerate().all(|(i, &comp)| {
-                    glyphs.get(i + 1).map(|g| g.0 == comp).unwrap_or(false)
-                });
-                
-                if matches {
-                    return Some((
-                        GlyphId(ligature.ligature_glyph),
-                        ligature.components.len() + 1,
-                    ));
-                }
-            }
-        }
-        
-        None
+
+        // Ligatures are tried in font order (longest first, by convention)
+        ligature_set.iter()
+            .find(|ligature| {
+                ligature.components.len() < len
+                    && ligature.components.iter().enumerate().all(|(i, &comp)| glyph_at(i + 1).0 == comp)
+            })
+            .map(|ligature| (GlyphId(ligature.ligature_glyph), ligature.components.len() + 1))
     }
 }
 

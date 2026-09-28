@@ -452,6 +452,10 @@ impl ScriptItemizer {
         let mut current_script = Script::Common;
         let mut run_start = 0;
         let mut last_real_script = Script::Common;
+        // Script of the first non-neutral character, which leading neutral
+        // characters take. Looked up once: rescanning for each of them
+        // would be quadratic in the length of a neutral prefix.
+        let mut leading_script: Option<Script> = None;
         
         while let Some((byte_offset, c)) = chars.next() {
             let char_script = Script::of(c);
@@ -464,16 +468,12 @@ impl ScriptItemizer {
                         last_real_script
                     } else {
                         // Look ahead for a real script
-                        let mut lookahead = chars.clone();
-                        let mut found = Script::Common;
-                        while let Some((_, ahead_c)) = lookahead.next() {
-                            let ahead_script = Script::of(ahead_c);
-                            if ahead_script != Script::Common && ahead_script != Script::Inherited {
-                                found = ahead_script;
-                                break;
-                            }
-                        }
-                        found
+                        *leading_script.get_or_insert_with(|| {
+                            chars.clone()
+                                .map(|(_, ahead_c)| Script::of(ahead_c))
+                                .find(|&s| s != Script::Common && s != Script::Inherited)
+                                .unwrap_or(Script::Common)
+                        })
                     }
                 }
                 _ => {
@@ -682,6 +682,22 @@ mod tests {
         // Mixed Latin and Arabic
         let runs = itemizer.itemize("Hello مرحبا");
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn test_neutral_prefix_takes_following_script() {
+        let itemizer = ScriptItemizer::new();
+
+        let runs = itemizer.itemize("123 - مرحبا");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].script, Script::Arabic);
+
+        // A long neutral-only string is itemized in linear time
+        let digits = "1234567890 ".repeat(20_000);
+        let runs = itemizer.itemize(&digits);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].script, Script::Common);
+        assert_eq!(runs[0].end, digits.len());
     }
     
     #[test]

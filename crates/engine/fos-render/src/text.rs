@@ -144,41 +144,46 @@ fn draw_glyph_bitmap(canvas: &mut Canvas, glyph: &RasterizedGlyph, x: i32, y: i3
         return;
     }
 
-    let pixels = canvas.pixmap_mut().pixels_mut();
+    // Row slices of the glyph and the canvas, so the inner loop has no
+    // bounds checks; pixels are premultiplied RGBA bytes
+    let canvas_w = canvas_w as usize;
+    let glyph_w = glyph_w as usize;
+    let (sx0, sx1) = ((x0 - x) as usize, (x1 - x) as usize);
+    let (pixels, _) = canvas.data_mut().as_chunks_mut::<4>();
     for cy in y0..y1 {
-        let src_row = ((cy - y) * glyph_w) as usize;
-        let dst_row = (cy * canvas_w) as usize;
-        for cx in x0..x1 {
-            let coverage = glyph.bitmap[src_row + (cx - x) as usize];
-            if coverage == 0 {
-                continue;
+        let src_row = (cy - y) as usize * glyph_w;
+        let src = &glyph.bitmap[src_row + sx0..src_row + sx1];
+        let dst_row = cy as usize * canvas_w;
+        let dst = &mut pixels[dst_row + x0 as usize..dst_row + x1 as usize];
+        for (pixel, &coverage) in dst.iter_mut().zip(src) {
+            if coverage != 0 {
+                *pixel = blend_premultiplied(*pixel, color, coverage);
             }
-            let dst = &mut pixels[dst_row + cx as usize];
-            *dst = blend_premultiplied(*dst, color, coverage);
         }
     }
 }
 
-/// Source-over blend of `color` at `coverage` onto a premultiplied pixel
+/// Source-over blend of `color` (straight alpha) at `coverage` onto a
+/// premultiplied RGBA pixel. The result stays premultiplied (no channel
+/// exceeds alpha), as the rounding of each term is bounded by alpha's.
 #[inline]
-fn blend_premultiplied(
-    dst: tiny_skia::PremultipliedColorU8,
-    color: Color,
-    coverage: u8,
-) -> tiny_skia::PremultipliedColorU8 {
+fn blend_premultiplied(dst: [u8; 4], color: Color, coverage: u8) -> [u8; 4] {
     let sa = (coverage as u32 * color.a as u32 + 127) / 255;
-    if sa == 0 {
-        return dst;
+    match sa {
+        0 => dst,
+        // Fully covered by an opaque color (glyph interiors)
+        255 => [color.r, color.g, color.b, 255],
+        _ => {
+            let inv = 255 - sa;
+            let mix = |src: u8, dst: u8| ((src as u32 * sa + dst as u32 * inv + 127) / 255) as u8;
+            [
+                mix(color.r, dst[0]),
+                mix(color.g, dst[1]),
+                mix(color.b, dst[2]),
+                (sa + (dst[3] as u32 * inv + 127) / 255) as u8,
+            ]
+        }
     }
-    let inv = 255 - sa;
-    let channel = |src: u8, dst: u8| ((src as u32 * sa + dst as u32 * inv + 127) / 255) as u8;
-
-    let r = channel(color.r, dst.red());
-    let g = channel(color.g, dst.green());
-    let b = channel(color.b, dst.blue());
-    let a = (sa + (dst.alpha() as u32 * inv + 127) / 255) as u8;
-
-    tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, a).unwrap_or(dst)
 }
 
 impl Default for TextRenderer {
@@ -231,17 +236,27 @@ mod tests {
 
     #[test]
     fn test_blend_premultiplied() {
-        let white = tiny_skia::PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+        let white = [255; 4];
 
         let full = blend_premultiplied(white, Color::BLACK, 255);
-        assert_eq!((full.red(), full.alpha()), (0, 255));
+        assert_eq!(full, [0, 0, 0, 255]);
 
         let half = blend_premultiplied(white, Color::BLACK, 128);
-        assert!(half.red() > 120 && half.red() < 135);
-        assert_eq!(half.alpha(), 255);
+        assert!(half[0] > 120 && half[0] < 135);
+        assert_eq!(half[3], 255);
 
         let none = blend_premultiplied(white, Color::BLACK, 0);
-        assert_eq!(none.red(), 255);
+        assert_eq!(none, white);
+
+        // Onto transparent pixels, channels never exceed alpha
+        for coverage in [1, 7, 128, 200, 254] {
+            for color in [Color::rgba(255, 128, 0, 200), Color::rgba(10, 250, 90, 255)] {
+                let [r, g, b, a] = blend_premultiplied([0; 4], color, coverage);
+                assert!(r <= a && g <= a && b <= a, "{coverage}: {:?}", [r, g, b, a]);
+                let again = blend_premultiplied([r, g, b, a], color, coverage);
+                assert!(again[..3].iter().all(|&c| c <= again[3]));
+            }
+        }
     }
 
     #[test]

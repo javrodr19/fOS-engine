@@ -111,7 +111,11 @@ impl DomSink {
         let is_class = &*attr.name.local == "class";
         let interned_id = is_id.then(|| interner.intern(&attr.value));
         let classes: Vec<InternedString> = if is_class {
-            attr.value.split_ascii_whitespace().map(|c| interner.intern(c)).collect()
+            // Sized exactly: most class lists hold one or two names, and a
+            // growing Vec would reserve four
+            let mut classes = Vec::with_capacity(attr.value.split_ascii_whitespace().count());
+            classes.extend(attr.value.split_ascii_whitespace().map(|c| interner.intern(c)));
+            classes
         } else {
             Vec::new()
         };
@@ -163,7 +167,10 @@ impl TreeSink for DomSink {
         let mut tree = self.tree.borrow_mut();
         let interner = tree.interner_mut();
         let qname = QualName::new(interner.intern(&name.ns), interner.intern(&name.local));
-        let id = tree.create_node(NodeData::Element(ElementData::new(qname)));
+        let mut element = ElementData::new(qname);
+        // Sized exactly (a growing Vec reserves four attributes for the first)
+        element.attrs.reserve_exact(attrs.len());
+        let id = tree.create_node(NodeData::Element(element));
         for attr in attrs {
             Self::set_attribute(&mut tree, id, attr, false);
         }

@@ -1,6 +1,6 @@
 //! Glyph atlas (cache)
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use super::RasterizedGlyph;
 
 /// Key for glyph cache lookup
@@ -28,8 +28,8 @@ impl GlyphKey {
 
 /// Glyph atlas for caching rasterized glyphs
 pub struct GlyphAtlas {
-    /// Cached glyphs
-    cache: HashMap<GlyphKey, RasterizedGlyph>,
+    /// Cached glyphs (looked up for every painted glyph, so a fast hasher)
+    cache: FxHashMap<GlyphKey, RasterizedGlyph>,
     /// Maximum cache size
     max_entries: usize,
     /// Cache hits
@@ -42,7 +42,7 @@ impl GlyphAtlas {
     /// Create a new glyph atlas
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: HashMap::with_capacity(max_entries.min(1024)),
+            cache: FxHashMap::with_capacity_and_hasher(max_entries.min(1024), Default::default()),
             max_entries,
             hits: 0,
             misses: 0,
@@ -69,22 +69,24 @@ impl GlyphAtlas {
         self.cache.insert(key, glyph);
     }
     
-    /// Get or insert a glyph
+    /// Get or insert a glyph (one hash lookup when cached)
     pub fn get_or_insert_with<F>(&mut self, key: GlyphKey, f: F) -> &RasterizedGlyph
     where
         F: FnOnce() -> RasterizedGlyph,
     {
-        if !self.cache.contains_key(&key) {
-            self.misses += 1;
-            let glyph = f();
-            if self.cache.len() >= self.max_entries {
-                self.evict_half();
-            }
-            self.cache.insert(key, glyph);
-        } else {
-            self.hits += 1;
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&key) {
+            self.evict_half();
         }
-        self.cache.get(&key).unwrap()
+        match self.cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                self.hits += 1;
+                entry.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.misses += 1;
+                entry.insert(f())
+            }
+        }
     }
     
     /// Clear the cache

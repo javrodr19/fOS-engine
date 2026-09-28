@@ -3,8 +3,10 @@
 //! Full HarfBuzz-compatible text shaper using custom GSUB/GPOS,
 //! Bidi algorithm, script itemization, and complex script shaping.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::font::{FontDatabase, FontId};
 use crate::font::parser::{FontParser, GlyphId};
@@ -178,7 +180,8 @@ impl ShapingPlan {
 
 /// Cheap fingerprint of a font buffer (length plus leading bytes)
 fn font_fingerprint(data: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Computed on every shaping call, so a fast non-cryptographic hash
+    let mut hasher = FxHasher::default();
     data.len().hash(&mut hasher);
     data[..data.len().min(256)].hash(&mut hasher);
     hasher.finish()
@@ -194,8 +197,9 @@ pub struct TextShaper {
     indic_shaper: IndicShaper,
     /// Configuration
     config: ShaperConfig,
-    /// Per-face shaping plans
-    plans: HashMap<PlanKey, ShapingPlan>,
+    /// Per-face shaping plans (shared, so shaping can hold one while
+    /// using `self` mutably)
+    plans: FxHashMap<PlanKey, Arc<ShapingPlan>>,
 }
 
 impl TextShaper {
@@ -206,7 +210,7 @@ impl TextShaper {
             arabic_shaper: ArabicShaper::new(),
             indic_shaper: IndicShaper::new(),
             config: ShaperConfig::default(),
-            plans: HashMap::new(),
+            plans: FxHashMap::default(),
         }
     }
     
@@ -279,10 +283,9 @@ impl TextShaper {
                 self.plans.clear();
             }
             let plan = ShapingPlan::build(&font, font_data, key.no_ligatures, key.no_kerning);
-            self.plans.insert(key, plan);
+            self.plans.insert(key, Arc::new(plan));
         }
-        // Taken out while shaping so `self` stays usable; put back below
-        let plan = self.plans.remove(&key).expect("plan inserted above");
+        let plan = Arc::clone(&self.plans[&key]);
         
         // Map characters to glyphs
         let mut glyphs: Vec<GlyphInfo> = text.chars()
@@ -311,8 +314,15 @@ impl TextShaper {
         let script_runs = self.script_itemizer.itemize(text);
         
         // Script runs are byte ranges, while glyphs are indexed by character
-        let char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-        let to_char_index = |byte: usize| char_starts.partition_point(|&start| start < byte);
+        // (the same thing for ASCII, the common case)
+        let char_starts: Vec<usize> = if text.is_ascii() {
+            Vec::new()
+        } else {
+            text.char_indices().map(|(i, _)| i).collect()
+        };
+        let to_char_index = |byte: usize| {
+            if char_starts.is_empty() { byte } else { char_starts.partition_point(|&start| start < byte) }
+        };
         
         // Process each script run
         for run in &script_runs {
@@ -340,8 +350,6 @@ impl TextShaper {
         
         // Apply GPOS kerning
         Self::apply_kerning(&plan.kerning, &mut glyphs);
-        
-        self.plans.insert(key, plan);
         
         // Convert to ShapedGlyph
         let shaped_glyphs: Vec<ShapedGlyph> = glyphs.into_iter()
@@ -449,11 +457,8 @@ impl TextShaper {
                     }
                     
                     GsubSubtable::Ligature(ligature) => {
-                        let remaining: Vec<GlyphId> = glyphs[i..].iter()
-                            .map(|g| g.glyph_id)
-                            .collect();
-                        
-                        if let Some((lig_id, consumed)) = ligature.apply(&remaining) {
+                        let matched = ligature.apply_with(glyphs.len() - i, |k| glyphs[i + k].glyph_id);
+                        if let Some((lig_id, consumed)) = matched {
                             glyphs[i].glyph_id = lig_id;
                             // Remove consumed glyphs (except first)
                             for _ in 1..consumed {
@@ -544,5 +549,23 @@ mod tests {
             let run = shaper.shape(&db, font, text, 16.0).unwrap();
             assert_eq!(run.glyphs.len(), text.chars().count(), "{text}");
         }
+    }
+
+    #[test]
+    fn test_ligatures_are_formed() {
+        let db = FontDatabase::shared();
+        let Some(font) = db.query(&crate::FontQuery::new(&["DejaVu Sans"])) else {
+            return; // Font not installed
+        };
+        if !db.font(font).is_some_and(|f| f.family.contains("DejaVu Sans")) {
+            return;
+        }
+
+        // DejaVu Sans has "ffi" and "fl" ligatures under `liga`
+        let text = "official flight";
+        let with = TextShaper::new().shape(&db, font, text, 16.0).unwrap();
+        let without = TextShaper::new().no_ligatures().shape(&db, font, text, 16.0).unwrap();
+        assert_eq!(without.glyphs.len(), text.chars().count());
+        assert_eq!(with.glyphs.len(), without.glyphs.len() - 3);
     }
 }

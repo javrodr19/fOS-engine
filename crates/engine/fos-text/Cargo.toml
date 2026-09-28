@@ -19,5 +19,6 @@ tiny-skia.workspace = true
 
 # Error handling
 thiserror.workspace = true
+rustc-hash = "2.1"
 
 [dev-dependencies]

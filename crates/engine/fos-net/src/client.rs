@@ -15,6 +15,7 @@ use crate::tls::{TlsStream, TlsConfig};
 use crate::http1::{Http1Request, Http1Parser};
 use crate::http2::{Http2Connection, Frame, Http2Event};
 use crate::cookies::CookieJar;
+use crate::content_encoding;
 use crate::quic::{AltSvc, AltSvcCache};
 use crate::url_util;
 use crate::{Response, NetError};
@@ -52,6 +53,9 @@ pub struct ClientConfig {
     pub max_idle_connections: usize,
     /// How long an idle connection is kept before it is closed
     pub idle_timeout: Duration,
+    /// Largest body accepted after content decoding (gzip, br, zstd...),
+    /// which stops decompression bombs
+    pub max_decoded_body_size: usize,
 }
 
 impl Default for ClientConfig {
@@ -69,6 +73,7 @@ impl Default for ClientConfig {
             http3_idle_timeout: Duration::from_secs(30),
             max_idle_connections: 8,
             idle_timeout: Duration::from_secs(30),
+            max_decoded_body_size: content_encoding::DEFAULT_MAX_DECODED_SIZE,
         }
     }
 }
@@ -130,6 +135,12 @@ impl HttpClientBuilder {
     /// Maximum idle keep-alive connections (0 disables connection reuse)
     pub fn max_idle_connections(mut self, max: usize) -> Self {
         self.config.max_idle_connections = max;
+        self
+    }
+
+    /// Largest body accepted after content decoding
+    pub fn max_decoded_body_size(mut self, max: usize) -> Self {
+        self.config.max_decoded_body_size = max;
         self
     }
 
@@ -322,6 +333,7 @@ impl HttpClient {
                 _ => None,
             };
             let Some(location) = location else {
+                self.decode_content(&method, &mut response)?;
                 response.url = url;
                 return Ok(response);
             };
@@ -335,6 +347,7 @@ impl HttpClient {
             }
             if UrlParts::parse(&next).is_err() {
                 // Not an HTTP(S) target; let the caller handle the redirect
+                self.decode_content(&method, &mut response)?;
                 response.url = url;
                 return Ok(response);
             }
@@ -382,9 +395,10 @@ impl HttpClient {
         if !has("accept") {
             req = req.header("Accept", "*/*");
         }
-        // Content codings are not decoded yet, so ask for unencoded bodies
         if !has("accept-encoding") {
-            req = req.header("Accept-Encoding", "identity");
+            // A range of a compressed body cannot be decoded on its own
+            let accept = if has("range") { "identity" } else { content_encoding::accept_encoding(url.is_https) };
+            req = req.header("Accept-Encoding", accept);
         }
 
         for (name, value) in self.config.default_headers.iter().chain(headers) {
@@ -406,6 +420,23 @@ impl HttpClient {
         }
 
         req
+    }
+
+    /// Undo the response's content codings, so callers always get the
+    /// representation itself. Headers are left as received, as in Fetch.
+    fn decode_content(&self, method: &str, response: &mut Response) -> Result<(), NetError> {
+        // These responses have no content, whatever their headers say
+        if method == "HEAD" || matches!(response.status, 100..=199 | 204 | 304) {
+            return Ok(());
+        }
+        let Some(coding) = response.header("content-encoding") else {
+            return Ok(());
+        };
+        let coding = coding.to_owned();
+        let body = std::mem::take(&mut response.body);
+        response.body = content_encoding::decode(body, &coding, self.config.max_decoded_body_size)
+            .map_err(|e| NetError::Network(format!("content decoding failed: {e}")))?;
+        Ok(())
     }
 
     fn execute_request(&mut self, url: &UrlParts, req: Http1Request) -> Result<Response, NetError> {
@@ -1190,6 +1221,64 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         assert_eq!(client.get(&base).unwrap().body, b"ok");
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// Serve one binary response on a local port. The handle yields the
+    /// request head the client sent.
+    fn serve_once(response: Vec<u8>) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            let head = read_request_head(&mut reader).unwrap();
+            stream.write_all(&response).unwrap();
+            head.to_ascii_lowercase()
+        });
+        (base, server)
+    }
+
+    fn encoded_response(coding: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: {}\r\nContent-Length: {}\r\n\r\n",
+            coding,
+            body.len()
+        ).into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[test]
+    fn test_compressed_body_is_decoded() {
+        let sample = include_bytes!("../tests/data/sample.html");
+        let gz = include_bytes!("../tests/data/sample.html.gz");
+        let (base, server) = serve_once(encoded_response("gzip", gz));
+
+        let response = HttpClient::new().get(&base).unwrap();
+        assert_eq!(response.body, sample);
+        // Headers stay as received
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
+        // Brotli and zstd are only offered over HTTPS
+        assert!(server.join().unwrap().contains("accept-encoding: gzip, deflate\r\n"));
+    }
+
+    #[test]
+    fn test_decoded_body_size_is_capped() {
+        let gz = include_bytes!("../tests/data/sample.html.gz");
+        let (base, _server) = serve_once(encoded_response("gzip", gz));
+
+        let mut client = HttpClient::builder().max_decoded_body_size(1024).build();
+        assert!(client.get(&base).is_err());
+    }
+
+    #[test]
+    fn test_range_requests_ask_for_identity() {
+        let (base, server) = serve_once(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\n\r\nhi".to_vec());
+
+        let headers = vec![("Range".to_string(), "bytes=0-1".to_string())];
+        let response = HttpClient::new().request("GET", &base, Some(headers), None).unwrap();
+        assert_eq!(response.body, b"hi");
+        assert!(server.join().unwrap().contains("accept-encoding: identity\r\n"));
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod priority_signals;
 pub mod connection_predictor;
 pub mod shared_dict;
 pub mod zstd;
+pub mod content_encoding;
 pub mod dns_resolver;
 pub mod tiered_pool;
 pub mod request_fusion;
@@ -77,6 +78,7 @@ pub use priority_signals::{PrioritySignal, ResourcePriority, PriorityScheduler, 
 pub use connection_predictor::{ConnectionPredictor, BloomFilter, NavigationModel, PreconnectHint, HintSource, DnsPrefetcher};
 pub use shared_dict::{SharedDictionary, Pattern, MatchScope, DictionaryCache, UseAsDictionary};
 pub use zstd::{ZstdCompressor, ZstdDecompressor, ZstdError, CompressionLevel};
+pub use content_encoding::{ContentCoding, DecodeError};
 pub use dns_resolver::{DnsResolver, DnsQuery, DnsResponse, DnsRecord, RecordType, DohClient, DnsCache};
 pub use tiered_pool::{TieredConnectionPool, ConnectionKey, PooledConnection as TieredPooledConnection, PoolConfig as TieredPoolConfig, AcquireResult as TieredAcquireResult};
 pub use request_fusion::{RequestFusion, FusionRequest, FusedBatch, FusionStats};

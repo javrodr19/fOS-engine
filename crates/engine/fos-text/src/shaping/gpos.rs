@@ -170,7 +170,7 @@ impl SinglePos {
         let coverage_offset = reader.read_u16().ok()?;
         let value_format = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let pos_data = match format {
             1 => {
@@ -254,7 +254,7 @@ impl PairPos {
         let value_format1 = reader.read_u16().ok()?;
         let value_format2 = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let pos_data = match format {
             1 => Self::parse_format1(data, value_format1, value_format2)?,
@@ -277,7 +277,7 @@ impl PairPos {
         
         let mut pair_sets = Vec::with_capacity(pair_set_count as usize);
         for offset in pair_set_offsets {
-            let set_data = &data[offset as usize..];
+            let set_data = data.get(offset as usize..)?;
             let mut set_reader = FontReader::new(set_data);
             let pair_count = set_reader.read_u16().ok()?;
             
@@ -304,8 +304,8 @@ impl PairPos {
         let class1_count = reader.read_u16().ok()?;
         let class2_count = reader.read_u16().ok()?;
         
-        let class_def1 = ClassDef::parse(&data[class_def1_offset as usize..])?;
-        let class_def2 = ClassDef::parse(&data[class_def2_offset as usize..])?;
+        let class_def1 = ClassDef::parse(data.get(class_def1_offset as usize..)?)?;
+        let class_def2 = ClassDef::parse(data.get(class_def2_offset as usize..)?)?;
         
         let mut class1_records = Vec::with_capacity(class1_count as usize);
         for _ in 0..class1_count {
@@ -384,7 +384,7 @@ impl CursivePos {
         let coverage_offset = reader.read_u16().ok()?;
         let entry_exit_count = reader.read_u16().ok()?;
         
-        let coverage = Coverage::parse(&data[coverage_offset as usize..])?;
+        let coverage = Coverage::parse(data.get(coverage_offset as usize..)?)?;
         
         let mut entry_exit_records = Vec::with_capacity(entry_exit_count as usize);
         for _ in 0..entry_exit_count {
@@ -392,13 +392,13 @@ impl CursivePos {
             let exit_offset = reader.read_u16().ok()?;
             
             let entry_anchor = if entry_offset != 0 {
-                Anchor::parse(&data[entry_offset as usize..])
+                Anchor::parse(data.get(entry_offset as usize..)?)
             } else {
                 None
             };
             
             let exit_anchor = if exit_offset != 0 {
-                Anchor::parse(&data[exit_offset as usize..])
+                Anchor::parse(data.get(exit_offset as usize..)?)
             } else {
                 None
             };
@@ -448,11 +448,11 @@ impl MarkToBasePos {
         let mark_array_offset = reader.read_u16().ok()?;
         let base_array_offset = reader.read_u16().ok()?;
         
-        let mark_coverage = Coverage::parse(&data[mark_coverage_offset as usize..])?;
-        let base_coverage = Coverage::parse(&data[base_coverage_offset as usize..])?;
+        let mark_coverage = Coverage::parse(data.get(mark_coverage_offset as usize..)?)?;
+        let base_coverage = Coverage::parse(data.get(base_coverage_offset as usize..)?)?;
         
         // Parse mark array
-        let mark_array_data = &data[mark_array_offset as usize..];
+        let mark_array_data = data.get(mark_array_offset as usize..)?;
         let mut mark_reader = FontReader::new(mark_array_data);
         let mark_count = mark_reader.read_u16().ok()?;
         
@@ -465,7 +465,7 @@ impl MarkToBasePos {
         }
         
         // Parse base array
-        let base_array_data = &data[base_array_offset as usize..];
+        let base_array_data = data.get(base_array_offset as usize..)?;
         let mut base_reader = FontReader::new(base_array_data);
         let base_count = base_reader.read_u16().ok()?;
         
@@ -537,11 +537,11 @@ impl MarkToLigaturePos {
         let mark_array_offset = reader.read_u16().ok()?;
         let ligature_array_offset = reader.read_u16().ok()?;
         
-        let mark_coverage = Coverage::parse(&data[mark_coverage_offset as usize..])?;
-        let ligature_coverage = Coverage::parse(&data[ligature_coverage_offset as usize..])?;
+        let mark_coverage = Coverage::parse(data.get(mark_coverage_offset as usize..)?)?;
+        let ligature_coverage = Coverage::parse(data.get(ligature_coverage_offset as usize..)?)?;
         
         // Parse mark array
-        let mark_array_data = &data[mark_array_offset as usize..];
+        let mark_array_data = data.get(mark_array_offset as usize..)?;
         let mut mark_reader = FontReader::new(mark_array_data);
         let mark_count = mark_reader.read_u16().ok()?;
         
@@ -554,7 +554,7 @@ impl MarkToLigaturePos {
         }
         
         // Parse ligature array
-        let lig_array_data = &data[ligature_array_offset as usize..];
+        let lig_array_data = data.get(ligature_array_offset as usize..)?;
         let mut lig_reader = FontReader::new(lig_array_data);
         let ligature_count = lig_reader.read_u16().ok()?;
         
@@ -634,11 +634,11 @@ impl MarkToMarkPos {
         let mark1_array_offset = reader.read_u16().ok()?;
         let mark2_array_offset = reader.read_u16().ok()?;
         
-        let mark1_coverage = Coverage::parse(&data[mark1_coverage_offset as usize..])?;
-        let mark2_coverage = Coverage::parse(&data[mark2_coverage_offset as usize..])?;
+        let mark1_coverage = Coverage::parse(data.get(mark1_coverage_offset as usize..)?)?;
+        let mark2_coverage = Coverage::parse(data.get(mark2_coverage_offset as usize..)?)?;
         
         // Parse mark1 array
-        let mark1_array_data = &data[mark1_array_offset as usize..];
+        let mark1_array_data = data.get(mark1_array_offset as usize..)?;
         let mut mark1_reader = FontReader::new(mark1_array_data);
         let mark1_count = mark1_reader.read_u16().ok()?;
         
@@ -651,7 +651,7 @@ impl MarkToMarkPos {
         }
         
         // Parse mark2 array
-        let mark2_array_data = &data[mark2_array_offset as usize..];
+        let mark2_array_data = data.get(mark2_array_offset as usize..)?;
         let mut mark2_reader = FontReader::new(mark2_array_data);
         let mark2_count = mark2_reader.read_u16().ok()?;
         
@@ -773,7 +773,7 @@ impl<'a> GposTable<'a> {
     
     /// Get lookup by index
     pub fn get_lookup(&self, index: u16) -> Option<GposLookup> {
-        let lookup_list_data = &self.data[self.lookup_list_offset as usize..];
+        let lookup_list_data = self.data.get(self.lookup_list_offset as usize..)?;
         let mut reader = FontReader::new(lookup_list_data);
         
         let lookup_count = reader.read_u16().ok()?;
@@ -785,9 +785,14 @@ impl<'a> GposTable<'a> {
         reader.skip((index as usize) * 2).ok()?;
         let lookup_offset = reader.read_u16().ok()?;
         
-        Self::parse_lookup(&lookup_list_data[lookup_offset as usize..])
+        Self::parse_lookup(lookup_list_data.get(lookup_offset as usize..)?)
     }
-    
+
+    /// Indices of the lookups used by features with the given tags
+    pub fn feature_lookup_indices(&self, tags: &[[u8; 4]]) -> Vec<u16> {
+        crate::shaping::gsub::feature_lookup_indices(self.data, self.feature_list_offset, tags)
+    }
+
     fn parse_lookup(data: &[u8]) -> Option<GposLookup> {
         let mut reader = FontReader::new(data);
         
@@ -807,8 +812,10 @@ impl<'a> GposTable<'a> {
         };
         
         let mut subtables = Vec::with_capacity(subtable_count as usize);
+        // Extension lookups (type 9) take the type of their wrapped subtables
+        let mut resolved_type = lookup_type;
         for offset in subtable_offsets {
-            let subtable_data = &data[offset as usize..];
+            let Some(subtable_data) = data.get(offset as usize..) else { continue };
             
             // Handle extension lookups
             let (actual_type, actual_data) = if lookup_type == 9 {
@@ -816,7 +823,9 @@ impl<'a> GposTable<'a> {
                 let _format = ext_reader.read_u16().ok()?;
                 let extension_type = ext_reader.read_u16().ok()?;
                 let extension_offset = ext_reader.read_u32().ok()?;
-                (extension_type, &subtable_data[extension_offset as usize..])
+                let Some(extension_data) = subtable_data.get(extension_offset as usize..) else { continue };
+                resolved_type = extension_type;
+                (extension_type, extension_data)
             } else {
                 (lookup_type, subtable_data)
             };
@@ -836,7 +845,7 @@ impl<'a> GposTable<'a> {
             subtables.push(subtable);
         }
         
-        let lookup_type = LookupType::try_from(if lookup_type == 9 { 1 } else { lookup_type }).ok()?;
+        let lookup_type = LookupType::try_from(resolved_type).ok()?;
         
         Some(GposLookup {
             lookup_type,
@@ -848,7 +857,7 @@ impl<'a> GposTable<'a> {
     
     /// Get number of lookups
     pub fn lookup_count(&self) -> u16 {
-        let lookup_list_data = &self.data[self.lookup_list_offset as usize..];
+        let lookup_list_data = self.data.get(self.lookup_list_offset as usize..).unwrap_or(&[]);
         let mut reader = FontReader::new(lookup_list_data);
         reader.read_u16().unwrap_or(0)
     }

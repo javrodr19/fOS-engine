@@ -12,8 +12,6 @@ pub mod woff2;
 pub mod woff2_optimize;
 mod brotli;
 mod woff2_transforms;
-// String interning for font names
-mod intern;
 // Arena allocator for efficient parsing
 pub mod arena;
 // Fixed-point arithmetic for variable font axes

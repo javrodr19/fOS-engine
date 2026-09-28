@@ -20,7 +20,4 @@ tiny-skia.workspace = true
 # Error handling
 thiserror.workspace = true
 
-# Optional: for system font scanning
-glob = "0.3"
-
 [dev-dependencies]

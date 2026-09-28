@@ -1,8 +1,8 @@
 //! fOS Text - Text Rendering Engine
 //!
 //! This crate provides text rendering for the fOS browser engine:
-//! - Font loading and matching (fontdb)
-//! - Text shaping (rustybuzz - HarfBuzz port)
+//! - Font loading and matching (custom OpenType parser, lazily loaded faces)
+//! - Text shaping (custom HarfBuzz-compatible shaper)
 //! - Text layout (line breaking, word wrap)
 //! - Glyph rasterization and caching
 //! - Pre-rendered glyph atlas for ASCII
@@ -16,7 +16,7 @@ pub mod glyph_atlas;
 pub mod ruby;
 pub mod mmap_resources;
 
-pub use font::{FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery};
+pub use font::{FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery, FontParser};
 pub use shaping::{TextShaper, ShapedGlyph, ShapedRun};
 pub use layout::{TextLayout, LineBreaker, ParagraphLayout};
 pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph};

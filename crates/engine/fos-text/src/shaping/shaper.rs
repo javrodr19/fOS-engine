@@ -3,13 +3,16 @@
 //! Full HarfBuzz-compatible text shaper using custom GSUB/GPOS,
 //! Bidi algorithm, script itemization, and complex script shaping.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
 use crate::font::{FontDatabase, FontId};
 use crate::font::parser::{FontParser, GlyphId};
 use crate::{Result, TextError};
 use super::{ShapedGlyph, ShapedRun};
-use super::gsub::{GsubTable, Substitution};
-use super::gpos::{GposTable, ValueRecord};
-use super::bidi::{BidiParagraph, Level};
+use super::gsub::{GsubLookup, GsubTable, Substitution};
+use super::gpos::{GposSubtable, GposTable, PairPos};
+use super::bidi::BidiParagraph;
 use super::script::{Script, ScriptItemizer, ScriptRun, Direction, Language};
 use super::arabic::ArabicShaper;
 use super::indic::IndicShaper;
@@ -89,6 +92,98 @@ impl Default for ShaperConfig {
     }
 }
 
+/// GSUB features applied by default. Contextual (`calt`), localized
+/// (`locl`) and composition (`ccmp`) features are left out: their lookup
+/// types, or the mark positioning they depend on, are not implemented yet,
+/// and applying them partially produces wrong glyphs.
+const DEFAULT_GSUB_FEATURES: &[[u8; 4]] = &[*b"liga", *b"clig", *b"rlig"];
+
+/// GPOS features used for kerning
+const KERNING_FEATURES: &[[u8; 4]] = &[*b"kern"];
+
+/// Shaping plans kept per shaper (one per font face in use)
+const MAX_CACHED_PLANS: usize = 16;
+
+/// Identifies a font face (and the options that affect its plan)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanKey {
+    data_ptr: usize,
+    data_len: usize,
+    face_index: u32,
+    no_ligatures: bool,
+    no_kerning: bool,
+}
+
+/// Everything shaping needs from a font face, parsed once and reused for
+/// every run: the lookups of the enabled features and ASCII glyph metrics.
+///
+/// Parsing GSUB/GPOS lookups is far more expensive than applying them;
+/// previously every lookup was re-parsed for every glyph pair.
+struct ShapingPlan {
+    /// Guards against a different font later occupying the same buffer
+    fingerprint: u64,
+    /// GSUB lookups for the default features, in LookupList order
+    gsub: Vec<GsubLookup>,
+    /// Pair adjustment subtables of the `kern` feature
+    kerning: Vec<PairPos>,
+    /// Glyph ID and advance for each ASCII character
+    ascii: [(GlyphId, i32); 128],
+}
+
+impl ShapingPlan {
+    fn build(font: &FontParser, font_data: &[u8], no_ligatures: bool, no_kerning: bool) -> Self {
+        let mut ascii = [(GlyphId(0), 0); 128];
+        for (c, slot) in ascii.iter_mut().enumerate() {
+            let glyph = font.glyph_index(c as u8 as char).unwrap_or(GlyphId(0));
+            *slot = (glyph, font.glyph_hor_advance(glyph).unwrap_or(0) as i32);
+        }
+        
+        let gsub = if no_ligatures {
+            Vec::new()
+        } else {
+            font.table_data(b"GSUB")
+                .and_then(GsubTable::parse)
+                .map(|gsub| {
+                    gsub.feature_lookup_indices(DEFAULT_GSUB_FEATURES)
+                        .into_iter()
+                        .filter_map(|index| gsub.get_lookup(index))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        
+        let mut kerning = Vec::new();
+        if !no_kerning {
+            if let Some(gpos) = font.table_data(b"GPOS").and_then(GposTable::parse) {
+                for index in gpos.feature_lookup_indices(KERNING_FEATURES) {
+                    if let Some(lookup) = gpos.get_lookup(index) {
+                        for subtable in lookup.subtables {
+                            if let GposSubtable::PairAdjustment(pair) = subtable {
+                                kerning.push(pair);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Self {
+            fingerprint: font_fingerprint(font_data),
+            gsub,
+            kerning,
+            ascii,
+        }
+    }
+}
+
+/// Cheap fingerprint of a font buffer (length plus leading bytes)
+fn font_fingerprint(data: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.len().hash(&mut hasher);
+    data[..data.len().min(256)].hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Custom text shaper (HarfBuzz-compatible)
 pub struct TextShaper {
     /// Script itemizer
@@ -99,6 +194,8 @@ pub struct TextShaper {
     indic_shaper: IndicShaper,
     /// Configuration
     config: ShaperConfig,
+    /// Per-face shaping plans
+    plans: HashMap<PlanKey, ShapingPlan>,
 }
 
 impl TextShaper {
@@ -109,6 +206,7 @@ impl TextShaper {
             arabic_shaper: ArabicShaper::new(),
             indic_shaper: IndicShaper::new(),
             config: ShaperConfig::default(),
+            plans: HashMap::new(),
         }
     }
     
@@ -167,16 +265,41 @@ impl TextShaper {
         let font = FontParser::parse_index(font_data, face_index)
             .map_err(|_| TextError::FontParsing("Failed to parse font".into()))?;
         
+        // Get (or build) the plan for this face
+        let key = PlanKey {
+            data_ptr: font_data.as_ptr() as usize,
+            data_len: font_data.len(),
+            face_index,
+            no_ligatures: self.config.no_ligatures,
+            no_kerning: self.config.no_kerning,
+        };
+        let fingerprint = font_fingerprint(font_data);
+        if self.plans.get(&key).is_none_or(|plan| plan.fingerprint != fingerprint) {
+            if self.plans.len() >= MAX_CACHED_PLANS {
+                self.plans.clear();
+            }
+            let plan = ShapingPlan::build(&font, font_data, key.no_ligatures, key.no_kerning);
+            self.plans.insert(key, plan);
+        }
+        // Taken out while shaping so `self` stays usable; put back below
+        let plan = self.plans.remove(&key).expect("plan inserted above");
+        
         // Map characters to glyphs
         let mut glyphs: Vec<GlyphInfo> = text.chars()
             .enumerate()
             .map(|(i, c)| {
-                let glyph_id = font.glyph_index(c).unwrap_or(GlyphId(0));
+                let (glyph_id, x_advance) = match plan.ascii.get(c as usize) {
+                    Some(&metrics) => metrics,
+                    None => {
+                        let glyph_id = font.glyph_index(c).unwrap_or(GlyphId(0));
+                        (glyph_id, font.glyph_hor_advance(glyph_id).unwrap_or(0) as i32)
+                    }
+                };
                 GlyphInfo {
                     glyph_id,
                     cluster: i as u32,
                     char_code: c,
-                    x_advance: font.glyph_hor_advance(glyph_id).unwrap_or(0) as i32,
+                    x_advance,
                     y_advance: 0,
                     x_offset: 0,
                     y_offset: 0,
@@ -187,12 +310,21 @@ impl TextShaper {
         // Script itemization
         let script_runs = self.script_itemizer.itemize(text);
         
+        // Script runs are byte ranges, while glyphs are indexed by character
+        let char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let to_char_index = |byte: usize| char_starts.partition_point(|&start| start < byte);
+        
         // Process each script run
         for run in &script_runs {
             let script = self.config.script.unwrap_or(run.script);
+            let char_run = ScriptRun {
+                start: to_char_index(run.start),
+                end: to_char_index(run.end),
+                script: run.script,
+            };
             
             // Apply script-specific shaping
-            self.shape_script_run(&font, font_data, &mut glyphs, run, script);
+            self.shape_script_run(&font, font_data, &mut glyphs, &char_run, script);
         }
         
         // Apply Bidi algorithm if needed
@@ -201,15 +333,15 @@ impl TextShaper {
             self.apply_bidi(text, &mut glyphs);
         }
         
-        // Apply GSUB substitutions
-        if let Some(gsub_data) = font.table_data(b"GSUB") {
-            self.apply_gsub(gsub_data, &mut glyphs);
+        // Apply GSUB substitutions (enabled features only)
+        for lookup in &plan.gsub {
+            Self::apply_gsub_lookup(lookup, &mut glyphs);
         }
         
-        // Apply GPOS positioning
-        if let Some(gpos_data) = font.table_data(b"GPOS") {
-            self.apply_gpos(gpos_data, &mut glyphs, &font);
-        }
+        // Apply GPOS kerning
+        Self::apply_kerning(&plan.kerning, &mut glyphs);
+        
+        self.plans.insert(key, plan);
         
         // Convert to ShapedGlyph
         let shaped_glyphs: Vec<ShapedGlyph> = glyphs.into_iter()
@@ -235,13 +367,14 @@ impl TextShaper {
         run: &ScriptRun,
         script: Script,
     ) {
-        // Skip empty runs
-        if run.start >= run.end {
+        // Skip empty runs (and never index past the glyph buffer)
+        let end = run.end.min(glyphs.len());
+        if run.start >= end {
             return;
         }
         
         // Get glyph slice for this run
-        let run_glyphs = &mut glyphs[run.start..run.end];
+        let run_glyphs = &mut glyphs[run.start..end];
         
         match script {
             Script::Arabic | Script::Syriac | Script::Nko | Script::Thaana => {
@@ -286,24 +419,9 @@ impl TextShaper {
         }
     }
     
-    /// Apply GSUB substitutions
-    fn apply_gsub(&self, gsub_data: &[u8], glyphs: &mut Vec<GlyphInfo>) {
-        let gsub = match GsubTable::parse(gsub_data) {
-            Some(g) => g,
-            None => return,
-        };
-        
-        // Apply lookups
-        for i in 0..gsub.lookup_count() {
-            if let Some(lookup) = gsub.get_lookup(i) {
-                self.apply_gsub_lookup(&lookup, glyphs);
-            }
-        }
-    }
-    
     /// Apply a single GSUB lookup
-    fn apply_gsub_lookup(&self, lookup: &super::gsub::GsubLookup, glyphs: &mut Vec<GlyphInfo>) {
-        use super::gsub::{GsubSubtable, LookupType};
+    fn apply_gsub_lookup(lookup: &GsubLookup, glyphs: &mut Vec<GlyphInfo>) {
+        use super::gsub::GsubSubtable;
         
         let mut i = 0;
         while i < glyphs.len() {
@@ -355,27 +473,18 @@ impl TextShaper {
         }
     }
     
-    /// Apply GPOS positioning
-    fn apply_gpos(&self, gpos_data: &[u8], glyphs: &mut [GlyphInfo], font: &FontParser) {
-        let gpos = match GposTable::parse(gpos_data) {
-            Some(g) => g,
-            None => return,
-        };
-        
-        // Apply kerning
-        if !self.config.no_kerning && glyphs.len() >= 2 {
-            for i in 0..glyphs.len() - 1 {
-                let first = glyphs[i].glyph_id;
-                let second = glyphs[i + 1].glyph_id;
-                
-                if let Some(kern) = gpos.get_kerning(first, second) {
-                    glyphs[i].x_advance += kern as i32;
-                }
+    /// Apply pair kerning: the first subtable that covers a pair wins
+    fn apply_kerning(kerning: &[PairPos], glyphs: &mut [GlyphInfo]) {
+        if kerning.is_empty() {
+            return;
+        }
+        for i in 1..glyphs.len() {
+            let (first, second) = (glyphs[i - 1].glyph_id, glyphs[i].glyph_id);
+            let adjustment = kerning.iter().find_map(|pair| pair.apply(first, second));
+            if let Some((value, _)) = adjustment {
+                glyphs[i - 1].x_advance += value.x_advance as i32;
             }
         }
-        
-        // Apply mark positioning would be done here
-        // For now, we apply basic adjustments from lookups
     }
 }
 
@@ -419,5 +528,21 @@ mod tests {
         let config = ShaperConfig::default();
         assert!(!config.no_ligatures);
         assert!(!config.no_kerning);
+    }
+    
+    #[test]
+    fn test_shape_multibyte_text() {
+        // Regression: script runs are byte ranges but glyphs are per
+        // character, so multi-byte text used to index out of bounds
+        let db = FontDatabase::shared();
+        let Some(font) = db.query(&crate::FontQuery::new(&["sans-serif"])) else {
+            return; // No fonts installed
+        };
+        
+        let mut shaper = TextShaper::new();
+        for text in ["• item", "café — “quoted”", "Привет, мир", "日本語 text", "a"] {
+            let run = shaper.shape(&db, font, text, 16.0).unwrap();
+            assert_eq!(run.glyphs.len(), text.chars().count(), "{text}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Character to glyph mapping (cmap table)
 
-use super::reader::FontReader;
+use super::reader::{tail, FontReader};
 use super::GlyphId;
 
 /// Look up glyph ID for a Unicode codepoint
@@ -36,13 +36,14 @@ pub fn lookup_glyph(cmap_data: &[u8], codepoint: u32) -> Option<GlyphId> {
     }
     
     let table_offset = best_offset? as usize;
-    let mut table_reader = FontReader::new(&cmap_data[table_offset..]);
-    
+    let table = tail(cmap_data, table_offset);
+    let mut table_reader = FontReader::new(table);
+
     let format = table_reader.read_u16().ok()?;
-    
+
     match format {
-        4 => lookup_format4(&cmap_data[table_offset..], codepoint),
-        12 => lookup_format12(&cmap_data[table_offset..], codepoint),
+        4 => lookup_format4(table, codepoint),
+        12 => lookup_format12(table, codepoint),
         _ => None,
     }
 }
@@ -73,7 +74,7 @@ fn lookup_format4(data: &[u8], codepoint: u32) -> Option<GlyphId> {
     
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let mut r = FontReader::new(&data[end_codes_start + (mid as usize) * 2..]);
+        let mut r = FontReader::new(tail(data, end_codes_start + (mid as usize) * 2));
         let end_code = r.read_u16().ok()?;
         
         if end_code < code {
@@ -95,27 +96,27 @@ fn lookup_format4(data: &[u8], codepoint: u32) -> Option<GlyphId> {
     let deltas_offset = start_codes_offset + (seg_count as usize) * 2;
     let ranges_offset = deltas_offset + (seg_count as usize) * 2;
     
-    let mut r = FontReader::new(&data[end_codes_offset + seg_idx * 2..]);
+    let mut r = FontReader::new(tail(data, end_codes_offset + seg_idx * 2));
     let end_code = r.read_u16().ok()?;
-    
-    let mut r = FontReader::new(&data[start_codes_offset + seg_idx * 2..]);
+
+    let mut r = FontReader::new(tail(data, start_codes_offset + seg_idx * 2));
     let start_code = r.read_u16().ok()?;
     
     if code < start_code || code > end_code {
         return None;
     }
     
-    let mut r = FontReader::new(&data[deltas_offset + seg_idx * 2..]);
+    let mut r = FontReader::new(tail(data, deltas_offset + seg_idx * 2));
     let id_delta = r.read_i16().ok()?;
-    
-    let mut r = FontReader::new(&data[ranges_offset + seg_idx * 2..]);
+
+    let mut r = FontReader::new(tail(data, ranges_offset + seg_idx * 2));
     let id_range_offset = r.read_u16().ok()?;
     
     let glyph_id = if id_range_offset == 0 {
         (code as i32 + id_delta as i32) as u16
     } else {
         let glyph_offset = ranges_offset + seg_idx * 2 + id_range_offset as usize + ((code - start_code) as usize) * 2;
-        let mut r = FontReader::new(&data[glyph_offset..]);
+        let mut r = FontReader::new(tail(data, glyph_offset));
         let glyph = r.read_u16().ok()?;
         if glyph == 0 {
             0
@@ -148,7 +149,7 @@ fn lookup_format12(data: &[u8], codepoint: u32) -> Option<GlyphId> {
     
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let mut r = FontReader::new(&data[groups_start + (mid as usize) * 12..]);
+        let mut r = FontReader::new(tail(data, groups_start + (mid as usize) * 12));
         let start_char = r.read_u32().ok()?;
         let end_char = r.read_u32().ok()?;
         

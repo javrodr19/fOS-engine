@@ -74,6 +74,10 @@ pub struct PreParser<'src> {
     found_this: bool,
     found_super: bool,
     found_use_strict: bool,
+    /// Still inside the function body's directive prologue
+    in_prologue: bool,
+    /// Start of the string literal being scanned, if it may be a directive
+    directive_start: Option<usize>,
 }
 
 impl<'src> PreParser<'src> {
@@ -91,6 +95,8 @@ impl<'src> PreParser<'src> {
             found_this: false,
             found_super: false,
             found_use_strict: false,
+            in_prologue: false,
+            directive_start: None,
         }
     }
 
@@ -105,6 +111,8 @@ impl<'src> PreParser<'src> {
         self.found_this = false;
         self.found_super = false;
         self.found_use_strict = false;
+        self.in_prologue = false;
+        self.directive_start = None;
 
         // Count parameters first
         let param_count = self.count_params();
@@ -178,6 +186,7 @@ impl<'src> PreParser<'src> {
             if self.current_char() == Some('{') {
                 self.pos += 1;
                 self.brace_depth = 1;
+                self.in_prologue = true;
                 return;
             }
             self.pos += 1;
@@ -205,6 +214,12 @@ impl<'src> PreParser<'src> {
             None => return,
         };
 
+        // The directive prologue is the run of string-literal statements at
+        // the start of the body; anything else ends it
+        if self.in_prologue && !(c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '/')) {
+            self.in_prologue = false;
+        }
+        
         match c {
             '{' => {
                 self.brace_depth += 1;
@@ -233,6 +248,9 @@ impl<'src> PreParser<'src> {
             '"' | '\'' => {
                 self.state = PreParseState::String(c);
                 self.pos += 1;
+                if self.in_prologue && self.brace_depth == 1 {
+                    self.directive_start = Some(self.pos);
+                }
             }
             '`' => {
                 self.state = PreParseState::Template;
@@ -252,6 +270,7 @@ impl<'src> PreParser<'src> {
                     _ => {
                         // Could be regex or division - simplified: assume division
                         // Full parser handles this correctly
+                        self.in_prologue = false;
                     }
                 }
             }
@@ -287,24 +306,6 @@ impl<'src> PreParser<'src> {
             _ => {}
         }
 
-        // Check for "use strict" at start of function
-        if ident == "use" && self.brace_depth == 1 {
-            self.check_use_strict();
-        }
-    }
-
-    /// Check for "use strict" directive
-    fn check_use_strict(&mut self) {
-        // Skip whitespace
-        while self.pos < self.source.len() && self.current_char().map(|c| c.is_whitespace()).unwrap_or(false) {
-            self.pos += 1;
-        }
-
-        // Check for string "strict"
-        let remaining = &self.source[self.pos..];
-        if remaining.starts_with("\"strict\"") || remaining.starts_with("'strict'") {
-            self.found_use_strict = true;
-        }
     }
 
     /// Scan string literal
@@ -315,6 +316,12 @@ impl<'src> PreParser<'src> {
                     self.pos += 2; // Skip escape sequence
                 }
                 Some(c) if c == quote => {
+                    // A "use strict" directive must be spelled exactly, without escapes
+                    if let Some(start) = self.directive_start.take() {
+                        if &self.source[start..self.pos] == "use strict" {
+                            self.found_use_strict = true;
+                        }
+                    }
                     self.pos += 1;
                     self.state = PreParseState::Normal;
                     return;
@@ -375,6 +382,10 @@ impl<'src> PreParser<'src> {
                     let quote = self.current_char().unwrap();
                     self.pos += 1;
                     self.scan_string(quote);
+                }
+                // `this`, `arguments` etc. inside ${...} count as uses
+                Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                    self.scan_identifier();
                 }
                 _ => {
                     self.pos += 1;
@@ -444,18 +455,23 @@ impl<'src> PreParser<'src> {
     }
 
     /// Get current character
+    ///
+    /// The scanner advances one byte at a time. Everything it looks for is
+    /// ASCII, and bytes of multi-byte UTF-8 characters are never ASCII, so
+    /// reading bytes is exact and cannot land inside a character (slicing
+    /// the `str` there would panic on any non-ASCII source text).
     fn current_char(&self) -> Option<char> {
-        self.source[self.pos..].chars().next()
+        self.source.as_bytes().get(self.pos).map(|&b| b as char)
     }
 
     /// Check if source contains `arguments` keyword (quick check)
     pub fn has_arguments_keyword(source: &str) -> bool {
-        source.contains("arguments")
+        contains_identifier(source, "arguments")
     }
 
     /// Check if source contains `eval` keyword (quick check)
     pub fn has_eval(source: &str) -> bool {
-        source.contains("eval")
+        contains_identifier(source, "eval")
     }
 
     /// Detect strict mode (quick check)
@@ -463,6 +479,17 @@ impl<'src> PreParser<'src> {
         let trimmed = source.trim_start();
         trimmed.starts_with("\"use strict\"") || trimmed.starts_with("'use strict'")
     }
+}
+
+/// Whether `word` occurs in `source` as a whole identifier (not as part of
+/// a longer one such as `evaluate`)
+fn contains_identifier(source: &str, word: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    source.match_indices(word).any(|(i, _)| {
+        let before = source[..i].chars().next_back();
+        let after = source[i + word.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
 }
 
 /// Streaming source buffer for incremental parsing
@@ -532,7 +559,7 @@ impl ArrowDetector {
     /// Check if a sequence of tokens might be an arrow function
     /// Returns true if we should try parsing as arrow function
     pub fn might_be_arrow(source: &str, pos: usize) -> bool {
-        let remaining = &source[pos..];
+        let Some(remaining) = source.get(pos..) else { return false };
         
         // Check for patterns:
         // () =>
@@ -669,6 +696,18 @@ mod tests {
         let info = pp.scan_function(0);
         
         assert!(info.is_strict);
+        
+        // Other directives may precede it; comments are allowed
+        let source = r#"function foo() { 'use asm'; /* c */ 'use strict'; }"#;
+        assert!(PreParser::new(source).scan_function(0).is_strict);
+        
+        // Not a directive: after another statement, or inside an expression
+        let source = r#"function foo() { var x = 1; "use strict"; }"#;
+        assert!(!PreParser::new(source).scan_function(0).is_strict);
+        let source = r#"function foo() { return "use strict"; }"#;
+        assert!(!PreParser::new(source).scan_function(0).is_strict);
+        let source = r#"function foo() { "use\x20strict"; }"#;
+        assert!(!PreParser::new(source).scan_function(0).is_strict);
     }
 
     #[test]
@@ -683,6 +722,21 @@ mod tests {
         assert!(!info.uses_this);
     }
 
+    #[test]
+    fn test_preparser_non_ascii_source() {
+        // Regression: non-ASCII characters used to panic the scanner
+        let source = "function foo() { var s = \"héllo 世界\\é\"; /* ñ */ // ü\n return s + 'ö' + ` 🌍 ${this}`; }";
+        let info = PreParser::new(source).scan_function(0);
+        assert!(info.uses_this);
+        
+        let source = "function f(ä, b) { \"use strict\"; return arguments; }";
+        let info = PreParser::new(source).scan_function(0);
+        assert!(info.is_strict);
+        assert!(info.uses_arguments);
+        
+        assert!(!ArrowDetector::might_be_arrow("é => 1", 1));
+    }
+    
     #[test]
     fn test_preparser_nested_braces() {
         let source = "function foo() { if (true) { { } } return 1; }";
@@ -726,7 +780,10 @@ mod tests {
         assert!(!PreParser::has_arguments_keyword("function() { return 1; }"));
         
         assert!(PreParser::has_eval("eval('code')"));
+        assert!(PreParser::has_eval("x = eval;"));
         assert!(!PreParser::has_eval("evaluate()"));
+        assert!(!PreParser::has_eval("retrieval()"));
+        assert!(!PreParser::has_arguments_keyword("my_arguments.length"));
         
         assert!(PreParser::detect_strict("\"use strict\"; var x;"));
         assert!(PreParser::detect_strict("'use strict'; var x;"));

@@ -1017,6 +1017,7 @@ dependencies = [
 name = "fos-security"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "thiserror 1.0.69",
 ]
 

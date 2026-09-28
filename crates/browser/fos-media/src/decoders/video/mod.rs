@@ -114,7 +114,8 @@ impl<'a> BitReader<'a> {
             let bits_in_byte = 8 - self.bit_pos;
             let bits_to_read = bits_remaining.min(bits_in_byte);
             
-            let mask = (1u8 << bits_to_read) - 1;
+            // `1u8 << 8` would overflow for a whole-byte read
+            let mask = (0xFFu16 >> (8 - bits_to_read)) as u8;
             let shift = bits_in_byte - bits_to_read;
             let bits = (self.data[self.byte_pos] >> shift) & mask;
             

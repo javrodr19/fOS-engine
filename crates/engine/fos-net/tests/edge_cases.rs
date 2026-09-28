@@ -102,8 +102,7 @@ fn test_response_success_codes() {
     for code in &success_codes {
         let resp = Response {
             status: *code,
-            headers: vec![],
-            body: vec![],
+            ..Default::default()
         };
         assert!(resp.is_success(), "Status {} should be success", code);
     }
@@ -115,8 +114,7 @@ fn test_response_error_codes() {
     for code in &error_codes {
         let resp = Response {
             status: *code,
-            headers: vec![],
-            body: vec![],
+            ..Default::default()
         };
         assert!(!resp.is_success(), "Status {} should not be success", code);
     }
@@ -128,6 +126,7 @@ fn test_response_text() {
         status: 200,
         headers: vec![],
         body: "Hello, World!".as_bytes().to_vec(),
+        ..Default::default()
     };
     
     assert_eq!(resp.text().unwrap(), "Hello, World!");
@@ -139,6 +138,7 @@ fn test_response_text_utf8() {
         status: 200,
         headers: vec![],
         body: "Привет 世界 🌍".as_bytes().to_vec(),
+        ..Default::default()
     };
     
     let text = resp.text().unwrap();
@@ -151,8 +151,7 @@ fn test_response_text_utf8() {
 fn test_response_text_empty() {
     let resp = Response {
         status: 204,
-        headers: vec![],
-        body: vec![],
+        ..Default::default()
     };
     
     assert_eq!(resp.text().unwrap(), "");
@@ -166,7 +165,7 @@ fn test_response_headers() {
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Content-Length".to_string(), "42".to_string()),
         ],
-        body: vec![],
+        ..Default::default()
     };
     
     assert_eq!(resp.headers.len(), 2);

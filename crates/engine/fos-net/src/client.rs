@@ -2,27 +2,28 @@
 //!
 //! Main HTTP client integrating TCP, TLS, HTTP/1.1, HTTP/2, HTTP/3, and cookies.
 //! Replaces reqwest with a custom zero-dependency implementation.
+//!
+//! Connections are kept alive and reused per origin (HTTP/1.1 keep-alive and
+//! HTTP/2), so repeat requests skip the TCP and TLS handshakes.
 
-use std::io::{self, BufReader, Read, Write};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use std::net::SocketAddr;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::time::{Duration, Instant};
 
 use crate::tcp::{TcpConnection, TcpConfig};
-use crate::tls::{TlsStream, TlsConfig, TlsState};
-use crate::http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};
-use crate::http2::{Http2Connection, Frame, Http2Event, Http2Error};
-use crate::cookies::{CookieJar, Cookie};
-use crate::connection_pool::{ConnectionPool, HostKey, PoolConfig, AcquireResult, ConnId};
-use crate::quic::{
-    QuicConnection, ConnectionState, QuicStream,
-    QpackEncoder, QpackDecoder,
-    AltSvc, AltSvcCache, AltSvcEntry,
-    Http3Frame, Http3Setting,
-    PushManager, PushState,
-};
+use crate::tls::{TlsStream, TlsConfig};
+use crate::http1::{Http1Request, Http1Parser};
+use crate::http2::{Http2Connection, Frame, Http2Event};
+use crate::cookies::CookieJar;
+use crate::quic::{AltSvc, AltSvcCache};
+use crate::url_util;
 use crate::{Response, NetError};
+
+/// Read buffer size per connection
+const CONNECTION_READ_BUFFER: usize = 8 * 1024;
+
+/// Maximum idle connections kept per origin
+const MAX_IDLE_PER_ORIGIN: usize = 2;
 
 /// HTTP client configuration
 #[derive(Debug, Clone)]
@@ -47,6 +48,10 @@ pub struct ClientConfig {
     pub prefer_http3: bool,
     /// HTTP/3 idle timeout
     pub http3_idle_timeout: Duration,
+    /// Maximum idle keep-alive connections kept across all origins
+    pub max_idle_connections: usize,
+    /// How long an idle connection is kept before it is closed
+    pub idle_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -62,6 +67,8 @@ impl Default for ClientConfig {
             http3_enabled: true,
             prefer_http3: false,
             http3_idle_timeout: Duration::from_secs(30),
+            max_idle_connections: 8,
+            idle_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -77,49 +84,55 @@ impl HttpClientBuilder {
             config: ClientConfig::default(),
         }
     }
-    
+
     pub fn user_agent(mut self, ua: &str) -> Self {
         self.config.user_agent = ua.to_string();
         self
     }
-    
+
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.config.connect_timeout = timeout;
         self
     }
-    
+
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
         self
     }
-    
+
     pub fn max_redirects(mut self, max: u32) -> Self {
         self.config.max_redirects = max;
         self
     }
-    
+
     pub fn cookie_store(mut self, enabled: bool) -> Self {
         self.config.cookies_enabled = enabled;
         self
     }
-    
+
     pub fn default_header(mut self, name: &str, value: &str) -> Self {
         self.config.default_headers.push((name.to_string(), value.to_string()));
         self
     }
-    
+
     /// Enable or disable HTTP/3 support
     pub fn http3(mut self, enabled: bool) -> Self {
         self.config.http3_enabled = enabled;
         self
     }
-    
+
     /// Prefer HTTP/3 over HTTP/2 when available
     pub fn prefer_http3(mut self, prefer: bool) -> Self {
         self.config.prefer_http3 = prefer;
         self
     }
-    
+
+    /// Maximum idle keep-alive connections (0 disables connection reuse)
+    pub fn max_idle_connections(mut self, max: usize) -> Self {
+        self.config.max_idle_connections = max;
+        self
+    }
+
     pub fn build(self) -> HttpClient {
         HttpClient::with_config(self.config)
     }
@@ -131,14 +144,112 @@ impl Default for HttpClientBuilder {
     }
 }
 
+/// Buffered bidirectional stream: reads go through a buffer, writes go
+/// straight to the underlying stream.
+struct BufStream<S: Read + Write> {
+    inner: BufReader<S>,
+}
+
+impl<S: Read + Write> BufStream<S> {
+    fn new(stream: S) -> Self {
+        Self { inner: BufReader::with_capacity(CONNECTION_READ_BUFFER, stream) }
+    }
+}
+
+impl<S: Read + Write> Read for BufStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Read + Write> BufRead for BufStream<S> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt)
+    }
+}
+
+impl<S: Read + Write> Write for BufStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.get_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.get_mut().flush()
+    }
+}
+
+/// Plain TCP or TLS connection
+enum Transport {
+    Plain(BufStream<TcpConnection>),
+    Tls(BufStream<TlsStream>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.read(buf),
+            Transport::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl BufRead for Transport {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Transport::Plain(s) => s.fill_buf(),
+            Transport::Tls(s) => s.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self {
+            Transport::Plain(s) => s.consume(amt),
+            Transport::Tls(s) => s.consume(amt),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.write(buf),
+            Transport::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Transport::Plain(s) => s.flush(),
+            Transport::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Application protocol spoken on a connection
+enum Protocol {
+    Http1,
+    Http2(Box<Http2Connection>),
+}
+
+/// A keep-alive connection waiting to be reused
+struct IdleConnection {
+    transport: Transport,
+    protocol: Protocol,
+    idle_since: Instant,
+}
+
 /// HTTP client
 pub struct HttpClient {
     /// Configuration
     config: ClientConfig,
     /// Cookie jar
     cookies: CookieJar,
-    /// Connection pool
-    pool: ConnectionPool,
+    /// Idle keep-alive connections by origin (`https://host:443`)
+    idle: HashMap<String, Vec<IdleConnection>>,
     /// Alt-Svc cache for HTTP/3 discovery
     alt_svc_cache: AltSvcCache,
 }
@@ -148,38 +259,35 @@ impl HttpClient {
     pub fn new() -> Self {
         Self::builder().build()
     }
-    
+
     /// Create a client builder
     pub fn builder() -> HttpClientBuilder {
         HttpClientBuilder::new()
     }
-    
+
     /// Create with custom config
     pub fn with_config(config: ClientConfig) -> Self {
-        let pool_config = PoolConfig {
-            connect_timeout: config.connect_timeout,
-            ..Default::default()
-        };
-        
         Self {
             config,
             cookies: CookieJar::new(),
-            pool: ConnectionPool::new(pool_config),
+            idle: HashMap::new(),
             alt_svc_cache: AltSvcCache::new(),
         }
     }
-    
+
     /// Make a GET request
     pub fn get(&mut self, url: &str) -> Result<Response, NetError> {
         self.request("GET", url, None, None)
     }
-    
+
     /// Make a POST request
     pub fn post(&mut self, url: &str, body: Option<Vec<u8>>) -> Result<Response, NetError> {
         self.request("POST", url, None, body)
     }
-    
-    /// Make an HTTP request
+
+    /// Make an HTTP request, following redirects.
+    ///
+    /// The returned response's `url` is the final URL after redirects.
     pub fn request(
         &mut self,
         method: &str,
@@ -187,162 +295,314 @@ impl HttpClient {
         headers: Option<Vec<(String, String)>>,
         body: Option<Vec<u8>>,
     ) -> Result<Response, NetError> {
-        self.request_with_redirects(method, url, headers, body, 0)
+        let mut method = method.to_ascii_uppercase();
+        let mut url = url.trim().to_string();
+        let mut headers = headers.unwrap_or_default();
+        let mut body = body;
+        let mut redirects = 0;
+
+        loop {
+            let parsed = UrlParts::parse(&url)?;
+            let req = self.build_request(&method, &parsed, &headers, body.clone());
+            let mut response = self.execute_request(&parsed, req)?;
+
+            // Store cookies from response
+            if self.config.cookies_enabled {
+                for (name, value) in &response.headers {
+                    if name.eq_ignore_ascii_case("set-cookie") {
+                        self.cookies.add_from_header(value, &parsed.host);
+                    }
+                }
+            }
+
+            let location = match response.status {
+                301 | 302 | 303 | 307 | 308 if redirects < self.config.max_redirects => {
+                    response.header("location").map(str::to_owned)
+                }
+                _ => None,
+            };
+            let Some(location) = location else {
+                response.url = url;
+                return Ok(response);
+            };
+
+            let mut next = url_util::resolve(&url, &location);
+            // A Location without a fragment inherits the original one (RFC 9110 §10.2.2)
+            if !next.contains('#') {
+                if let Some(i) = url.find('#') {
+                    next.push_str(&url[i..]);
+                }
+            }
+            if UrlParts::parse(&next).is_err() {
+                // Not an HTTP(S) target; let the caller handle the redirect
+                response.url = url;
+                return Ok(response);
+            }
+
+            // 303 (and 301/302 after POST, as browsers do) switch to GET
+            let to_get = (response.status == 303 && method != "HEAD")
+                || (matches!(response.status, 301 | 302) && method == "POST");
+            if to_get {
+                method = "GET".to_string();
+                body = None;
+                headers.retain(|(name, _)| !is_content_header(name));
+            }
+
+            // Never forward credentials to a different origin
+            if url_util::origin(&url) != url_util::origin(&next) {
+                headers.retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("authorization") && !name.eq_ignore_ascii_case("cookie")
+                });
+            }
+
+            url = next;
+            redirects += 1;
+        }
     }
-    
-    fn request_with_redirects(
-        &mut self,
+
+    fn build_request(
+        &self,
         method: &str,
-        url: &str,
-        headers: Option<Vec<(String, String)>>,
+        url: &UrlParts,
+        headers: &[(String, String)],
         body: Option<Vec<u8>>,
-        redirect_count: u32,
-    ) -> Result<Response, NetError> {
-        // Parse URL
-        let parsed = UrlParts::parse(url)?;
-        
-        // Build request
-        let mut req = Http1Request::new(method, &parsed.path_and_query());
-        
-        // Add Host header
-        req = req.header("Host", &parsed.host_with_port());
-        
-        // Add User-Agent
-        req = req.header("User-Agent", &self.config.user_agent);
-        
-        // Add default headers
-        for (name, value) in &self.config.default_headers {
+    ) -> Http1Request {
+        let has = |name: &str| {
+            headers.iter()
+                .chain(&self.config.default_headers)
+                .any(|(n, _)| n.eq_ignore_ascii_case(name))
+        };
+
+        let mut req = Http1Request::new(method, &url.path_and_query())
+            .header("Host", &url.host_with_port());
+
+        if !has("user-agent") {
+            req = req.header("User-Agent", &self.config.user_agent);
+        }
+        if !has("accept") {
+            req = req.header("Accept", "*/*");
+        }
+        // Content codings are not decoded yet, so ask for unencoded bodies
+        if !has("accept-encoding") {
+            req = req.header("Accept-Encoding", "identity");
+        }
+
+        for (name, value) in self.config.default_headers.iter().chain(headers) {
             req = req.header(name, value);
         }
-        
-        // Add custom headers
-        if let Some(hdrs) = headers {
-            for (name, value) in hdrs {
-                req = req.header(&name, &value);
-            }
-        }
-        
-        // Add cookies
-        if self.config.cookies_enabled {
-            if let Some(cookie_header) = self.cookies.get_cookie_header(&parsed.host, &parsed.path, parsed.is_https) {
+
+        if self.config.cookies_enabled && !has("cookie") {
+            if let Some(cookie_header) = self.cookies.get_cookie_header(&url.host, &url.path, url.is_https) {
                 req = req.header("Cookie", &cookie_header);
             }
         }
-        
-        // Add body
-        if let Some(b) = body.clone() {
+
+        if !has("connection") {
+            req = req.header("Connection", if self.config.keep_alive { "keep-alive" } else { "close" });
+        }
+
+        if let Some(b) = body {
             req = req.body(b);
         }
-        
-        // Add Connection header
-        if self.config.keep_alive {
-            req = req.header("Connection", "keep-alive");
-        } else {
-            req = req.header("Connection", "close");
-        }
-        
-        // Make the connection
-        let response = self.execute_request(&parsed, req)?;
-        
-        // Store cookies from response
-        if self.config.cookies_enabled {
-            for (name, value) in &response.headers {
-                if name.eq_ignore_ascii_case("set-cookie") {
-                    self.cookies.add_from_header(value, &parsed.host);
-                }
-            }
-        }
-        
-        // Handle redirects
-        if response.status >= 300 && response.status < 400 && redirect_count < self.config.max_redirects {
-            if let Some(location) = response.headers.iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("location"))
-                .map(|(_, v)| v.as_str())
-            {
-                let new_url = Self::resolve_redirect(url, location);
-                
-                // For 307/308, preserve method and body
-                let (new_method, new_body) = if response.status == 307 || response.status == 308 {
-                    (method, body)
-                } else {
-                    ("GET", None)
-                };
-                
-                return self.request_with_redirects(new_method, &new_url, None, new_body, redirect_count + 1);
-            }
-        }
-        
-        Ok(response)
+
+        req
     }
-    
+
     fn execute_request(&mut self, url: &UrlParts, req: Http1Request) -> Result<Response, NetError> {
-        let port = url.port.unwrap_or(if url.is_https { 443 } else { 80 });
-        let origin = format!("{}:{}", url.host, port);
-        
         // Check Alt-Svc cache for HTTP/3 support
         if self.config.http3_enabled && url.is_https {
             if let Some(alt_entry) = self.alt_svc_cache.get_h3(&url.host) {
-                // Try HTTP/3
                 let h3_host = alt_entry.effective_host(&url.host);
                 let h3_port = alt_entry.port;
-                
-                match self.try_http3(h3_host, h3_port, url, &req) {
-                    Ok(response) => return Ok(response),
-                    Err(_) => {
-                        // Fall back to HTTP/2 or HTTP/1.1
+
+                if let Ok(response) = self.try_http3(h3_host, h3_port, url, &req) {
+                    return Ok(response);
+                }
+                // Fall back to HTTP/2 or HTTP/1.1
+            }
+        }
+
+        let key = url.origin_key();
+        let retry_safe = matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE" | "TRACE");
+
+        let response = match self.take_idle(&key) {
+            Some(idle) => match self.round_trip(&key, idle.transport, idle.protocol, url, &req) {
+                Ok(response) => response,
+                // The server may have closed the idle connection in the
+                // meantime; idempotent requests are retried once on a new one
+                Err(_) if retry_safe => {
+                    let (transport, protocol) = self.connect(url)?;
+                    self.round_trip(&key, transport, protocol, url, &req)?
+                }
+                Err(e) => return Err(e),
+            },
+            None => {
+                let (transport, protocol) = self.connect(url)?;
+                self.round_trip(&key, transport, protocol, url, &req)?
+            }
+        };
+
+        // Parse Alt-Svc header for future HTTP/3 discovery
+        if self.config.http3_enabled && url.is_https {
+            for (name, value) in &response.headers {
+                if name.eq_ignore_ascii_case("alt-svc") {
+                    if let Some(alt_svc) = AltSvc::parse(value) {
+                        self.alt_svc_cache.insert(&url.host, alt_svc);
                     }
                 }
             }
         }
-        
-        // Connect via TCP
-        let addr = format!("{}:{}", url.host, port);
+
+        Ok(response)
+    }
+
+    /// Open a new connection, negotiating HTTP/2 via ALPN for HTTPS
+    fn connect(&self, url: &UrlParts) -> Result<(Transport, Protocol), NetError> {
         let tcp_config = TcpConfig {
             connect_timeout: self.config.connect_timeout,
             read_timeout: Some(self.config.request_timeout),
             write_timeout: Some(self.config.request_timeout),
             ..Default::default()
         };
-        
+
+        let addr = format!("{}:{}", url.host, url.port_or_default());
         let stream = TcpConnection::connect_with_config(&addr, tcp_config)
-            .map_err(|e| NetError::Network(format!("Connection failed: {}", e)))?;
-        
-        if url.is_https {
-            // Upgrade to TLS
-            let tls = TlsStream::connect(stream, &url.host, TlsConfig::default())
-                .map_err(|e| NetError::Network(format!("TLS failed: {}", e)))?;
-            
-            // Check ALPN for HTTP/2
-            let response = if tls.is_h2() {
-                self.send_and_receive_h2(tls, &url, req)?
-            } else {
-                self.send_and_receive_tls(tls, req)?
-            };
-            
-            // Parse Alt-Svc header for future HTTP/3 discovery
-            if self.config.http3_enabled {
-                for (name, value) in &response.headers {
-                    if name.eq_ignore_ascii_case("alt-svc") {
-                        if let Some(alt_svc) = AltSvc::parse(value) {
-                            self.alt_svc_cache.insert(&url.host, alt_svc);
-                        }
-                    }
-                }
-            }
-            
-            Ok(response)
+            .map_err(|e| NetError::Network(format!("Connection to {} failed: {}", addr, e)))?;
+
+        if !url.is_https {
+            return Ok((Transport::Plain(BufStream::new(stream)), Protocol::Http1));
+        }
+
+        let tls = TlsStream::connect(stream, url.tls_server_name(), TlsConfig::default())
+            .map_err(|e| NetError::Network(format!("TLS handshake with {} failed: {}", url.host, e)))?;
+        let is_h2 = tls.is_h2();
+        let mut transport = Transport::Tls(BufStream::new(tls));
+
+        if is_h2 {
+            let mut h2 = Box::new(Http2Connection::new_client());
+            h2.send_preface(&mut transport).map_err(h2_error)?;
+            Ok((transport, Protocol::Http2(h2)))
         } else {
-            self.send_and_receive_tcp(stream, req)
+            Ok((transport, Protocol::Http1))
         }
     }
-    
+
+    /// Send a request and read its response, returning the connection to
+    /// the pool when it can be reused
+    fn round_trip(
+        &mut self,
+        key: &str,
+        mut transport: Transport,
+        protocol: Protocol,
+        url: &UrlParts,
+        req: &Http1Request,
+    ) -> Result<Response, NetError> {
+        match protocol {
+            Protocol::Http1 => {
+                req.write_to(&mut transport)
+                    .map_err(|e| NetError::Network(format!("Write failed: {}", e)))?;
+
+                let resp = Http1Parser::parse_response(&mut transport, &req.method)
+                    .map_err(|e| NetError::Network(format!("Parse failed: {}", e)))?;
+
+                // Only a response with explicit framing leaves the connection
+                // positioned at the start of the next response
+                let framed = resp.is_chunked()
+                    || resp.content_length().is_some()
+                    || req.method == "HEAD"
+                    || resp.status == 204
+                    || resp.status == 304;
+                if self.config.keep_alive && framed && resp.keep_alive() {
+                    self.put_idle(key, transport, Protocol::Http1);
+                }
+
+                Ok(Response {
+                    status: resp.status,
+                    headers: resp.headers,
+                    body: resp.body,
+                    url: String::new(),
+                })
+            }
+            Protocol::Http2(mut h2) => {
+                let (response, reusable) = h2_exchange(&mut transport, &mut h2, url, req)?;
+                if self.config.keep_alive && reusable {
+                    self.put_idle(key, transport, Protocol::Http2(h2));
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    /// Take an idle connection for `key`, discarding expired ones
+    fn take_idle(&mut self, key: &str) -> Option<IdleConnection> {
+        let timeout = self.config.idle_timeout;
+        let conns = self.idle.get_mut(key)?;
+        conns.retain(|c| c.idle_since.elapsed() < timeout);
+        let conn = conns.pop();
+        if conns.is_empty() {
+            self.idle.remove(key);
+        }
+        conn
+    }
+
+    /// Return a connection to the pool, evicting the oldest idle connections
+    /// to stay within the configured budget
+    fn put_idle(&mut self, key: &str, transport: Transport, protocol: Protocol) {
+        let max = self.config.max_idle_connections;
+        if max == 0 {
+            return;
+        }
+
+        let timeout = self.config.idle_timeout;
+        self.idle.retain(|_, conns| {
+            conns.retain(|c| c.idle_since.elapsed() < timeout);
+            !conns.is_empty()
+        });
+
+        if let Some(conns) = self.idle.get_mut(key) {
+            if conns.len() >= MAX_IDLE_PER_ORIGIN {
+                conns.remove(0);
+            }
+        }
+
+        while self.idle.values().map(Vec::len).sum::<usize>() >= max {
+            let oldest = self.idle.iter()
+                .filter_map(|(k, conns)| conns.first().map(|c| (k.clone(), c.idle_since)))
+                .min_by_key(|(_, since)| *since)
+                .map(|(k, _)| k);
+            let Some(oldest) = oldest else { break };
+            if let Some(conns) = self.idle.get_mut(&oldest) {
+                conns.remove(0);
+                if conns.is_empty() {
+                    self.idle.remove(&oldest);
+                }
+            }
+        }
+
+        self.idle.entry(key.to_string()).or_default().push(IdleConnection {
+            transport,
+            protocol,
+            idle_since: Instant::now(),
+        });
+    }
+
+    /// Close all idle connections (e.g. under memory pressure)
+    pub fn clear_idle_connections(&mut self) {
+        self.idle.clear();
+    }
+
+    /// Number of idle connections currently kept alive
+    pub fn idle_connection_count(&self) -> usize {
+        self.idle.values().map(Vec::len).sum()
+    }
+
     /// Try HTTP/3 connection (returns error if not available)
     fn try_http3(&self, _host: &str, _port: u16, _url: &UrlParts, _req: &Http1Request) -> Result<Response, NetError> {
         // HTTP/3 requires async UDP - for now, return error to fall back
         // Full implementation would use smol::block_on with UdpSocket
         Err(NetError::Network("HTTP/3 requires async runtime".into()))
     }
-    
+
     /// Send HTTP/3 request (for future async implementation)
     #[allow(dead_code)]
     fn build_h3_request(&self, url: &UrlParts, req: &Http1Request) -> Vec<(String, String)> {
@@ -352,169 +612,27 @@ impl HttpClient {
             (":authority".to_string(), url.host_with_port()),
             (":path".to_string(), url.path_and_query()),
         ];
-        
+
         for (name, value) in &req.headers {
             if !name.starts_with(':') && !name.eq_ignore_ascii_case("host") {
                 headers.push((name.to_lowercase(), value.clone()));
             }
         }
-        
+
         headers
     }
-    
-    fn send_and_receive_tcp(&self, mut stream: TcpConnection, req: Http1Request) -> Result<Response, NetError> {
-        // Send request
-        req.write_to(&mut stream)
-            .map_err(|e| NetError::Network(format!("Write failed: {}", e)))?;
-        
-        // Read response
-        let mut reader = BufReader::new(stream);
-        let resp = Http1Parser::parse(&mut reader)
-            .map_err(|e| NetError::Network(format!("Parse failed: {}", e)))?;
-        
-        Ok(Response {
-            status: resp.status,
-            headers: resp.headers,
-            body: resp.body,
-        })
-    }
-    
-    fn send_and_receive_tls(&self, mut stream: TlsStream, req: Http1Request) -> Result<Response, NetError> {
-        // Send request
-        req.write_to(&mut stream)
-            .map_err(|e| NetError::Network(format!("Write failed: {}", e)))?;
-        
-        // Read response
-        let mut reader = BufReader::new(stream);
-        let resp = Http1Parser::parse(&mut reader)
-            .map_err(|e| NetError::Network(format!("Parse failed: {}", e)))?;
-        
-        Ok(Response {
-            status: resp.status,
-            headers: resp.headers,
-            body: resp.body,
-        })
-    }
-    
-    /// Send request using HTTP/2
-    fn send_and_receive_h2(&self, mut stream: TlsStream, url: &UrlParts, req: Http1Request) -> Result<Response, NetError> {
-        // Create HTTP/2 connection
-        let mut h2 = Http2Connection::new_client();
-        
-        // Send connection preface
-        h2.send_preface(&mut stream)
-            .map_err(|e| NetError::Network(format!("H2 preface failed: {}", e)))?;
-        
-        // Send request
-        let headers: Vec<(String, String)> = req.headers.iter()
-            .filter(|(n, _)| !n.starts_with(':'))
-            .cloned()
-            .collect();
-        
-        let stream_id = h2.send_request(
-            &mut stream,
-            &req.method,
-            &url.path_and_query(),
-            &url.host_with_port(),
-            &headers,
-            req.body.is_none(),
-        ).map_err(|e| NetError::Network(format!("H2 request failed: {}", e)))?;
-        
-        // Send body if present
-        if let Some(body) = &req.body {
-            h2.send_data(&mut stream, stream_id, body, true)
-                .map_err(|e| NetError::Network(format!("H2 data failed: {}", e)))?;
-        }
-        
-        // Read response frames
-        let mut response_headers = Vec::new();
-        let mut response_body = Vec::new();
-        let mut response_status = 200u16;
-        let max_frame_size = h2.remote_settings.max_frame_size;
-        
-        loop {
-            let frame = Frame::read_from(&mut stream, max_frame_size)
-                .map_err(|e| NetError::Network(format!("H2 frame read failed: {}", e)))?;
-            
-            match h2.process_frame(frame)
-                .map_err(|e| NetError::Network(format!("H2 process failed: {}", e)))? 
-            {
-                Some(Http2Event::SettingsReceived) => {
-                    // Send SETTINGS ACK
-                    h2.send_settings_ack(&mut stream)
-                        .map_err(|e| NetError::Network(format!("H2 settings ack failed: {}", e)))?;
-                }
-                Some(Http2Event::Headers { stream_id: sid, headers, end_stream }) if sid == stream_id => {
-                    // Parse status from pseudo-header
-                    for (name, value) in &headers {
-                        if name == ":status" {
-                            response_status = value.parse().unwrap_or(200);
-                        } else if !name.starts_with(':') {
-                            response_headers.push((name.clone(), value.clone()));
-                        }
-                    }
-                    if end_stream {
-                        break;
-                    }
-                }
-                Some(Http2Event::Data { stream_id: sid, data, end_stream }) if sid == stream_id => {
-                    response_body.extend(data);
-                    if end_stream {
-                        break;
-                    }
-                }
-                Some(Http2Event::Ping { ack: false, data }) => {
-                    h2.send_ping_ack(&mut stream, data)
-                        .map_err(|e| NetError::Network(format!("H2 ping ack failed: {}", e)))?;
-                }
-                Some(Http2Event::WindowUpdate { .. }) => {
-                    // Flow control update - continue
-                }
-                Some(Http2Event::GoAway { error_code, .. }) => {
-                    return Err(NetError::Network(format!("H2 GOAWAY: error {}", error_code)));
-                }
-                Some(Http2Event::RstStream { error_code, .. }) => {
-                    return Err(NetError::Network(format!("H2 RST_STREAM: error {}", error_code)));
-                }
-                _ => {}
-            }
-        }
-        
-        Ok(Response {
-            status: response_status,
-            headers: response_headers,
-            body: response_body,
-        })
-    }
-    
+
+    /// Resolve a redirect `Location` against the request URL
+    #[cfg(test)]
     fn resolve_redirect(base_url: &str, location: &str) -> String {
-        if location.starts_with("http://") || location.starts_with("https://") {
-            location.to_string()
-        } else if location.starts_with('/') {
-            // Absolute path
-            if let Ok(parsed) = UrlParts::parse(base_url) {
-                format!("{}://{}{}", 
-                    if parsed.is_https { "https" } else { "http" },
-                    parsed.host_with_port(),
-                    location)
-            } else {
-                location.to_string()
-            }
-        } else {
-            // Relative path
-            if let Some(last_slash) = base_url.rfind('/') {
-                format!("{}/{}", &base_url[..last_slash], location)
-            } else {
-                location.to_string()
-            }
-        }
+        url_util::resolve(base_url, location)
     }
-    
+
     /// Get cookie jar reference
     pub fn cookies(&self) -> &CookieJar {
         &self.cookies
     }
-    
+
     /// Get mutable cookie jar
     pub fn cookies_mut(&mut self) -> &mut CookieJar {
         &mut self.cookies
@@ -527,10 +645,133 @@ impl Default for HttpClient {
     }
 }
 
+fn h2_error(e: impl std::fmt::Display) -> NetError {
+    NetError::Network(format!("HTTP/2: {}", e))
+}
+
+/// Headers describing a request body, dropped when a redirect turns the
+/// request into a body-less GET
+fn is_content_header(name: &str) -> bool {
+    ["content-type", "content-length", "content-encoding", "content-language", "content-location"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Perform one request/response exchange on an HTTP/2 connection.
+///
+/// Returns the response and whether the connection can be reused.
+fn h2_exchange(
+    stream: &mut Transport,
+    h2: &mut Http2Connection,
+    url: &UrlParts,
+    req: &Http1Request,
+) -> Result<(Response, bool), NetError> {
+    let body = req.body.as_deref().filter(|b| !b.is_empty());
+
+    let stream_id = h2.send_request(
+        stream,
+        &req.method,
+        &url.path_and_query(),
+        &url.host_with_port(),
+        &req.headers,
+        body.is_none(),
+    ).map_err(h2_error)?;
+
+    if let Some(body) = body {
+        h2.send_data(stream, stream_id, body, true).map_err(h2_error)?;
+    }
+
+    let mut status: Option<u16> = None;
+    let mut headers = Vec::new();
+    let mut response_body = Vec::new();
+    let mut reusable = true;
+    let max_frame_size = h2.local_settings.max_frame_size;
+
+    loop {
+        let frame = Frame::read_from(stream, max_frame_size).map_err(h2_error)?;
+
+        match h2.process_frame(frame).map_err(h2_error)? {
+            Some(Http2Event::SettingsReceived) => {
+                h2.send_settings_ack(stream).map_err(h2_error)?;
+            }
+            Some(Http2Event::Headers { stream_id: sid, headers: block, end_stream }) if sid == stream_id => {
+                let block_status = block.iter()
+                    .find(|(name, _)| name == ":status")
+                    .and_then(|(_, value)| value.parse::<u16>().ok());
+
+                match (status, block_status) {
+                    // Informational responses (e.g. 103 Early Hints) precede the final one
+                    (None, Some(s)) if (100..200).contains(&s) => {}
+                    (None, Some(s)) => {
+                        status = Some(s);
+                        headers.extend(block.into_iter().filter(|(name, _)| !name.starts_with(':')));
+                    }
+                    (None, None) => return Err(h2_error("response without :status")),
+                    // Trailers
+                    (Some(_), _) => {
+                        headers.extend(block.into_iter().filter(|(name, _)| !name.starts_with(':')));
+                    }
+                }
+
+                if end_stream {
+                    break;
+                }
+            }
+            Some(Http2Event::Data { stream_id: sid, data, end_stream }) => {
+                if sid == stream_id {
+                    if response_body.is_empty() {
+                        response_body = data;
+                    } else {
+                        response_body.extend_from_slice(&data);
+                    }
+                    if end_stream {
+                        break;
+                    }
+                }
+                // Return flow-control credit so the server keeps sending
+                h2.replenish_windows(stream, sid).map_err(h2_error)?;
+            }
+            Some(Http2Event::Ping { ack: false, data }) => {
+                h2.send_ping_ack(stream, data).map_err(h2_error)?;
+            }
+            Some(Http2Event::GoAway { last_stream_id, error_code }) => {
+                reusable = false;
+                if stream_id > last_stream_id {
+                    return Err(h2_error("GOAWAY before the request was processed"));
+                }
+                if error_code != 0 {
+                    return Err(h2_error(format!("GOAWAY: error {}", error_code)));
+                }
+                // Graceful shutdown: our stream still completes
+            }
+            Some(Http2Event::RstStream { stream_id: sid, error_code }) if sid == stream_id => {
+                return Err(h2_error(format!("RST_STREAM: error {}", error_code)));
+            }
+            _ => {}
+        }
+    }
+
+    h2.remove_stream(stream_id);
+    // Keep the connection-level window topped up for the next request
+    h2.replenish_windows(stream, 0).map_err(h2_error)?;
+
+    let status = status.ok_or_else(|| h2_error("stream ended without a response"))?;
+    Ok((
+        Response {
+            status,
+            headers,
+            body: response_body,
+            url: String::new(),
+        },
+        reusable,
+    ))
+}
+
 /// Simple URL parsing (for internal use)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct UrlParts {
     is_https: bool,
+    /// Lowercased host; IPv6 literals keep their brackets
     host: String,
     port: Option<u16>,
     path: String,
@@ -539,89 +780,159 @@ struct UrlParts {
 
 impl UrlParts {
     fn parse(url: &str) -> Result<Self, NetError> {
-        let is_https = url.starts_with("https://");
-        let is_http = url.starts_with("http://");
-        
-        if !is_https && !is_http {
-            return Err(NetError::InvalidUrl(format!("Invalid scheme: {}", url)));
-        }
-        
-        let rest = if is_https { &url[8..] } else { &url[7..] };
-        
-        // Split at first /
-        let (host_port, path_query) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        
-        // Parse host:port
-        let (host, port) = if let Some(colon) = host_port.rfind(':') {
-            let h = &host_port[..colon];
-            let p: u16 = host_port[colon + 1..].parse()
-                .map_err(|_| NetError::InvalidUrl("Invalid port".into()))?;
-            (h.to_string(), Some(p))
+        let url = url.trim();
+        let (scheme, rest) = url.split_once("://")
+            .ok_or_else(|| NetError::InvalidUrl(format!("Invalid scheme: {}", url)))?;
+
+        let is_https = if scheme.eq_ignore_ascii_case("https") {
+            true
+        } else if scheme.eq_ignore_ascii_case("http") {
+            false
         } else {
-            (host_port.to_string(), None)
+            return Err(NetError::InvalidUrl(format!("Invalid scheme: {}", url)));
         };
-        
-        // Parse path?query
-        let (path, query) = match path_query.find('?') {
-            Some(i) => (&path_query[..i], Some(path_query[i + 1..].to_string())),
+
+        // The fragment is never sent to the server
+        let rest = rest.split('#').next().unwrap_or("");
+
+        // Authority ends at the first '/' or '?'
+        let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, path_query) = rest.split_at(authority_end);
+
+        // Strip credentials (userinfo)
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        let (host, port) = split_host_port(host_port)?;
+        if host.is_empty() {
+            return Err(NetError::InvalidUrl(format!("Missing host: {}", url)));
+        }
+
+        let (path, query) = match path_query.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
             None => (path_query, None),
         };
-        
+        let path = if path.is_empty() { "/" } else { path };
+
         Ok(Self {
             is_https,
-            host,
+            host: host.to_ascii_lowercase(),
             port,
-            path: path.to_string(),
-            query,
+            path: encode_request_target(path),
+            query: query.map(encode_request_target),
         })
     }
-    
+
     fn path_and_query(&self) -> String {
         match &self.query {
             Some(q) => format!("{}?{}", self.path, q),
             None => self.path.clone(),
         }
     }
-    
+
     fn host_with_port(&self) -> String {
         match self.port {
             Some(p) => format!("{}:{}", self.host, p),
             None => self.host.clone(),
         }
     }
+
+    fn port_or_default(&self) -> u16 {
+        self.port.unwrap_or(if self.is_https { 443 } else { 80 })
+    }
+
+    /// Connection pool key
+    fn origin_key(&self) -> String {
+        format!(
+            "{}://{}:{}",
+            if self.is_https { "https" } else { "http" },
+            self.host,
+            self.port_or_default()
+        )
+    }
+
+    /// Host name for SNI and certificate verification (no IPv6 brackets)
+    fn tls_server_name(&self) -> &str {
+        self.host.trim_start_matches('[').trim_end_matches(']')
+    }
+}
+
+/// Split `host[:port]`, handling bracketed IPv6 literals
+fn split_host_port(s: &str) -> Result<(&str, Option<u16>), NetError> {
+    let parse_port = |p: &str| -> Result<Option<u16>, NetError> {
+        if p.is_empty() {
+            Ok(None)
+        } else {
+            p.parse().map(Some).map_err(|_| NetError::InvalidUrl(format!("Invalid port: {}", p)))
+        }
+    };
+
+    if s.starts_with('[') {
+        let end = s.find(']')
+            .ok_or_else(|| NetError::InvalidUrl(format!("Invalid IPv6 host: {}", s)))?;
+        let port = match &s[end + 1..] {
+            "" => None,
+            rest => parse_port(rest.strip_prefix(':')
+                .ok_or_else(|| NetError::InvalidUrl(format!("Invalid host: {}", s)))?)?,
+        };
+        Ok((&s[..=end], port))
+    } else {
+        match s.rsplit_once(':') {
+            Some((host, port)) => Ok((host, parse_port(port)?)),
+            None => Ok((s, None)),
+        }
+    }
+}
+
+/// Percent-encode bytes that may not appear raw in a request target
+/// (spaces, controls, non-ASCII, and a few delimiters). Existing escapes
+/// are left untouched.
+fn encode_request_target(s: &str) -> String {
+    let needs_encoding = |b: u8| {
+        b <= b' ' || b >= 0x7F || matches!(b, b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}')
+    };
+
+    if !s.bytes().any(needs_encoding) {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len() + 16);
+    for b in s.bytes() {
+        if needs_encoding(b) {
+            out.push_str(&format!("%{:02X}", b));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 // Blocking API for sync contexts
 pub mod blocking {
     use super::*;
-    
+
     /// Blocking HTTP client (for sync code)
     pub struct Client {
         inner: HttpClient,
     }
-    
+
     impl Client {
         pub fn new() -> Self {
             Self {
                 inner: HttpClient::new(),
             }
         }
-        
+
         pub fn builder() -> ClientBuilder {
             ClientBuilder::new()
         }
-        
+
         pub fn get(&mut self, url: &str) -> Result<Response, NetError> {
             self.inner.get(url)
         }
-        
+
         pub fn post(&mut self, url: &str, body: Option<Vec<u8>>) -> Result<Response, NetError> {
             self.inner.post(url, body)
         }
-        
+
         pub fn request(
             &mut self,
             method: &str,
@@ -631,42 +942,57 @@ pub mod blocking {
         ) -> Result<Response, NetError> {
             self.inner.request(method, url, headers, body)
         }
+
+        /// Close idle keep-alive connections
+        pub fn clear_idle_connections(&mut self) {
+            self.inner.clear_idle_connections();
+        }
     }
-    
+
     impl Default for Client {
         fn default() -> Self {
             Self::new()
         }
     }
-    
+
     pub struct ClientBuilder {
         inner: HttpClientBuilder,
     }
-    
+
     impl ClientBuilder {
         pub fn new() -> Self {
             Self {
                 inner: HttpClientBuilder::new(),
             }
         }
-        
+
         pub fn user_agent(mut self, ua: &str) -> Self {
             self.inner = self.inner.user_agent(ua);
             self
         }
-        
+
         pub fn timeout(mut self, timeout: Duration) -> Self {
             self.inner = self.inner.request_timeout(timeout);
             self
         }
-        
+
+        pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+            self.inner = self.inner.connect_timeout(timeout);
+            self
+        }
+
+        pub fn default_header(mut self, name: &str, value: &str) -> Self {
+            self.inner = self.inner.default_header(name, value);
+            self
+        }
+
         pub fn build(self) -> Result<Client, NetError> {
             Ok(Client {
                 inner: self.inner.build(),
             })
         }
     }
-    
+
     impl Default for ClientBuilder {
         fn default() -> Self {
             Self::new()
@@ -677,7 +1003,11 @@ pub mod blocking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
     #[test]
     fn test_url_parse() {
         let url = UrlParts::parse("https://example.com/path?query=1").unwrap();
@@ -686,7 +1016,7 @@ mod tests {
         assert_eq!(url.path, "/path");
         assert_eq!(url.query, Some("query=1".to_string()));
     }
-    
+
     #[test]
     fn test_url_with_port() {
         let url = UrlParts::parse("http://localhost:8080/api").unwrap();
@@ -694,18 +1024,51 @@ mod tests {
         assert_eq!(url.host, "localhost");
         assert_eq!(url.port, Some(8080));
     }
-    
+
+    #[test]
+    fn test_url_parse_edge_cases() {
+        // Fragments are never sent to the server
+        let url = UrlParts::parse("https://en.wikipedia.org/wiki/Rust#History").unwrap();
+        assert_eq!(url.path_and_query(), "/wiki/Rust");
+
+        // Query without a path
+        let url = UrlParts::parse("https://example.com?q=1").unwrap();
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.path_and_query(), "/?q=1");
+
+        // IPv6 literal, with and without port
+        let url = UrlParts::parse("http://[::1]:8080/x").unwrap();
+        assert_eq!(url.host, "[::1]");
+        assert_eq!(url.port, Some(8080));
+        assert_eq!(url.tls_server_name(), "::1");
+        let url = UrlParts::parse("http://[::1]/x").unwrap();
+        assert_eq!(url.port, None);
+
+        // Credentials are stripped, scheme and host are case-insensitive
+        let url = UrlParts::parse("HTTPS://user:pw@Example.COM/").unwrap();
+        assert!(url.is_https);
+        assert_eq!(url.host, "example.com");
+
+        // Unescaped spaces and non-ASCII are percent-encoded
+        let url = UrlParts::parse("https://example.com/a b/é?q=a b").unwrap();
+        assert_eq!(url.path_and_query(), "/a%20b/%C3%A9?q=a%20b");
+
+        assert!(UrlParts::parse("ftp://example.com/").is_err());
+        assert!(UrlParts::parse("https:///path").is_err());
+        assert!(UrlParts::parse("http://host:notaport/").is_err());
+    }
+
     #[test]
     fn test_client_builder() {
         let client = HttpClient::builder()
             .user_agent("TestAgent/1.0")
             .max_redirects(5)
             .build();
-        
+
         assert_eq!(client.config.user_agent, "TestAgent/1.0");
         assert_eq!(client.config.max_redirects, 5);
     }
-    
+
     #[test]
     fn test_redirect_resolution() {
         // Absolute URL
@@ -713,11 +1076,129 @@ mod tests {
             HttpClient::resolve_redirect("http://example.com/page", "https://other.com/new"),
             "https://other.com/new"
         );
-        
+
         // Absolute path
         assert_eq!(
             HttpClient::resolve_redirect("http://example.com/old/path", "/new/path"),
             "http://example.com/new/path"
         );
+
+        // Relative path against a bare origin
+        assert_eq!(
+            HttpClient::resolve_redirect("https://example.com", "login"),
+            "https://example.com/login"
+        );
+
+        // Protocol-relative
+        assert_eq!(
+            HttpClient::resolve_redirect("https://example.com/a", "//www.example.com/b"),
+            "https://www.example.com/b"
+        );
+    }
+
+    /// Read one request head (requests in these tests have no body)
+    fn read_request_head(reader: &mut impl BufRead) -> Option<String> {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return None,
+                Ok(_) if line == "\r\n" => return Some(head),
+                Ok(_) => head.push_str(&line),
+            }
+        }
+    }
+
+    /// Serve canned responses over HTTP/1.1 on a local port. Returns the base
+    /// URL and a counter of accepted connections.
+    fn serve(responses: Vec<&'static str>, close_after_each: bool) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+
+        thread::spawn(move || {
+            let mut responses = responses.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+
+                while read_request_head(&mut reader).is_some() {
+                    let Some(response) = responses.next() else { return };
+                    stream.write_all(response.as_bytes()).unwrap();
+                    if close_after_each || response.contains("Connection: close") {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (base, connections)
+    }
+
+    #[test]
+    fn test_keep_alive_reuses_connection() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let (base, connections) = serve(vec![ok, ok, ok], false);
+
+        let mut client = HttpClient::new();
+        for _ in 0..3 {
+            let response = client.get(&format!("{}/page", base)).unwrap();
+            assert_eq!(response.body, b"hi");
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(client.idle_connection_count(), 1);
+    }
+
+    #[test]
+    fn test_follows_relative_redirect_and_reports_final_url() {
+        let (base, connections) = serve(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /final?x=1\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone",
+        ], false);
+
+        let mut client = HttpClient::new();
+        let response = client.get(&format!("{}/start#section", base)).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"done");
+        assert_eq!(response.url, format!("{}/final?x=1#section", base));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_body_delimited_by_close_is_not_pooled() {
+        let (base, _) = serve(vec![
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close",
+        ], false);
+
+        let mut client = HttpClient::new();
+        let response = client.get(&base).unwrap();
+        assert_eq!(response.body, b"body until close");
+        assert_eq!(client.idle_connection_count(), 0);
+    }
+
+    #[test]
+    fn test_stale_pooled_connection_is_retried() {
+        // The server silently closes every connection after one response
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (base, connections) = serve(vec![ok, ok], true);
+
+        let mut client = HttpClient::new();
+        assert_eq!(client.get(&base).unwrap().body, b"ok");
+        // Give the server a moment to close its end
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(client.get(&base).unwrap().body, b"ok");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_redirect_loop_is_bounded() {
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n";
+        let (base, _) = serve(vec![redirect; 4], false);
+
+        let mut client = HttpClient::builder().max_redirects(3).build();
+        let response = client.get(&base).unwrap();
+        assert_eq!(response.status, 302);
     }
 }

@@ -200,7 +200,7 @@ impl SimulcastSelector {
         if pref == QualityPreference::Auto { self.auto_select = true; }
     }
     
-    pub fn auto_select_layer(&mut self, layers: &[SimulcastLayer], bandwidth: u64) -> Option<&SimulcastLayer> {
+    pub fn auto_select_layer<'a>(&mut self, layers: &'a [SimulcastLayer], bandwidth: u64) -> Option<&'a SimulcastLayer> {
         if !self.auto_select {
             return self.selected_rid.as_ref().and_then(|rid| layers.iter().find(|l| l.rid == *rid));
         }

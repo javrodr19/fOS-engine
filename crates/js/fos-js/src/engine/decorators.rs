@@ -91,7 +91,7 @@ pub struct DecoratorAccess {
 // =============================================================================
 
 /// Decorator application result
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DecoratorResult {
     /// Decorator returned undefined (keep original)
     Unchanged,

@@ -115,7 +115,7 @@ pub enum DecoderError {
 }
 
 /// Video decoder trait
-pub trait VideoDecoderTrait: Send {
+pub trait VideoDecoderTrait: Send + std::fmt::Debug {
     /// Decode a single packet
     fn decode(&mut self, packet: &EncodedPacket) -> DecoderResult<Vec<VideoFrame>>;
     

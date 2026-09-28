@@ -41,6 +41,42 @@ struct SsrcContext {
     replay_window: u64,
 }
 
+impl SsrcContext {
+    /// Estimate the rollover counter for an incoming sequence number (RFC 3711 3.3.1).
+    fn estimate_roc(&self, seq: u16) -> u32 {
+        let s_l = self.highest_seq;
+        if s_l < 32768 {
+            if seq.wrapping_sub(s_l) > 32768 { self.roc.wrapping_sub(1) }
+            else { self.roc }
+        } else {
+            if s_l.wrapping_sub(32768) > seq { self.roc.wrapping_add(1) }
+            else { self.roc }
+        }
+    }
+
+    /// Returns true if `seq` has not already been seen (i.e. is not a replay).
+    fn check_replay(&self, seq: u16) -> bool {
+        let delta = seq.wrapping_sub(self.highest_seq) as i16;
+        if delta > 0 { return true; } // New packet
+        if delta < -64 { return false; } // Too old
+        let bit = 1u64 << (-delta as u32);
+        self.replay_window & bit == 0
+    }
+
+    /// Record `seq` in the replay window, sliding the window forward if it is newer.
+    fn update_replay(&mut self, seq: u16) {
+        let delta = seq.wrapping_sub(self.highest_seq) as i16;
+        if delta > 0 {
+            self.replay_window = (self.replay_window << delta) | 1;
+            self.highest_seq = seq;
+            if seq < self.highest_seq { self.roc += 1; }
+        } else {
+            let bit = 1u64 << (-delta as u32);
+            self.replay_window |= bit;
+        }
+    }
+}
+
 impl SrtpSession {
     /// Create from DTLS-exported keying material
     pub fn from_keying_material(material: &[u8], profile: SrtpProfile, is_client: bool) -> Option<Self> {
@@ -131,17 +167,21 @@ impl SrtpSession {
         let ssrc = u32::from_be_bytes([encrypted[8], encrypted[9], encrypted[10], encrypted[11]]);
         let seq = u16::from_be_bytes([encrypted[2], encrypted[3]]);
         
-        // Estimate ROC
-        let ctx = self.ssrc_contexts.entry(ssrc).or_default();
-        let roc = self.estimate_roc(ctx, seq);
-        let index = ((roc as u64) << 16) | seq as u64;
-        
-        // Verify authentication (simplified - real impl would use HMAC)
-        // let expected_tag = self.compute_auth_tag(encrypted, roc);
-        // if received_tag != expected_tag { return None; }
-        
-        // Check replay
-        if !self.check_replay(ctx, seq, index) { return None; }
+        // Estimate ROC and screen out replays. The per-SSRC context borrow is scoped
+        // to this block so the `&self` key-derivation helpers below can run.
+        let index = {
+            let ctx = self.ssrc_contexts.entry(ssrc).or_default();
+            let roc = ctx.estimate_roc(seq);
+            let index = ((roc as u64) << 16) | seq as u64;
+
+            // Verify authentication (simplified - real impl would use HMAC)
+            // let expected_tag = self.compute_auth_tag(encrypted, roc);
+            // if received_tag != expected_tag { return None; }
+
+            // Check replay
+            if !ctx.check_replay(seq) { return None; }
+            index
+        };
         
         // Decrypt
         let session_key = self.derive_session_key(&self.remote_key, index, 0);
@@ -154,41 +194,11 @@ impl SrtpSession {
         }
         
         // Update replay window
-        self.update_replay(ctx, seq);
+        if let Some(ctx) = self.ssrc_contexts.get_mut(&ssrc) {
+            ctx.update_replay(seq);
+        }
         
         Some(decrypted)
-    }
-    
-    fn estimate_roc(&self, ctx: &SsrcContext, seq: u16) -> u32 {
-        let s_l = ctx.highest_seq;
-        if s_l < 32768 {
-            if seq.wrapping_sub(s_l) > 32768 { ctx.roc.wrapping_sub(1) }
-            else { ctx.roc }
-        } else {
-            if s_l.wrapping_sub(32768) > seq { ctx.roc.wrapping_add(1) }
-            else { ctx.roc }
-        }
-    }
-    
-    fn check_replay(&self, ctx: &SsrcContext, seq: u16, _index: u64) -> bool {
-        // Check if packet is in replay window
-        let delta = seq.wrapping_sub(ctx.highest_seq) as i16;
-        if delta > 0 { return true; } // New packet
-        if delta < -64 { return false; } // Too old
-        let bit = 1u64 << (-delta as u32);
-        ctx.replay_window & bit == 0
-    }
-    
-    fn update_replay(&mut self, ctx: &mut SsrcContext, seq: u16) {
-        let delta = seq.wrapping_sub(ctx.highest_seq) as i16;
-        if delta > 0 {
-            ctx.replay_window = (ctx.replay_window << delta) | 1;
-            ctx.highest_seq = seq;
-            if seq < ctx.highest_seq { ctx.roc += 1; }
-        } else {
-            let bit = 1u64 << (-delta as u32);
-            ctx.replay_window |= bit;
-        }
     }
     
     fn derive_session_key(&self, material: &SrtpKeyMaterial, _index: u64, label: u8) -> Vec<u8> {

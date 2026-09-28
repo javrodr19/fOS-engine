@@ -11,8 +11,12 @@
 /// 
 /// Stores layout data using relative coordinates and small integers.
 /// Suitable for 95%+ of web layouts where dimensions are < 32K pixels.
+// `repr(C)` alone already lays these four 2-byte fields out at offsets 0/2/4/6 for
+// a total of 8 bytes, so `packed` would buy nothing while making every field
+// potentially unaligned (and references to them unsound). The size is pinned by
+// `test_compact_size` below.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[repr(C, packed)]
+#[repr(C)]
 pub struct CompactLayoutResult {
     /// X position relative to parent (covers ±32K)
     pub x: i16,

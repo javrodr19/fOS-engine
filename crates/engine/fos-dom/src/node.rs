@@ -132,21 +132,22 @@ pub enum NodeData {
 pub struct ElementData {
     /// Tag name (qualified)
     pub name: QualName,
-    /// Attributes - stored inline for small counts, Vec for large
-    pub attrs: SmallVec<Attribute>,
+    /// Attributes. An empty `Vec` does not allocate, so attribute-less elements
+    /// (the common case) cost only the 24-byte header.
+    pub attrs: Vec<Attribute>,
     /// Cached id attribute (very common lookup)
     pub id: Option<InternedString>,
     /// Cached class list
-    pub classes: SmallVec<InternedString>,
+    pub classes: Vec<InternedString>,
 }
 
 impl ElementData {
     pub fn new(name: QualName) -> Self {
         Self {
             name,
-            attrs: SmallVec::new(),
+            attrs: Vec::new(),
             id: None,
-            classes: SmallVec::new(),
+            classes: Vec::new(),
         }
     }
     
@@ -184,136 +185,44 @@ pub struct Attribute {
     pub value: String,
 }
 
-/// Small vector - inline storage for up to 4 items
-/// Avoids heap allocation for common cases (most elements have < 5 attributes)
-#[derive(Debug)]
-pub enum SmallVec<T> {
-    /// Inline storage (no heap allocation)
-    Inline {
-        data: [Option<T>; 4],
-        len: u8,
-    },
-    /// Heap storage for larger collections
-    Heap(Vec<T>),
-}
+#[cfg(test)]
+mod size_guard {
+    use super::*;
+    use std::mem::size_of;
 
-impl<T> SmallVec<T> {
-    pub fn new() -> Self {
-        Self::Inline {
-            data: [None, None, None, None],
-            len: 0,
-        }
-    }
-    
-    pub fn push(&mut self, value: T) {
-        match self {
-            Self::Inline { data, len } => {
-                if (*len as usize) < 4 {
-                    data[*len as usize] = Some(value);
-                    *len += 1;
-                } else {
-                    // Upgrade to heap
-                    let mut vec = Vec::with_capacity(8);
-                    for item in data.iter_mut() {
-                        if let Some(v) = item.take() {
-                            vec.push(v);
-                        }
-                    }
-                    vec.push(value);
-                    *self = Self::Heap(vec);
-                }
-            }
-            Self::Heap(vec) => vec.push(value),
-        }
-    }
-    
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Inline { len, .. } => *len as usize,
-            Self::Heap(vec) => vec.len(),
-        }
-    }
-    
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        SmallVecIter { vec: self, idx: 0 }
-    }
-    
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        SmallVecIterMut { vec: self, idx: 0 }
-    }
-}
+    /// `Node` is the most-allocated struct in the engine: a content-heavy page holds
+    /// tens of thousands of them, so its size is a headline RAM number and must not
+    /// regress silently.
+    ///
+    /// The layout is 5 x NodeId (20 bytes) + padding + NodeData. `NodeData` is as
+    /// large as its biggest variant, so growing *any* variant grows *every* node,
+    /// including the text nodes that usually outnumber elements.
+    #[test]
+    fn node_layout_is_compact() {
+        assert_eq!(size_of::<NodeId>(), 4, "NodeId must stay a u32 index");
+        assert_eq!(size_of::<TextData>(), 24, "TextData should be exactly a String");
 
-impl<T> Default for SmallVec<T> {
-    fn default() -> Self {
-        Self::new()
+        // ElementData: QualName(8) + Vec(24) + Option<InternedString>(8) + Vec(24).
+        assert_eq!(size_of::<ElementData>(), 64);
+
+        // NodeData is sized by its largest variant (Element). It matches ElementData
+        // exactly because the non-null Vec pointer inside gives the discriminant a
+        // niche to live in, so the tag costs nothing.
+        assert_eq!(size_of::<NodeData>(), 64);
+
+        // 5 x NodeId (20) + 4 padding + NodeData (64).
+        assert_eq!(
+            size_of::<Node>(),
+            88,
+            "Node grew. Every DOM node pays this, so check which NodeData variant expanded.",
+        );
     }
-}
 
-struct SmallVecIter<'a, T> {
-    vec: &'a SmallVec<T>,
-    idx: usize,
-}
-
-impl<'a, T> Iterator for SmallVecIter<'a, T> {
-    type Item = &'a T;
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.vec {
-            SmallVec::Inline { data, len } => {
-                if self.idx < *len as usize {
-                    let result = data[self.idx].as_ref();
-                    self.idx += 1;
-                    result
-                } else {
-                    None
-                }
-            }
-            SmallVec::Heap(vec) => {
-                if self.idx < vec.len() {
-                    let result = Some(&vec[self.idx]);
-                    self.idx += 1;
-                    result
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-struct SmallVecIterMut<'a, T> {
-    vec: &'a mut SmallVec<T>,
-    idx: usize,
-}
-
-impl<'a, T> Iterator for SmallVecIterMut<'a, T> {
-    type Item = &'a mut T;
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.vec {
-            SmallVec::Inline { data, len } => {
-                if self.idx < *len as usize {
-                    // Safety: we're iterating through unique indices
-                    let ptr = data[self.idx].as_mut()? as *mut T;
-                    self.idx += 1;
-                    Some(unsafe { &mut *ptr })
-                } else {
-                    None
-                }
-            }
-            SmallVec::Heap(vec) => {
-                if self.idx < vec.len() {
-                    let ptr = &mut vec[self.idx] as *mut T;
-                    self.idx += 1;
-                    Some(unsafe { &mut *ptr })
-                } else {
-                    None
-                }
-            }
-        }
+    /// An element with no attributes must not touch the heap.
+    #[test]
+    fn empty_element_does_not_allocate() {
+        let elem = ElementData::new(QualName::new(InternedString::EMPTY, InternedString::EMPTY));
+        assert_eq!(elem.attrs.capacity(), 0, "empty attrs must not allocate");
+        assert_eq!(elem.classes.capacity(), 0, "empty classes must not allocate");
     }
 }

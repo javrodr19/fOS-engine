@@ -16,7 +16,7 @@ use super::inline_cache::{InlineCacheManager, ShapeId};
 use super::direct_dispatch::{DirectDispatch, SuperInstructionTransformer};
 use super::tiered_compiler::{TieredCompiler, CompileTier, CompilationPolicy};
 use super::ssa::{SsaFunction, SsaBuilder};
-use super::generational_gc::{GenerationalGC, GcConfig};
+use super::generational_gc::{GenerationalGC, GcConfig, RootSet};
 use super::es2024::{ResizableArrayBuffer, AtomicsManager, DeferredPromise};
 use super::wasm_runtime::{Module as WasmModule, Instance as WasmInstance};
 use super::advanced_optimizations::{
@@ -32,9 +32,6 @@ use super::wasm_extensions::{SharedMemory, ThreadManager, ExceptionRuntime, V128
 
 /// Integrated JavaScript engine with all roadmap features
 pub struct IntegratedEngine {
-    // Parsing
-    preparser: PreParser,
-    
     // Compilation
     tiered_compiler: TieredCompiler,
     ssa_cache: HashMap<u32, SsaFunction>,
@@ -47,6 +44,8 @@ pub struct IntegratedEngine {
     
     // Memory
     gc: GenerationalGC,
+    /// Roots handed to the collector on each cycle.
+    roots: RootSet,
     
     // ES2024
     resizable_buffers: Vec<ResizableArrayBuffer>,
@@ -86,14 +85,14 @@ impl Default for IntegratedEngine {
 impl IntegratedEngine {
     pub fn new() -> Self {
         Self {
-            preparser: PreParser::new(),
             tiered_compiler: TieredCompiler::new(),
             ssa_cache: HashMap::new(),
             compilation_policy: CompilationPolicy::default(),
             inline_caches: InlineCacheManager::new(),
             direct_dispatch: DirectDispatch::new(),
             super_transformer: SuperInstructionTransformer::new(),
-            gc: GenerationalGC::new(GcConfig::default()),
+            gc: GenerationalGC::with_config(GcConfig::default()),
+            roots: RootSet::new(),
             resizable_buffers: Vec::new(),
             atomics_manager: AtomicsManager::new(),
             deferred_promises: HashMap::new(),
@@ -120,8 +119,11 @@ impl IntegratedEngine {
     // =========================================================================
 
     /// Pre-parse function for quick analysis
+    ///
+    /// `PreParser` borrows the source it scans, so it is built per call rather
+    /// than held as a field (which would leak a lifetime into `IntegratedEngine`).
     pub fn preparse_function(&mut self, source: &str) -> FunctionInfo {
-        self.preparser.scan_function(source)
+        PreParser::new(source).scan_function(0)
     }
 
     // =========================================================================
@@ -146,15 +148,19 @@ impl IntegratedEngine {
     }
 
     /// Check if function should be optimized
+    ///
+    /// A function is a candidate once it is profiled as hot and has not already
+    /// reached the top tier.
     pub fn should_optimize(&self, func_id: u32) -> bool {
-        self.tiered_compiler.should_upgrade(func_id) || self.pgo.is_hot(func_id)
+        self.tiered_compiler.get_tier(func_id) != CompileTier::Optimized
+            && self.pgo.is_hot(func_id)
     }
 
     /// Build SSA for function
     pub fn build_ssa(&mut self, func_id: u32) -> &SsaFunction {
         if !self.ssa_cache.contains_key(&func_id) {
-            let builder = SsaBuilder::new();
-            let ssa_func = builder.build();
+            let builder = SsaBuilder::new(None, 0);
+            let ssa_func = builder.finish();
             self.ssa_cache.insert(func_id, ssa_func);
         }
         self.ssa_cache.get(&func_id).unwrap()
@@ -166,12 +172,12 @@ impl IntegratedEngine {
 
     /// Get or create inline cache for property access
     pub fn get_inline_cache(&mut self, cache_id: u32, shape: ShapeId) -> Option<u32> {
-        self.inline_caches.lookup(cache_id, shape)
+        self.inline_caches.poly_lookup(cache_id, shape)
     }
 
     /// Update inline cache
-    pub fn update_inline_cache(&mut self, cache_id: u32, shape: ShapeId, offset: u32) {
-        self.inline_caches.update(cache_id, shape, offset);
+    pub fn update_inline_cache(&mut self, cache_id: u32, shape: ShapeId, slot: u16) {
+        self.inline_caches.poly_update(cache_id, shape, slot);
     }
 
     // =========================================================================
@@ -180,17 +186,22 @@ impl IntegratedEngine {
 
     /// Trigger minor GC (nursery only)
     pub fn minor_gc(&mut self) {
-        self.gc.minor_gc();
+        self.gc.minor_gc(&self.roots);
     }
 
     /// Trigger major GC (full collection)
     pub fn major_gc(&mut self) {
-        self.gc.major_gc();
+        self.gc.major_gc(&self.roots);
     }
 
     /// Check if GC should run
     pub fn should_gc(&self) -> bool {
-        self.gc.should_collect()
+        self.gc.needs_gc()
+    }
+
+    /// Mutable access to the root set the collector scans.
+    pub fn roots_mut(&mut self) -> &mut RootSet {
+        &mut self.roots
     }
 
     // =========================================================================
@@ -330,7 +341,7 @@ impl IntegratedEngine {
         EngineStats {
             functions_compiled: self.ssa_cache.len(),
             inline_cache_stats: self.inline_caches.stats(),
-            gc_stats: self.gc.stats(),
+            gc_stats: self.gc.stats().clone(),
             wasm_modules_loaded: self.wasm_modules.len(),
             wasm_threads_active: self.wasm_threads.active_count(),
             pgo_hot_functions: self.pgo_hot_count(),

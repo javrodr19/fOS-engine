@@ -20,7 +20,10 @@ pub struct ConnectionKey {
 }
 
 /// HTTP version
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordering is by protocol generation (Http1 < Http2 < Http3) so that
+/// `ConnectionKey` can derive `Ord` for use as a `BTreeMap` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HttpVersion {
     Http1,
     Http2,

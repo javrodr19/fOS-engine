@@ -48,7 +48,7 @@ pub enum OptimizationHint {
 }
 
 /// Type hint for specialization
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeHint {
     Smi,        // Small integer
     HeapNumber, // Boxed number
@@ -96,22 +96,31 @@ impl AotAnalyzer {
 
     /// Analyze code and generate hints
     pub fn analyze(&mut self, code_signature: u64) -> Vec<AotHint> {
-        if let Some(pattern) = self.patterns.get_mut(&code_signature) {
-            pattern.occurrences += 1;
-            
-            // Generate hints based on pattern
-            pattern.hints.iter().map(|h| {
-                let id = self.next_pattern_id;
-                self.next_pattern_id += 1;
-                AotHint {
-                    pattern_id: id,
-                    optimization: h.clone(),
-                    confidence: self.calculate_confidence(pattern.occurrences),
-                }
-            }).collect()
-        } else {
-            Vec::new()
-        }
+        let Some(pattern) = self.patterns.get_mut(&code_signature) else {
+            return Vec::new();
+        };
+        pattern.occurrences += 1;
+        let occurrences = pattern.occurrences;
+        let hint_count = pattern.hints.len();
+
+        // Reserve the id range and fold the pattern-wide confidence up front, so no
+        // borrow of `self` is still live when the mapping closure runs. Confidence
+        // depends only on the occurrence count, so hoisting it also avoids
+        // recomputing the same value once per hint.
+        let first_id = self.next_pattern_id;
+        self.next_pattern_id += hint_count as u32;
+        let confidence = self.calculate_confidence(occurrences);
+
+        self.patterns[&code_signature]
+            .hints
+            .iter()
+            .enumerate()
+            .map(|(i, h)| AotHint {
+                pattern_id: first_id + i as u32,
+                optimization: h.clone(),
+                confidence,
+            })
+            .collect()
     }
 
     fn calculate_confidence(&self, occurrences: u32) -> f32 {

@@ -46,23 +46,28 @@ impl TsDemuxer {
         Ok(demuxer)
     }
     
-    fn parse_packet(&self, offset: usize) -> DemuxerResult<TsPacket> {
-        if offset + TS_PACKET_SIZE > self.data.len() { return Err(DemuxerError::NeedMoreData); }
-        if self.data[offset] != SYNC_BYTE { return Err(DemuxerError::InvalidContainer("Invalid sync".into())); }
+    /// Parse one 188-byte TS packet out of `data`.
+    ///
+    /// Takes the buffer rather than `&self` so the returned packet borrows only the
+    /// byte buffer, leaving the demuxer's other fields free to be mutated by the
+    /// caller while the packet is alive.
+    fn parse_packet(data: &[u8], offset: usize) -> DemuxerResult<TsPacket<'_>> {
+        if offset + TS_PACKET_SIZE > data.len() { return Err(DemuxerError::NeedMoreData); }
+        if data[offset] != SYNC_BYTE { return Err(DemuxerError::InvalidContainer("Invalid sync".into())); }
         
-        let pid = (((self.data[offset + 1] & 0x1F) as u16) << 8) | self.data[offset + 2] as u16;
-        let payload_unit_start = (self.data[offset + 1] & 0x40) != 0;
-        let adaptation_field_control = (self.data[offset + 3] >> 4) & 0x03;
-        let continuity_counter = self.data[offset + 3] & 0x0F;
+        let pid = (((data[offset + 1] & 0x1F) as u16) << 8) | data[offset + 2] as u16;
+        let payload_unit_start = (data[offset + 1] & 0x40) != 0;
+        let adaptation_field_control = (data[offset + 3] >> 4) & 0x03;
+        let continuity_counter = data[offset + 3] & 0x0F;
         
         let mut payload_start = offset + 4;
         if adaptation_field_control & 0x02 != 0 {
-            let af_len = self.data[offset + 4] as usize;
+            let af_len = data[offset + 4] as usize;
             payload_start += 1 + af_len;
         }
         
         let payload = if adaptation_field_control & 0x01 != 0 && payload_start < offset + TS_PACKET_SIZE {
-            &self.data[payload_start..offset + TS_PACKET_SIZE]
+            &data[payload_start..offset + TS_PACKET_SIZE]
         } else {
             &[]
         };
@@ -74,13 +79,24 @@ impl TsDemuxer {
         let mut pos = 0;
         while pos + TS_PACKET_SIZE <= self.data.len() {
             if self.data[pos] == SYNC_BYTE {
-                if let Ok(pkt) = self.parse_packet(pos) {
-                    // PAT is PID 0
-                    if pkt.pid == 0 && !pkt.payload.is_empty() { self.parse_pat(pkt.payload)?; }
-                    // PMT
-                    if pkt.pid > 0 && pkt.pid < 0x1FFF && self.video_pid.is_none() {
-                        self.parse_pmt(pkt.payload);
+                // The packet borrows `self.data`, so the PMT payload is lifted out of
+                // the borrow before `parse_pmt` takes `&mut self`. This runs only until
+                // the first PID is found, so the copy is bounded and init-time only.
+                let pmt_payload = match Self::parse_packet(&self.data, pos) {
+                    Ok(pkt) => {
+                        // PAT is PID 0
+                        if pkt.pid == 0 && !pkt.payload.is_empty() { Self::parse_pat(pkt.payload)?; }
+                        // PMT
+                        if pkt.pid > 0 && pkt.pid < 0x1FFF && self.video_pid.is_none() {
+                            Some(pkt.payload.to_vec())
+                        } else {
+                            None
+                        }
                     }
+                    Err(_) => None,
+                };
+                if let Some(payload) = pmt_payload {
+                    self.parse_pmt(&payload);
                 }
                 pos += TS_PACKET_SIZE;
             } else {
@@ -91,7 +107,7 @@ impl TsDemuxer {
         Ok(())
     }
     
-    fn parse_pat(&mut self, data: &[u8]) -> DemuxerResult<()> {
+    fn parse_pat(data: &[u8]) -> DemuxerResult<()> {
         if data.len() < 8 { return Ok(()); }
         let pointer = data[0] as usize;
         let start = 1 + pointer;
@@ -181,7 +197,7 @@ impl Demuxer for TsDemuxer {
     
     fn read_packet(&mut self) -> DemuxerResult<Packet> {
         while self.pos + TS_PACKET_SIZE <= self.data.len() {
-            let pkt = self.parse_packet(self.pos)?;
+            let pkt = Self::parse_packet(&self.data, self.pos)?;
             self.pos += TS_PACKET_SIZE;
             
             if Some(pkt.pid) == self.video_pid && !pkt.payload.is_empty() {

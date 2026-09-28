@@ -123,8 +123,10 @@ impl PrioritySignal {
     /// Serialize to HTTP/2 PRIORITY frame format
     /// Returns (exclusive, stream_dependency, weight)
     pub fn to_h2_priority(&self) -> (bool, u32, u8) {
-        // Map urgency 0-7 to weight 256-1 (inverse relationship)
-        let weight = 256 - (self.urgency as u16 * 32).min(255) as u8;
+        // The HTTP/2 PRIORITY weight field stores `weight - 1`, i.e. the byte range
+        // 0..=255 represents weights 1..=256. Map urgency 0..=7 onto that byte so
+        // that `from_h2_priority` is an exact inverse for every urgency value.
+        let weight = 255 - self.urgency.min(7) * 32;
         (false, 0, weight)
     }
     
@@ -432,7 +434,27 @@ impl H3PriorityEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    /// The HTTP/2 PRIORITY weight byte encodes `weight - 1` (byte 0..=255 means
+    /// weight 1..=256), so `to_h2_priority` must land in that byte range and be an
+    /// exact inverse of `from_h2_priority` for every urgency level.
+    #[test]
+    fn test_h2_priority_roundtrip() {
+        for urgency in 0..=7u8 {
+            let signal = PrioritySignal::new(urgency, false);
+            let (_, _, weight) = signal.to_h2_priority();
+            assert_eq!(
+                PrioritySignal::from_h2_priority(weight).urgency(),
+                urgency,
+                "urgency {urgency} did not survive the h2 weight round-trip (weight={weight})",
+            );
+        }
+
+        // Most urgent maps to the largest weight byte, least urgent to the smallest.
+        assert_eq!(PrioritySignal::new(0, false).to_h2_priority().2, 255);
+        assert_eq!(PrioritySignal::new(7, false).to_h2_priority().2, 31);
+    }
+
     #[test]
     fn test_priority_signal_default() {
         let signal = PrioritySignal::default();

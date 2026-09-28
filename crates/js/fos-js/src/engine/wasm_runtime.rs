@@ -484,7 +484,6 @@ pub enum WasmOp {
 // =============================================================================
 
 /// WASM module instance
-#[derive(Debug)]
 pub struct Instance {
     /// Source module
     module: Module,
@@ -500,6 +499,20 @@ pub struct Instance {
 
 /// Imported function type
 pub type ImportedFunc = Box<dyn Fn(&[Value]) -> Vec<Value> + Send + Sync>;
+
+// Hand-written because the boxed host closures in `imports` cannot be `Debug`;
+// their names are printed instead.
+impl std::fmt::Debug for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("module", &self.module)
+            .field("memories", &self.memories)
+            .field("tables", &self.tables)
+            .field("globals", &self.globals)
+            .field("imports", &self.imports.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 impl Instance {
     /// Instantiate a module
@@ -639,6 +652,10 @@ impl<'a> Interpreter<'a> {
         let func_type = self.instance.module.types.get(*type_idx as usize)
             .ok_or(WasmError::ValidationError("Invalid type index".into()))?;
 
+        // Read the result arity out of the borrowed type now: `execute` below takes
+        // `&mut self`, which would conflict with `func_type` still being live.
+        let result_count = func_type.results.len();
+
         // Set up locals
         let mut locals = Vec::with_capacity(args.len() + func.locals.len());
         locals.extend_from_slice(args);
@@ -659,7 +676,6 @@ impl<'a> Interpreter<'a> {
         self.execute(&code)?;
 
         // Pop results
-        let result_count = func_type.results.len();
         let results: Vec<Value> = self.stack.drain(self.stack.len().saturating_sub(result_count)..).collect();
 
         self.call_stack.pop();
@@ -834,7 +850,7 @@ mod tests {
         
         assert_eq!(mem.size(), 1);
         
-        mem.store_i32(0, 42).unwrap();
+        assert!(mem.store_i32(0, 42));
         assert_eq!(mem.load_i32(0), Some(42));
         
         let old_size = mem.grow(1);

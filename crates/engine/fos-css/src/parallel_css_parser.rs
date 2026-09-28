@@ -803,45 +803,185 @@ impl<'a> CssParser<'a> {
 }
 
 /// Calculate selector specificity (a, b, c)
-fn calculate_specificity(selector: &str) -> (u32, u32, u32) {
-    let mut a = 0; // IDs
-    let mut b = 0; // Classes, attributes, pseudo-classes
-    let mut c = 0; // Elements, pseudo-elements
-    
-    let mut chars = selector.chars().peekable();
-    
-    while let Some(ch) = chars.next() {
-        match ch {
-            '#' => a += 1,
-            '.' | '[' => b += 1,
-            ':' => {
-                if chars.peek() == Some(&':') {
-                    chars.next();
-                    c += 1; // Pseudo-element
-                } else {
-                    // Check for pseudo-class exceptions
-                    let pseudo: String = chars.by_ref().take_while(|c| c.is_alphanumeric() || *c == '-').collect();
-                    if pseudo != "where" && pseudo != "is" {
-                        if pseudo == "not" || pseudo == "has" {
-                            // These add specificity of their argument
-                            b += 1;
-                        } else {
-                            b += 1;
-                        }
-                    }
+/// Scan past a CSS identifier starting at `i`, returning the index just after it.
+fn skip_ident(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(bytes.len()), // escaped character
+            c if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80 => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Scan past an attribute selector body, given `i` just after the `[`.
+/// Returns the index just after the closing `]`.
+fn skip_attr(bytes: &[u8], mut i: usize) -> usize {
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b']' => return i + 1,
+            None => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Given `i` at an opening `(`, return the index of the matching `)`, or the input
+/// length when the parentheses are unbalanced.
+fn matching_paren(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'(' => depth += 1,
+            None if c == b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
                 }
             }
-            ch if ch.is_alphabetic() => {
-                c += 1;
-                // Skip rest of tag name
-                while chars.peek().map(|x| x.is_alphanumeric() || *x == '-').unwrap_or(false) {
-                    chars.next();
-                }
+            None => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Highest specificity among a comma-separated selector list.
+///
+/// Specificity compares lexicographically as `(a, b, c)`, which is exactly the
+/// derived tuple ordering, so `max` implements the spec's "most specific" rule.
+fn most_specific(list: &str) -> (u32, u32, u32) {
+    let bytes = list.as_bytes();
+    let (mut parts, mut start, mut depth, mut i) = (Vec::new(), 0usize, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&list[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
+        i += 1;
     }
-    
+    parts.push(&list[start..]);
+    parts
+        .into_iter()
+        .map(|s| calculate_specificity(s.trim()))
+        .max()
+        .unwrap_or((0, 0, 0))
+}
+
+/// Compute a selector's specificity as the `(a, b, c)` tuple defined by
+/// [Selectors Level 4](https://www.w3.org/TR/selectors-4/#specificity-rules):
+///
+/// - `a` counts ID selectors
+/// - `b` counts class selectors, attribute selectors and pseudo-classes
+/// - `c` counts type (element) selectors and pseudo-elements
+///
+/// Combinators, the universal selector `*` and `:where()` contribute nothing.
+/// `:is()`, `:not()` and `:has()` contribute the specificity of their most specific
+/// argument.
+fn calculate_specificity(selector: &str) -> (u32, u32, u32) {
+    let bytes = selector.as_bytes();
+    let mut a = 0; // IDs
+    let mut b = 0; // Classes, attributes, pseudo-classes
+    let mut c = 0; // Elements, pseudo-elements
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                a += 1;
+                i = skip_ident(bytes, i + 1);
+            }
+            b'.' => {
+                b += 1;
+                i = skip_ident(bytes, i + 1);
+            }
+            b'[' => {
+                b += 1;
+                i = skip_attr(bytes, i + 1);
+            }
+            b':' => {
+                if bytes.get(i + 1) == Some(&b':') {
+                    c += 1; // pseudo-element
+                    i = skip_ident(bytes, i + 2);
+                } else {
+                    let end = skip_ident(bytes, i + 1);
+                    let name = selector[i + 1..end].to_ascii_lowercase();
+                    if bytes.get(end) == Some(&b'(') {
+                        let close = matching_paren(bytes, end);
+                        let arg = &selector[end + 1..close.min(bytes.len())];
+                        match name.as_str() {
+                            // Always contributes zero, arguments included.
+                            "where" => {}
+                            // Take the specificity of the most specific argument.
+                            "is" | "not" | "has" => {
+                                let (ia, ib, ic) = most_specific(arg);
+                                a += ia;
+                                b += ib;
+                                c += ic;
+                            }
+                            // Any other functional pseudo-class counts as one
+                            // pseudo-class; `:nth-child(... of S)` additionally
+                            // contributes the specificity of S.
+                            _ => {
+                                b += 1;
+                                if let Some(of) = arg.find(" of ") {
+                                    let (ia, ib, ic) = most_specific(&arg[of + 4..]);
+                                    a += ia;
+                                    b += ib;
+                                    c += ic;
+                                }
+                            }
+                        }
+                        i = (close + 1).min(bytes.len());
+                    } else {
+                        // The four original pseudo-elements may be written with a
+                        // single colon, and still count as pseudo-elements.
+                        if matches!(
+                            name.as_str(),
+                            "before" | "after" | "first-line" | "first-letter"
+                        ) {
+                            c += 1;
+                        } else {
+                            b += 1;
+                        }
+                        i = end;
+                    }
+                }
+            }
+            ch if ch.is_ascii_alphabetic() || ch == b'_' || ch >= 0x80 => {
+                let end = skip_ident(bytes, i);
+                // In `ns|tag` the part before `|` is a namespace prefix, not a type
+                // selector, so it must not be counted. `||` is the column combinator.
+                if bytes.get(end) == Some(&b'|') && bytes.get(end + 1) != Some(&b'|') {
+                    i = end + 1;
+                } else {
+                    c += 1;
+                    i = end;
+                }
+            }
+            // Namespace separator after `*`, combinators, whitespace, `*` and commas
+            // all contribute nothing.
+            _ => i += 1,
+        }
+    }
+
     (a, b, c)
 }
 

@@ -29,11 +29,6 @@ use crate::advanced_net::AdvancedNetworking;
 use crate::security::SecurityManager;
 use crate::memory::MemoryIntegration;
 
-/// Height of the rendered page buffer, in viewports. One viewport above and
-/// one below the visible area keeps most scrolling a plain memory copy
-/// while bounding the buffer's memory.
-const RENDER_BUFFER_VIEWPORTS: f32 = 3.0;
-
 /// Interval for running JavaScript timers while any are pending
 const TIMER_TICK: Duration = Duration::from_millis(16);
 
@@ -348,8 +343,7 @@ impl BrowserApp {
     /// The layout is cached by the renderer until the DOM or the width
     /// changes, so this usually only repaints.
     fn rerender_at(&mut self, start_y: f32) {
-        let render_height = (self.viewport_height() * RENDER_BUFFER_VIEWPORTS) as u32;
-        self.renderer.set_viewport(self.content_width(), render_height.max(1));
+        self.renderer.set_viewport(self.content_width(), self.buffer_height());
 
         let Some(doc) = self.current_document() else { return };
         // Free the old buffer first, so two are never alive at once
@@ -367,8 +361,7 @@ impl BrowserApp {
         let Some(previous) = self.rendered_page.take() else {
             return self.rerender_at(start_y);
         };
-        let render_height = (self.viewport_height() * RENDER_BUFFER_VIEWPORTS) as u32;
-        self.renderer.set_viewport(self.content_width(), render_height.max(1));
+        self.renderer.set_viewport(self.content_width(), self.buffer_height());
 
         let Some(doc) = self.current_document() else { return };
         let rendered = self.renderer.render_document_scrolled(&lock_document(&doc), start_y, previous);
@@ -378,8 +371,16 @@ impl BrowserApp {
         }
     }
 
-    /// Clamp the scroll position to the document and re-render the buffer
-    /// when the viewport gets close to its edge
+    /// Height of the page pixel buffer: exactly the visible area. Scrolling
+    /// moves the rows that stay visible and paints only the exposed ones, so
+    /// no off-screen rows need to be kept (at 1920x1080 an off-screen margin
+    /// of one viewport each way would cost 16 MB).
+    fn buffer_height(&self) -> u32 {
+        (self.viewport_height() as u32).max(1)
+    }
+
+    /// Clamp the scroll position to the document and move the page buffer
+    /// to it
     fn ensure_render_covers_scroll(&mut self) {
         let viewport_height = self.viewport_height();
         let Some(rendered) = self.rendered_page.as_ref() else { return };
@@ -387,19 +388,11 @@ impl BrowserApp {
         let max_scroll = (rendered.content_height - viewport_height).max(0.0);
         self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll);
 
-        let buffer_height = rendered.height as f32;
-        let in_buffer = self.scroll_offset - self.render_start_y;
-        let margin = viewport_height * 0.25;
-
-        let covers_end = self.render_start_y + buffer_height >= rendered.content_height;
-        let near_top = self.render_start_y > 0.0 && in_buffer < margin;
-        let near_bottom = !covers_end && in_buffer + viewport_height > buffer_height - margin;
-
-        if near_top || near_bottom {
-            // Center the viewport in the new buffer. A whole-pixel start lets
-            // the renderer reuse the rows the old and new buffers share.
-            let new_start = (self.scroll_offset - viewport_height).max(0.0).round();
-            self.rerender_scrolled(new_start);
+        // A whole-pixel origin lets the renderer reuse the rows the old and
+        // new buffers share
+        let start = self.scroll_offset.round();
+        if start != self.render_start_y {
+            self.rerender_scrolled(start);
         }
     }
 

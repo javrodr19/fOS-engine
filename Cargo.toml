@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     # JS Engine
     "crates/js/fos-js",
+    "crates/js/fos-jsvm",
     
     # Core Engine
     "crates/engine/fos-engine",

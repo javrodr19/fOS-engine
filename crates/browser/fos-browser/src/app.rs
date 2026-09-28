@@ -4,7 +4,7 @@
 
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -20,6 +20,7 @@ use crate::ui::tab_bar::TAB_BAR_WIDTH;
 use crate::ui::url_bar::URL_BAR_HEIGHT;
 use crate::network::NetworkManager;
 use crate::page::Page;
+use fos_dom::Document;
 use crate::devtools::DevTools;
 use crate::accessibility::AccessibilityManager;
 use crate::media::MediaManager;
@@ -96,8 +97,6 @@ struct BrowserApp {
     scroll_offset: f32,
     /// Y position where rendered buffer starts in document (for sliding window)
     render_start_y: f32,
-    /// Current page HTML (shared with the tab's cache, for re-rendering)
-    current_html: Arc<str>,
     /// Current page URL (final URL after redirects)
     current_url: String,
     /// Mouse position
@@ -144,7 +143,6 @@ impl BrowserApp {
             needs_reload: true,
             scroll_offset: 0.0,
             render_start_y: 0.0,
-            current_html: Arc::from(""),
             current_url: String::new(),
             mouse_x: 0,
             mouse_y: 0,
@@ -180,108 +178,61 @@ impl BrowserApp {
             None => return,
         };
 
-        // If we have cached HTML and don't need network, just re-render
-        if let Some(html) = cached_html {
-            if !needs_network {
-                log::info!("Using cached HTML ({} bytes)", html.len());
-                // Reset scroll only if URL changed (not resize)
-                let reset_scroll = self.current_url != url;
-                self.render_page(html, &url, reset_scroll);
-                self.needs_reload = false;
-                return;
-            }
+        // A tab switch rebuilds the page from its cached HTML, without the network
+        if let (Some(html), false) = (cached_html, needs_network) {
+            log::info!("Using cached HTML ({} bytes)", html.len());
+            // Keep the scroll position if this is the page already shown
+            let reset_scroll = self.current_url != url;
+            self.show_page(Page::from_html(&url, html), reset_scroll);
+            self.run_page_scripts();
+            self.needs_reload = false;
+            return;
         }
 
         log::info!("Loading: {}", url);
         let request_id = self.devtools.log_request(&url, "GET");
 
-        // about: and file: pages never touch the network
+        // about: and file: pages never touch the network. Either way the
+        // HTML is parsed once, into the page's DOM, which scripts and
+        // rendering share.
         let loaded = if Loader::is_local_url(&url) {
             self.loader.load_sync(&url)
-                .map(|page| (page.html, url.clone(), 200))
+                .map(|page| (page, 200))
                 .map_err(|e| e.to_string())
         } else {
             self.network.fetch_page(&url)
-                .map(|page| (page.html, page.url, page.status))
+                .map(|fetched| (Page::from_html(&fetched.url, fetched.html), fetched.status))
                 .map_err(|e| e.to_string())
         };
 
         match loaded {
-            Ok((html, final_url, status)) => {
+            Ok((page, status)) => {
                 self.devtools.log_response(request_id, status, if status < 400 { "OK" } else { "Error" });
 
+                let final_url = page.url.clone();
                 if final_url != url {
                     log::info!("Redirected to {}", final_url);
                     self.chrome.url_bar.set_url(&final_url);
                 }
-
-                // Create page with JavaScript runtime
-                let html: Arc<str> = Arc::from(html);
-                let mut page = Page::from_html(&final_url, html.to_string());
 
                 // Update tab with loaded content and cache the HTML
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     tab.set_final_url(&final_url);
                     tab.title = page.title.clone().unwrap_or_else(|| final_url.clone());
                     tab.loading = false;
-                    tab.cached_html = Some(html.clone());
+                    tab.cached_html = Some(page.html.clone());
                     tab.needs_network_load = false;
                 }
 
-                // Initialize JavaScript (if scripts exist)
-                if let Err(e) = page.initialize_javascript() {
-                    log::warn!("Failed to initialize JavaScript: {}", e);
-                    self.devtools.warn(&format!("JS init failed: {}", e));
-                }
-
-                // Store the page
-                self.current_page = Some(page);
-
-                // Reset scroll for new page loads
-                self.render_page(html, &final_url, true);
+                // Paint first, then run scripts
+                self.show_page(page, true);
 
                 // Jump to the fragment, if the URL has one
                 if let Some((_, fragment)) = final_url.split_once('#') {
                     self.scroll_to_anchor(fragment);
                 }
 
-                // Execute scripts after initial render
-                if let Some(ref mut page) = self.current_page {
-                    if let Err(e) = page.execute_scripts() {
-                        log::warn!("Failed to execute scripts: {}", e);
-                        self.devtools.error(&format!("Script error: {}", e));
-                    }
-
-                    // Build accessibility tree and extract media/canvas from DOM
-                    if let Some(doc) = page.document() {
-                        let doc_guard = match doc.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-
-                        // Accessibility tree
-                        self.a11y.build_from_document(&doc_guard);
-                        let a11y_stats = self.a11y.stats();
-                        log::info!("Built a11y tree: {} focusable elements, {} links",
-                            a11y_stats.focusable_count, a11y_stats.link_count);
-
-                        // Media elements
-                        self.media.extract_from_document(&doc_guard);
-                        let media_stats = self.media.stats();
-                        if media_stats.video_count > 0 || media_stats.audio_count > 0 {
-                            log::info!("Found media: {} videos, {} audios",
-                                media_stats.video_count, media_stats.audio_count);
-                        }
-
-                        // Canvas elements
-                        self.canvas.extract_from_document(&doc_guard);
-                        let canvas_stats = self.canvas.stats();
-                        if canvas_stats.canvas_count > 0 {
-                            log::info!("Found {} canvas elements ({} total pixels)",
-                                canvas_stats.canvas_count, canvas_stats.total_pixels);
-                        }
-                    }
-                }
+                self.run_page_scripts();
             }
             Err(e) => {
                 // Log failed request
@@ -306,20 +257,19 @@ impl BrowserApp {
                     </html>
                 "#, escape_html(&url), escape_html(&e));
 
-                self.current_page = None;
-                self.render_page(Arc::from(error_html), &url, true);
+                self.show_page(Page::from_html(&url, error_html), true);
             }
         }
 
         self.needs_reload = false;
     }
 
-    /// Render a page from HTML (helper for caching)
-    /// If reset_scroll is false, keeps current scroll position (for resize)
-    fn render_page(&mut self, html: Arc<str>, url: &str, reset_scroll: bool) {
-        log::info!("Rendering {} bytes of HTML...", html.len());
-        self.current_html = html;
-        self.current_url = url.to_string();
+    /// Make `page` the displayed page and render it.
+    /// If reset_scroll is false, keeps the current scroll position.
+    fn show_page(&mut self, page: Page, reset_scroll: bool) {
+        log::info!("Rendering {} bytes of HTML...", page.html.len());
+        self.current_url = page.url.clone();
+        self.current_page = Some(page);
 
         if reset_scroll {
             self.scroll_offset = 0.0;
@@ -333,14 +283,77 @@ impl BrowserApp {
         }
     }
 
+    /// Run the current page's scripts, then update everything derived from
+    /// its DOM, which the scripts may have changed
+    fn run_page_scripts(&mut self) {
+        let Some(page) = self.current_page.as_mut() else { return };
+
+        if let Err(e) = page.initialize_javascript() {
+            log::warn!("Failed to initialize JavaScript: {}", e);
+            self.devtools.warn(&format!("JS init failed: {}", e));
+        }
+        if let Err(e) = page.execute_scripts() {
+            log::warn!("Failed to execute scripts: {}", e);
+            self.devtools.error(&format!("Script error: {}", e));
+        }
+
+        self.refresh_if_dom_changed();
+
+        // Build accessibility tree and extract media/canvas from DOM
+        let Some(doc) = self.current_document() else { return };
+        let doc_guard = lock_document(&doc);
+
+        // Accessibility tree
+        self.a11y.build_from_document(&doc_guard);
+        let a11y_stats = self.a11y.stats();
+        log::info!("Built a11y tree: {} focusable elements, {} links",
+            a11y_stats.focusable_count, a11y_stats.link_count);
+
+        // Media elements
+        self.media.extract_from_document(&doc_guard);
+        let media_stats = self.media.stats();
+        if media_stats.video_count > 0 || media_stats.audio_count > 0 {
+            log::info!("Found media: {} videos, {} audios",
+                media_stats.video_count, media_stats.audio_count);
+        }
+
+        // Canvas elements
+        self.canvas.extract_from_document(&doc_guard);
+        let canvas_stats = self.canvas.stats();
+        if canvas_stats.canvas_count > 0 {
+            log::info!("Found {} canvas elements ({} total pixels)",
+                canvas_stats.canvas_count, canvas_stats.total_pixels);
+        }
+    }
+
+    /// The current page's DOM
+    fn current_document(&self) -> Option<Arc<Mutex<Document>>> {
+        self.current_page.as_ref().and_then(Page::document)
+    }
+
+    /// Re-render if the DOM changed since it was laid out (e.g. by a script)
+    fn refresh_if_dom_changed(&mut self) {
+        let Some(doc) = self.current_document() else { return };
+        let current = self.renderer.is_layout_current(&lock_document(&doc));
+        if !current {
+            log::debug!("DOM changed, re-rendering");
+            self.rerender_at(self.render_start_y);
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+    }
+
     /// Render the page buffer starting at document position `start_y`.
     ///
-    /// Parsing and styles are cached by the renderer, so this only repaints.
+    /// The layout is cached by the renderer until the DOM or the width
+    /// changes, so this usually only repaints.
     fn rerender_at(&mut self, start_y: f32) {
         let render_height = (self.viewport_height() * RENDER_BUFFER_VIEWPORTS) as u32;
         self.renderer.set_viewport(self.content_width(), render_height.max(1));
 
-        if let Some(rendered) = self.renderer.render_html(&self.current_html, &self.current_url, start_y) {
+        let Some(doc) = self.current_document() else { return };
+        let rendered = self.renderer.render_document(&lock_document(&doc), start_y);
+        if let Some(rendered) = rendered {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
         }
@@ -401,6 +414,8 @@ impl BrowserApp {
                 if let Err(e) = page.process_timers() {
                     log::warn!("Timer processing error: {}", e);
                 }
+                // Timer callbacks may have changed the DOM
+                self.refresh_if_dom_changed();
             }
         }
     }
@@ -427,7 +442,7 @@ impl BrowserApp {
         } else if self.resize_pending {
             // Re-render at the new size (the parsed page is reused)
             self.resize_pending = false;
-            if !self.current_html.is_empty() {
+            if self.current_page.is_some() {
                 let start = self.render_start_y;
                 self.rerender_at(start);
                 self.ensure_render_covers_scroll();
@@ -639,14 +654,8 @@ impl BrowserApp {
                     // Log to console when opening
                     self.devtools.log("DevTools opened");
                     // Inspect current page DOM
-                    if let Some(ref page) = self.current_page {
-                        if let Some(doc) = page.document() {
-                            let doc_guard = match doc.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            self.devtools.inspect_document(&doc_guard);
-                        }
+                    if let Some(doc) = self.current_document() {
+                        self.devtools.inspect_document(&lock_document(&doc));
                     }
                 }
                 self.request_redraw();
@@ -798,6 +807,12 @@ impl BrowserApp {
 }
 
 /// Escape text for inclusion in HTML
+/// Lock a page's DOM. A panic while it was locked may leave it half
+/// mutated, but it is still a valid tree, so rendering carries on.
+fn lock_document(doc: &Mutex<Document>) -> MutexGuard<'_, Document> {
+    doc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }

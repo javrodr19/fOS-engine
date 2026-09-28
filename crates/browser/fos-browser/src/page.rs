@@ -12,8 +12,8 @@ pub struct Page {
     pub url: String,
     /// Page title
     pub title: Option<String>,
-    /// HTML source
-    pub html: String,
+    /// HTML source (shared, e.g. with the tab's cache)
+    pub html: Arc<str>,
     /// Parsed DOM document
     pub document: Option<Arc<Mutex<Document>>>,
     /// JavaScript runtime for this page
@@ -63,7 +63,7 @@ impl Page {
         Self {
             url: url.to_string(),
             title: None,
-            html: String::new(),
+            html: Arc::from(""),
             document: None,
             js_runtime: Some(PageJsRuntime::new(url)),
             rendered: None,
@@ -76,21 +76,20 @@ impl Page {
         }
     }
     
-    /// Create from HTML content
-    pub fn from_html(url: &str, html: String) -> Self {
+    /// Create from HTML content, parsing it into the page's DOM. The DOM
+    /// is the page's single parsed form: scripts and rendering share it.
+    pub fn from_html(url: &str, html: impl Into<Arc<str>>) -> Self {
         let mut page = Self::new(url);
-        page.html = html.clone();
-        
-        // Extract title from HTML (simple extraction)
-        page.title = extract_title(&page.html);
-        
-        // Parse HTML into DOM
-        let document = fos_html::parse_with_url(&html, url);
+        page.html = html.into();
+
+        let document = fos_html::parse_with_url(&page.html, url);
+        let title = document.title();
+        page.title = (!title.is_empty()).then_some(title);
         page.document = Some(Arc::new(Mutex::new(document)));
-        
+
         page
     }
-    
+
     /// Initialize JavaScript runtime and execute scripts
     pub fn initialize_javascript(&mut self) -> Result<(), String> {
         if self.js_initialized {
@@ -196,36 +195,17 @@ impl Page {
     }
 }
 
-/// Extract title from HTML (simple regex-free extraction)
-fn extract_title(html: &str) -> Option<String> {
-    let html_lower = html.to_lowercase();
-    
-    let start = html_lower.find("<title>")?;
-    let end = html_lower.find("</title>")?;
-    
-    if end > start + 7 {
-        let title = &html[start + 7..end];
-        Some(title.trim().to_string())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     
     #[test]
-    fn test_extract_title() {
-        let html = r#"<!DOCTYPE html>
-            <html>
-            <head><title>Test Page</title></head>
-            <body></body>
-            </html>"#;
-        
-        assert_eq!(extract_title(html), Some("Test Page".to_string()));
+    fn test_title_whitespace_is_collapsed() {
+        let page = Page::from_html("https://example.com", "<title>\n  Two\t words  </title><p>x</p>");
+        assert_eq!(page.title.as_deref(), Some("Two words"));
+        assert_eq!(Page::from_html("https://example.com", "<p>untitled</p>").title, None);
     }
-    
+
     #[test]
     fn test_page_from_html() {
         let html = r#"<!DOCTYPE html>
@@ -234,8 +214,9 @@ mod tests {
             <body><p>Content</p></body>
             </html>"#;
         
-        let page = Page::from_html("https://example.com", html.to_string());
+        let page = Page::from_html("https://example.com", html);
         assert_eq!(page.title, Some("Hello".to_string()));
+        assert_eq!(&*page.html, html);
         assert!(page.document.is_some());
         assert!(page.js_runtime.is_some());
     }

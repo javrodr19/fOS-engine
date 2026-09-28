@@ -83,28 +83,21 @@ impl Document {
         &self.url
     }
     
-    /// Get document title
+    /// Get document title: the text of the `<title>` in `<head>`, with
+    /// ASCII whitespace stripped and collapsed (HTML `document.title`)
     pub fn title(&self) -> String {
-        // Find <title> in <head>
         if !self.head_element.is_valid() {
             return String::new();
         }
-        
-        for (id, node) in self.tree.children(self.head_element) {
-            if let Some(elem) = node.as_element() {
-                let tag = self.tree.resolve(elem.name.local);
-                if tag == "title" {
-                    // Get text content of title
-                    for (_, child) in self.tree.children(id) {
-                        if let Some(text) = child.as_text() {
-                            return text.to_string();
-                        }
-                    }
-                }
-            }
-        }
-        
-        String::new()
+
+        let Some((title_id, _)) = self.tree.children(self.head_element).find(|(_, node)| {
+            node.as_element().is_some_and(|elem| self.tree.resolve(elem.name.local) == "title")
+        }) else {
+            return String::new();
+        };
+
+        let text: String = self.tree.children(title_id).filter_map(|(_, child)| child.as_text()).collect();
+        text.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
     }
     
     /// Get <html> element

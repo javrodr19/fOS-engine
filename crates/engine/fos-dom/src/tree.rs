@@ -6,14 +6,35 @@
 //! - O(1) node lookup by ID
 //! - Easy serialization/cloning
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{Node, NodeId, NodeData, QualName, InternedString, StringInterner};
+
+/// Source of process-unique tree IDs
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies one state of one DOM tree.
+///
+/// Two equal revisions mean the same tree with no mutation in between, so
+/// anything derived from the tree (styles, layout) is still valid. Trees
+/// get process-unique IDs, so revisions of different trees never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DomRevision {
+    tree: u64,
+    mutations: u64,
+}
 
 /// Arena-based DOM tree
 pub struct DomTree {
-    /// All nodes in contiguous memory (pub for TreeSink access)
+    /// All nodes in contiguous memory (pub for TreeSink access). Code that
+    /// writes to it directly must call [`DomTree::mark_mutated`].
     pub nodes: Vec<Node>,
     /// String interner for deduplication
     interner: StringInterner,
+    /// Process-unique ID of this tree
+    id: u64,
+    /// Mutations made through the tree's API
+    mutations: u64,
 }
 
 impl DomTree {
@@ -22,6 +43,8 @@ impl DomTree {
         let mut tree = Self {
             nodes: Vec::with_capacity(256), // Pre-allocate for typical page
             interner: StringInterner::new(),
+            id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
+            mutations: 0,
         };
         
         // Create document root at index 0
@@ -35,11 +58,25 @@ impl DomTree {
         let mut tree = Self {
             nodes: Vec::with_capacity(node_count),
             interner: StringInterner::new(),
+            id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
+            mutations: 0,
         };
         tree.nodes.push(Node::document());
         tree
     }
     
+    /// The tree's current revision; it changes on every mutation
+    #[inline]
+    pub fn revision(&self) -> DomRevision {
+        DomRevision { tree: self.id, mutations: self.mutations }
+    }
+
+    /// Record a mutation made by writing to `nodes` directly
+    #[inline]
+    pub fn mark_mutated(&mut self) {
+        self.mutations += 1;
+    }
+
     /// Get the document root
     #[inline]
     pub fn root(&self) -> NodeId {
@@ -52,9 +89,10 @@ impl DomTree {
         self.nodes.get(id.index())
     }
     
-    /// Get a mutable node by ID
+    /// Get a mutable node by ID (counts as a mutation)
     #[inline]
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.mark_mutated();
         self.nodes.get_mut(id.index())
     }
     
@@ -64,6 +102,7 @@ impl DomTree {
         let ns = InternedString::EMPTY;
         let name = QualName::new(ns, local);
         
+        self.mark_mutated();
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node::element(name));
         id
@@ -75,6 +114,7 @@ impl DomTree {
         let local = self.interner.intern(tag);
         let name = QualName::new(ns, local);
         
+        self.mark_mutated();
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node::element(name));
         id
@@ -82,6 +122,7 @@ impl DomTree {
     
     /// Create a new text node
     pub fn create_text(&mut self, content: &str) -> NodeId {
+        self.mark_mutated();
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node::text(content.to_string()));
         id
@@ -89,6 +130,7 @@ impl DomTree {
     
     /// Create a comment node
     pub fn create_comment(&mut self, content: &str) -> NodeId {
+        self.mark_mutated();
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node {
             parent: NodeId::NONE,
@@ -103,6 +145,7 @@ impl DomTree {
     
     /// Append a child to a parent node
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        self.mark_mutated();
         // Update child's parent
         if let Some(child) = self.nodes.get_mut(child_id.index()) {
             child.parent = parent_id;
@@ -136,6 +179,7 @@ impl DomTree {
     
     /// Remove a node from its parent
     pub fn remove(&mut self, node_id: NodeId) {
+        self.mark_mutated();
         let (parent_id, prev_id, next_id) = {
             let node = match self.nodes.get(node_id.index()) {
                 Some(n) => n,
@@ -266,6 +310,31 @@ mod tests {
         assert_eq!(tree.len(), 4);
     }
     
+    #[test]
+    fn test_revision_tracks_mutations() {
+        let mut tree = DomTree::new();
+        let other = DomTree::new();
+        assert_ne!(tree.revision(), other.revision());
+
+        let start = tree.revision();
+        assert_eq!(tree.revision(), start);
+
+        let div = tree.create_element("div");
+        let after_create = tree.revision();
+        assert_ne!(after_create, start);
+
+        tree.append_child(tree.root(), div);
+        let after_append = tree.revision();
+        assert_ne!(after_append, after_create);
+
+        tree.get_mut(div);
+        assert_ne!(tree.revision(), after_append);
+
+        let before_remove = tree.revision();
+        tree.remove(div);
+        assert_ne!(tree.revision(), before_remove);
+    }
+
     #[test]
     fn test_memory_size() {
         // Verify Node is reasonably sized

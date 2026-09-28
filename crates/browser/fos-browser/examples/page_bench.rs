@@ -9,6 +9,7 @@
 use std::time::Instant;
 
 use fos_browser::network::NetworkManager;
+use fos_browser::page::Page;
 use fos_browser::renderer::PageRenderer;
 
 const VIEWPORT_WIDTH: u32 = 1024;
@@ -40,14 +41,21 @@ fn main() {
         (page.html, page.url)
     };
 
+    // Parse once into the page's DOM, as the browser does
+    let start = Instant::now();
+    let page = Page::from_html(&url, html);
+    let document = page.document().expect("page has a DOM");
+    let document = document.lock().unwrap();
+    println!("parse:        {:>8.1} ms  {} DOM nodes", ms(start), document.tree().len());
+
     // Render three viewports, as the browser does
     let buffer_height = VIEWPORT_HEIGHT * 3;
     let mut renderer = PageRenderer::new(VIEWPORT_WIDTH, buffer_height);
 
     let start = Instant::now();
-    let first = renderer.render_html(&html, &url, 0.0).expect("render failed");
+    let first = renderer.render_document(&document, 0.0).expect("render failed");
     println!(
-        "first render: {:>8.1} ms  {}x{} buffer, document height {:.0}px, {} links",
+        "first render: {:>8.1} ms  (layout + paint) {}x{} buffer, document height {:.0}px, {} links",
         ms(start),
         first.width,
         first.height,
@@ -60,7 +68,7 @@ fn main() {
     let start = Instant::now();
     for i in 1..=steps {
         let y = i as f32 * VIEWPORT_HEIGHT as f32;
-        renderer.render_html(&html, &url, y).expect("render failed");
+        renderer.render_document(&document, y).expect("render failed");
     }
     println!("scroll:       {:>8.1} ms/render over {} re-renders", ms(start) / steps as f64, steps);
 

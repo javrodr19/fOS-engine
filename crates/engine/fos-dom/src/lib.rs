@@ -40,7 +40,7 @@ pub mod concurrent_dom;
 pub mod query_index;
 
 pub use node::{Node, NodeData, ElementData, TextData};
-pub use tree::DomTree;
+pub use tree::{DomTree, DomRevision};
 pub use document::Document;
 pub use interner::{StringInterner, InternedString};
 pub use forms::{

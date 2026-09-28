@@ -1032,6 +1032,7 @@ dependencies = [
 name = "fos-render"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fos-css",
  "fos-layout",
  "fos-text",

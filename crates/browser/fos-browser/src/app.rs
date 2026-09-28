@@ -352,7 +352,26 @@ impl BrowserApp {
         self.renderer.set_viewport(self.content_width(), render_height.max(1));
 
         let Some(doc) = self.current_document() else { return };
+        // Free the old buffer first, so two are never alive at once
+        self.rendered_page = None;
         let rendered = self.renderer.render_document(&lock_document(&doc), start_y);
+        if let Some(rendered) = rendered {
+            self.rendered_page = Some(rendered);
+            self.render_start_y = start_y;
+        }
+    }
+
+    /// Move the page buffer to document position `start_y`, repainting only
+    /// the rows that were not in the previous buffer
+    fn rerender_scrolled(&mut self, start_y: f32) {
+        let Some(previous) = self.rendered_page.take() else {
+            return self.rerender_at(start_y);
+        };
+        let render_height = (self.viewport_height() * RENDER_BUFFER_VIEWPORTS) as u32;
+        self.renderer.set_viewport(self.content_width(), render_height.max(1));
+
+        let Some(doc) = self.current_document() else { return };
+        let rendered = self.renderer.render_document_scrolled(&lock_document(&doc), start_y, previous);
         if let Some(rendered) = rendered {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
@@ -377,9 +396,10 @@ impl BrowserApp {
         let near_bottom = !covers_end && in_buffer + viewport_height > buffer_height - margin;
 
         if near_top || near_bottom {
-            // Center the viewport in the new buffer
-            let new_start = (self.scroll_offset - viewport_height).max(0.0);
-            self.rerender_at(new_start);
+            // Center the viewport in the new buffer. A whole-pixel start lets
+            // the renderer reuse the rows the old and new buffers share.
+            let new_start = (self.scroll_offset - viewport_height).max(0.0).round();
+            self.rerender_scrolled(new_start);
         }
     }
 

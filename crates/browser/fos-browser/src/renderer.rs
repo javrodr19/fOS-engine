@@ -60,6 +60,10 @@ pub struct RenderedPage {
     pub links: Vec<LinkRegion>,
     /// Anchor positions for in-page navigation (buffer coordinates)
     pub anchors: Vec<AnchorPosition>,
+    /// Document y of the buffer's first row
+    origin: f32,
+    /// Layout the pixels were painted from (see `PageRenderer::layout_generation`)
+    layout_generation: u64,
 }
 
 /// A run of text with uniform style within a line
@@ -135,6 +139,9 @@ pub struct PageRenderer {
     default_font: Option<FontId>,
     /// Layout of the most recently rendered page
     cached: Option<CachedLayout>,
+    /// Incremented for every new layout, to tell whether a rendered
+    /// buffer was painted from the current one
+    layout_generation: u64,
 }
 
 impl PageRenderer {
@@ -155,6 +162,7 @@ impl PageRenderer {
             text_renderer,
             default_font,
             cached: None,
+            layout_generation: 0,
         }
     }
 
@@ -204,6 +212,37 @@ impl PageRenderer {
         self.paint_cached(scroll_offset)
     }
 
+    /// Render like [`Self::render_document`], reusing `previous` (a render
+    /// of the same layout at another scroll offset) when the viewport has
+    /// only moved: rows still in view are moved, and only the newly exposed
+    /// rows are painted. Falls back to a full render when the buffers are
+    /// not compatible (new layout, new size, fractional or large scroll).
+    pub fn render_document_scrolled(
+        &mut self,
+        document: &Document,
+        scroll_offset: f32,
+        previous: RenderedPage,
+    ) -> Option<RenderedPage> {
+        let source = LayoutSource::Dom(document.tree().revision());
+        if !self.has_layout(source) {
+            self.lay_out(source, document);
+        }
+
+        let delta = scroll_offset - previous.origin;
+        let reusable = previous.layout_generation == self.layout_generation
+            && previous.width == self.viewport_width
+            && previous.height == self.viewport_height
+            && previous.pixels.len() == self.viewport_width as usize * self.viewport_height as usize
+            && delta.fract() == 0.0
+            && delta.abs() < self.viewport_height as f32;
+        if reusable {
+            self.repaint_scrolled(previous, scroll_offset)
+        } else {
+            drop(previous);
+            self.paint_cached(scroll_offset)
+        }
+    }
+
     /// Whether the cached layout reflects `document` as it is now
     pub fn is_layout_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
@@ -222,6 +261,7 @@ impl PageRenderer {
         let layout = build_layout(document, &styles, width);
         // The styles are dropped here; only the display list is kept
         self.cached = Some(CachedLayout { source, width, layout });
+        self.layout_generation += 1;
     }
 
     /// Paint the visible region of the cached layout
@@ -229,11 +269,9 @@ impl PageRenderer {
         let cached = self.cached.take()?;
 
         let mut links = Vec::new();
-        let painted = self.paint(&cached.layout, scroll_offset, &mut links);
+        let painted = self.paint(&cached.layout, scroll_offset, self.viewport_height, &mut links);
         let content_height = cached.layout.content_height;
-        let anchors = cached.layout.anchors.iter()
-            .map(|a| AnchorPosition { id: a.id.clone(), y: a.y - scroll_offset })
-            .collect();
+        let anchors = anchors_from(&cached.layout, scroll_offset);
         self.cached = Some(cached);
 
         Some(RenderedPage {
@@ -243,7 +281,59 @@ impl PageRenderer {
             content_height,
             links,
             anchors,
+            origin: scroll_offset,
+            layout_generation: self.layout_generation,
         })
+    }
+
+    /// Move `page` (painted from the cached layout) to `scroll_offset`,
+    /// less than a buffer height away, painting only the exposed rows
+    fn repaint_scrolled(&mut self, mut page: RenderedPage, scroll_offset: f32) -> Option<RenderedPage> {
+        let delta = (scroll_offset - page.origin) as i64;
+        if delta == 0 {
+            return Some(page);
+        }
+        let cached = self.cached.take()?;
+
+        let width = page.width as usize;
+        let height = page.height as usize;
+        let shift = delta.unsigned_abs() as usize;
+        // Rows [kept_top, kept_bottom) of the new buffer come from the old one
+        let (kept_top, band_top) = if delta > 0 {
+            page.pixels.copy_within(shift * width.., 0);
+            (0, height - shift)
+        } else {
+            page.pixels.copy_within(..(height - shift) * width, shift * width);
+            (shift, 0)
+        };
+        let kept_bottom = kept_top + (height - shift);
+
+        let mut band_links = Vec::new();
+        let band_origin = scroll_offset + band_top as f32;
+        let band = self.paint(&cached.layout, band_origin, shift as u32, &mut band_links);
+        page.anchors = anchors_from(&cached.layout, scroll_offset);
+        self.cached = Some(cached);
+        page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
+
+        // Links: the old ones still in view, moved, plus the band's. A link
+        // crossing the band edge is in both lists.
+        let (kept_top, kept_bottom) = (kept_top as f32, kept_bottom as f32);
+        page.links.retain_mut(|link| {
+            link.y -= delta as f32;
+            link.y + link.height > kept_top && link.y < kept_bottom
+        });
+        for mut link in band_links {
+            link.y += band_top as f32;
+            let duplicate = page.links.iter().any(|l| {
+                l.href == link.href && l.x == link.x && (l.y - link.y).abs() < 0.5
+            });
+            if !duplicate {
+                page.links.push(link);
+            }
+        }
+
+        page.origin = scroll_offset;
+        Some(page)
     }
 
     /// Compute styles for all elements using CSS from document
@@ -504,15 +594,13 @@ impl PageRenderer {
     /// Paint the part of `layout` starting at document y `scroll_offset`.
     ///
     /// Only lines intersecting the canvas are shaped and drawn.
-    fn paint(&mut self, layout: &PageLayout, scroll_offset: f32, links: &mut Vec<LinkRegion>) -> Option<Vec<u32>> {
-        let mut canvas = Canvas::new(self.viewport_width, self.viewport_height)?;
-        canvas.clear(Color::WHITE);
+    fn paint(&mut self, layout: &PageLayout, scroll_offset: f32, height: u32, links: &mut Vec<LinkRegion>) -> Option<Vec<u32>> {
+        let mut canvas = Canvas::filled(self.viewport_width, height, Color::WHITE)?;
 
         if layout.lines.is_empty() && layout.rules.is_empty() {
-            if scroll_offset < self.viewport_height as f32 {
-                self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0 - scroll_offset, Color::rgb(100, 100, 100), 16.0);
-            }
-            return Some(canvas.to_argb32());
+            // Clipped to the canvas like any text
+            self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0 - scroll_offset, Color::rgb(100, 100, 100), 16.0);
+            return Some(canvas.into_argb32());
         }
 
         let canvas_height = canvas.height() as f32;
@@ -532,9 +620,11 @@ impl PageRenderer {
                 // Painting returns the advance, so the text is shaped only once
                 let width = self.paint_text(&mut canvas, &segment.text, x, y, segment.color, segment.font_size);
 
-                if let Some(ref href) = segment.href {
-                    // Text is drawn with its baseline at y, so the region spans the line above it
-                    let height = segment.font_size * 1.2;
+                // Text is drawn with its baseline at y, so the region spans
+                // the line above it. Lines just outside the canvas are painted
+                // for their overhang, but their links are not on it.
+                let height = segment.font_size * 1.2;
+                if let Some(href) = segment.href.as_ref().filter(|_| y > 0.0 && y - height < canvas_height) {
                     links.push(LinkRegion {
                         x,
                         y: y - height,
@@ -553,7 +643,7 @@ impl PageRenderer {
             canvas.fill_rect(rule.x, rule.y - scroll_offset, rule.width, 1.0, Color::rgb(128, 128, 128));
         }
 
-        Some(canvas.to_argb32())
+        Some(canvas.into_argb32())
     }
 
     /// Text painting using TextRenderer with proper fonts.
@@ -620,6 +710,13 @@ fn page_key(html: &str, base_url: &str) -> u64 {
     html.hash(&mut hasher);
     base_url.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Anchor positions relative to a buffer starting at document y `origin`
+fn anchors_from(layout: &PageLayout, origin: f32) -> Vec<AnchorPosition> {
+    layout.anchors.iter()
+        .map(|a| AnchorPosition { id: a.id.clone(), y: a.y - origin })
+        .collect()
 }
 
 /// Lay out the document body into lines for a viewport of `width` pixels
@@ -1356,6 +1453,59 @@ mod tests {
         let after = renderer.render_document(&document, 0.0).unwrap();
         assert!(renderer.is_layout_current(&document));
         assert!(after.content_height > before.content_height);
+    }
+
+    /// A page tall enough to scroll, with links spread through it
+    fn long_page() -> String {
+        let mut html = String::from("<html><body>");
+        for i in 0..200 {
+            html.push_str(&format!("<p id=\"p{i}\">Paragraph {i} with <a href=\"/l{i}\">a link</a> and text.</p>"));
+        }
+        html.push_str("</body></html>");
+        html
+    }
+
+    #[test]
+    fn test_scrolled_render_matches_full_render() {
+        let document = fos_html::parse_with_url(&long_page(), "https://example.com/");
+        let mut renderer = PageRenderer::new(300, 240);
+        let mut page = renderer.render_document(&document, 0.0).unwrap();
+
+        // Down, further down, back up (both band positions), and a jump
+        // too far to reuse anything
+        for offset in [100.0, 339.0, 250.0, 17.0, 1500.0, 1400.0] {
+            page = renderer.render_document_scrolled(&document, offset, page).unwrap();
+            let mut fresh = PageRenderer::new(300, 240);
+            let full = fresh.render_document(&document, offset).unwrap();
+
+            assert!(page.pixels == full.pixels, "pixels differ at offset {offset}");
+            let mut got: Vec<_> = page.links.iter().map(|l| (l.href.clone(), l.y.round() as i32)).collect();
+            let mut want: Vec<_> = full.links.iter().map(|l| (l.href.clone(), l.y.round() as i32)).collect();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "links differ at offset {offset}");
+            assert_eq!(page.anchors.len(), full.anchors.len());
+            assert_eq!(page.anchors[5].y, full.anchors[5].y);
+        }
+    }
+
+    #[test]
+    fn test_scrolled_render_after_mutation_is_full() {
+        let mut document = fos_html::parse_with_url(&long_page(), "https://example.com/");
+        let mut renderer = PageRenderer::new(300, 240);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+
+        let body = document.body();
+        let tree = document.tree_mut();
+        let p = tree.create_element("p");
+        let text = tree.create_text("Inserted at the end");
+        tree.append_child(p, text);
+        tree.append_child(body, p);
+
+        let scrolled = renderer.render_document_scrolled(&document, 50.0, page).unwrap();
+        let full = PageRenderer::new(300, 240).render_document(&document, 50.0).unwrap();
+        assert!(scrolled.pixels == full.pixels);
+        assert_eq!(scrolled.content_height, full.content_height);
     }
 
     #[test]

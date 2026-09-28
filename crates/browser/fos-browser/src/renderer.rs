@@ -257,9 +257,13 @@ impl PageRenderer {
         // Free the old layout first, so two are never alive at once
         self.cached = None;
         let width = self.viewport_width;
-        let styles = self.compute_styles(document);
-        let layout = build_layout(document, &styles, width);
-        // The styles are dropped here; only the display list is kept
+        let styler = Styler {
+            renderer: self,
+            tree: document.tree(),
+            stylesheet: self.page_stylesheet(document),
+        };
+        let layout = build_layout(document, &styler, width);
+        // Only the display list is kept
         self.cached = Some(CachedLayout { source, width, layout });
         self.layout_generation += 1;
     }
@@ -336,34 +340,22 @@ impl PageRenderer {
         Some(page)
     }
 
-    /// Compute styles for all elements using CSS from document
-    fn compute_styles(&self, document: &Document) -> HashMap<NodeId, ComputedStyle> {
-        let mut styles = HashMap::new();
-        let tree = document.tree();
-
-        // 1. Extract CSS from <style> tags in <head>
+    /// Parse the page's own CSS (`<style>` elements)
+    fn page_stylesheet(&self, document: &Document) -> Option<Stylesheet> {
         let css_text = self.extract_css_from_document(document);
-
-        // 2. Parse CSS into stylesheet
-        let stylesheet = if !css_text.is_empty() {
-            match parse_stylesheet(&css_text) {
-                Ok(ss) => {
-                    log::debug!("Parsed {} CSS rules from page", ss.rules.len());
-                    Some(ss)
-                }
-                Err(e) => {
-                    log::warn!("CSS parse error: {}", e);
-                    None
-                }
+        if css_text.is_empty() {
+            return None;
+        }
+        match parse_stylesheet(&css_text) {
+            Ok(ss) => {
+                log::debug!("Parsed {} CSS rules from page", ss.rules.len());
+                Some(ss)
             }
-        } else {
-            None
-        };
-
-        // 3. Compute styles for all nodes (using old method that works)
-        self.compute_styles_recursive(tree, tree.root(), &mut styles, stylesheet.as_ref());
-
-        styles
+            Err(e) => {
+                log::warn!("CSS parse error: {}", e);
+                None
+            }
+        }
     }
 
     /// Extract CSS text from <style> tags in document
@@ -444,52 +436,28 @@ impl PageRenderer {
         }
     }
 
-    /// Recursively compute styles with CSS matching
-    fn compute_styles_recursive(
+    /// Compute an element's style: browser defaults, then the page's
+    /// matching rules, then its `style` attribute
+    fn compute_element_style(
         &self,
         tree: &DomTree,
         node_id: NodeId,
-        styles: &mut HashMap<NodeId, ComputedStyle>,
+        element: &fos_dom::ElementData,
         stylesheet: Option<&Stylesheet>,
-    ) {
-        if !node_id.is_valid() {
-            return;
-        }
-
-        // Create default computed style
+    ) -> ComputedStyle {
         let mut style = ComputedStyle::default();
+        let tag_name = tree.resolve(element.name.local);
 
-        // Get node to check for element type and attributes
-        if let Some(node) = tree.get(node_id) {
-            if let Some(element) = node.as_element() {
-                // Get tag name
-                let tag_name = tree.resolve(element.name.local);
-
-                // 1. Apply default browser styles based on element type
-                apply_default_styles(&mut style, tag_name);
-
-                // 2. Apply matching CSS rules from stylesheet
-                if let Some(ss) = stylesheet {
-                    self.apply_matching_rules(tree, node_id, element, tag_name, ss, &mut style);
-                }
-
-                // 3. Apply inline style attribute
-                for attr in element.attrs.iter() {
-                    let attr_name = tree.resolve(attr.name.local);
-                    if attr_name == "style" {
-                        // Parse inline CSS declarations
-                        self.apply_inline_style(&attr.value, &mut style);
-                    }
-                }
+        apply_default_styles(&mut style, tag_name);
+        if let Some(ss) = stylesheet {
+            self.apply_matching_rules(tree, node_id, element, tag_name, ss, &mut style);
+        }
+        for attr in element.attrs.iter() {
+            if tree.resolve(attr.name.local) == "style" {
+                self.apply_inline_style(&attr.value, &mut style);
             }
         }
-
-        styles.insert(node_id, style);
-
-        // Process children
-        for (child_id, _) in tree.children(node_id) {
-            self.compute_styles_recursive(tree, child_id, styles, stylesheet);
-        }
+        style
     }
 
     /// Apply matching CSS rules to element style
@@ -719,8 +687,28 @@ fn anchors_from(layout: &PageLayout, origin: f32) -> Vec<AnchorPosition> {
         .collect()
 }
 
+/// Computes element styles on demand while laying out.
+///
+/// Layout visits each element once and needs its style only while visiting
+/// it, so styles are never stored for the whole tree: memory stays
+/// proportional to the tree's depth, and elements layout skips (`<head>`,
+/// scripts, hidden subtrees) are never styled at all.
+struct Styler<'a> {
+    renderer: &'a PageRenderer,
+    tree: &'a DomTree,
+    stylesheet: Option<Stylesheet>,
+}
+
+impl Styler<'_> {
+    /// Style of an element (`None` for other nodes)
+    fn style(&self, node_id: NodeId) -> Option<ComputedStyle> {
+        let element = self.tree.get(node_id)?.as_element()?;
+        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref()))
+    }
+}
+
 /// Lay out the document body into lines for a viewport of `width` pixels
-fn build_layout(document: &Document, styles: &HashMap<NodeId, ComputedStyle>, width: u32) -> PageLayout {
+fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLayout {
     let tree = document.tree();
     let body = document.body();
 
@@ -728,7 +716,7 @@ fn build_layout(document: &Document, styles: &HashMap<NodeId, ComputedStyle>, wi
 
     let mut builder = LayoutBuilder {
         tree,
-        styles,
+        styler,
         // Leave margin for the right edge
         line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, 16.0),
         // Document y of the first line
@@ -751,7 +739,7 @@ fn build_layout(document: &Document, styles: &HashMap<NodeId, ComputedStyle>, wi
 /// Walks the DOM, accumulating inline text into lines
 struct LayoutBuilder<'a> {
     tree: &'a DomTree,
-    styles: &'a HashMap<NodeId, ComputedStyle>,
+    styler: &'a Styler<'a>,
     line_buffer: LineBuffer,
     /// Current document y (baseline of the next line)
     y: f32,
@@ -773,14 +761,11 @@ impl LayoutBuilder<'_> {
         };
 
         // Get style
-        let styles = self.styles;
-        let style = styles.get(&node_id);
+        let style = self.styler.style(node_id);
 
         // Check if hidden
-        if let Some(s) = style {
-            if matches!(s.display, Display::None) {
-                return;
-            }
+        if style.as_ref().is_some_and(|s| matches!(s.display, Display::None)) {
+            return;
         }
 
         // If text node, add to line buffer (collapsing whitespace)
@@ -825,7 +810,7 @@ impl LayoutBuilder<'_> {
             "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
             "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
 
-        let font_size = style.map(|s| s.font_size).unwrap_or(self.line_buffer.current_font_size);
+        let font_size = style.as_ref().map(|s| s.font_size).unwrap_or(self.line_buffer.current_font_size);
 
         // Block elements flush the line buffer and add vertical space
         if is_block {
@@ -1529,8 +1514,8 @@ mod tests {
     fn test_layout_lines_are_ordered() {
         let document = fos_html::parse_with_url(PAGE, "https://example.com/");
         let renderer = PageRenderer::new(320, 240);
-        let styles = renderer.compute_styles(&document);
-        let layout = build_layout(&document, &styles, 320);
+        let styler = Styler { renderer: &renderer, tree: document.tree(), stylesheet: renderer.page_stylesheet(&document) };
+        let layout = build_layout(&document, &styler, 320);
 
         assert!(!layout.lines.is_empty());
         assert!(layout.lines.windows(2).all(|w| w[0].y <= w[1].y));

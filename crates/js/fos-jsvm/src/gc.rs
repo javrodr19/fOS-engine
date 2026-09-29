@@ -111,6 +111,14 @@ impl<T> Gc<T> {
         unsafe { &mut *(*self.ptr.as_ptr()).value.get() }
     }
 
+    /// Mutable access not tied to a borrow of this handle (for returning
+    /// references into a cell from helpers). Same rules as `get_mut`.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut_detached<'a>(self) -> &'a mut T {
+        unsafe { &mut *(*self.ptr.as_ptr()).value.get() }
+    }
+
     #[inline(always)]
     fn header(&self) -> &Header {
         unsafe { &(*self.ptr.as_ptr()).header }
@@ -136,9 +144,15 @@ pub trait Trace {
 /// Marking state: cells marked but not yet scanned
 pub struct Tracer {
     stack: Vec<*mut Header>,
+    epoch: u32,
 }
 
 impl Tracer {
+    /// Distinguishes collections (for structures traced at most once each)
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     #[inline]
     pub fn mark<T: Trace>(&mut self, gc: Gc<T>) {
         let header = gc.header();
@@ -174,6 +188,8 @@ pub struct Heap {
     threshold: Cell<usize>,
     cells: Cell<usize>,
     collections: Cell<u32>,
+    /// Collect at every safepoint (testing)
+    stress: Cell<bool>,
 }
 
 /// Never collect below this heap size
@@ -193,6 +209,7 @@ impl Heap {
             threshold: Cell::new(MIN_THRESHOLD),
             cells: Cell::new(0),
             collections: Cell::new(0),
+            stress: Cell::new(false),
         }
     }
 
@@ -214,6 +231,15 @@ impl Heap {
         self.bytes.set(self.bytes.get() + size);
         self.cells.set(self.cells.get() + 1);
         Gc { ptr: unsafe { NonNull::new_unchecked(ptr) }, _marker: PhantomData }
+    }
+
+    /// Collect very often (after 16 KB or a quarter of the live heap has
+    /// been allocated), to shake out missing roots in tests
+    pub fn set_stress(&self, on: bool) {
+        self.stress.set(on);
+        if on {
+            self.threshold.set(0);
+        }
     }
 
     /// Record memory a cell gained after allocation (e.g. a growing array)
@@ -243,7 +269,7 @@ impl Heap {
     /// runs after marking completes, when `Gc::is_marked` tells what will
     /// survive (for weak tables).
     pub fn collect(&self, mark_roots: impl FnOnce(&mut Tracer), before_sweep: impl FnOnce()) {
-        let mut tracer = Tracer { stack: Vec::with_capacity(256) };
+        let mut tracer = Tracer { stack: Vec::with_capacity(256), epoch: self.collections.get() + 1 };
         mark_roots(&mut tracer);
         while let Some(header) = tracer.stack.pop() {
             unsafe { trace_cell(header, &mut tracer) };
@@ -275,7 +301,8 @@ impl Heap {
         }
         self.bytes.set(live_bytes);
         self.cells.set(live_cells);
-        self.threshold.set((live_bytes * 2).max(MIN_THRESHOLD));
+        let threshold = if self.stress.get() { live_bytes + (live_bytes / 4).max(16 * 1024) } else { (live_bytes * 2).max(MIN_THRESHOLD) };
+        self.threshold.set(threshold);
         self.collections.set(self.collections.get() + 1);
     }
 }

@@ -996,6 +996,9 @@ dependencies = [
 [[package]]
 name = "fos-jsvm"
 version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+]
 
 [[package]]
 name = "fos-layout"

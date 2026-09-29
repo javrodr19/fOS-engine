@@ -142,6 +142,12 @@ pub enum ObjectKind {
     Map(Box<MapData>),
     Set(Box<MapData>),
     MapIterator { map: Gc<JsObject>, pos: u32, kind: u8 },
+    /// A user-defined iterator with its `next` method and state
+    IterRecord { iter: Value, next: Value, done: bool },
+    /// Keys of WeakMap/WeakSet entries are not traced (see the VM's
+    /// collector, which prunes dead keys)
+    WeakMap(Box<MapData>),
+    WeakSet(Box<MapData>),
 }
 
 pub struct Closure {
@@ -154,6 +160,8 @@ pub struct Closure {
 }
 
 pub struct NativeFunction {
+    pub name: Atom,
+    pub length: u32,
     pub call: NativeFn,
     /// Behavior under `new` (None: not a constructor)
     pub construct: Option<NativeFn>,
@@ -195,6 +203,8 @@ pub struct Symbol {
     pub description: Option<Gc<JsString>>,
     /// Key in the global registry (`Symbol.for`)
     pub registered: bool,
+    /// A class private name (`#x`): never listed as a key
+    pub is_private: bool,
 }
 
 impl Trace for Symbol {
@@ -233,6 +243,9 @@ pub struct JsObject {
     pub class_constructor: bool,
     /// Keep shape mode however many properties it gets (the global object)
     pub keep_shape: bool,
+    /// Built-in properties not created yet (functions' `length`, `name`
+    /// and `prototype`): see `LAZY_*`
+    pub lazy: u8,
     pub proto: Option<Gc<JsObject>>,
     pub slots: Vec<Value>,
     pub elements: Vec<Value>,
@@ -259,6 +272,7 @@ impl Trace for JsObject {
         }
         match &self.kind {
             ObjectKind::Function(c) => {
+                c.proto.trace(tracer);
                 for &u in c.upvalues.iter() {
                     tracer.mark(u);
                 }
@@ -294,6 +308,18 @@ impl Trace for JsObject {
                 }
             }
             ObjectKind::MapIterator { map, .. } => tracer.mark(*map),
+            ObjectKind::IterRecord { iter, next, .. } => {
+                tracer.mark_value(*iter);
+                tracer.mark_value(*next);
+            }
+            ObjectKind::WeakMap(m) => {
+                // Values stay alive while the entry does; dead keys are
+                // pruned after marking
+                for (_, v) in m.entries.iter().flatten() {
+                    tracer.mark_value(*v);
+                }
+            }
+            ObjectKind::WeakSet(_) => {}
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }
             | ObjectKind::Error
@@ -304,6 +330,10 @@ impl Trace for JsObject {
         }
     }
 }
+
+pub const LAZY_LENGTH: u8 = 1;
+pub const LAZY_NAME: u8 = 2;
+pub const LAZY_PROTOTYPE: u8 = 4;
 
 /// Objects with more named properties than this switch to dictionary mode
 const MAX_SHAPE_PROPERTIES: u32 = 64;
@@ -320,6 +350,7 @@ impl JsObject {
             is_prototype: false,
             class_constructor: false,
             keep_shape: false,
+            lazy: 0,
             proto,
             slots: Vec::new(),
             elements: Vec::new(),

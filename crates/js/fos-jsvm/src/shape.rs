@@ -21,6 +21,8 @@ impl ShapeId {
     pub const ROOT: ShapeId = ShapeId(0);
     /// Objects in dictionary mode (never matched by inline caches)
     pub const DICT: ShapeId = ShapeId(u32::MAX);
+    /// Pseudo-shape of primitive strings (inline caches for their methods)
+    pub const PRIMITIVE_STRING: ShapeId = ShapeId(u32::MAX - 1);
 }
 
 /// Shapes with more properties than this get a lookup table

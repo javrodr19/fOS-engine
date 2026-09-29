@@ -7,3 +7,4 @@ license.workspace = true
 description = "JavaScript engine core for fOS: parser, bytecode compiler, register VM, GC"
 
 [dependencies]
+rustc-hash = "2.1"

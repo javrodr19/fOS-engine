@@ -11,7 +11,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::gc::Gc;
+use crate::gc::{Gc, Tracer};
 use crate::object::JsObject;
 use crate::shape::ShapeId;
 use crate::string::Atom;
@@ -71,6 +71,8 @@ pub enum Insn {
     Shr { dst: Reg, a: Reg, b: Reg },
     /// dst = a + imm (numbers fast path, ToPrimitive otherwise)
     AddImm { dst: Reg, a: Reg, imm: i16 },
+    /// dst = a - imm (numeric)
+    SubImm { dst: Reg, a: Reg, imm: i16 },
     Eq { dst: Reg, a: Reg, b: Reg },
     Ne { dst: Reg, a: Reg, b: Reg },
     StrictEq { dst: Reg, a: Reg, b: Reg },
@@ -104,12 +106,20 @@ pub enum Insn {
     JmpNotUndefined { src: Reg, off: i32 },
     /// Jump if the value is the internal hole (iteration done)
     JmpHole { src: Reg, off: i32 },
+    JmpNotHole { src: Reg, off: i32 },
     /// Fused compare-and-branch (loop conditions, compiled at the bottom
     /// of the loop so the jump is backward with a known offset)
     JmpLt { a: Reg, b: Reg, off: i16 },
     JmpLe { a: Reg, b: Reg, off: i16 },
     JmpGt { a: Reg, b: Reg, off: i16 },
     JmpGe { a: Reg, b: Reg, off: i16 },
+    /// Negated forms (jump unless the comparison holds; NaN jumps)
+    JmpNLt { a: Reg, b: Reg, off: i16 },
+    JmpNLe { a: Reg, b: Reg, off: i16 },
+    JmpNGt { a: Reg, b: Reg, off: i16 },
+    JmpNGe { a: Reg, b: Reg, off: i16 },
+    JmpStrictEq { a: Reg, b: Reg, off: i16 },
+    JmpStrictNe { a: Reg, b: Reg, off: i16 },
 
     NewObject { dst: Reg },
     NewArray { dst: Reg, cap: u16 },
@@ -118,7 +128,7 @@ pub enum Insn {
     GetElem { dst: Reg, obj: Reg, key: Reg },
     SetElem { obj: Reg, key: Reg, src: Reg },
     /// Define an own enumerable data property (object literals)
-    DefineProp { obj: Reg, src: Reg, name: u16 },
+    DefineProp { obj: Reg, src: Reg, ic: u16 },
     DefineElem { obj: Reg, key: Reg, src: Reg },
     /// Define a non-enumerable method (classes); `key` holds the key value
     DefineMethod { obj: Reg, key: Reg, func: Reg },
@@ -155,17 +165,18 @@ pub enum Insn {
     CallSpread { dst: Reg, func: Reg },
     New { dst: Reg, func: Reg, argc: u16 },
     NewSpread { dst: Reg, func: Reg },
-    /// super(...) in a derived constructor; args start at `args`
-    SuperCall { dst: Reg, args: Reg, argc: u16 },
-    SuperCallSpread { dst: Reg, args: Reg },
+    /// super(...) in a derived constructor: `func` holds the running class
+    /// constructor (its prototype is the parent), `func + 1` new.target,
+    /// arguments from `func + 2`
+    SuperCall { dst: Reg, func: Reg, argc: u16 },
+    /// Like SuperCall with the arguments in an array at `func + 2`
+    SuperCallSpread { dst: Reg, func: Reg },
     /// dst = the home object's prototype (for super.x)
     GetSuperBase { dst: Reg },
     /// dst = new.target
     LoadNewTarget { dst: Reg },
     /// dst = the running function (named function expressions)
     LoadCallee { dst: Reg },
-    /// Check that `this` has been initialized (derived constructors)
-    CheckThis,
     Return { src: Reg },
     ReturnUndef,
     Throw { src: Reg },
@@ -178,11 +189,17 @@ pub enum Insn {
     GetIterator { dst: Reg, src: Reg },
     /// dst = next value or hole when done
     IterNext { dst: Reg, iter: Reg },
+    /// dst = next value, undefined when done (destructuring)
+    IterValue { dst: Reg, iter: Reg },
+    /// dst = array of the remaining values
+    IterRest { dst: Reg, iter: Reg },
     IterClose { iter: Reg },
 
     /// dst = template strings array for tagged template `idx`
     TemplateObject { dst: Reg, idx: u16 },
     RegExp { dst: Reg, idx: u16 },
+    /// dst = a fresh private name (class `#x`); `name` indexes atoms
+    NewPrivateName { dst: Reg, name: u16 },
     Debugger,
 }
 
@@ -226,8 +243,15 @@ pub enum IcState {
     /// with `shape` and prototype `proto`, valid while no prototype has
     /// changed shape (`epoch`)
     Proto { shape: ShapeId, proto: Gc<JsObject>, holder: Gc<JsObject>, slot: u32, epoch: u32 },
-    /// Add property: shape `from` becomes `to`, value at `slot`
-    Add { from: ShapeId, to: ShapeId, slot: u32 },
+    /// Add property: shape `from` becomes `to`, value at `slot`, for
+    /// receivers with prototype `proto`, while no prototype changed
+    Add { from: ShapeId, to: ShapeId, slot: u32, proto: Option<Gc<JsObject>>, epoch: u32 },
+    /// `length` of arrays
+    ArrayLength,
+    /// `length` of primitive strings
+    StringLength,
+    /// Global lexical (`let`/`const`) binding at `slot`
+    GlobalLex { slot: u32 },
     /// Too many shapes seen: always use the slow path
     Megamorphic,
 }
@@ -271,6 +295,33 @@ pub struct FunctionProto {
     pub rest_reg: Option<Reg>,
     /// Source text range (for Function.prototype.toString)
     pub source: (u32, u32),
+    /// Collection number this was last traced in
+    pub traced: Cell<u32>,
+}
+
+impl FunctionProto {
+    /// Mark the constants and inline-cache objects of this function and
+    /// its nested functions (once per collection)
+    pub fn trace(&self, tracer: &mut Tracer) {
+        if self.traced.get() == tracer.epoch() {
+            return;
+        }
+        self.traced.set(tracer.epoch());
+        tracer.mark_values(&self.consts);
+        for ic in self.ics.iter() {
+            match ic.get().state {
+                IcState::Proto { proto, holder, .. } => {
+                    tracer.mark(proto);
+                    tracer.mark(holder);
+                }
+                IcState::Add { proto: Some(p), .. } => tracer.mark(p),
+                _ => {}
+            }
+        }
+        for f in self.funcs.iter() {
+            f.trace(tracer);
+        }
+    }
 }
 
 impl std::fmt::Debug for FunctionProto {

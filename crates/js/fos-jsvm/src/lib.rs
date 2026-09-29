@@ -12,6 +12,7 @@ pub mod lexer;
 pub mod number;
 pub mod object;
 pub mod parser;
+pub mod regex;
 pub mod shape;
 pub mod string;
 pub mod value;

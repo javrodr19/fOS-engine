@@ -263,6 +263,13 @@ pub struct TemplateSite {
     pub raw: Vec<Box<[u16]>>,
 }
 
+/// A regular expression literal (compiled on first evaluation)
+pub struct RegexLiteral {
+    pub pattern: Box<[u16]>,
+    pub flags: Box<str>,
+    pub compiled: std::cell::OnceCell<Rc<crate::regex::Regex>>,
+}
+
 /// Compiled function
 pub struct FunctionProto {
     pub name: Atom,
@@ -274,7 +281,7 @@ pub struct FunctionProto {
     pub upvals: Box<[UpvalDesc]>,
     pub handlers: Box<[Handler]>,
     pub templates: Box<[TemplateSite]>,
-    pub regexps: Box<[(Box<str>, Box<str>)]>,
+    pub regexps: Box<[RegexLiteral]>,
     pub nregs: u16,
     pub nparams: u16,
     /// Function.prototype.length

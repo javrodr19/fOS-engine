@@ -177,7 +177,7 @@ pub(crate) struct FuncState<'a> {
     upvals: Vec<UpvalInfo>,
     handlers: Vec<Handler>,
     templates: Vec<TemplateSite>,
-    regexps: Vec<(Box<str>, Box<str>)>,
+    regexps: Vec<RegexLiteral>,
     bindings: Vec<Binding>,
     scopes: Vec<Scope>,
     controls: Vec<Control>,

@@ -950,8 +950,8 @@ impl Vm {
                         w!(dst, v);
                     }
                     Insn::RegExp { dst, idx } => {
-                        let (pattern, flags) = unsafe { &(*proto).regexps[idx as usize] };
-                        let v = tri!(crate::builtins::regexp::create(self, pattern, flags));
+                        let lit = unsafe { &(*proto).regexps[idx as usize] };
+                        let v = tri!(crate::builtins::regexp::from_literal(self, lit));
                         w!(dst, v);
                     }
                     Insn::NewPrivateName { dst, name } => {

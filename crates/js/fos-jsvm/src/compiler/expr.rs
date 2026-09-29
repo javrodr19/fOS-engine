@@ -144,7 +144,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 if idx >= u16::MAX as usize {
                     return self.error("too many regular expressions");
                 }
-                f.regexps.push((pattern.clone(), flags.clone()));
+                f.regexps.push(RegexLiteral { pattern: pattern.encode_utf16().collect(), flags: flags.clone(), compiled: Default::default() });
                 self.emit(Insn::RegExp { dst, idx: idx as u16 });
             }
             Expr::Ident(n) => self.load_var(n, dst)?,

@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
-use crate::bytecode::{FunctionProto, Insn};
+use crate::bytecode::FunctionProto;
 use crate::gc::{Gc, Heap, Tracer};
 use crate::object::*;
 use crate::shape::Shapes;
@@ -155,8 +155,6 @@ pub struct Vm {
     pub print: Box<dyn FnMut(&str)>,
     /// Microtask queue: (callback, argument)
     pub(crate) jobs: std::collections::VecDeque<(Value, Value)>,
-    /// Source text of each script, for Function.prototype.toString
-    pub(crate) sources: Vec<(usize, Rc<str>)>,
 }
 
 impl Drop for Vm {
@@ -275,7 +273,6 @@ impl Vm {
             char_strings,
             print: Box::new(|s| println!("{s}")),
             jobs: Default::default(),
-            sources: Vec::new(),
         };
         crate::builtins::init(&mut vm);
         vm
@@ -331,10 +328,6 @@ impl Vm {
     pub(crate) fn set_slot(&mut self, i: usize, v: Value) {
         debug_assert!(i < STACK_SIZE);
         unsafe { *self.stack.add(i) = v }
-    }
-
-    pub(crate) fn stack_limit(&self) -> usize {
-        STACK_SIZE
     }
 
     // ---- allocation (every allocation is temp-rooted; see module docs) ----
@@ -805,13 +798,6 @@ impl Vm {
         heap.collect(|t| this.trace_roots(t), || this.prune_weak());
     }
 
-    #[inline]
-    pub(crate) fn maybe_collect(&mut self) {
-        if self.heap.should_collect() {
-            self.collect_garbage();
-        }
-    }
-
     fn trace_roots(&self, t: &mut Tracer) {
         for i in 0..self.sp {
             t.mark_value(self.slot(i));
@@ -866,13 +852,6 @@ impl Vm {
                 }
             }
         }
-    }
-
-    /// Current `this` of the innermost frame (for natives' error messages)
-    pub(crate) fn current_insn(&self) -> Option<Insn> {
-        let f = self.frames.last()?;
-        let p = unsafe { &*f.proto };
-        p.code.get(f.pc as usize).copied()
     }
 }
 

@@ -148,6 +148,13 @@ pub enum ObjectKind {
     /// collector, which prunes dead keys)
     WeakMap(Box<MapData>),
     WeakSet(Box<MapData>),
+    RegExp(Box<RegExpData>),
+}
+
+pub struct RegExpData {
+    pub source: Gc<JsString>,
+    pub flags: Gc<JsString>,
+    pub regex: Rc<crate::regex::Regex>,
 }
 
 pub struct Closure {
@@ -320,6 +327,10 @@ impl Trace for JsObject {
                 }
             }
             ObjectKind::WeakSet(_) => {}
+            ObjectKind::RegExp(r) => {
+                tracer.mark(r.source);
+                tracer.mark(r.flags);
+            }
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }
             | ObjectKind::Error

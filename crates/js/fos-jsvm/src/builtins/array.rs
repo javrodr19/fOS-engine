@@ -229,8 +229,18 @@ fn array_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<Js
     Ok(Value::object(a))
 }
 
+/// IsArray (looks through proxies)
+pub(crate) fn is_array_value(v: Value) -> bool {
+    let Some(o) = v.as_object() else { return false };
+    match &o.get().kind {
+        ObjectKind::Array { .. } => true,
+        ObjectKind::Proxy(p) => is_array_value(p.target),
+        _ => false,
+    }
+}
+
 fn is_array(_vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    Ok(Value::bool(arg(args, 0).as_object().is_some_and(|o| o.get().is_array())))
+    Ok(Value::bool(is_array_value(arg(args, 0))))
 }
 
 fn of(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -238,9 +248,12 @@ fn of(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Va
 }
 
 fn from(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    let src = arg(args, 0);
-    let f = arg(args, 1);
-    let this_arg = arg(args, 2);
+    let out = from_values(vm, arg(args, 0), arg(args, 1), arg(args, 2))?;
+    Ok(create_array(vm, out))
+}
+
+/// Values of Array.from(src, f, this_arg)
+pub(crate) fn from_values(vm: &mut Vm, src: Value, f: Value, this_arg: Value) -> JsResult<Vec<Value>> {
     let mapping = !f.is_undefined();
     if mapping && !vm.is_callable(f) {
         return Err(vm.type_error("Array.from: when provided, the second argument must be a function"));
@@ -267,7 +280,7 @@ fn from(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<
             out.push(v);
         }
     }
-    Ok(create_array(vm, out))
+    Ok(out)
 }
 
 // ---- mutators ----

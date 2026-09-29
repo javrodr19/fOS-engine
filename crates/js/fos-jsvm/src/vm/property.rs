@@ -78,6 +78,12 @@ impl Vm {
             ObjectKind::Array { length } if key == PropertyKey::Atom(atoms::length) => {
                 return Some(Own::Virtual(Value::number(*length as f64), PropFlags(PropFlags::WRITABLE)));
             }
+            ObjectKind::TypedArray(t) => {
+                if let PropertyKey::Index(i) = key {
+                    let _ = t;
+                    return crate::builtins::typedarray::ta_get(ob, i).map(|v| Own::Virtual(v, PropFlags::DEFAULT));
+                }
+            }
             ObjectKind::String(s) => match key {
                 PropertyKey::Index(i) if i < s.get().len() => {
                     let u = s.get().code_unit_at(i).unwrap();
@@ -114,6 +120,9 @@ impl Vm {
     pub fn has_property(&mut self, o: Gc<JsObject>, key: PropertyKey) -> bool {
         let mut cur = o;
         loop {
+            if crate::builtins::proxy::is_proxy(cur) {
+                return self.proxy_has(cur, key).unwrap_or(false);
+            }
             if self.own_prop(cur, key).is_some() {
                 return true;
             }
@@ -177,6 +186,9 @@ impl Vm {
     pub(crate) fn get_from(&mut self, o: Gc<JsObject>, key: PropertyKey, receiver: Value) -> JsResult<Value> {
         let mut cur = o;
         loop {
+            if let ObjectKind::Proxy(_) = cur.get().kind {
+                return self.proxy_get(cur, key, receiver);
+            }
             match self.own_prop(cur, key) {
                 Some(Own::Slot(slot, flags)) => {
                     let v = cur.get().read(slot);
@@ -186,10 +198,16 @@ impl Vm {
                     return Ok(v);
                 }
                 Some(Own::Virtual(v, _)) => return Ok(v),
-                None => match cur.get().proto {
-                    Some(p) => cur = p,
-                    None => return Ok(Value::UNDEFINED),
-                },
+                None => {
+                    // Typed arrays have no inherited integer properties
+                    if matches!(key, PropertyKey::Index(_)) && cur.get().is_typed_array() {
+                        return Ok(Value::UNDEFINED);
+                    }
+                    match cur.get().proto {
+                        Some(p) => cur = p,
+                        None => return Ok(Value::UNDEFINED),
+                    }
+                }
             }
         }
     }
@@ -214,6 +232,9 @@ impl Vm {
         let atom = cell.get().atom;
         let key = PropertyKey::Atom(atom);
         if let Some(o) = v.as_object() {
+            if crate::builtins::proxy::is_proxy(o) {
+                return self.proxy_get(o, key, v);
+            }
             if atom == atoms::length && o.get().is_array() {
                 set_state(cell, IcState::ArrayLength);
                 return self.get(v, key);
@@ -289,6 +310,16 @@ impl Vm {
 
     /// OrdinarySet on `o` with `receiver`; false if the assignment failed
     pub(crate) fn set_on(&mut self, o: Gc<JsObject>, key: PropertyKey, val: Value, receiver: Value) -> JsResult<bool> {
+        if crate::builtins::proxy::is_proxy(o) {
+            return self.proxy_set(o, key, val, receiver);
+        }
+        if let PropertyKey::Index(i) = key {
+            if o.get().is_typed_array() && Value::object(o) == receiver {
+                let n = self.to_number(val)?;
+                crate::builtins::typedarray::ta_set(o.get(), i, n);
+                return Ok(true);
+            }
+        }
         let mut cur = o;
         loop {
             match self.own_prop(cur, key) {
@@ -331,6 +362,26 @@ impl Vm {
             }
         }
         let Some(r) = receiver.as_object() else { return Ok(false) };
+        if crate::builtins::proxy::is_proxy(r) {
+            // Receiver.[[DefineOwnProperty]] through the proxy: just the
+            // value if the property exists, else a new data property
+            let existing = self.proxy_get_own_property(r, key)?;
+            let d = self.new_object();
+            self.define_value(d, PropertyKey::Atom(atoms::value), val, PropFlags::DEFAULT);
+            if existing.is_undefined() {
+                for a in [atoms::writable, atoms::enumerable, atoms::configurable] {
+                    self.define_value(d, PropertyKey::Atom(a), Value::TRUE, PropFlags::DEFAULT);
+                }
+            } else {
+                let g = self.get(existing, PropertyKey::Atom(atoms::get))?;
+                let st = self.get(existing, PropertyKey::Atom(atoms::set))?;
+                let w = self.get(existing, PropertyKey::Atom(atoms::writable))?;
+                if !g.is_undefined() || !st.is_undefined() || !super::ops::truthy(w) {
+                    return Ok(false);
+                }
+            }
+            return self.proxy_define(r, key, Value::object(d));
+        }
         if r != o {
             // Assignment through a prototype (or super): define on the receiver
             if let Some(Own::Slot(slot, flags)) = self.own_prop(r, key) {
@@ -438,6 +489,12 @@ impl Vm {
 
     /// Define (or redefine) an own data property. Never calls scripts.
     pub fn define_value(&mut self, o: Gc<JsObject>, key: PropertyKey, v: Value, flags: PropFlags) {
+        if let (PropertyKey::Index(i), true) = (key, o.get().is_typed_array()) {
+            if let Some(n) = v.as_number() {
+                crate::builtins::typedarray::ta_set(o.get(), i, n);
+            }
+            return;
+        }
         match self.own_prop(o, key) {
             Some(Own::Slot(slot, old)) => {
                 if old == flags {
@@ -520,6 +577,14 @@ impl Vm {
         let Some(o) = v.as_object() else {
             return Ok(true);
         };
+        if crate::builtins::proxy::is_proxy(o) {
+            let ok = self.proxy_delete(o, key)?;
+            if !ok && strict {
+                let k = self.key_display(key);
+                return Err(self.type_error(&format!("Cannot delete property '{k}'")));
+            }
+            return Ok(ok);
+        }
         self.materialize(o);
         match self.own_prop(o, key) {
             None => Ok(true),
@@ -610,6 +675,9 @@ impl Vm {
     /// Own keys with attributes, in property order, including virtual
     /// ones and excluding private names
     pub fn own_keys(&mut self, o: Gc<JsObject>) -> Vec<(PropertyKey, PropFlags)> {
+        if crate::builtins::proxy::is_proxy(o) {
+            return self.own_keys_js(o).unwrap_or_default();
+        }
         self.materialize(o);
         let mut keys = o.get().own_keys(&self.shapes);
         match &o.get().kind {
@@ -617,6 +685,11 @@ impl Vm {
                 let n = s.get().len();
                 let mut v: Vec<(PropertyKey, PropFlags)> = (0..n).map(|i| (PropertyKey::Index(i), PropFlags(PropFlags::ENUMERABLE))).collect();
                 v.push((PropertyKey::Atom(atoms::length), PropFlags::NONE));
+                v.extend(keys);
+                keys = v;
+            }
+            ObjectKind::TypedArray(t) => {
+                let mut v: Vec<(PropertyKey, PropFlags)> = (0..t.length).map(|i| (PropertyKey::Index(i), PropFlags::DEFAULT)).collect();
                 v.extend(keys);
                 keys = v;
             }
@@ -633,6 +706,24 @@ impl Vm {
     /// Values of own enumerable string-keyed properties (Object.keys order)
     pub fn enumerable_own_keys(&mut self, o: Gc<JsObject>) -> Vec<PropertyKey> {
         self.own_keys(o).into_iter().filter(|(k, f)| f.enumerable() && !matches!(k, PropertyKey::Symbol(_))).map(|(k, _)| k).collect()
+    }
+
+    /// `with` scope lookup: the object has the property and
+    /// @@unscopables doesn't hide it
+    pub(crate) fn with_has(&mut self, obj: Value, name: Atom) -> JsResult<bool> {
+        let o = self.to_object(obj)?;
+        let key = PropertyKey::Atom(name);
+        if !self.has_property_js(o, key)? {
+            return Ok(false);
+        }
+        let unscopables = self.get(Value::object(o), PropertyKey::Symbol(self.sym.unscopables))?;
+        if unscopables.is_object() {
+            let blocked = self.get(unscopables, key)?;
+            if super::ops::truthy(blocked) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     // ---- globals ----

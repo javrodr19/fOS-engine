@@ -11,10 +11,12 @@ mod json;
 mod math;
 mod number;
 mod object;
+pub(crate) mod proxy;
 mod reflect;
 pub(crate) mod regexp;
 mod string;
 mod symbol;
+pub mod typedarray;
 
 use crate::gc::Gc;
 use crate::object::*;
@@ -34,9 +36,11 @@ pub(crate) fn init(vm: &mut Vm) {
     json::init(vm);
     collections::init(vm);
     reflect::init(vm);
+    proxy::init(vm);
     regexp::init(vm);
     promise::init(vm);
     date::init(vm);
+    typedarray::init(vm);
     generator::init(vm);
 
     let g = vm.global;
@@ -211,6 +215,21 @@ impl Vm {
                     }
                 }
                 out.push_str(" }");
+                return;
+            }
+            ObjectKind::TypedArray(t) => {
+                let (name, len) = (t.kind.name(), t.length);
+                out.push_str(&format!("{name}({len}) ["));
+                for i in 0..len.min(100) {
+                    out.push_str(if i == 0 { " " } else { ", " });
+                    let v = typedarray::ta_get(o.get(), i).unwrap_or(Value::UNDEFINED);
+                    self.display_into(v, out, depth + 1, false);
+                }
+                out.push_str(if len == 0 { "]" } else { " ]" });
+                return;
+            }
+            ObjectKind::ArrayBuffer(b) => {
+                out.push_str(&format!("ArrayBuffer {{ byteLength: {} }}", b.len()));
                 return;
             }
             ObjectKind::String(s) => {

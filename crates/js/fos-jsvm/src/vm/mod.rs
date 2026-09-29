@@ -142,6 +142,14 @@ realm! {
     throw_type_error,
 }
 
+/// Intrinsics created by built-in initialization
+#[derive(Default)]
+pub struct RealmExtra {
+    pub array_buffer_proto: Option<Gc<JsObject>>,
+    /// Prototypes of Int8Array..Float64Array, in TaKind order
+    pub typed_array_protos: Vec<Gc<JsObject>>,
+}
+
 pub struct Vm {
     pub heap: Heap,
     pub atoms: Atoms,
@@ -156,6 +164,7 @@ pub struct Vm {
     /// Script-level `let`/`const`/`class` bindings
     pub(crate) global_lex: Gc<JsObject>,
     pub realm: Realm,
+    pub realm_extra: RealmExtra,
     pub sym: WellKnown,
     /// Bumped whenever an object used as a prototype changes shape;
     /// invalidates inline caches that looked through prototypes
@@ -287,6 +296,7 @@ impl Vm {
             global,
             global_lex,
             realm,
+            realm_extra: RealmExtra::default(),
             sym,
             proto_epoch: 0,
             temp_roots: Vec::with_capacity(64),
@@ -566,6 +576,12 @@ impl Vm {
                 all.extend_from_slice(args);
                 self.call(Value::object(target), bthis, &all)
             }
+            ObjectKind::Proxy(_) => {
+                self.enter_native()?;
+                let r = self.proxy_call(func, this, args);
+                self.native_depth -= 1;
+                r
+            }
             ObjectKind::Function(c) => {
                 if func.get().class_constructor {
                     return Err(self.type_error("Class constructor cannot be invoked without 'new'"));
@@ -739,6 +755,12 @@ impl Vm {
                     Err(self.type_error(&format!("{d} is not a constructor")))
                 }
             },
+            ObjectKind::Proxy(pd) if pd.constructor => {
+                self.enter_native()?;
+                let r = self.proxy_construct(func, args, new_target);
+                self.native_depth -= 1;
+                r
+            }
             ObjectKind::Bound(b) => {
                 let target = b.target;
                 let mut all = b.args.to_vec();
@@ -862,6 +884,12 @@ impl Vm {
         t.mark(self.global);
         t.mark(self.global_lex);
         self.realm.trace(t);
+        if let Some(p) = self.realm_extra.array_buffer_proto {
+            t.mark(p);
+        }
+        for &p in &self.realm_extra.typed_array_protos {
+            t.mark(p);
+        }
         for s in self.sym.all() {
             t.mark(s);
         }

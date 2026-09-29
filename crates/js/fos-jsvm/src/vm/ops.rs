@@ -377,7 +377,7 @@ impl Vm {
             return Err(self.type_error("Cannot use 'in' operator to search for a key in a non-object"));
         };
         let k = self.to_property_key(key)?;
-        Ok(self.has_property(o, k))
+        self.has_property_js(o, k)
     }
 
     pub fn instance_of(&mut self, v: Value, target: Value) -> JsResult<bool> {
@@ -424,6 +424,7 @@ impl Vm {
             ObjectKind::Function(c) => c.proto.is_constructor,
             ObjectKind::Native(n) => n.construct.is_some(),
             ObjectKind::Bound(b) => self.is_constructor(Value::object(b.target)),
+            ObjectKind::Proxy(p) => p.constructor,
             _ => false,
         })
     }

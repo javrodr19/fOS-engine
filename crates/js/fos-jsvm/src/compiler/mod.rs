@@ -201,6 +201,8 @@ pub(crate) struct FuncState<'a> {
     is_async: bool,
     /// Script completion value register
     completion: Option<Reg>,
+    /// Active `with` statements: (object register, first binding inside)
+    withs: Vec<(Reg, usize)>,
 }
 
 impl<'a> FuncState<'a> {
@@ -239,6 +241,7 @@ impl<'a> FuncState<'a> {
             is_generator: false,
             is_async: false,
             completion: None,
+            withs: Vec::new(),
         }
     }
 }
@@ -596,6 +599,14 @@ impl<'a, 'h> Compiler<'a, 'h> {
     /// Register of a local variable that can be read directly (after any
     /// dead-zone check), or None for upvalues and globals
     fn local_reg(&mut self, name: &str) -> CResult<Option<Reg>> {
+        if !self.with_objects(name).is_empty() {
+            return Ok(None);
+        }
+        self.local_reg_static(name)
+    }
+
+    /// `local_reg` ignoring `with` scopes
+    fn local_reg_static(&mut self, name: &str) -> CResult<Option<Reg>> {
         match self.resolve(name) {
             Res::Local(b) => {
                 let reg = self.fr().bindings[b].reg;
@@ -612,8 +623,59 @@ impl<'a, 'h> Compiler<'a, 'h> {
         }
     }
 
+    /// `with` objects that may provide `name`, innermost first
+    pub(crate) fn with_objects(&mut self, name: &str) -> Vec<Reg> {
+        if self.fr().withs.is_empty() || name == "this" || name == "new.target" || name.starts_with('%') || name.starts_with('#') {
+            return Vec::new();
+        }
+        let binding = match self.resolve(name) {
+            Res::Local(b) => Some(b),
+            _ => None,
+        };
+        self.fr()
+            .withs
+            .iter()
+            .rev()
+            .filter(|(_, first)| binding.is_none_or(|b| b < *first))
+            .map(|(r, _)| *r)
+            .collect()
+    }
+
+    /// Emit the `with` object checks for `name`: for each object, jump to
+    /// its handler if it has the property. Returns (object, jump) pairs.
+    pub(crate) fn with_dispatch(&mut self, name: &str, objs: &[Reg]) -> CResult<Vec<(Reg, u32)>> {
+        let n = self.name_index(name)?;
+        let mut out = Vec::new();
+        let mark = self.mark();
+        let t = self.alloc()?;
+        for &obj in objs {
+            self.emit(Insn::WithHas { dst: t, obj, name: n });
+            out.push((obj, self.emit(Insn::JmpTrue { cond: t, off: 0 })));
+        }
+        self.release(mark);
+        Ok(out)
+    }
+
     fn load_var(&mut self, name: &str, dst: Reg) -> CResult<()> {
-        if let Some(reg) = self.local_reg(name)? {
+        let objs = self.with_objects(name);
+        if !objs.is_empty() {
+            let hits = self.with_dispatch(name, &objs)?;
+            self.load_var_static(name, dst)?;
+            let mut ends = vec![self.jump()];
+            let atom = self.intern(name);
+            for (obj, j) in hits {
+                self.patch_here(vec![j])?;
+                let ic = self.new_ic(atom)?;
+                self.emit(Insn::GetProp { dst, obj, ic });
+                ends.push(self.jump());
+            }
+            return self.patch_here(ends);
+        }
+        self.load_var_static(name, dst)
+    }
+
+    pub(crate) fn load_var_static(&mut self, name: &str, dst: Reg) -> CResult<()> {
+        if let Some(reg) = self.local_reg_static(name)? {
             if reg != dst {
                 self.emit(Insn::Mov { dst, src: reg });
             }
@@ -648,6 +710,24 @@ impl<'a, 'h> Compiler<'a, 'h> {
     /// Assign to a variable. `init` marks the declaration's own
     /// initialization (no const or dead-zone checks).
     fn store_var(&mut self, name: &str, src: Reg, init: bool) -> CResult<()> {
+        let objs = if init { Vec::new() } else { self.with_objects(name) };
+        if !objs.is_empty() {
+            let hits = self.with_dispatch(name, &objs)?;
+            self.store_var_static(name, src, init)?;
+            let mut ends = vec![self.jump()];
+            let atom = self.intern(name);
+            for (obj, j) in hits {
+                self.patch_here(vec![j])?;
+                let ic = self.new_ic(atom)?;
+                self.emit(Insn::SetProp { obj, src, ic });
+                ends.push(self.jump());
+            }
+            return self.patch_here(ends);
+        }
+        self.store_var_static(name, src, init)
+    }
+
+    fn store_var_static(&mut self, name: &str, src: Reg, init: bool) -> CResult<()> {
         let level = self.fs.len() - 1;
         match self.resolve(name) {
             Res::Local(b) => {

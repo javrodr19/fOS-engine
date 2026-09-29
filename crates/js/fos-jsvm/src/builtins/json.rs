@@ -365,7 +365,7 @@ impl Stringifier {
                         return Err(vm.range_error("Maximum call stack size exceeded"));
                     }
                     self.stack.push(o);
-                    let r = if o.get().is_array() { self.array(vm, o) } else { self.object(vm, o) };
+                    let r = if super::array::is_array_value(value) { self.array(vm, o) } else { self.object(vm, o) };
                     self.stack.pop();
                     r?;
                 } else {

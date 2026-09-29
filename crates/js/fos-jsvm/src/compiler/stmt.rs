@@ -1,5 +1,7 @@
 //! Statements
 
+use std::rc::Rc;
+
 use super::*;
 
 impl<'a, 'h> Compiler<'a, 'h> {
@@ -118,7 +120,23 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.stmt(body)?;
                 self.pop_control()
             }
-            Stmt::With { .. } => self.error("'with' statements are not supported"),
+            Stmt::With { object, body } => {
+                if self.fr().strict {
+                    return self.error("Strict mode code may not include a with statement");
+                }
+                self.push_scope(false);
+                let b = self.declare(&Rc::from(format!("%with{}", self.fr().withs.len())), BindKind::Internal)?;
+                let reg = self.fr().bindings[b].reg;
+                self.expr_to(object, reg)?;
+                self.emit(Insn::RequireObjectCoercible { src: reg });
+                let first = self.fr().bindings.len();
+                self.f().withs.push((reg, first));
+                let r = self.stmt(body);
+                self.f().withs.pop();
+                r?;
+                self.pop_scope();
+                Ok(())
+            }
             Stmt::Empty | Stmt::Debugger => Ok(()),
         }
     }
@@ -170,7 +188,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
     /// `name = value` with the value computed straight into the
     /// variable's register when that is safe
     pub(super) fn expr_to_var(&mut self, name: &Name, value: &'a Expr, init: bool) -> CResult<()> {
-        if let Res::Local(b) = self.resolve(name) {
+        let with = !init && !self.with_objects(name).is_empty();
+        if let (Res::Local(b), false) = (self.resolve(name), with) {
             let binding = &self.fr().bindings[b];
             let writable = matches!(binding.kind, BindKind::Var | BindKind::Let | BindKind::Param)
                 || (init && matches!(binding.kind, BindKind::Const | BindKind::Class));

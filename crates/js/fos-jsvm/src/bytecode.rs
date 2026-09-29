@@ -201,6 +201,9 @@ pub enum Insn {
     /// dst = a fresh private name (class `#x`); `name` indexes atoms
     NewPrivateName { dst: Reg, name: u16 },
 
+    /// `with` lookup: dst = whether `obj` has property `name` (and it is not
+    /// blocked by @@unscopables)
+    WithHas { dst: Reg, obj: Reg, name: u16 },
     /// Generator functions: suspend right after argument binding and
     /// return the generator object
     GenStart,

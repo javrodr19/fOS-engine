@@ -65,7 +65,7 @@ fn object_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<J
 
 fn keys(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = vm.to_object(arg(args, 0))?;
-    let keys = vm.enumerable_own_keys(o);
+    let keys: Vec<PropertyKey> = vm.own_keys_js(o)?.into_iter().filter(|(k, f)| f.enumerable() && !matches!(k, PropertyKey::Symbol(_))).map(|(k, _)| k).collect();
     let values: Vec<Value> = keys.into_iter().map(|k| vm.key_value(k)).collect();
     Ok(Value::object(vm.new_array(values)))
 }
@@ -233,6 +233,12 @@ fn define_property(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -
         return Err(vm.type_error("Object.defineProperty called on non-object"));
     };
     let key = vm.to_property_key(arg(args, 1))?;
+    if super::proxy::is_proxy(o) {
+        if !vm.proxy_define(o, key, arg(args, 2))? {
+            return Err(vm.type_error("'defineProperty' on proxy: trap returned falsish"));
+        }
+        return Ok(target);
+    }
     let desc = to_descriptor(vm, arg(args, 2))?;
     if !define_from_descriptor(vm, o, key, &desc)? {
         let k = vm.key_display(key);
@@ -292,6 +298,9 @@ pub(crate) fn from_descriptor(vm: &mut Vm, o: Gc<JsObject>, key: PropertyKey) ->
 fn get_own_property_descriptor(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = vm.to_object(arg(args, 0))?;
     let key = vm.to_property_key(arg(args, 1))?;
+    if super::proxy::is_proxy(o) {
+        return vm.proxy_get_own_property(o, key);
+    }
     from_descriptor(vm, o, key)
 }
 
@@ -327,6 +336,9 @@ fn get_own_property_symbols(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsO
 
 pub(crate) fn proto_of(vm: &mut Vm, v: Value) -> JsResult<Value> {
     let o = vm.to_object(v)?;
+    if super::proxy::is_proxy(o) {
+        return vm.proxy_get_prototype(o);
+    }
     Ok(match o.get().proto {
         Some(p) => Value::object(p),
         None => Value::NULL,
@@ -476,6 +488,9 @@ fn has_own(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResu
 fn has_own_property(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let key = vm.to_property_key(arg(args, 0))?;
     let o = vm.to_object(this)?;
+    if super::proxy::is_proxy(o) {
+        return Ok(Value::bool(!vm.proxy_get_own_property(o, key)?.is_undefined()));
+    }
     Ok(Value::bool(vm.has_own_property(o, key)))
 }
 
@@ -511,6 +526,8 @@ pub(crate) fn to_string(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObjec
     let o = vm.to_object(this)?;
     let builtin = match &o.get().kind {
         ObjectKind::Array { .. } => "Array",
+        ObjectKind::Proxy(_) if super::array::is_array_value(Value::object(o)) => "Array",
+        ObjectKind::Proxy(p) if p.callable => "Function",
         ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) => "Function",
         ObjectKind::Error => "Error",
         ObjectKind::Boolean(_) => "Boolean",
@@ -518,6 +535,7 @@ pub(crate) fn to_string(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObjec
         ObjectKind::String(_) => "String",
         ObjectKind::Date(_) => "Date",
         ObjectKind::Arguments => "Arguments",
+        ObjectKind::RegExp(_) => "RegExp",
         _ => "Object",
     };
     let tag = vm.get(Value::object(o), PropertyKey::Symbol(vm.sym.to_string_tag))?;

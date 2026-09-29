@@ -667,11 +667,15 @@ impl Vm {
                         let v = r!(obj);
                         let k = r!(key);
                         if let (Some(o), Some(i)) = (v.as_object(), k.as_int()) {
-                            if let Some(&e) = o.get().elements.get(i as u32 as usize) {
+                            let ob = o.get();
+                            if let Some(&e) = ob.elements.get(i as u32 as usize) {
                                 if !e.is_hole() {
                                     w!(dst, e);
                                     continue;
                                 }
+                            } else if i >= 0 && ob.is_typed_array() {
+                                w!(dst, crate::builtins::typedarray::ta_get(ob, i as u32).unwrap_or(Value::UNDEFINED));
+                                continue;
                             }
                         }
                         let r = tri!(self.get_elem(v, k));
@@ -687,6 +691,11 @@ impl Vm {
                             if i < ob.elements.len() {
                                 if !ob.elements[i].is_hole() {
                                     ob.elements[i] = val;
+                                    continue;
+                                }
+                            } else if ob.is_typed_array() && i32::try_from(i).is_ok() {
+                                if let Some(n) = val.as_number() {
+                                    crate::builtins::typedarray::ta_set(ob, i as u32, n);
                                     continue;
                                 }
                             } else if i == ob.elements.len() && ob.extensible && !ob.is_prototype {
@@ -957,6 +966,11 @@ impl Vm {
                         let lit = unsafe { &(*proto).regexps[idx as usize] };
                         let v = tri!(crate::builtins::regexp::from_literal(self, lit));
                         w!(dst, v);
+                    }
+                    Insn::WithHas { dst, obj, name } => {
+                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let v = tri!(self.with_has(r!(obj), atom));
+                        w!(dst, Value::bool(v));
                     }
                     Insn::GenStart => {
                         let genobj = tri!(self.new_gen_state(true));

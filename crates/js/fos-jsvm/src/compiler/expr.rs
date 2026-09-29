@@ -462,6 +462,31 @@ impl<'a, 'h> Compiler<'a, 'h> {
                     inner = e;
                 }
                 if let Expr::Ident(n) = inner {
+                    let objs = self.with_objects(n);
+                    if !objs.is_empty() {
+                        let hits = self.with_dispatch(n, &objs)?;
+                        let t = self.alloc()?;
+                        match self.resolve(n) {
+                            Res::Global(atom) => {
+                                let ic = self.new_ic(atom)?;
+                                self.emit(Insn::TypeofGlobal { dst, ic });
+                            }
+                            _ => {
+                                self.load_var_static(n, t)?;
+                                self.emit(Insn::Typeof { dst, src: t });
+                            }
+                        }
+                        let mut ends = vec![self.jump()];
+                        let atom = self.intern(n);
+                        for (obj, j) in hits {
+                            self.patch_here(vec![j])?;
+                            let ic = self.new_ic(atom)?;
+                            self.emit(Insn::GetProp { dst: t, obj, ic });
+                            self.emit(Insn::Typeof { dst, src: t });
+                            ends.push(self.jump());
+                        }
+                        return self.patch_here(ends);
+                    }
                     if let Res::Global(atom) = self.resolve(n) {
                         let ic = self.new_ic(atom)?;
                         self.emit(Insn::TypeofGlobal { dst, ic });
@@ -514,6 +539,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
     /// A local variable that can be assigned in place
     fn writable_local(&mut self, name: &str) -> CResult<Option<Reg>> {
+        if !self.with_objects(name).is_empty() {
+            return Ok(None);
+        }
         if let Res::Local(b) = self.resolve(name) {
             if matches!(self.fr().bindings[b].kind, BindKind::Var | BindKind::Let | BindKind::Param) {
                 return self.local_reg(name);
@@ -755,6 +783,22 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.get_member(f, prop, f)?;
                 self.release(mark);
                 self.load_var("this", f + 1)?;
+            }
+            Expr::Ident(name) if !self.with_objects(name).is_empty() => {
+                let objs = self.with_objects(name);
+                let hits = self.with_dispatch(name, &objs)?;
+                self.load_var_static(name, f)?;
+                self.emit(Insn::LoadUndef { dst: f + 1 });
+                let mut ends = vec![self.jump()];
+                let atom = self.intern(name);
+                for (obj, j) in hits {
+                    self.patch_here(vec![j])?;
+                    let ic = self.new_ic(atom)?;
+                    self.emit(Insn::GetProp { dst: f, obj, ic });
+                    self.emit(Insn::Mov { dst: f + 1, src: obj });
+                    ends.push(self.jump());
+                }
+                self.patch_here(ends)?;
             }
             _ => {
                 self.expr_to(callee, f)?;
@@ -1305,3 +1349,4 @@ fn member_key_simple(prop: &MemberProp) -> bool {
         _ => true,
     }
 }
+

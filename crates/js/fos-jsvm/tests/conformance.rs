@@ -842,7 +842,7 @@ fn regular_expressions() {
         ("new RegExp('a', 'gg')", "throws SyntaxError*"),
         ("RegExp('x') instanceof RegExp", "true"),
         ("let r = /x/; RegExp(r) === r", "true"),
-        ("Object.prototype.toString.call(/x/)", "'[object Object]'"),
+        ("Object.prototype.toString.call(/x/)", "'[object RegExp]'"),
         ("/(?:ab)+/.exec('ababx')[0]", "'abab'"),
         ("/a|b|c/.exec('xcx')[0]", "'c'"),
         ("/[]/.test('a')", "false"),
@@ -972,5 +972,87 @@ fn dates() {
         ("let d = new Date(0); d.setHours(25); d.toISOString()", "'1970-01-02T01:00:00.000Z'"),
         ("Object.prototype.toString.call(new Date())", "'[object Date]'"),
         ("typeof Date()", "'string'"),
+    ]);
+}
+
+#[test]
+fn typed_arrays() {
+    check(&[
+        ("new Uint8Array(3)", "Uint8Array(3) [ 0, 0, 0 ]"),
+        ("let a = new Uint8Array([1, 256, -1]); a", "Uint8Array(3) [ 1, 0, 255 ]"),
+        ("new Int8Array([200])[0]", "-56"),
+        ("new Uint8ClampedArray([300, -5, 1.5, 2.5])", "Uint8ClampedArray(4) [ 255, 0, 2, 2 ]"),
+        ("new Float32Array([0.1])[0]", "0.10000000149011612"),
+        ("new Float64Array([0.1])[0]", "0.1"),
+        ("new Uint32Array([-1])[0]", "4294967295"),
+        ("let b = new ArrayBuffer(8); let f = new Float64Array(b); f[0] = 1; Array.from(new Uint8Array(b))", "[ 0, 0, 0, 0, 0, 0, 240, 63 ]"),
+        ("let b = new ArrayBuffer(8); new Uint16Array(b, 2, 2).length", "2"),
+        ("new Uint16Array(new ArrayBuffer(8), 1)", "throws RangeError*"),
+        ("let a = new Int16Array(4); a[10] = 5; [a[10], a.length]", "[ undefined, 4 ]"),
+        ("let a = new Int32Array([5, 1, 4]); a.sort(); Array.from(a)", "[ 1, 4, 5 ]"),
+        ("Array.from(new Uint8Array([1, 2, 3]).map(x => x * 2))", "[ 2, 4, 6 ]"),
+        ("new Uint8Array([1, 2, 3]).filter(x => x > 1).length", "2"),
+        ("new Uint8Array([1, 2, 3]).reduce((a, b) => a + b)", "6"),
+        ("new Uint8Array([1, 2, 3]).join('-')", "'1-2-3'"),
+        ("let a = new Uint8Array([1, 2, 3, 4]); let s = a.subarray(1, 3); s[0] = 9; Array.from(a)", "[ 1, 9, 3, 4 ]"),
+        ("let a = new Uint8Array([1, 2, 3, 4]); let s = a.slice(1, 3); s[0] = 9; Array.from(a)", "[ 1, 2, 3, 4 ]"),
+        ("let a = new Uint8Array(4); a.set([7, 8], 2); Array.from(a)", "[ 0, 0, 7, 8 ]"),
+        ("[...new Uint8Array([4, 5])]", "[ 4, 5 ]"),
+        ("let t = 0; for (const x of new Float64Array([1.5, 2.5])) t += x; t", "4"),
+        ("Uint8Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT", "9"),
+        ("Object.prototype.toString.call(new Uint8Array(1))", "'[object Uint8Array]'"),
+        ("new Uint8Array(2).buffer.byteLength", "2"),
+        ("ArrayBuffer.isView(new DataView(new ArrayBuffer(1)))", "true"),
+        ("let v = new DataView(new ArrayBuffer(4)); v.setUint16(0, 0x1234); [v.getUint8(0), v.getUint16(0, true)]", "[ 18, 13330 ]"),
+        ("let v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, Math.PI, true); v.getFloat64(0, true) === Math.PI", "true"),
+        ("new DataView(new ArrayBuffer(2)).getUint32(0)", "throws RangeError*"),
+        ("Uint8Array.from([1, 2], x => x * 3)", "Uint8Array(2) [ 3, 6 ]"),
+        ("Int16Array.of(1, -2)", "Int16Array(2) [ 1, -2 ]"),
+        ("new Uint8Array(new ArrayBuffer(4).slice(1, 3)).length", "2"),
+        ("Object.keys(new Uint8Array(2))", "[ '0', '1' ]"),
+        ("let a = new Float64Array(100000); for (let i = 0; i < a.length; i++) a[i] = i * 0.5; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; s", "2499975000"),
+        ("new Uint8Array([3, 1]) instanceof Uint8Array", "true"),
+        ("Object.getPrototypeOf(Uint8Array) === Object.getPrototypeOf(Int8Array)", "true"),
+    ]);
+}
+
+#[test]
+fn proxies() {
+    check(&[
+        ("let p = new Proxy({}, { get: (t, k) => 'got ' + String(k) }); p.foo", "'got foo'"),
+        ("let log = []; let p = new Proxy({}, { set(t, k, v) { log.push(k + '=' + v); t[k] = v; return true; } }); p.a = 1; p['b'] = 2; [log, p.a]", "[ [ 'a=1', 'b=2' ], 1 ]"),
+        ("let p = new Proxy({x: 1}, { has: (t, k) => k === 'magic' }); ['magic' in p, 'x' in p]", "[ true, false ]"),
+        ("let p = new Proxy({a: 1, b: 2}, { deleteProperty(t, k) { return k !== 'a' && delete t[k]; } }); [delete p.a, delete p.b, Object.keys(p)]", "[ false, true, [ 'a' ] ]"),
+        ("let p = new Proxy({}, { ownKeys: () => ['z', 'y'], getOwnPropertyDescriptor: () => ({ value: 1, enumerable: true, configurable: true }) }); Object.keys(p)", "[ 'z', 'y' ]"),
+        ("let target = {v: 5}; let p = new Proxy(target, {}); p.v = 6; [p.v, target.v]", "[ 6, 6 ]"),
+        ("let f = new Proxy(function (a) { return a * 2; }, { apply: (t, self, args) => t(...args) + 1 }); [typeof f, f(10)]", "[ 'function', 21 ]"),
+        ("class A { constructor(x) { this.x = x; } } let P = new Proxy(A, { construct: (t, args) => new t(args[0] * 10) }); new P(4).x", "40"),
+        ("let {proxy, revoke} = Proxy.revocable({}, {}); revoke(); proxy.x", "throws TypeError*"),
+        ("Array.isArray(new Proxy([], {}))", "true"),
+        ("let p = new Proxy([1, 2, 3], {}); [p.length, p[1], JSON.stringify(p)]", "[ 3, 2, '[1,2,3]' ]"),
+        ("let p = new Proxy({}, { getPrototypeOf: () => Array.prototype }); Object.getPrototypeOf(p) === Array.prototype", "true"),
+        ("let seen = []; let p = new Proxy({a: 1}, { get(t, k, r) { seen.push(typeof k === 'symbol' ? 'sym' : k); return Reflect.get(t, k, r); } }); p.a; `${p.a}`; seen", "[ 'a', 'a' ]"),
+        ("let deps = new Set(); const reactive = o => new Proxy(o, { get(t, k) { deps.add(k); return t[k]; } }); const s = reactive({n: 1, m: 2}); s.n + s.n; [...deps]", "[ 'n' ]"),
+        ("let p = new Proxy({}, { defineProperty(t, k, d) { t[k] = 'defined ' + d.value; return true; } }); Object.defineProperty(p, 'q', {value: 1}); p.q", "'defined 1'"),
+        ("let p = new Proxy({a: 1}, {}); let ks = []; for (const k in p) ks.push(k); ks", "[ 'a' ]"),
+        ("new Proxy(1, {})", "throws TypeError*"),
+        ("Reflect.ownKeys(new Proxy({b: 1, a: 2}, {}))", "[ 'b', 'a' ]"),
+    ]);
+}
+
+#[test]
+fn with_statement() {
+    check(&[
+        ("var o = {a: 1}; with (o) { a + 1 }", "2"),
+        ("var o = {a: 1}; var a = 'outer'; with (o) { a = 5; } [o.a, a]", "[ 5, 'outer' ]"),
+        ("var o = {}; var b = 'outer'; with (o) { b = 'set'; } [o.b, b]", "[ undefined, 'set' ]"),
+        ("function f(obj) { var x = 'local'; with (obj) { return x; } } [f({}), f({x: 'prop'})]", "[ 'local', 'prop' ]"),
+        ("var o = {m() { return this === o; }}; with (o) { m() }", "true"),
+        ("with ({x: 1}) { with ({y: 2}) { x + y } }", "3"),
+        ("with (null) {}", "throws TypeError*"),
+        ("'use strict'; with ({}) {}", "throws SyntaxError*"),
+        ("var o = {v: 1, [Symbol.unscopables]: {v: true}}; var v = 'global v'; with (o) { v }", "'global v'"),
+        ("function tpl(data) { var out = ''; with (data) { out += 'Hi ' + name + '!'; } return out; } tpl({name: 'Ann'})", "'Hi Ann!'"),
+        ("new Function('obj', 'with (obj) { return typeof missing + typeof x; }')({x: 1})", "'undefinednumber'"),
     ]);
 }

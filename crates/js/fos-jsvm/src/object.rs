@@ -149,9 +149,32 @@ pub enum ObjectKind {
     WeakMap(Box<MapData>),
     WeakSet(Box<MapData>),
     RegExp(Box<RegExpData>),
+    ArrayBuffer(Box<Vec<u8>>),
+    TypedArray(Box<TypedArrayData>),
+    DataView(Box<TypedArrayData>),
+    Proxy(Box<ProxyData>),
     /// Generator object or async function state
     Generator(Box<GenState>),
     Promise(Box<PromiseData>),
+}
+
+pub struct ProxyData {
+    /// Null once revoked
+    pub target: Value,
+    pub handler: Value,
+    pub callable: bool,
+    pub constructor: bool,
+}
+
+/// A view on an ArrayBuffer (typed arrays; DataView uses bytes)
+#[derive(Clone, Copy, Debug)]
+pub struct TypedArrayData {
+    pub kind: crate::builtins::typedarray::TaKind,
+    pub buffer: Gc<JsObject>,
+    /// Byte offset
+    pub offset: u32,
+    /// Elements (bytes for DataView)
+    pub length: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -403,6 +426,12 @@ impl Trace for JsObject {
                 tracer.mark(r.source);
                 tracer.mark(r.flags);
             }
+            ObjectKind::TypedArray(t) | ObjectKind::DataView(t) => tracer.mark(t.buffer),
+            ObjectKind::ArrayBuffer(_) => {}
+            ObjectKind::Proxy(p) => {
+                tracer.mark_value(p.target);
+                tracer.mark_value(p.handler);
+            }
             ObjectKind::Generator(g) => {
                 tracer.mark(g.func);
                 tracer.mark_values(&g.regs);
@@ -461,11 +490,19 @@ impl JsObject {
     }
 
     pub fn is_callable(&self) -> bool {
-        matches!(self.kind, ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_))
+        match &self.kind {
+            ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) => true,
+            ObjectKind::Proxy(p) => p.callable,
+            _ => false,
+        }
     }
 
     pub fn is_array(&self) -> bool {
         matches!(self.kind, ObjectKind::Array { .. })
+    }
+
+    pub fn is_typed_array(&self) -> bool {
+        matches!(self.kind, ObjectKind::TypedArray(_))
     }
 
     /// Estimated bytes owned outside the cell (for GC accounting)
@@ -533,7 +570,7 @@ impl JsObject {
             self.to_dictionary(shapes);
         }
         if self.shape == ShapeId::DICT {
-            return Slot::Dict(self.dict.as_mut().unwrap().insert(key, value, flags));
+            return Slot::Dict(self.dict.get_or_insert_with(Default::default).insert(key, value, flags));
         }
         self.shape = shapes.add(self.shape, key, flags);
         self.slots.push(value);

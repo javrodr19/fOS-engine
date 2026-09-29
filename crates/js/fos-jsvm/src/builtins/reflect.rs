@@ -85,13 +85,13 @@ fn get_own_property_descriptor(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<
 
 fn get_prototype_of(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = target(vm, args)?;
-    Ok(o.get().proto.map(Value::object).unwrap_or(Value::NULL))
+    super::object::proto_of(vm, Value::object(o))
 }
 
 fn has(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = target(vm, args)?;
     let key = vm.to_property_key(arg(args, 1))?;
-    Ok(Value::bool(vm.has_property(o, key)))
+    Ok(Value::bool(vm.has_property_js(o, key)?))
 }
 
 fn is_extensible(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -101,7 +101,7 @@ fn is_extensible(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> 
 
 fn own_keys(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = target(vm, args)?;
-    let keys: Vec<PropertyKey> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
+    let keys: Vec<PropertyKey> = vm.own_keys_js(o)?.into_iter().map(|(k, _)| k).collect();
     let values: Vec<Value> = keys.into_iter().map(|k| vm.key_value(k)).collect();
     Ok(Value::object(vm.new_array(values)))
 }

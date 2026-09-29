@@ -40,7 +40,7 @@ use crate::value::Value;
 /// function returns the value of the script's last top-level expression
 /// statement.
 pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new() };
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
     let mut no_fused = false;
     loop {
         match c.script(program, no_fused) {
@@ -58,7 +58,7 @@ pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Progr
 /// Compile a function created by the `Function` constructor (its scope is
 /// the global scope)
 pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: &Function) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new() };
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
     // An empty script level to resolve names against (all globals)
     c.fs.push(FuncState::new(true, false, func.strict, FunctionKind::Normal, false));
     let name = c.atoms.intern_str(heap, "anonymous");
@@ -94,6 +94,24 @@ pub(crate) enum BindKind {
 }
 
 impl BindKind {
+    pub(crate) fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(v: u8) -> BindKind {
+        [
+            BindKind::Var,
+            BindKind::Let,
+            BindKind::Const,
+            BindKind::Class,
+            BindKind::Param,
+            BindKind::This,
+            BindKind::ThisUninit,
+            BindKind::Callee,
+            BindKind::Internal,
+        ][v as usize]
+    }
+
     fn is_lexical(self) -> bool {
         matches!(self, BindKind::Let | BindKind::Const | BindKind::Class | BindKind::ThisUninit)
     }
@@ -203,6 +221,8 @@ pub(crate) struct FuncState<'a> {
     completion: Option<Reg>,
     /// Active `with` statements: (object register, first binding inside)
     withs: Vec<(Reg, usize)>,
+    /// Lazily compiled function: names of the precomputed upvalues
+    lazy_names: Option<Vec<Name>>,
 }
 
 impl<'a> FuncState<'a> {
@@ -242,6 +262,7 @@ impl<'a> FuncState<'a> {
             is_async: false,
             completion: None,
             withs: Vec::new(),
+            lazy_names: None,
         }
     }
 }
@@ -259,6 +280,45 @@ pub(crate) struct Compiler<'a, 'h> {
     atoms: &'h mut Atoms,
     src: &'a str,
     fs: Vec<FuncState<'a>>,
+    /// Shared copy of `src` kept by lazy functions
+    src_rc: Option<Rc<str>>,
+    /// Compiling a lazy function: its upvalues (by name) and the
+    /// strictness of its definition
+    lazy_root: Option<(Vec<UpvalInfo>, Vec<Name>, bool)>,
+}
+
+/// Compile the body of a lazy function (on its first call)
+pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Result<Code, SyntaxError> {
+    let info = proto.lazy.as_ref().expect("not a lazy function");
+    let reparse = crate::parser::ReparseInfo {
+        params_start: info.params_start,
+        span_start: proto.source.0,
+        kind: info.kind,
+        is_async: proto.is_async,
+        is_generator: proto.is_generator,
+        outer_strict: info.outer_strict,
+    };
+    let src: &str = &info.source;
+    let mut func = crate::parser::reparse_function(src, &reparse)?;
+    func.name = info.fn_name.clone();
+    let upvals: Vec<UpvalInfo> = proto
+        .upvals
+        .iter()
+        .zip(&info.upval_names)
+        .map(|(&desc, (_, checked, kind))| UpvalInfo { desc, checked: *checked, kind: BindKind::from_u8(*kind) })
+        .collect();
+    let names: Vec<Name> = info.upval_names.iter().map(|(n, _, _)| n.clone()).collect();
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: Some(info.source.clone()), lazy_root: Some((upvals, names, info.outer_strict)) };
+    // The function borrows from `func`, which lives until the end
+    let func: &Function = unsafe { &*(&func as *const Function) };
+    match c.function(func, Some(proto.name), info.is_expression) {
+        Ok((compiled, _)) => {
+            let compiled = Rc::try_unwrap(compiled).ok().expect("fresh function prototype");
+            Ok(compiled.compiled.into_inner().expect("compiled"))
+        }
+        Err(CErr::Retry) => Err(SyntaxError { message: "function too large".into(), pos: 0 }),
+        Err(CErr::Syntax(e)) => Err(e),
+    }
 }
 
 impl<'a, 'h> Compiler<'a, 'h> {
@@ -557,6 +617,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
         if let Some(b) = self.find_local(level, name) {
             self.touch(level, b);
             return Res::Local(b);
+        }
+        if let Some(names) = &self.fs[level].lazy_names {
+            return match names.iter().position(|n| &**n == name) {
+                Some(i) => Res::Upval(i as u16),
+                None => Res::Global(self.intern(name)),
+            };
         }
         if level == 0 || (self.fs[level].is_script) {
             return Res::Global(self.intern(name));
@@ -949,8 +1015,20 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
     fn function_attempt(&mut self, func: &'a Function, name: Option<Atom>, is_expression: bool, no_fused: bool) -> CResult<(Rc<FunctionProto>, bool)> {
         let is_arrow = func.kind == FunctionKind::Arrow;
-        let strict = func.strict || self.fr().strict;
+        if let FunctionBody::Lazy(_) = func.body {
+            return self.lazy_function(func, name, is_expression);
+        }
+        let lazy_root = if self.fs.is_empty() { self.lazy_root.clone() } else { None };
+        let outer_strict = match &lazy_root {
+            Some((_, _, s)) => *s,
+            None => self.fr().strict,
+        };
+        let strict = func.strict || outer_strict;
         self.fs.push(FuncState::new(false, is_arrow, strict, func.kind, no_fused));
+        if let Some((upvals, names, _)) = lazy_root {
+            self.f().upvals = upvals;
+            self.f().lazy_names = Some(names);
+        }
         self.push_scope(false);
         let text = self.src.get(func.span.start as usize..func.span.end as usize).unwrap_or("");
 
@@ -1028,7 +1106,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
         // Hoisted variables
         let body: &'a [Stmt] = match &func.body {
             FunctionBody::Block(stmts) => stmts,
-            FunctionBody::Expr(_) => &[],
+            FunctionBody::Expr(_) | FunctionBody::Lazy(_) => &[],
         };
         let mut vars = Vec::new();
         collect_vars(body, &mut vars, !strict);
@@ -1093,6 +1171,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.emit_return(r);
                 self.release(mark);
             }
+            FunctionBody::Lazy(_) => unreachable!(),
         }
         if let Some(r) = async_exc {
             let entry = self.close_try();
@@ -1104,13 +1183,76 @@ impl<'a, 'h> Compiler<'a, 'h> {
         let f = self.fs.pop().unwrap();
         let uses_super = f.uses_super;
         // Arrows see their parent's `super`
-        if is_arrow && uses_super {
+        if is_arrow && uses_super && !self.fs.is_empty() {
             self.f().uses_super = true;
         }
         let name = name.or_else(|| func.name.as_ref().map(|n| self.intern(n))).unwrap_or(atoms::empty);
         let length = func.params.iter().take_while(|p| p.default.is_none()).count() as u16;
         let proto = self.finish(f, name, length, (func.span.start, func.span.end));
         Ok((proto, uses_super))
+    }
+
+    /// A function compiled on its first call: resolve the names it may
+    /// capture now (capturing them from this scope), keep its source
+    fn lazy_function(&mut self, func: &'a Function, name: Option<Atom>, is_expression: bool) -> CResult<(Rc<FunctionProto>, bool)> {
+        let FunctionBody::Lazy(lb) = &func.body else { unreachable!() };
+        let is_arrow = func.kind == FunctionKind::Arrow;
+        let outer_strict = self.fr().strict;
+        let strict = func.strict || outer_strict;
+        self.fs.push(FuncState::new(false, is_arrow, strict, func.kind, false));
+        let level = self.fs.len() - 1;
+        let mut uses_super = false;
+        let mut names: Vec<(Name, u16)> = Vec::new();
+        for n in &lb.free {
+            if &**n == "super" {
+                uses_super = true;
+                continue;
+            }
+            if let Res::Upval(i) = self.resolve_at(level, n) {
+                names.push((n.clone(), i));
+            }
+        }
+        let f = self.fs.pop().unwrap();
+        if is_arrow && uses_super {
+            self.f().uses_super = true;
+        }
+        // Upvalue order is creation order; map each to its name
+        let mut upval_names: Vec<(Name, bool, u8)> = Vec::with_capacity(f.upvals.len());
+        for (i, u) in f.upvals.iter().enumerate() {
+            let n = names.iter().find(|(_, j)| *j as usize == i).map(|(n, _)| n.clone()).unwrap_or_else(|| Rc::from(""));
+            upval_names.push((n, u.checked, u.kind.to_u8()));
+        }
+        let source = self.src_rc.get_or_insert_with(|| Rc::from(self.src)).clone();
+        let name = name.or_else(|| func.name.as_ref().map(|n| self.intern(n))).unwrap_or(atoms::empty);
+        let is_constructor = matches!(func.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
+            && !func.is_generator
+            && !func.is_async;
+        let proto = FunctionProto {
+            name,
+            upvals: f.upvals.iter().map(|u| u.desc).collect(),
+            nparams: lb.nparams as u16,
+            length: lb.length as u16,
+            strict,
+            is_arrow,
+            is_constructor,
+            is_class_constructor: matches!(func.kind, FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor),
+            is_derived: func.kind == FunctionKind::DerivedConstructor,
+            is_generator: func.is_generator,
+            is_async: func.is_async,
+            source: (func.span.start, func.span.end),
+            traced: Cell::new(0),
+            lazy: Some(Box::new(LazyInfo {
+                source,
+                params_start: func.params_start,
+                kind: func.kind,
+                fn_name: func.name.clone(),
+                is_expression,
+                outer_strict,
+                upval_names,
+            })),
+            compiled: std::cell::OnceCell::new(),
+        };
+        Ok((Rc::new(proto), uses_super))
     }
 
     /// A function whose body the compiler generates (class field
@@ -1157,18 +1299,23 @@ impl<'a, 'h> Compiler<'a, 'h> {
             && !f.is_script
             && !f.is_generator
             && !f.is_async;
-        Rc::new(FunctionProto {
-            name,
+        let code = Code {
             code: f.code.into_boxed_slice(),
             consts: f.consts.into_boxed_slice(),
             atoms: f.atoms.into_boxed_slice(),
             funcs: f.funcs.into_boxed_slice(),
             ics: f.ics.into_iter().map(Cell::new).collect(),
-            upvals: f.upvals.iter().map(|u| u.desc).collect(),
             handlers: f.handlers.into_boxed_slice(),
             templates: f.templates.into_boxed_slice(),
             regexps: f.regexps.into_boxed_slice(),
             nregs: f.max_reg.max(1),
+            coerce_this: !f.strict && f.uses_this,
+            arguments_reg,
+            rest_reg: f.rest_reg,
+        };
+        Rc::new(FunctionProto {
+            name,
+            upvals: f.upvals.iter().map(|u| u.desc).collect(),
             nparams: f.nparams,
             length,
             strict: f.strict,
@@ -1178,11 +1325,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
             is_derived: f.kind == FunctionKind::DerivedConstructor,
             is_generator: f.is_generator,
             is_async: f.is_async,
-            coerce_this: !f.strict && f.uses_this,
-            arguments_reg,
-            rest_reg: f.rest_reg,
             source,
             traced: Cell::new(0),
+            lazy: None,
+            compiled: std::cell::OnceCell::from(code),
         })
     }
 

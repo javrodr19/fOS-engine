@@ -6,7 +6,8 @@
 //! "shape S has property P at slot N", which makes property access on
 //! monomorphic code a comparison and an indexed load.
 
-use std::cell::OnceCell;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
@@ -34,6 +35,12 @@ enum Transitions {
     Many(FxHashMap<(PropertyKey, PropFlags), u32>),
 }
 
+/// Key -> (slot, flags) for a chain of shapes. A table built for one
+/// shape is extended in place when that shape gains its first child, so a
+/// whole chain (an object getting one property after another) shares one
+/// table; a shape only uses the entries whose slot is below its length.
+type Table = Rc<RefCell<FxHashMap<PropertyKey, (u32, PropFlags)>>>;
+
 struct Node {
     parent: u32,
     key: PropertyKey,
@@ -41,7 +48,7 @@ struct Node {
     /// Number of properties (the new property's slot is `len - 1`)
     len: u32,
     transitions: Transitions,
-    table: OnceCell<FxHashMap<PropertyKey, (u32, PropFlags)>>,
+    table: RefCell<Option<Table>>,
 }
 
 pub struct Shapes {
@@ -63,7 +70,7 @@ impl Shapes {
                 flags: PropFlags::NONE,
                 len: 0,
                 transitions: Transitions::None,
-                table: OnceCell::new(),
+                table: RefCell::new(None),
             }],
         }
     }
@@ -75,6 +82,22 @@ impl Shapes {
 
     pub fn count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Number of shapes holding a lookup table, and their total entries
+    pub fn table_stats(&self) -> (usize, usize) {
+        let mut seen: Vec<*const RefCell<FxHashMap<PropertyKey, (u32, PropFlags)>>> = Vec::new();
+        let mut entries = 0;
+        for n in &self.nodes {
+            if let Some(t) = n.table.borrow().as_ref() {
+                let p = Rc::as_ptr(t);
+                if !seen.contains(&p) {
+                    seen.push(p);
+                    entries += t.borrow().len();
+                }
+            }
+        }
+        (seen.len(), entries)
     }
 
     /// Shape with `key` added
@@ -91,13 +114,18 @@ impl Shapes {
         }
         let len = node.len + 1;
         let child = self.nodes.len() as u32;
+        // Extend the parent's table if nothing else has
+        let table = node.table.borrow().as_ref().filter(|t| t.borrow().len() as u32 == node.len).cloned();
+        if let Some(t) = &table {
+            t.borrow_mut().insert(key, (len - 1, flags));
+        }
         self.nodes.push(Node {
             parent: shape.0,
             key,
             flags,
             len,
             transitions: Transitions::None,
-            table: OnceCell::new(),
+            table: RefCell::new(table),
         });
         let node = &mut self.nodes[shape.0 as usize];
         node.transitions = match std::mem::replace(&mut node.transitions, Transitions::None) {
@@ -120,17 +148,24 @@ impl Shapes {
     pub fn lookup(&self, shape: ShapeId, key: PropertyKey) -> Option<(u32, PropFlags)> {
         let node = &self.nodes[shape.0 as usize];
         if node.len > LINEAR_LOOKUP_MAX {
-            let table = node.table.get_or_init(|| {
-                let mut table = FxHashMap::default();
-                let mut id = shape.0;
-                while id != 0 {
-                    let n = &self.nodes[id as usize];
-                    table.insert(n.key, (n.len - 1, n.flags));
-                    id = n.parent;
+            let existing = node.table.borrow().clone();
+            let table = match existing {
+                Some(t) => t,
+                None => {
+                    let mut table = FxHashMap::default();
+                    let mut id = shape.0;
+                    while id != 0 {
+                        let n = &self.nodes[id as usize];
+                        table.insert(n.key, (n.len - 1, n.flags));
+                        id = n.parent;
+                    }
+                    let t = Rc::new(RefCell::new(table));
+                    *node.table.borrow_mut() = Some(t.clone());
+                    t
                 }
-                table
-            });
-            return table.get(&key).copied();
+            };
+            let r = table.borrow().get(&key).copied();
+            return r.filter(|&(slot, _)| slot < node.len);
         }
         let mut id = shape.0;
         while id != 0 {

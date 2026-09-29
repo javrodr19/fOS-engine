@@ -20,6 +20,46 @@ pub fn parse_script(src: &str) -> PResult<Program> {
     Ok(Program { body, strict })
 }
 
+/// What re-parsing a lazily compiled function needs to know
+pub struct ReparseInfo {
+    pub params_start: u32,
+    pub span_start: u32,
+    pub kind: FunctionKind,
+    pub is_async: bool,
+    pub is_generator: bool,
+    /// Strictness of the enclosing code
+    pub outer_strict: bool,
+}
+
+/// Parse a function again from its source (for lazy compilation); its
+/// nested functions come back as lazy stubs
+pub fn reparse_function(src: &str, info: &ReparseInfo) -> PResult<Function> {
+    let mut p = Parser::new("")?;
+    p.lexer = Lexer::new(src);
+    p.lexer.seek(info.params_start as usize);
+    p.tok = p.lexer.next_token()?;
+    p.strict = info.outer_strict;
+    p.in_function = true;
+    p.lazy_depth = Some(1);
+    if info.kind == FunctionKind::Arrow {
+        match p.parse_assign()? {
+            Expr::Function(f) => Ok(*f),
+            _ => Err(SyntaxError { message: "invalid lazy function".into(), pos: info.params_start }),
+        }
+    } else {
+        p.parse_function_rest(None, info.kind, info.is_async, info.is_generator, info.span_start)
+    }
+}
+
+/// Parse a script keeping only lazy stubs for its functions' bodies
+/// (compiled when first called)
+pub fn parse_script_lazy(src: &str) -> PResult<Program> {
+    let mut parser = Parser::new(src)?;
+    parser.set_lazy(true);
+    let (body, strict) = parser.parse_body_until_eof()?;
+    Ok(Program { body, strict })
+}
+
 /// Parse the parameter list and body of a `Function(...)` constructor call
 pub fn parse_function_parts(params: &str, body: &str) -> PResult<Function> {
     let src = format!("(function anonymous({}\n) {{\n{}\n}})", params, body);
@@ -49,7 +89,18 @@ pub struct Parser<'a> {
     no_in: bool,
     /// `{ a = 1 }` shorthands not yet turned into patterns
     cover_inits: usize,
+    /// Function nesting depth
+    depth: u32,
+    /// Functions finishing at this depth or deeper keep only what lazy
+    /// compilation needs (None: keep every body)
+    lazy_depth: Option<u32>,
+    /// Start of a parenthesized function expression, which is probably
+    /// invoked immediately and so compiled eagerly (as V8 does)
+    eager_function: Option<u32>,
+    /// Interned identifier names (one allocation per distinct name)
+    names: std::cell::RefCell<std::collections::HashSet<Name>>,
 }
+
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> PResult<Self> {
@@ -65,7 +116,62 @@ impl<'a> Parser<'a> {
             in_async: false,
             no_in: false,
             cover_inits: 0,
+            depth: 0,
+            lazy_depth: None,
+            eager_function: None,
+            names: Default::default(),
         })
+    }
+
+    fn name(&self, s: &str) -> Name {
+        let mut names = self.names.borrow_mut();
+        if let Some(n) = names.get(s) {
+            return n.clone();
+        }
+        let n: Name = Rc::from(s);
+        names.insert(n.clone());
+        n
+    }
+
+    /// Keep only lazy stubs for nested functions (see `FunctionBody::Lazy`)
+    pub fn set_lazy(&mut self, on: bool) {
+        self.lazy_depth = if on { Some(0) } else { None };
+    }
+
+    /// Whether a function starting here (at `start`) is pre-parsed: its
+    /// statements are checked and dropped, keeping only a lazy stub
+    fn preparse_function(&self, start: u32) -> bool {
+        self.lazy_depth.is_some_and(|d| self.depth >= d) && self.eager_function != Some(start)
+    }
+
+    /// Parse a function body's statements up to (not including) `}`,
+    /// either keeping them or (pre-parsing) folding them into free names
+    fn parse_body_items(&mut self, pre: Option<&mut FreeNames>) -> PResult<Vec<Stmt>> {
+        let mut body = Vec::new();
+        self.parse_directives(&mut body)?;
+        match pre {
+            None => {
+                while !self.at(P::RBrace) {
+                    if self.tok.tok == Tok::Eof {
+                        return self.unexpected("expected '}'");
+                    }
+                    body.push(self.parse_statement_list_item()?);
+                }
+            }
+            Some(free) => {
+                for st in body.drain(..) {
+                    free.stmt(&st);
+                }
+                while !self.at(P::RBrace) {
+                    if self.tok.tok == Tok::Eof {
+                        return self.unexpected("expected '}'");
+                    }
+                    let st = self.parse_statement_list_item()?;
+                    free.stmt(&st);
+                }
+            }
+        }
+        Ok(body)
     }
 
     // ---- token helpers ----
@@ -175,7 +281,7 @@ impl<'a> Parser<'a> {
     /// Current token as an identifier reference, if it can be one here
     fn ident_reference(&self) -> Option<Name> {
         match &self.tok.tok {
-            Tok::Ident(n) => Some(Rc::from(&**n)),
+            Tok::Ident(n) => Some(self.name(n)),
             Tok::Keyword(Kw::Let) | Tok::Keyword(Kw::Static) if !self.strict => Some(Rc::from(self.kw_text())),
             Tok::Keyword(Kw::Yield) if !self.in_generator && !self.strict => Some(Rc::from("yield")),
             Tok::Keyword(Kw::Await) if !self.in_async => Some(Rc::from("await")),
@@ -206,8 +312,8 @@ impl<'a> Parser<'a> {
     /// IdentifierName (any identifier or keyword), e.g. after `.`
     fn parse_identifier_name(&mut self) -> PResult<Name> {
         let name: Name = match &self.tok.tok {
-            Tok::Ident(n) => Rc::from(&**n),
-            Tok::Keyword(k) => Rc::from(k.as_str()),
+            Tok::Ident(n) => self.name(n),
+            Tok::Keyword(k) => self.name(k.as_str()),
             _ => return self.unexpected("expected property name"),
         };
         self.advance()?;
@@ -626,35 +732,48 @@ impl<'a> Parser<'a> {
         self.in_generator = is_generator;
         self.in_async = is_async;
         self.no_in = false;
+        let params_start = self.tok.span.start;
+        let pre = self.preparse_function(start);
+        self.depth += 1;
         let result = (|| {
             let (params, rest) = self.parse_params()?;
             self.expect(P::LBrace)?;
-            let mut body = Vec::new();
-            self.parse_directives(&mut body)?;
-            while !self.at(P::RBrace) {
-                if self.tok.tok == Tok::Eof {
-                    return self.unexpected("expected '}'");
+            if pre {
+                let mut free = FreeNames::default();
+                params.iter().for_each(|p| free.param(p));
+                if let Some(r) = &rest {
+                    free.rest(r);
                 }
-                body.push(self.parse_statement_list_item()?);
+                self.parse_body_items(Some(&mut free))?;
+                self.advance()?;
+                let lazy = LazyBody {
+                    free: free.finish(kind),
+                    nparams: params.len() as u32,
+                    length: params.iter().take_while(|p| p.default.is_none()).count() as u32,
+                };
+                return Ok((Vec::new(), None, FunctionBody::Lazy(Box::new(lazy)), false));
             }
+            let body = self.parse_body_items(None)?;
             self.advance()?;
-            Ok((params, rest, body))
+            let simple = rest.is_none() && params.iter().all(|p| p.default.is_none() && matches!(p.target, Pattern::Ident(_)));
+            Ok((params, rest, FunctionBody::Block(body), simple))
         })();
         let strict = self.strict;
+        self.depth -= 1;
         (self.in_function, self.in_generator, self.in_async, self.strict, self.no_in) = saved;
-        let (params, rest, body) = result?;
-        let simple_params = rest.is_none() && params.iter().all(|p| p.default.is_none() && matches!(p.target, Pattern::Ident(_)));
+        let (params, rest, body, simple_params) = result?;
         Ok(Function {
             name,
             params,
             rest,
-            body: FunctionBody::Block(body),
+            body,
             kind,
             is_async,
             is_generator,
             strict,
             simple_params,
             span: self.span_from(start),
+            params_start,
         })
     }
 
@@ -1116,31 +1235,56 @@ impl<'a> Parser<'a> {
         }
         self.expect(P::Arrow)?;
         let saved = (self.in_function, self.in_generator, self.in_async, self.strict, self.no_in);
+        let pre = self.preparse_function(start);
+        self.depth += 1;
         self.in_function = true;
         self.in_generator = false;
         self.in_async = is_async;
-        let body = if self.at(P::LBrace) {
+        let mut free = FreeNames::default();
+        if pre {
+            params.iter().for_each(|p| free.param(p));
+            if let Some(r) = &rest {
+                free.rest(r);
+            }
+        }
+        let block_body = self.at(P::LBrace);
+        let body = if block_body {
             self.no_in = false;
             (|| {
                 self.advance()?;
-                let mut body = Vec::new();
-                self.parse_directives(&mut body)?;
-                while !self.at(P::RBrace) {
-                    if self.tok.tok == Tok::Eof {
-                        return self.unexpected("expected '}'");
-                    }
-                    body.push(self.parse_statement_list_item()?);
+                // The closing brace is consumed after restoring the flags
+                if pre {
+                    self.parse_body_items(Some(&mut free))?;
+                    Ok(FunctionBody::Block(Vec::new()))
+                } else {
+                    Ok(FunctionBody::Block(self.parse_body_items(None)?))
                 }
-                // The closing brace is consumed by the caller's loop below
-                Ok(FunctionBody::Block(body))
             })()
         } else {
-            self.parse_assign().map(|e| FunctionBody::Expr(Box::new(e)))
+            self.parse_assign().map(|e| {
+                if pre {
+                    free.expr(&e);
+                    FunctionBody::Block(Vec::new())
+                } else {
+                    FunctionBody::Expr(Box::new(e))
+                }
+            })
         };
         let strict = self.strict;
-        let block_body = matches!(body, Ok(FunctionBody::Block(_)));
+        self.depth -= 1;
         (self.in_function, self.in_generator, self.in_async, self.strict, self.no_in) = saved;
-        let body = body?;
+        let mut body = body?;
+        let (mut params, mut rest) = (params, rest);
+        if pre {
+            let lazy = LazyBody {
+                free: free.finish(FunctionKind::Arrow),
+                nparams: params.len() as u32,
+                length: params.iter().take_while(|p| p.default.is_none()).count() as u32,
+            };
+            body = FunctionBody::Lazy(Box::new(lazy));
+            params = Vec::new();
+            rest = None;
+        }
         if block_body {
             // Consume `}` with the outer flags restored, so the token after
             // it is lexed in the outer context
@@ -1158,6 +1302,7 @@ impl<'a> Parser<'a> {
             strict,
             simple_params,
             span: self.span_from(start),
+            params_start: start,
         })))
     }
 
@@ -1543,6 +1688,9 @@ impl<'a> Parser<'a> {
     fn parse_paren(&mut self, start: u32) -> PResult<Expr> {
         let before = self.cover_inits;
         self.expect(P::LParen)?;
+        if self.at_kw(Kw::Function) {
+            self.eager_function = Some(self.tok.span.start);
+        }
         let saved = std::mem::replace(&mut self.no_in, false);
         let result = (|| {
             let mut items = Vec::new();

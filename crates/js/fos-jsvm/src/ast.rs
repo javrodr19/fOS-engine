@@ -264,6 +264,21 @@ pub enum FunctionBody {
     Block(Vec<Stmt>),
     /// Concise arrow body
     Expr(Box<Expr>),
+    /// Not kept: compiled on first call by parsing the source again
+    Lazy(Box<LazyBody>),
+}
+
+/// What the enclosing code needs to know about a function whose body is
+/// compiled later
+#[derive(Debug)]
+pub struct LazyBody {
+    /// Names the function may take from enclosing scopes (a superset),
+    /// including the pseudo-names "this", "arguments", "new.target",
+    /// "%ctor", "super" and "#private" names
+    pub free: Vec<Name>,
+    pub nparams: u32,
+    /// Function.prototype.length
+    pub length: u32,
 }
 
 #[derive(Debug)]
@@ -279,6 +294,9 @@ pub struct Function {
     /// Parameters are plain identifiers without defaults or rest
     pub simple_params: bool,
     pub span: Span,
+    /// Where parsing resumes to compile a lazy body: the `(` of the
+    /// parameters (arrows: the start of the arrow)
+    pub params_start: u32,
 }
 
 #[derive(Debug)]
@@ -302,4 +320,419 @@ pub struct Class {
     pub constructor: Option<Box<Function>>,
     pub members: Vec<ClassMember>,
     pub span: Span,
+}
+
+// ---- free names (for lazily compiled functions) ----
+
+/// Referenced names, deduplicated as they are collected
+#[derive(Default)]
+struct Refs {
+    set: std::collections::HashSet<Name>,
+    list: Vec<Name>,
+}
+
+impl Refs {
+    fn push(&mut self, n: Name) {
+        if self.set.insert(n.clone()) {
+            self.list.push(n);
+        }
+    }
+
+    fn extend(&mut self, names: impl IntoIterator<Item = Name>) {
+        for n in names {
+            self.push(n);
+        }
+    }
+}
+
+fn pattern_refs(p: &Pattern, out: &mut Refs) {
+    match p {
+        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Member(e) => expr_refs(e, out),
+        Pattern::Array { elems, rest } => {
+            for e in elems.iter().flatten() {
+                pattern_refs(&e.target, out);
+                if let Some(d) = &e.default {
+                    expr_refs(d, out);
+                }
+            }
+            if let Some(r) = rest {
+                pattern_refs(r, out);
+            }
+        }
+        Pattern::Object { props, rest } => {
+            for p in props {
+                key_refs(&p.key, out);
+                pattern_refs(&p.target, out);
+                if let Some(d) = &p.default {
+                    expr_refs(d, out);
+                }
+            }
+            if let Some(r) = rest {
+                pattern_refs(r, out);
+            }
+        }
+    }
+}
+
+fn key_refs(k: &PropKey, out: &mut Refs) {
+    match k {
+        PropKey::Computed(e) => expr_refs(e, out),
+        PropKey::Private(n) => out.push(Rc::from(format!("#{n}"))),
+        _ => {}
+    }
+}
+
+fn member_refs(p: &MemberProp, out: &mut Refs) {
+    match p {
+        MemberProp::Computed(e) => expr_refs(e, out),
+        MemberProp::Private(n) => out.push(Rc::from(format!("#{n}"))),
+        MemberProp::Name(_) => {}
+    }
+}
+
+fn elems_refs(v: &[ArrayElem], out: &mut Refs) {
+    for a in v {
+        match a {
+            ArrayElem::Expr(e) | ArrayElem::Spread(e) => expr_refs(e, out),
+        }
+    }
+}
+
+fn function_refs(f: &Function, out: &mut Refs) {
+    match &f.body {
+        FunctionBody::Lazy(l) => out.extend(l.free.iter().cloned()),
+        _ => out.extend(function_free_names(f)),
+    }
+}
+
+fn class_refs(c: &Class, out: &mut Refs) {
+    if let Some(e) = &c.extends {
+        expr_refs(e, out);
+    }
+    if let Some(f) = &c.constructor {
+        function_refs(f, out);
+    }
+    for m in &c.members {
+        key_refs(&m.key, out);
+        match &m.kind {
+            ClassMemberKind::Method(_, f) => function_refs(f, out),
+            ClassMemberKind::Field(Some(e)) => expr_refs(e, out),
+            ClassMemberKind::Field(None) => {}
+            ClassMemberKind::StaticBlock(b) => stmts_refs(b, out),
+        }
+    }
+}
+
+fn expr_refs(e: &Expr, out: &mut Refs) {
+    match e {
+        Expr::Num(_) | Expr::Str(_) | Expr::BigInt(_) | Expr::Bool(_) | Expr::Null | Expr::Regex { .. } => {}
+        Expr::Template(t) => t.exprs.iter().for_each(|x| expr_refs(x, out)),
+        Expr::TaggedTemplate { tag, template } => {
+            expr_refs(tag, out);
+            template.exprs.iter().for_each(|x| expr_refs(x, out));
+        }
+        Expr::Ident(n) => out.push(n.clone()),
+        Expr::This => out.push(Rc::from("this")),
+        Expr::NewTarget => out.push(Rc::from("new.target")),
+        Expr::Array(v) => {
+            for a in v.iter().flatten() {
+                match a {
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => expr_refs(e, out),
+                }
+            }
+        }
+        Expr::Object(props) => {
+            for p in props {
+                match p {
+                    ObjProp::KeyValue(k, v) => {
+                        key_refs(k, out);
+                        expr_refs(v, out);
+                    }
+                    ObjProp::Shorthand(n) => out.push(n.clone()),
+                    ObjProp::CoverInit(n, v) => {
+                        out.push(n.clone());
+                        expr_refs(v, out);
+                    }
+                    ObjProp::Method { key, func, .. } => {
+                        key_refs(key, out);
+                        function_refs(func, out);
+                    }
+                    ObjProp::Spread(e) => expr_refs(e, out),
+                }
+            }
+        }
+        Expr::Function(f) => function_refs(f, out),
+        Expr::Class(c) => class_refs(c, out),
+        Expr::Unary { arg, .. } => expr_refs(arg, out),
+        Expr::Update { target, .. } => expr_refs(target, out),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            expr_refs(left, out);
+            expr_refs(right, out);
+        }
+        Expr::Assign { target, value, .. } => {
+            pattern_refs(target, out);
+            expr_refs(value, out);
+        }
+        Expr::Cond { test, cons, alt } => {
+            expr_refs(test, out);
+            expr_refs(cons, out);
+            expr_refs(alt, out);
+        }
+        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+            expr_refs(callee, out);
+            elems_refs(args, out);
+        }
+        Expr::SuperCall(args) => {
+            for n in ["%ctor", "new.target", "this"] {
+                out.push(Rc::from(n));
+            }
+            elems_refs(args, out);
+        }
+        Expr::Member { object, prop, .. } => {
+            expr_refs(object, out);
+            member_refs(prop, out);
+        }
+        Expr::SuperMember(p) => {
+            out.push(Rc::from("super"));
+            out.push(Rc::from("this"));
+            member_refs(p, out);
+        }
+        Expr::OptionalChain(e) | Expr::Await(e) | Expr::Paren(e) | Expr::Import(e) => expr_refs(e, out),
+        Expr::Seq(v) => v.iter().for_each(|x| expr_refs(x, out)),
+        Expr::Yield { arg, .. } => {
+            if let Some(a) = arg {
+                expr_refs(a, out);
+            }
+        }
+    }
+}
+
+fn stmts_refs(v: &[Stmt], out: &mut Refs) {
+    for s in v {
+        stmt_refs(s, out);
+    }
+}
+
+fn stmt_refs(s: &Stmt, out: &mut Refs) {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_refs(e, out),
+        Stmt::Var { decls, .. } => {
+            for d in decls {
+                pattern_refs(&d.target, out);
+                if let Some(i) = &d.init {
+                    expr_refs(i, out);
+                }
+            }
+        }
+        Stmt::Function(f) => {
+            if let Some(n) = &f.name {
+                out.push(n.clone());
+            }
+            function_refs(f, out);
+        }
+        Stmt::Class(c) => {
+            if let Some(n) = &c.name {
+                out.push(n.clone());
+            }
+            class_refs(c, out);
+        }
+        Stmt::Return(e) => {
+            if let Some(e) = e {
+                expr_refs(e, out);
+            }
+        }
+        Stmt::If { test, cons, alt } => {
+            expr_refs(test, out);
+            stmt_refs(cons, out);
+            if let Some(a) = alt {
+                stmt_refs(a, out);
+            }
+        }
+        Stmt::Block(b) => stmts_refs(b, out),
+        Stmt::For { init, test, update, body } => {
+            match init {
+                Some(ForInit::Var(_, decls)) => {
+                    for d in decls {
+                        pattern_refs(&d.target, out);
+                        if let Some(i) = &d.init {
+                            expr_refs(i, out);
+                        }
+                    }
+                }
+                Some(ForInit::Expr(e)) => expr_refs(e, out),
+                None => {}
+            }
+            if let Some(t) = test {
+                expr_refs(t, out);
+            }
+            if let Some(u) = update {
+                expr_refs(u, out);
+            }
+            stmt_refs(body, out);
+        }
+        Stmt::ForIn { head, object: e, body } | Stmt::ForOf { head, iterable: e, body, .. } => {
+            match head {
+                ForHead::Decl(_, p) | ForHead::Target(p) => pattern_refs(p, out),
+            }
+            expr_refs(e, out);
+            stmt_refs(body, out);
+        }
+        Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+            expr_refs(test, out);
+            stmt_refs(body, out);
+        }
+        Stmt::Try { block, param, handler, finalizer } => {
+            stmts_refs(block, out);
+            if let Some(p) = param {
+                pattern_refs(p, out);
+            }
+            if let Some(h) = handler {
+                stmts_refs(h, out);
+            }
+            if let Some(f) = finalizer {
+                stmts_refs(f, out);
+            }
+        }
+        Stmt::Switch { discriminant, cases } => {
+            expr_refs(discriminant, out);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    expr_refs(t, out);
+                }
+                stmts_refs(&c.body, out);
+            }
+        }
+        Stmt::Labeled { body, .. } => stmt_refs(body, out),
+        Stmt::With { object, body } => {
+            expr_refs(object, out);
+            stmt_refs(body, out);
+        }
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty | Stmt::Debugger => {}
+    }
+}
+
+fn bound_names(p: &Pattern, out: &mut Refs) {
+    match p {
+        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Member(_) => {}
+        Pattern::Array { elems, rest } => {
+            for e in elems.iter().flatten() {
+                bound_names(&e.target, out);
+            }
+            if let Some(r) = rest {
+                bound_names(r, out);
+            }
+        }
+        Pattern::Object { props, rest } => {
+            for p in props {
+                bound_names(&p.target, out);
+            }
+            if let Some(r) = rest {
+                bound_names(r, out);
+            }
+        }
+    }
+}
+
+/// Free-name collection for a function whose statements are dropped as
+/// soon as they are parsed
+#[derive(Default)]
+pub struct FreeNames {
+    refs: Refs,
+    own: Refs,
+}
+
+impl FreeNames {
+    pub fn param(&mut self, p: &Param) {
+        pattern_refs(&p.target, &mut self.refs);
+        if let Some(d) = &p.default {
+            expr_refs(d, &mut self.refs);
+        }
+        bound_names(&p.target, &mut self.own);
+    }
+
+    pub fn rest(&mut self, p: &Pattern) {
+        pattern_refs(p, &mut self.refs);
+        bound_names(p, &mut self.own);
+    }
+
+    /// A top-level statement of the function body
+    pub fn stmt(&mut self, s: &Stmt) {
+        stmt_refs(s, &mut self.refs);
+        match s {
+            Stmt::Var { decls, .. } => decls.iter().for_each(|d| bound_names(&d.target, &mut self.own)),
+            Stmt::Function(g) => self.own.extend(g.name.clone()),
+            Stmt::Class(c) => self.own.extend(c.name.clone()),
+            _ => {}
+        }
+    }
+
+    pub fn expr(&mut self, e: &Expr) {
+        expr_refs(e, &mut self.refs);
+    }
+
+    pub fn finish(mut self, kind: FunctionKind) -> Vec<Name> {
+        if kind != FunctionKind::Arrow {
+            for n in ["this", "arguments", "new.target", "%ctor"] {
+                self.own.push(Rc::from(n));
+            }
+        }
+        let mut list = self.refs.list;
+        list.retain(|n| !self.own.set.contains(n));
+        list.shrink_to_fit();
+        list
+    }
+}
+
+/// Names a function may take from its enclosing scopes. A superset:
+/// references are only discounted when a parameter or a top-level
+/// declaration of the function itself binds them.
+pub fn function_free_names(f: &Function) -> Vec<Name> {
+    let mut refs = Refs::default();
+    for p in &f.params {
+        pattern_refs(&p.target, &mut refs);
+        if let Some(d) = &p.default {
+            expr_refs(d, &mut refs);
+        }
+    }
+    if let Some(r) = &f.rest {
+        pattern_refs(r, &mut refs);
+    }
+    let body: &[Stmt] = match &f.body {
+        FunctionBody::Block(b) => {
+            stmts_refs(b, &mut refs);
+            b
+        }
+        FunctionBody::Expr(e) => {
+            expr_refs(e, &mut refs);
+            &[]
+        }
+        FunctionBody::Lazy(l) => return l.free.clone(),
+    };
+    // Names bound for the whole function
+    let mut own = Refs::default();
+    for p in &f.params {
+        bound_names(&p.target, &mut own);
+    }
+    if let Some(r) = &f.rest {
+        bound_names(r, &mut own);
+    }
+    for s in body {
+        match s {
+            Stmt::Var { decls, .. } => decls.iter().for_each(|d| bound_names(&d.target, &mut own)),
+            Stmt::Function(g) => own.extend(g.name.clone()),
+            Stmt::Class(c) => own.extend(c.name.clone()),
+            _ => {}
+        }
+    }
+    if f.kind != FunctionKind::Arrow {
+        for n in ["this", "arguments", "new.target", "%ctor"] {
+            own.push(Rc::from(n));
+        }
+    }
+    let mut list = refs.list;
+    list.retain(|n| !own.set.contains(n));
+    list.shrink_to_fit();
+    list
 }

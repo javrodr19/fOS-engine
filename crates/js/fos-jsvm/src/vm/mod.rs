@@ -319,7 +319,7 @@ impl Vm {
 
     /// Parse, compile and run a script; returns its completion value
     pub fn eval(&mut self, src: &str) -> JsResult<Value> {
-        let program = match crate::parser::parse_script(src) {
+        let program = match crate::parser::parse_script_lazy(src) {
             Ok(p) => p,
             Err(e) => return Err(self.make_error(ErrorKind::Syntax, &e.message)),
         };
@@ -645,6 +645,7 @@ impl Vm {
     ) -> JsResult<Value> {
         let base = self.sp;
         let p = unsafe { &*proto };
+        self.ensure_compiled(p)?;
         if base + args.len() + p.nregs as usize + 2 >= STACK_SIZE {
             return Err(self.range_error("Maximum call stack size exceeded"));
         }
@@ -670,6 +671,9 @@ impl Vm {
         new_target: Value,
     ) -> JsResult<()> {
         let p = unsafe { &*proto };
+        if p.compiled.get().is_none() {
+            self.ensure_compiled(p)?;
+        }
         let nregs = p.nregs as usize;
         if base + nregs.max(argc + 1) + 1 >= STACK_SIZE {
             return Err(self.range_error("Maximum call stack size exceeded"));
@@ -733,6 +737,21 @@ impl Vm {
         }
         if let (Some(r), Some(a)) = (p.arguments_reg, self.pending_arguments.take()) {
             self.set_slot(base + r as usize, Value::object(a));
+        }
+    }
+
+    /// Compile a lazy function's body if that hasn't happened yet
+    #[cold]
+    pub(crate) fn ensure_compiled(&mut self, p: &FunctionProto) -> JsResult<()> {
+        if p.compiled.get().is_some() {
+            return Ok(());
+        }
+        match crate::compiler::compile_lazy(&self.heap, &mut self.atoms, p) {
+            Ok(code) => {
+                let _ = p.compiled.set(code);
+                Ok(())
+            }
+            Err(e) => Err(self.make_error(ErrorKind::Syntax, &e.message)),
         }
     }
 

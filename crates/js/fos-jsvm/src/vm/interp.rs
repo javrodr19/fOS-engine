@@ -25,6 +25,7 @@ impl Vm {
         let mut base: usize;
         let mut pc: usize;
         let mut proto: *const FunctionProto;
+        let mut cp: *const Code;
         let mut code: *const Insn;
         let mut regs: *mut Value;
         let mut closure: *const Closure;
@@ -35,7 +36,8 @@ impl Vm {
                 base = f.base;
                 pc = f.pc as usize;
                 proto = f.proto;
-                code = unsafe { (*proto).code.as_ptr() };
+                cp = unsafe { (*proto).compiled.get().unwrap_unchecked() };
+                code = unsafe { (*cp).code.as_ptr() };
                 regs = unsafe { stack.add(base) };
                 closure = match &f.func.get().kind {
                     ObjectKind::Function(c) => &**c,
@@ -58,7 +60,7 @@ impl Vm {
         }
         macro_rules! ic {
             ($i:expr) => {
-                unsafe { &(*proto).ics[$i as usize] }
+                unsafe { &(*cp).ics[$i as usize] }
             };
         }
         macro_rules! safepoint {
@@ -158,7 +160,7 @@ impl Vm {
                     Insn::Nop | Insn::Debugger => {}
                     Insn::Mov { dst, src } => w!(dst, r!(src)),
                     Insn::LoadInt { dst, value } => w!(dst, Value::int(value)),
-                    Insn::LoadConst { dst, idx } => w!(dst, unsafe { (*proto).consts[idx as usize] }),
+                    Insn::LoadConst { dst, idx } => w!(dst, unsafe { (*cp).consts[idx as usize] }),
                     Insn::LoadUndef { dst } => w!(dst, Value::UNDEFINED),
                     Insn::LoadNull { dst } => w!(dst, Value::NULL),
                     Insn::LoadTrue { dst } => w!(dst, Value::TRUE),
@@ -166,7 +168,7 @@ impl Vm {
                     Insn::LoadHole { dst } => w!(dst, Value::HOLE),
                     Insn::CheckInit { reg, name } => {
                         if r!(reg).is_hole() {
-                            let e = self.tdz_error(unsafe { (*proto).atoms[name as usize] });
+                            let e = self.tdz_error(unsafe { (*cp).atoms[name as usize] });
                             break 'inner e;
                         }
                     }
@@ -186,7 +188,7 @@ impl Vm {
                             Upvalue::Closed(v) => v,
                         };
                         if v.is_hole() {
-                            let e = self.tdz_error(unsafe { (*proto).atoms[name as usize] });
+                            let e = self.tdz_error(unsafe { (*cp).atoms[name as usize] });
                             break 'inner e;
                         }
                         w!(dst, v);
@@ -243,19 +245,19 @@ impl Vm {
                         }
                     }
                     Insn::DeclareGlobalVar { name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         self.declare_global_var(atom);
                     }
                     Insn::DeclareGlobalFunc { src, name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         tri!(self.declare_global_func(atom, r!(src)));
                     }
                     Insn::DeclareGlobalLex { name, is_const } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         tri!(self.declare_global_lex(atom, is_const));
                     }
                     Insn::InitGlobalLex { src, name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         self.init_global_lex(atom, r!(src));
                     }
 
@@ -770,7 +772,7 @@ impl Vm {
                         w!(dst, Value::object(o));
                     }
                     Insn::DeleteProp { dst, obj, name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         let strict = unsafe { (*proto).strict };
                         let v = tri!(self.delete_property(r!(obj), PropertyKey::Atom(atom), strict));
                         w!(dst, Value::bool(v));
@@ -800,7 +802,7 @@ impl Vm {
 
                     // ---- functions ----
                     Insn::Closure { dst, idx } => {
-                        let p = unsafe { (*proto).funcs[idx as usize].clone() };
+                        let p = unsafe { (*cp).funcs[idx as usize].clone() };
                         let mut ups = Vec::with_capacity(p.upvals.len());
                         for d in p.upvals.iter() {
                             if d.from_parent_reg {
@@ -913,7 +915,7 @@ impl Vm {
                     },
                     Insn::Throw { src } => break 'inner r!(src),
                     Insn::ThrowError { kind, msg } => {
-                        let text = unsafe { (*proto).consts[msg as usize] };
+                        let text = unsafe { (*cp).consts[msg as usize] };
                         let text = text.as_string().map(|s| s.get().to_rust_string()).unwrap_or_default();
                         let kind = match kind {
                             ERR_TYPE => ErrorKind::Type,
@@ -958,17 +960,17 @@ impl Vm {
                         tri!(self.iter_close(r!(iter)));
                     }
                     Insn::TemplateObject { dst, idx } => {
-                        let site = unsafe { &(*proto).templates[idx as usize] };
+                        let site = unsafe { &(*cp).templates[idx as usize] };
                         let v = self.template_object(site);
                         w!(dst, v);
                     }
                     Insn::RegExp { dst, idx } => {
-                        let lit = unsafe { &(*proto).regexps[idx as usize] };
+                        let lit = unsafe { &(*cp).regexps[idx as usize] };
                         let v = tri!(crate::builtins::regexp::from_literal(self, lit));
                         w!(dst, v);
                     }
                     Insn::WithHas { dst, obj, name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         let v = tri!(self.with_has(r!(obj), atom));
                         w!(dst, Value::bool(v));
                     }
@@ -1045,7 +1047,7 @@ impl Vm {
                         }
                     }
                     Insn::NewPrivateName { dst, name } => {
-                        let atom = unsafe { (*proto).atoms[name as usize] };
+                        let atom = unsafe { (*cp).atoms[name as usize] };
                         let d = self.atoms.string(atom);
                         let s = self.new_symbol(Some(d));
                         s.get_mut().is_private = true;
@@ -1076,7 +1078,7 @@ impl Vm {
                 }
                 self.frames.pop();
                 self.sp = match self.frames.last() {
-                    Some(f) => f.base + unsafe { (*f.proto).nregs as usize },
+                    Some(f) => f.base + unsafe { (&*f.proto).nregs as usize },
                     None => 0,
                 };
                 if flags & F_ENTRY != 0 {
@@ -1108,13 +1110,13 @@ impl Vm {
         self.frames.pop();
         if flags & F_ENTRY != 0 {
             self.sp = match self.frames.last() {
-                Some(f) => f.base + unsafe { (*f.proto).nregs as usize },
+                Some(f) => f.base + unsafe { (&*f.proto).nregs as usize },
                 None => 0,
             };
             return Ok(Some(v));
         }
         let f = self.frames.last().unwrap();
-        self.sp = f.base + unsafe { (*f.proto).nregs as usize };
+        self.sp = f.base + unsafe { (&*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         Ok(None)
     }
@@ -1125,7 +1127,7 @@ impl Vm {
             return Some(v);
         }
         let f = self.frames.last().unwrap();
-        self.sp = f.base + unsafe { (*f.proto).nregs as usize };
+        self.sp = f.base + unsafe { (&*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         None
     }

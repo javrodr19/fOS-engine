@@ -292,19 +292,11 @@ pub struct RegexLiteral {
     pub compiled: std::cell::OnceCell<Rc<crate::regex::Regex>>,
 }
 
-/// Compiled function
+/// A function: header known when its definition is compiled, code
+/// compiled then or (lazy functions) on first call
 pub struct FunctionProto {
     pub name: Atom,
-    pub code: Box<[Insn]>,
-    pub consts: Box<[Value]>,
-    pub atoms: Box<[Atom]>,
-    pub funcs: Box<[Rc<FunctionProto>]>,
-    pub ics: Box<[Cell<Ic>]>,
     pub upvals: Box<[UpvalDesc]>,
-    pub handlers: Box<[Handler]>,
-    pub templates: Box<[TemplateSite]>,
-    pub regexps: Box<[RegexLiteral]>,
-    pub nregs: u16,
     pub nparams: u16,
     /// Function.prototype.length
     pub length: u16,
@@ -316,16 +308,47 @@ pub struct FunctionProto {
     pub is_derived: bool,
     pub is_generator: bool,
     pub is_async: bool,
+    /// Source text range (for Function.prototype.toString)
+    pub source: (u32, u32),
+    /// Collection number this was last traced in
+    pub traced: Cell<u32>,
+    /// How to compile the body later (lazy functions)
+    pub lazy: Option<Box<LazyInfo>>,
+    pub compiled: std::cell::OnceCell<Code>,
+}
+
+/// A compiled function body
+pub struct Code {
+    pub code: Box<[Insn]>,
+    pub consts: Box<[Value]>,
+    pub atoms: Box<[Atom]>,
+    pub funcs: Box<[Rc<FunctionProto>]>,
+    pub ics: Box<[Cell<Ic>]>,
+    pub handlers: Box<[Handler]>,
+    pub templates: Box<[TemplateSite]>,
+    pub regexps: Box<[RegexLiteral]>,
+    pub nregs: u16,
     /// Sloppy functions that use `this` coerce it to an object
     pub coerce_this: bool,
     /// Register receiving the `arguments` object, if used
     pub arguments_reg: Option<Reg>,
     /// Register receiving the rest parameter array, if any
     pub rest_reg: Option<Reg>,
-    /// Source text range (for Function.prototype.toString)
-    pub source: (u32, u32),
-    /// Collection number this was last traced in
-    pub traced: Cell<u32>,
+}
+
+/// Source and scope information for compiling a lazy function
+pub struct LazyInfo {
+    /// The whole script's source
+    pub source: Rc<str>,
+    pub params_start: u32,
+    pub kind: crate::ast::FunctionKind,
+    pub fn_name: Option<crate::ast::Name>,
+    /// Compiled as a function expression (binds its own name)
+    pub is_expression: bool,
+    pub outer_strict: bool,
+    /// Names reachable through upvalues, parallel to `upvals`, with
+    /// dead-zone check and binding kind flags
+    pub upval_names: Vec<(crate::ast::Name, bool, u8)>,
 }
 
 impl FunctionProto {
@@ -336,8 +359,9 @@ impl FunctionProto {
             return;
         }
         self.traced.set(tracer.epoch());
-        tracer.mark_values(&self.consts);
-        for ic in self.ics.iter() {
+        let Some(code) = self.compiled.get() else { return };
+        tracer.mark_values(&code.consts);
+        for ic in code.ics.iter() {
             match ic.get().state {
                 IcState::Proto { proto, holder, .. } => {
                     tracer.mark(proto);
@@ -347,8 +371,21 @@ impl FunctionProto {
                 _ => {}
             }
         }
-        for f in self.funcs.iter() {
+        for f in code.funcs.iter() {
             f.trace(tracer);
+        }
+    }
+}
+
+impl std::ops::Deref for FunctionProto {
+    type Target = Code;
+
+    /// The compiled body (callers make sure it is compiled)
+    #[inline(always)]
+    fn deref(&self) -> &Code {
+        match self.compiled.get() {
+            Some(c) => c,
+            None => panic!("function used before compilation"),
         }
     }
 }
@@ -357,9 +394,8 @@ impl std::fmt::Debug for FunctionProto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FunctionProto")
             .field("name", &self.name)
-            .field("nregs", &self.nregs)
             .field("nparams", &self.nparams)
-            .field("code", &self.code)
+            .field("compiled", &self.compiled.get().is_some())
             .finish()
     }
 }

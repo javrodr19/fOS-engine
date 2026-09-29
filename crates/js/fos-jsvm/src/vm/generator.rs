@@ -51,7 +51,7 @@ impl Vm {
     pub(crate) fn suspend(&mut self, pc: usize, resume_reg: u16, status: GenStatus) -> (u16, u8) {
         let f = self.frames.pop().unwrap();
         let st = Self::gen_state(f.activation.unwrap());
-        let nregs = unsafe { (*f.proto).nregs as usize };
+        let nregs = unsafe { (&*f.proto).nregs as usize };
         st.regs.clear();
         st.regs.extend((0..nregs).map(|i| self.slot(f.base + i)));
         st.pc = pc as u32;
@@ -70,7 +70,7 @@ impl Vm {
             }
         }
         self.sp = match self.frames.last() {
-            Some(c) => c.base + unsafe { (*c.proto).nregs as usize },
+            Some(c) => c.base + unsafe { (&*c.proto).nregs as usize },
             None => 0,
         };
         (f.ret, f.flags)

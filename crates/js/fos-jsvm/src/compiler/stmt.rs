@@ -206,18 +206,16 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 }
             }
             let exited = self.exit_tries(0)?;
-            self.emit(Insn::Return { src: t });
+            self.emit_return(t);
             self.reenter_tries(exited);
             return Ok(());
         }
         match arg {
             Some(e) => {
                 let r = self.expr_any(e)?;
-                self.emit(Insn::Return { src: r });
+                self.emit_return(r);
             }
-            None => {
-                self.emit(Insn::ReturnUndef);
-            }
+            None => self.emit_return_undef(),
         }
         Ok(())
     }

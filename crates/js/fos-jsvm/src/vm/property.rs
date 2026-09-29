@@ -54,9 +54,17 @@ impl Vm {
             self.add_prop(o, PropertyKey::Atom(atoms::name), v, PropFlags::READONLY_HIDDEN);
         }
         if lazy & LAZY_PROTOTYPE != 0 {
-            let p = self.new_object();
-            self.add_prop(p, PropertyKey::Atom(atoms::constructor), Value::object(o), PropFlags::HIDDEN);
-            self.add_prop(o, PropertyKey::Atom(atoms::prototype), Value::object(p), PropFlags(PropFlags::WRITABLE));
+            let is_gen = matches!(&o.get().kind, ObjectKind::Function(c) if c.proto.is_generator);
+            if is_gen {
+                // Generator functions: prototype of their generator objects
+                let gp = self.realm.generator_proto;
+                let p = self.new_object_with(Some(gp), ObjectKind::Ordinary);
+                self.add_prop(o, PropertyKey::Atom(atoms::prototype), Value::object(p), PropFlags(PropFlags::WRITABLE));
+            } else {
+                let p = self.new_object();
+                self.add_prop(p, PropertyKey::Atom(atoms::constructor), Value::object(o), PropFlags::HIDDEN);
+                self.add_prop(o, PropertyKey::Atom(atoms::prototype), Value::object(p), PropFlags(PropFlags::WRITABLE));
+            }
         }
     }
 
@@ -904,6 +912,19 @@ impl Vm {
                     return Ok(None);
                 }
                 let (iter, next) = (*iter, *next);
+                // Generators with the built-in next: resume directly
+                if next == Value::object(self.realm.generator_next) {
+                    if let Some(g) = iter.as_object().filter(|g| matches!(g.get().kind, ObjectKind::Generator(_))) {
+                        let (v, finished) = self.resume(g, super::generator::ResumeMode::Next, Value::UNDEFINED)?;
+                        if finished {
+                            if let ObjectKind::IterRecord { done, .. } = &mut o.get_mut().kind {
+                                *done = true;
+                            }
+                            return Ok(None);
+                        }
+                        return Ok(Some(v));
+                    }
+                }
                 let r = self.call(next, iter, &[])?;
                 if !r.is_object() {
                     return Err(self.type_error("Iterator result is not an object"));
@@ -919,6 +940,20 @@ impl Vm {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `yield*` step: the inner iterator's result object for next(v)
+    pub(crate) fn iter_send(&mut self, it: Value, v: Value) -> JsResult<Value> {
+        let o = it.as_object().unwrap();
+        if let ObjectKind::IterRecord { iter, next, .. } = o.get().kind {
+            let r = self.call(next, iter, &[v])?;
+            if !r.is_object() {
+                return Err(self.type_error("Iterator result is not an object"));
+            }
+            return Ok(r);
+        }
+        let r = self.iter_step(it)?;
+        Ok(crate::builtins::array::iter_result(self, r.unwrap_or(Value::UNDEFINED), r.is_none()))
     }
 
     pub fn iter_close(&mut self, it: Value) -> JsResult<()> {

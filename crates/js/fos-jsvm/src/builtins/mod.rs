@@ -1,9 +1,12 @@
 //! Built-in objects
 
-mod array;
+pub(crate) mod array;
 mod collections;
+mod date;
 mod error;
 mod function;
+pub(crate) mod generator;
+pub(crate) mod promise;
 mod json;
 mod math;
 mod number;
@@ -32,6 +35,9 @@ pub(crate) fn init(vm: &mut Vm) {
     collections::init(vm);
     reflect::init(vm);
     regexp::init(vm);
+    promise::init(vm);
+    date::init(vm);
+    generator::init(vm);
 
     let g = vm.global;
     vm.def_value(g, "globalThis", Value::object(g), PropFlags::HIDDEN);
@@ -274,6 +280,6 @@ fn queue_microtask(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -
     if !vm.is_callable(f) {
         return Err(vm.type_error("queueMicrotask requires a function"));
     }
-    vm.jobs.push_back((f, Value::UNDEFINED));
+    vm.jobs.push_back(crate::vm::Job::Call(f, Value::UNDEFINED));
     Ok(Value::UNDEFINED)
 }

@@ -71,7 +71,11 @@ impl Vm {
         }
 
         'outer: loop {
-            let exc: Value = 'inner: loop {
+            let exc: Value = if let Some(e) = self.pending_throw.take() {
+                // Resumed with generator.throw(): raise at the yield
+                e
+            } else {
+                'inner: loop {
                 macro_rules! tri {
                     ($e:expr) => {
                         match $e {
@@ -954,6 +958,78 @@ impl Vm {
                         let v = tri!(crate::builtins::regexp::from_literal(self, lit));
                         w!(dst, v);
                     }
+                    Insn::GenStart => {
+                        let genobj = tri!(self.new_gen_state(true));
+                        let (ret, flags) = self.suspend(pc, u16::MAX, GenStatus::SuspendedStart);
+                        if let Some(v) = self.deliver(Value::object(genobj), ret, flags) {
+                            self.temp_roots.truncate(temp_base);
+                            self.temp_roots.push(v);
+                            return Ok(v);
+                        }
+                        load_frame!();
+                    }
+                    Insn::Yield { dst, src } => {
+                        let v = r!(src);
+                        self.suspend(pc, dst, GenStatus::SuspendedYield);
+                        self.suspended = true;
+                        self.temp_roots.truncate(temp_base);
+                        self.temp_roots.push(v);
+                        return Ok(v);
+                    }
+                    Insn::IterSend { dst, iter, val } => {
+                        let v = tri!(self.iter_send(r!(iter), r!(val)));
+                        w!(dst, v);
+                    }
+                    Insn::AsyncStart => {
+                        tri!(self.new_gen_state(false));
+                    }
+                    Insn::Await { dst, src } => {
+                        let v = r!(src);
+                        let state = self.frames.last().unwrap().activation.unwrap();
+                        let p = self.promise_resolve(v);
+                        self.add_reaction(p, Reaction { kind: ReactionKind::Await(state), on_fulfilled: Value::UNDEFINED, on_rejected: Value::UNDEFINED, derived: None });
+                        let (ret, flags) = self.suspend(pc, dst, GenStatus::SuspendedYield);
+                        if flags & F_RESUMED != 0 {
+                            self.suspended = true;
+                            self.temp_roots.truncate(temp_base);
+                            return Ok(Value::UNDEFINED);
+                        }
+                        let promise = match &state.get().kind {
+                            ObjectKind::Generator(g) => g.promise.unwrap(),
+                            _ => unreachable!(),
+                        };
+                        if let Some(v) = self.deliver(Value::object(promise), ret, flags) {
+                            self.temp_roots.truncate(temp_base);
+                            self.temp_roots.push(v);
+                            return Ok(v);
+                        }
+                        load_frame!();
+                    }
+                    Insn::AsyncReturn { src } | Insn::AsyncThrow { src } => {
+                        let v = r!(src);
+                        let state = self.frames.last().unwrap().activation.unwrap();
+                        let promise = match &mut state.get_mut().kind {
+                            ObjectKind::Generator(g) => {
+                                g.status = GenStatus::Done;
+                                g.promise.unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        if matches!(insn, Insn::AsyncReturn { .. }) {
+                            self.resolve_promise(promise, v);
+                        } else {
+                            self.reject_promise(promise, v);
+                        }
+                        match self.do_return(Value::object(promise), base) {
+                            Ok(Some(v)) => {
+                                self.temp_roots.truncate(temp_base);
+                                self.temp_roots.push(v);
+                                return Ok(v);
+                            }
+                            Ok(None) => load_frame!(),
+                            Err(e) => break 'inner e,
+                        }
+                    }
                     Insn::NewPrivateName { dst, name } => {
                         let atom = unsafe { (*proto).atoms[name as usize] };
                         let d = self.atoms.string(atom);
@@ -962,6 +1038,7 @@ impl Vm {
                         w!(dst, Value::symbol(s));
                     }
                 }
+            }
             };
 
             // ---- exception handling ----
@@ -969,7 +1046,9 @@ impl Vm {
             loop {
                 let f = self.frames.last().unwrap();
                 let p = unsafe { &*f.proto };
-                if let Some(h) = p.handlers.iter().find(|h| (h.start as usize) <= fault && fault < h.end as usize) {
+                // Closing a generator runs finally blocks but not catches
+                let closing = exc == Value::object(self.realm.generator_return);
+                if let Some(h) = p.handlers.iter().find(|h| (h.start as usize) <= fault && fault < h.end as usize && (h.finally || !closing)) {
                     let (target, reg) = (h.target, h.reg);
                     self.frames.last_mut().unwrap().pc = target;
                     load_frame!();
@@ -1024,6 +1103,17 @@ impl Vm {
         self.sp = f.base + unsafe { (*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         Ok(None)
+    }
+
+    /// Hand a value to the caller of a frame that was just popped
+    pub(crate) fn deliver(&mut self, v: Value, ret: u16, flags: u8) -> Option<Value> {
+        if flags & F_ENTRY != 0 {
+            return Some(v);
+        }
+        let f = self.frames.last().unwrap();
+        self.sp = f.base + unsafe { (*f.proto).nregs as usize };
+        self.set_slot(f.base + ret as usize, v);
+        None
     }
 
     fn tdz_error(&mut self, name: crate::string::Atom) -> Value {

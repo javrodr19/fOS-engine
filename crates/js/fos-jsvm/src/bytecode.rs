@@ -200,6 +200,22 @@ pub enum Insn {
     RegExp { dst: Reg, idx: u16 },
     /// dst = a fresh private name (class `#x`); `name` indexes atoms
     NewPrivateName { dst: Reg, name: u16 },
+
+    /// Generator functions: suspend right after argument binding and
+    /// return the generator object
+    GenStart,
+    /// Suspend with `src`; on resumption dst receives the sent value
+    Yield { dst: Reg, src: Reg },
+    /// `yield*` step: dst = iterator result object of iter.next(val)
+    IterSend { dst: Reg, iter: Reg, val: Reg },
+    /// Async functions: create the result promise
+    AsyncStart,
+    /// Suspend until `src` settles; dst receives the value (or the reason
+    /// is thrown)
+    Await { dst: Reg, src: Reg },
+    /// Settle the async function's promise and return it
+    AsyncReturn { src: Reg },
+    AsyncThrow { src: Reg },
     Debugger,
 }
 
@@ -225,6 +241,9 @@ pub struct Handler {
     pub end: u32,
     pub target: u32,
     pub reg: Reg,
+    /// A `finally` (or iterator-closing) handler, which also runs when a
+    /// generator is closed with `return()`; catch handlers don't
+    pub finally: bool,
 }
 
 /// Inline cache state for a property or global access site

@@ -246,11 +246,50 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 }
                 self.expr_to(last, dst)?;
             }
-            Expr::Yield { .. } => return self.error("generators are not supported yet"),
-            Expr::Await(_) => return self.error("async functions are not supported yet"),
+            Expr::Yield { arg, delegate: false } => {
+                let v = match arg {
+                    Some(a) => self.expr_any(a)?,
+                    None => {
+                        let t = self.alloc()?;
+                        self.emit(Insn::LoadUndef { dst: t });
+                        t
+                    }
+                };
+                self.emit(Insn::Yield { dst, src: v });
+            }
+            Expr::Yield { arg, delegate: true } => self.yield_star(arg.as_deref(), dst)?,
+            Expr::Await(arg) => {
+                let v = self.expr_any(arg)?;
+                self.emit(Insn::Await { dst, src: v });
+            }
             Expr::Paren(inner) => self.expr_to(inner, dst)?,
             Expr::Import(_) => return self.error("dynamic import is not supported"),
         }
+        Ok(())
+    }
+
+    /// `yield* iterable`: forward values until the inner iterator is done
+    fn yield_star(&mut self, arg: Option<&'a Expr>, dst: Reg) -> CResult<()> {
+        let Some(arg) = arg else { return self.error("yield* needs an operand") };
+        let it = self.alloc()?;
+        let recv = self.alloc()?;
+        let res = self.alloc()?;
+        let tmp = self.alloc()?;
+        let src = self.expr_any(arg)?;
+        self.emit(Insn::GetIterator { dst: it, src });
+        self.emit(Insn::LoadUndef { dst: recv });
+        let top = self.pc();
+        self.emit(Insn::IterSend { dst: res, iter: it, val: recv });
+        let done_ic = self.new_ic(atoms::done)?;
+        self.emit(Insn::GetProp { dst: tmp, obj: res, ic: done_ic });
+        let exit = self.emit(Insn::JmpTrue { cond: tmp, off: 0 });
+        let value_ic = self.new_ic(atoms::value)?;
+        self.emit(Insn::GetProp { dst: tmp, obj: res, ic: value_ic });
+        self.emit(Insn::Yield { dst: recv, src: tmp });
+        self.jump_to(top)?;
+        self.patch_here(vec![exit])?;
+        let value_ic = self.new_ic(atoms::value)?;
+        self.emit(Insn::GetProp { dst, obj: res, ic: value_ic });
         Ok(())
     }
 

@@ -149,6 +149,78 @@ pub enum ObjectKind {
     WeakMap(Box<MapData>),
     WeakSet(Box<MapData>),
     RegExp(Box<RegExpData>),
+    /// Generator object or async function state
+    Generator(Box<GenState>),
+    Promise(Box<PromiseData>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GenStatus {
+    SuspendedStart,
+    SuspendedYield,
+    Running,
+    Done,
+}
+
+/// A suspended function activation
+pub struct GenState {
+    pub func: Gc<JsObject>,
+    /// Saved registers
+    pub regs: Vec<Value>,
+    pub pc: u32,
+    /// Register receiving the value sent on resumption (u16::MAX: none)
+    pub resume_reg: u16,
+    /// Upvalues of this activation's registers, closed while suspended
+    pub upvals: Vec<(Gc<Upvalue>, u16)>,
+    pub new_target: Value,
+    pub status: GenStatus,
+    /// Async functions: the promise they return
+    pub promise: Option<Gc<JsObject>>,
+    /// Value of a pending `return()`
+    pub return_value: Value,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+pub struct PromiseData {
+    pub state: PromiseState,
+    pub value: Value,
+    pub reactions: Vec<Reaction>,
+    pub handled: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum ReactionKind {
+    /// `then` callbacks settling `derived`
+    Then,
+    /// Resume an async function
+    Await(Gc<JsObject>),
+}
+
+#[derive(Clone, Copy)]
+pub struct Reaction {
+    pub kind: ReactionKind,
+    pub on_fulfilled: Value,
+    pub on_rejected: Value,
+    pub derived: Option<Gc<JsObject>>,
+}
+
+impl Reaction {
+    pub fn trace(&self, tracer: &mut Tracer) {
+        if let ReactionKind::Await(g) = self.kind {
+            tracer.mark(g);
+        }
+        tracer.mark_value(self.on_fulfilled);
+        tracer.mark_value(self.on_rejected);
+        if let Some(d) = self.derived {
+            tracer.mark(d);
+        }
+    }
 }
 
 pub struct RegExpData {
@@ -330,6 +402,24 @@ impl Trace for JsObject {
             ObjectKind::RegExp(r) => {
                 tracer.mark(r.source);
                 tracer.mark(r.flags);
+            }
+            ObjectKind::Generator(g) => {
+                tracer.mark(g.func);
+                tracer.mark_values(&g.regs);
+                for &(u, _) in &g.upvals {
+                    tracer.mark(u);
+                }
+                tracer.mark_value(g.new_target);
+                if let Some(p) = g.promise {
+                    tracer.mark(p);
+                }
+                tracer.mark_value(g.return_value);
+            }
+            ObjectKind::Promise(p) => {
+                tracer.mark_value(p.value);
+                for r in &p.reactions {
+                    r.trace(tracer);
+                }
             }
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }

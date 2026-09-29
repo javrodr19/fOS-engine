@@ -197,6 +197,8 @@ pub(crate) struct FuncState<'a> {
     no_fused: bool,
     uses_this: bool,
     uses_super: bool,
+    is_generator: bool,
+    is_async: bool,
     /// Script completion value register
     completion: Option<Reg>,
 }
@@ -234,6 +236,8 @@ impl<'a> FuncState<'a> {
             no_fused,
             uses_this: false,
             uses_super: false,
+            is_generator: false,
+            is_async: false,
             completion: None,
         }
     }
@@ -803,13 +807,35 @@ impl<'a, 'h> Compiler<'a, 'h> {
     /// Compile a nested function into register `dst` as a closure.
     /// Returns whether it uses `super` (needs a home object).
     fn closure(&mut self, func: &'a Function, name: Option<Atom>, dst: Reg, is_expression: bool) -> CResult<bool> {
-        if func.is_async || func.is_generator {
-            return self.error("async functions and generators are not supported yet");
+        if func.is_async && func.is_generator {
+            return self.error("async generators are not supported yet");
         }
         let (proto, uses_super) = self.function(func, name, is_expression)?;
         let idx = self.add_func(proto)?;
         self.emit(Insn::Closure { dst, idx });
         Ok(uses_super)
+    }
+
+    /// `return r` (async functions settle their promise)
+    pub(crate) fn emit_return(&mut self, r: Reg) {
+        if self.fr().is_async {
+            self.emit(Insn::AsyncReturn { src: r });
+        } else {
+            self.emit(Insn::Return { src: r });
+        }
+    }
+
+    pub(crate) fn emit_return_undef(&mut self) {
+        if self.fr().is_async {
+            let mark = self.mark();
+            if let Ok(t) = self.alloc() {
+                self.emit(Insn::LoadUndef { dst: t });
+                self.emit(Insn::AsyncReturn { src: t });
+            }
+            self.release(mark);
+        } else {
+            self.emit(Insn::ReturnUndef);
+        }
     }
 
     fn add_func(&mut self, proto: Rc<FunctionProto>) -> CResult<u16> {
@@ -959,20 +985,40 @@ impl<'a, 'h> Compiler<'a, 'h> {
             }
         }
 
+        self.f().is_generator = func.is_generator;
+        self.f().is_async = func.is_async;
+        // Async functions settle their promise instead of throwing
+        let async_exc = if func.is_async {
+            self.emit(Insn::AsyncStart);
+            let r = self.alloc()?;
+            self.open_try(TryKind::Catch, r);
+            Some(r)
+        } else {
+            None
+        };
         match &func.body {
             FunctionBody::Block(stmts) => {
                 self.hoist_block(stmts, true)?;
+                if func.is_generator {
+                    self.emit(Insn::GenStart);
+                }
                 for s in stmts {
                     self.stmt(s)?;
                 }
-                self.emit(Insn::ReturnUndef);
+                self.emit_return_undef();
             }
             FunctionBody::Expr(e) => {
                 let mark = self.mark();
                 let r = self.expr_any(e)?;
-                self.emit(Insn::Return { src: r });
+                self.emit_return(r);
                 self.release(mark);
             }
+        }
+        if let Some(r) = async_exc {
+            let entry = self.close_try();
+            let target = self.pc();
+            self.set_handler_target(&entry, target);
+            self.emit(Insn::AsyncThrow { src: r });
         }
 
         let f = self.fs.pop().unwrap();
@@ -1027,7 +1073,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
         strip_nops(&mut f.code, &mut f.handlers);
         let arguments_reg = f.arguments_binding.map(|b| f.bindings.get(b).map(|b| b.reg).unwrap_or(0));
         let arguments_reg = if f.arguments_binding.is_some() { arguments_reg } else { None };
-        let is_constructor = matches!(f.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor) && !f.is_script;
+        let is_constructor = matches!(f.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
+            && !f.is_script
+            && !f.is_generator
+            && !f.is_async;
         Rc::new(FunctionProto {
             name,
             code: f.code.into_boxed_slice(),
@@ -1047,8 +1096,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
             is_constructor,
             is_class_constructor: matches!(f.kind, FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor),
             is_derived: f.kind == FunctionKind::DerivedConstructor,
-            is_generator: false,
-            is_async: false,
+            is_generator: f.is_generator,
+            is_async: f.is_async,
             coerce_this: !f.strict && f.uses_this,
             arguments_reg,
             rest_reg: f.rest_reg,
@@ -1149,7 +1198,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
         let end = self.pc();
         if end > entry.seg_start {
             let f = self.f();
-            f.handlers.push(Handler { start: entry.seg_start, end, target: 0, reg: entry.reg });
+            let finally = !matches!(entry.kind, TryKind::Catch);
+            f.handlers.push(Handler { start: entry.seg_start, end, target: 0, reg: entry.reg, finally });
             entry.handler_idxs.push(f.handlers.len() - 1);
         }
         entry.seg_start = end;

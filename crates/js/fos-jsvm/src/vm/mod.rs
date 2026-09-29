@@ -18,6 +18,7 @@
 //! discipline. Natives that loop over many callbacks trim the stack
 //! themselves to keep it small.
 
+pub(crate) mod generator;
 mod interp;
 pub(crate) mod ops;
 pub(crate) mod property;
@@ -47,6 +48,8 @@ const MAX_NATIVE_DEPTH: u32 = 400;
 
 pub(crate) const F_ENTRY: u8 = 1;
 pub(crate) const F_CONSTRUCT: u8 = 2;
+/// A resumed generator or async function (always also F_ENTRY)
+pub(crate) const F_RESUMED: u8 = 4;
 
 pub(crate) struct Frame {
     pub func: Gc<JsObject>,
@@ -58,6 +61,15 @@ pub(crate) struct Frame {
     pub ret: u16,
     pub flags: u8,
     pub new_target: Value,
+    /// Generator / async state of this activation
+    pub activation: Option<Gc<JsObject>>,
+}
+
+/// A queued microtask
+pub(crate) enum Job {
+    Call(Value, Value),
+    Reaction { reaction: Reaction, arg: Value, rejected: bool },
+    ResolveThenable { promise: Gc<JsObject>, thenable: Value, then: Value },
 }
 
 /// Well-known symbols
@@ -118,6 +130,12 @@ realm! {
     syntax_error_proto, eval_error_proto, uri_error_proto, iterator_proto, array_iterator_proto,
     string_iterator_proto, map_proto, set_proto, map_iterator_proto, set_iterator_proto,
     weakmap_proto, weakset_proto, date_proto, regexp_proto, promise_proto,
+    /// %GeneratorPrototype%
+    generator_proto,
+    /// %GeneratorPrototype%.next (recognized to step generators natively)
+    generator_next,
+    /// Internal exception value that unwinds a generator for `return()`
+    generator_return,
     /// Array.prototype.values (recognized to iterate arrays natively)
     array_values,
     /// %ThrowTypeError%
@@ -153,8 +171,12 @@ pub struct Vm {
     pub(crate) char_strings: Vec<Gc<JsString>>,
     /// Output of `console.log` and friends
     pub print: Box<dyn FnMut(&str)>,
-    /// Microtask queue: (callback, argument)
-    pub(crate) jobs: std::collections::VecDeque<(Value, Value)>,
+    /// Microtask queue
+    pub(crate) jobs: std::collections::VecDeque<Job>,
+    /// Exception to raise when the next resumed frame starts running
+    pub(crate) pending_throw: Option<Value>,
+    /// Set when `run` returned because a generator suspended
+    pub(crate) suspended: bool,
 }
 
 impl Drop for Vm {
@@ -222,6 +244,9 @@ impl Vm {
             date_proto: mk(object_proto, ObjectKind::Ordinary),
             regexp_proto: mk(object_proto, ObjectKind::Ordinary),
             promise_proto: mk(object_proto, ObjectKind::Ordinary),
+            generator_proto: mk(iterator_proto, ObjectKind::Ordinary),
+            generator_next: mk(function_proto, native(noop)),
+            generator_return: mk(object_proto, ObjectKind::Ordinary),
             array_values: mk(function_proto, native(noop)),
             throw_type_error: mk(function_proto, native(noop)),
         };
@@ -273,6 +298,8 @@ impl Vm {
             char_strings,
             print: Box::new(|s| println!("{s}")),
             jobs: Default::default(),
+            pending_throw: None,
+            suspended: false,
         };
         crate::builtins::init(&mut vm);
         vm
@@ -304,10 +331,26 @@ impl Vm {
         r
     }
 
-    /// Run queued promise reactions
+    /// Run queued microtasks (promise reactions) until the queue is empty
     pub fn run_jobs(&mut self) {
-        while let Some((f, arg)) = self.jobs.pop_front() {
-            let _ = self.call(f, Value::UNDEFINED, &[arg]);
+        while let Some(job) = self.jobs.pop_front() {
+            let mark = self.temp_roots.len();
+            // The job's values are no longer reachable from the queue
+            match &job {
+                Job::Call(f, a) => self.temp_roots.extend([*f, *a]),
+                Job::Reaction { reaction, arg, .. } => {
+                    self.temp_roots.extend([reaction.on_fulfilled, reaction.on_rejected, *arg]);
+                    if let Some(d) = reaction.derived {
+                        self.temp_roots.push(Value::object(d));
+                    }
+                    if let ReactionKind::Await(g) = reaction.kind {
+                        self.temp_roots.push(Value::object(g));
+                    }
+                }
+                Job::ResolveThenable { promise, thenable, then } => self.temp_roots.extend([Value::object(*promise), *thenable, *then]),
+            }
+            self.run_job(job);
+            self.temp_roots.truncate(mark);
         }
     }
 
@@ -316,6 +359,10 @@ impl Vm {
     #[inline(always)]
     pub(crate) fn stack_ptr(&self) -> *mut Value {
         self.stack
+    }
+
+    pub(crate) fn stack_size(&self) -> usize {
+        STACK_SIZE
     }
 
     #[inline(always)]
@@ -420,7 +467,7 @@ impl Vm {
     pub(crate) fn new_closure(&mut self, proto: Rc<FunctionProto>, upvalues: Box<[Gc<Upvalue>]>) -> Gc<JsObject> {
         let lazy = if proto.is_class_constructor {
             LAZY_LENGTH | LAZY_NAME
-        } else if proto.is_constructor {
+        } else if proto.is_constructor || proto.is_generator {
             LAZY_LENGTH | LAZY_NAME | LAZY_PROTOTYPE
         } else {
             LAZY_LENGTH | LAZY_NAME
@@ -635,7 +682,7 @@ impl Vm {
                 self.set_slot(base, Value::object(o));
             }
         }
-        self.frames.push(Frame { func, proto, base, pc: 0, ret, flags, new_target });
+        self.frames.push(Frame { func, proto, base, pc: 0, ret, flags, new_target, activation: None });
         self.sp = base + nregs;
         Ok(())
     }
@@ -805,6 +852,9 @@ impl Vm {
         for f in &self.frames {
             t.mark(f.func);
             t.mark_value(f.new_target);
+            if let Some(g) = f.activation {
+                t.mark(g);
+            }
         }
         for &u in &self.open_upvals {
             t.mark(u);
@@ -822,9 +872,25 @@ impl Vm {
             t.mark(s);
         }
         t.mark_values(&self.temp_roots);
-        for (f, a) in &self.jobs {
-            t.mark_value(*f);
-            t.mark_value(*a);
+        for job in &self.jobs {
+            match job {
+                Job::Call(f, a) => {
+                    t.mark_value(*f);
+                    t.mark_value(*a);
+                }
+                Job::Reaction { reaction, arg, .. } => {
+                    reaction.trace(t);
+                    t.mark_value(*arg);
+                }
+                Job::ResolveThenable { promise, thenable, then } => {
+                    t.mark(*promise);
+                    t.mark_value(*thenable);
+                    t.mark_value(*then);
+                }
+            }
+        }
+        if let Some(e) = self.pending_throw {
+            t.mark_value(e);
         }
         if let Some(a) = self.pending_rest {
             t.mark(a);

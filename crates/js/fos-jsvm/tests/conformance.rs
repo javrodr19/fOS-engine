@@ -5,6 +5,41 @@
 
 use fos_jsvm::Vm;
 
+/// Run a script, then its promise jobs, returning the value of the global
+/// `result` if the script defines one (for asynchronous tests)
+fn run_async(src: &str) -> String {
+    let mut vm = Vm::new();
+    if std::env::var_os("FOS_GC_STRESS").is_some() {
+        vm.heap.set_stress(true);
+    }
+    if let Err(e) = vm.eval(src) {
+        return format!("throws {}", vm.display(e));
+    }
+    vm.run_jobs();
+    match vm.eval("result") {
+        Ok(v) => {
+            if let Some(s) = v.as_string() {
+                format!("'{}'", s.get().to_rust_string())
+            } else {
+                vm.display(v)
+            }
+        }
+        Err(e) => format!("throws {}", vm.display(e)),
+    }
+}
+
+fn check_async(cases: &[(&str, &str)]) {
+    let mut failures = Vec::new();
+    for (src, want) in cases {
+        let got = run_async(src);
+        let ok = if let Some(prefix) = want.strip_suffix('*') { got.starts_with(prefix) } else { got == *want };
+        if !ok {
+            failures.push(format!("  {src}\n    want: {want}\n     got: {got}"));
+        }
+    }
+    assert!(failures.is_empty(), "{} failure(s):\n{}", failures.len(), failures.join("\n"));
+}
+
 fn run(src: &str) -> String {
     let mut vm = Vm::new();
     // FOS_GC_STRESS=1: collect at every safepoint
@@ -520,7 +555,7 @@ fn control_flow() {
         ("let log = []; let it = { [Symbol.iterator]() { let i = 0; return { next: () => ({ value: i++, done: i > 5 }), return() { log.push('closed'); return {}; } }; } }; for (const v of it) { if (v === 2) break; } log", "[ 'closed' ]"),
         ("let log = []; let it = { [Symbol.iterator]() { return { next: () => ({ value: 1, done: false }), return() { log.push('closed'); return {}; } }; } }; try { for (const v of it) throw 'boom'; } catch (e) { log.push(e); } log", "[ 'closed', 'boom' ]"),
         ("let it = { [Symbol.iterator]() { let n = 0; return { next() { return { value: n, done: n++ >= 3 }; } }; } }; [...it]", "[ 0, 1, 2 ]"),
-        ("let [a, b] = { [Symbol.iterator]: function* () {} }; a", "throws SyntaxError*"),
+        ("let [a, b] = { [Symbol.iterator]: function* () {} }; a", "undefined"),
         ("let x = 0; while (x < 10) x += 3; x", "12"),
         ("for (;;) { break; } 'done'", "'done'"),
         ("let c = 0; for (let i = 0, j = 10; i < j; i++, j--) c++; c", "5"),
@@ -653,7 +688,6 @@ fn iteration_protocols() {
         ("let it = [1, 2][Symbol.iterator](); [it.next(), it.next(), it.next()]", "[ { value: 1, done: false }, { value: 2, done: false }, { value: undefined, done: true } ]"),
         ("let it = 'ab'[Symbol.iterator](); it.next().value", "'a'"),
         ("let it = new Map([[1, 2]]).entries(); it.next().value", "[ 1, 2 ]"),
-        ("let o = { *[Symbol.iterator]() {} }", "throws SyntaxError*"),
         ("let range = { from: 1, to: 4, [Symbol.iterator]() { let c = this.from, t = this.to; return { next: () => c <= t ? { value: c++, done: false } : { value: undefined, done: true } }; } }; [...range]", "[ 1, 2, 3, 4 ]"),
         ("let [a, ...b] = 'xyz'; b", "[ 'y', 'z' ]"),
         ("Array.from({length: 2, 0: 'a', 1: 'b'})", "[ 'a', 'b' ]"),
@@ -712,10 +746,6 @@ fn larger_programs() {
              const freq = {}; for (const w of words) freq[w] = (freq[w] || 0) + 1;
              Object.entries(freq).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 2).map(([w, c]) => w + ':' + c).join()",
             "'the:3,brown:1'",
-        ),
-        (
-            "function* gen() {}",
-            "throws SyntaxError: async functions and generators are not supported yet",
         ),
         (
             "const compose = (...fns) => x => fns.reduceRight((v, f) => f(v), x);
@@ -824,5 +854,123 @@ fn regular_expressions() {
         ("/^[\\w.+-]+@[\\w-]+\\.[\\w.]+$/.test('user.name+tag@example.co.uk')", "true"),
         ("/(\\d)(?=(\\d{3})+$)/g[Symbol.replace]('1234567', '$1,')", "'1,234,567'"),
         ("let n = 0; for (let i = 0; i < 1000; i++) if (/^item-\\d+$/.test('item-' + i)) n++; n", "1000"),
+    ]);
+}
+
+#[test]
+fn generators() {
+    check(&[
+        ("function* g() { yield 1; yield 2; return 3; } [...g()]", "[ 1, 2 ]"),
+        ("function* g() { yield 1; return 3; } let it = g(); [it.next(), it.next(), it.next()]", "[ { value: 1, done: false }, { value: 3, done: true }, { value: undefined, done: true } ]"),
+        ("function* g() { let x = yield 1; yield x * 2; } let it = g(); it.next(); it.next(21).value", "42"),
+        ("function* nat() { let n = 0; while (true) yield n++; } let out = []; for (const n of nat()) { if (n > 4) break; out.push(n); } out", "[ 0, 1, 2, 3, 4 ]"),
+        ("function* g() { try { yield 1; } catch (e) { yield 'caught ' + e; } } let it = g(); it.next(); it.throw('boom').value", "'caught boom'"),
+        ("function* g() { yield 1; } let it = g(); it.throw(new Error('x'))", "throws Error: x"),
+        ("function* g() { yield 1; yield 2; } let it = g(); it.next(); [it.return(9), it.next()]", "[ { value: 9, done: true }, { value: undefined, done: true } ]"),
+        ("function* inner() { yield 'a'; yield 'b'; return 'r'; } function* outer() { const r = yield* inner(); yield r; } [...outer()]", "[ 'a', 'b', 'r' ]"),
+        ("function* g() { yield* [1, 2]; yield* 'xy'; } [...g()]", "[ 1, 2, 'x', 'y' ]"),
+        ("function* g() { let x = 1; const f = () => x; yield f(); x = 5; yield f(); } [...g()]", "[ 1, 5 ]"),
+        ("function* g() { let x = 1; const inc = () => ++x; yield 0; inc(); yield x; } [...g()]", "[ 0, 2 ]"),
+        ("function* g() { for (let i = 0; i < 3; i++) yield () => i; } [...g()].map(f => f())", "[ 0, 1, 2 ]"),
+        ("function* fib() { let [a, b] = [0, 1]; for (;;) { yield a; [a, b] = [b, a + b]; } } let r = []; for (const f of fib()) { if (f > 50) break; r.push(f); } r.join()", "'0,1,1,2,3,5,8,13,21,34'"),
+        ("function* g() { yield this.v; } g.call({v: 7}).next().value", "7"),
+        ("let o = { *items() { yield* this.list; }, list: [1, 2] }; [...o.items()]", "[ 1, 2 ]"),
+        ("class C { *[Symbol.iterator]() { yield 'c'; } } [...new C()]", "[ 'c' ]"),
+        ("function* g() {} Object.getPrototypeOf(g()) === g.prototype", "true"),
+        ("function* g() {} g() instanceof g", "true"),
+        ("function* g() {} new g()", "throws TypeError*"),
+        ("function* g() {} g()[Symbol.iterator]() instanceof g", "true"),
+        ("function* g() { yield 1; } String(g())", "'[object Generator]'"),
+        ("function* g(a, b = a + 1) { yield a + b; } g(1).next().value", "3"),
+        ("function* g() { const x = yield; return x; } let it = g(); it.next(); it.next('sent')", "{ value: 'sent', done: true }"),
+        ("function* g() { yield 1; } let it = g(); it.next(); it.next(); it.next()", "{ value: undefined, done: true }"),
+        ("function* g() { try { yield 1; } finally { log.push('cleanup'); } } var log = []; for (const x of g()) break; log", "[ 'cleanup' ]*"),
+        ("function* take(n, it) { for (const x of it) { if (n-- <= 0) return; yield x; } } function* nat() { let i = 0; while (true) yield i++; } [...take(3, nat())]", "[ 0, 1, 2 ]"),
+        ("function* g() { yield [yield 1, yield 2]; } let it = g(); it.next(); it.next('a'); it.next('b').value", "[ 'a', 'b' ]"),
+        ("let n = 0; function* g() { while (true) { yield {n: n++}; } } let it = g(); for (let i = 0; i < 50000; i++) it.next(); it.next().value.n", "50000"),
+    ]);
+}
+
+#[test]
+fn promises_and_async() {
+    check_async(&[
+        ("var result; Promise.resolve(5).then(v => result = v * 2);", "10"),
+        ("var result = []; Promise.resolve().then(() => result.push('micro')); result.push('sync');", "[ 'sync', 'micro' ]"),
+        ("var result; new Promise((res) => res('ok')).then(v => { result = v; });", "'ok'"),
+        ("var result; new Promise((_, rej) => rej(new Error('bad'))).catch(e => { result = e.message; });", "'bad'"),
+        ("var result; new Promise(() => { throw 'thrown'; }).catch(e => { result = e; });", "'thrown'"),
+        ("var result; Promise.reject(1).then(() => 'no', e => 'handled ' + e).then(v => result = v);", "'handled 1'"),
+        ("var result; Promise.resolve(1).then(v => v + 1).then(v => v * 10).then(v => result = v);", "20"),
+        ("var result; Promise.resolve(1).then(v => Promise.resolve(v + 1)).then(v => result = v);", "2"),
+        ("var result = []; Promise.resolve(1).finally(() => result.push('f')).then(v => result.push(v));", "[ 'f', 1 ]"),
+        ("var result; Promise.reject('e').finally(() => {}).catch(e => result = 'still ' + e);", "'still e'"),
+        ("var result; Promise.all([1, Promise.resolve(2), new Promise(r => r(3))]).then(v => result = v);", "[ 1, 2, 3 ]"),
+        ("var result; Promise.all([]).then(v => result = v);", "[]"),
+        ("var result; Promise.all([1, Promise.reject('no')]).catch(e => result = e);", "'no'"),
+        ("var result; Promise.allSettled([1, Promise.reject('x')]).then(v => result = v.map(s => s.status));", "[ 'fulfilled', 'rejected' ]"),
+        ("var result; Promise.race([new Promise(() => {}), Promise.resolve('fast')]).then(v => result = v);", "'fast'"),
+        ("var result; Promise.any([Promise.reject(1), Promise.resolve(2)]).then(v => result = v);", "2"),
+        ("var result; Promise.any([Promise.reject(1)]).catch(e => result = e.errors);", "[ 1 ]"),
+        ("var result; const {promise, resolve} = Promise.withResolvers(); promise.then(v => result = v); resolve('wr');", "'wr'"),
+        ("var result; ({ then(r) { r('thenable'); } }); Promise.resolve({ then(r) { r('thenable'); } }).then(v => result = v);", "'thenable'"),
+        ("var result = []; setTimeoutLike = f => Promise.resolve().then(f); Promise.resolve().then(() => result.push(1)).then(() => result.push(3)); Promise.resolve().then(() => result.push(2)).then(() => result.push(4));", "[ 1, 2, 3, 4 ]"),
+        ("var result; async function f() { return 42; } f().then(v => result = v);", "42"),
+        ("var result; async function f() { return await Promise.resolve(7) * 2; } f().then(v => result = v);", "14"),
+        ("var result; async function f() { throw new Error('async fail'); } f().catch(e => result = e.message);", "'async fail'"),
+        ("var result; async function f() { try { await Promise.reject('r'); } catch (e) { return 'caught ' + e; } } f().then(v => result = v);", "'caught r'"),
+        ("var result = []; async function f() { result.push('a'); await null; result.push('c'); } f(); result.push('b');", "[ 'a', 'b', 'c' ]"),
+        ("var result; async function f() { let s = 0; for (let i = 0; i < 5; i++) s += await i; return s; } f().then(v => result = v);", "10"),
+        ("var result; const f = async (x) => x + (await 1); f(1).then(v => result = v);", "2"),
+        ("var result; class A { async m() { return this.v; } } let a = new A(); a.v = 'mv'; a.m().then(v => result = v);", "'mv'"),
+        ("var result; async function inner() { await null; return 'in'; } async function outer() { return 'out+' + await inner(); } outer().then(v => result = v);", "'out+in'"),
+        ("var result; async function f() { const [a, b] = await Promise.all([1, 2]); return a + b; } f().then(v => result = v);", "3"),
+        ("var result; async function f() { let x = 1; const g = () => x; await null; x = 9; return g(); } f().then(v => result = v);", "9"),
+        ("var result; function delay(v) { return new Promise(r => Promise.resolve().then(() => r(v))); } async function f() { let out = []; for (const v of [1, 2, 3]) out.push(await delay(v)); return out; } f().then(v => result = v);", "[ 1, 2, 3 ]"),
+        ("var result; async function f() { try { await null; throw 'late'; } finally { result = 'finally ran'; } } f().catch(() => {});", "'finally ran'"),
+        ("var result = typeof (async function() {})().then;", "'function'"),
+        ("var result = Object.prototype.toString.call(Promise.resolve());", "'[object Promise]'"),
+        ("var result; Promise.resolve().then(() => { throw new TypeError('in then'); }).catch(e => result = e instanceof TypeError);", "true"),
+        ("var result = 0; for (let i = 0; i < 1000; i++) Promise.resolve(i).then(v => result += v);", "499500"),
+        ("var result; async function* ag() {}", "throws SyntaxError*"),
+        ("var result; queueMicrotask(() => result = 'queued');", "'queued'"),
+        ("var result; new Promise(r => r()).then(() => new Promise(r => r('nested'))).then(v => result = v);", "'nested'"),
+        ("var result; const p = Promise.resolve(); result = p.then() instanceof Promise;", "true"),
+        ("var result; let p = new Promise(r => r(1)); p.then(v => { result = v; }); p.then(v => { result += v; });", "2"),
+    ]);
+}
+
+#[test]
+fn dates() {
+    check(&[
+        ("new Date(0).toISOString()", "'1970-01-01T00:00:00.000Z'"),
+        ("new Date(Date.UTC(2024, 1, 29, 12, 30, 15, 250)).toISOString()", "'2024-02-29T12:30:15.250Z'"),
+        ("new Date('2024-03-10').getTime()", "1710028800000"),
+        ("new Date('2024-03-10T08:05:03Z').getUTCHours()", "8"),
+        ("new Date('2024-03-10T08:05:03.5+02:00').toISOString()", "'2024-03-10T06:05:03.500Z'"),
+        ("Date.parse('Tue Mar 05 2024 10:00:00 GMT+0000')", "1709632800000"),
+        ("Date.parse('March 5, 2024')", "1709596800000"),
+        ("Date.parse('2024/03/05')", "1709596800000"),
+        ("Date.parse('Tue, 05 Mar 2024 10:00:00 GMT')", "1709632800000"),
+        ("Date.parse('not a date')", "NaN"),
+        ("let d = new Date(2020, 0, 31); d.setMonth(1); d.getDate()", "2"),
+        ("let d = new Date(2024, 0, 1); [d.getFullYear(), d.getMonth(), d.getDate(), d.getDay()]", "[ 2024, 0, 1, 1 ]"),
+        ("new Date(2024, 11, 32).getMonth()", "0"),
+        ("new Date(99, 0).getFullYear()", "1999"),
+        ("new Date(1e20).getTime()", "NaN"),
+        ("String(new Date(NaN))", "'Invalid Date'"),
+        ("new Date(NaN).toISOString()", "throws RangeError: Invalid time value"),
+        ("new Date(0).toString()", "'Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)'"),
+        ("new Date(0).toUTCString()", "'Thu, 01 Jan 1970 00:00:00 GMT'"),
+        ("JSON.stringify({d: new Date(0)})", "'{\"d\":\"1970-01-01T00:00:00.000Z\"}'"),
+        ("new Date(0) - new Date(1000)", "-1000"),
+        ("typeof (new Date() + 1)", "'string'"),
+        ("new Date(0) < new Date(1)", "true"),
+        ("let t = Date.now(); typeof t === 'number' && t > 1.6e12", "true"),
+        ("new Date(new Date(5)).getTime()", "5"),
+        ("new Date(-1).toISOString()", "'1969-12-31T23:59:59.999Z'"),
+        ("new Date('2000-02-29T00:00:00Z').getUTCDate()", "29"),
+        ("let d = new Date(0); d.setHours(25); d.toISOString()", "'1970-01-02T01:00:00.000Z'"),
+        ("Object.prototype.toString.call(new Date())", "'[object Date]'"),
+        ("typeof Date()", "'string'"),
     ]);
 }

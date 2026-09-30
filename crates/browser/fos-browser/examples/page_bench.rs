@@ -50,6 +50,8 @@ fn main() {
         (page.html, page.url)
     };
 
+    println!("input:        {} bytes of HTML  (RSS {})", html.len(), rss());
+
     // Parse once into the page's DOM, as the browser does
     let start = Instant::now();
     let page = Page::from_html(&url, html);
@@ -57,9 +59,8 @@ fn main() {
     let document = document.lock().unwrap();
     println!("parse:        {:>8.1} ms  {} DOM nodes  (RSS {})", ms(start), document.tree().len(), rss());
 
-    // Render three viewports, as the browser does
-    let buffer_height = VIEWPORT_HEIGHT * 3;
-    let mut renderer = PageRenderer::new(VIEWPORT_WIDTH, buffer_height);
+    // The browser keeps a buffer of exactly the visible area
+    let mut renderer = PageRenderer::new(VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
 
     let start = Instant::now();
     let first = renderer.render_document(&document, 0.0).expect("render failed");
@@ -73,21 +74,25 @@ fn main() {
     );
     println!("              RSS after first render {}", rss());
 
-    // Scroll through the document, moving the buffer one viewport at a time
-    // as the browser does (only the newly exposed rows are painted)
-    let steps = ((first.content_height / VIEWPORT_HEIGHT as f32) as usize).clamp(1, 50);
-    let start = Instant::now();
+    // Scrolling moves the buffer: rows still visible are moved and only the
+    // newly exposed rows are painted
+    let max_scroll = (first.content_height - VIEWPORT_HEIGHT as f32).max(0.0);
     let mut page = first;
-    for i in 1..=steps {
-        let y = i as f32 * VIEWPORT_HEIGHT as f32;
-        page = renderer.render_document_scrolled(&document, y, page).expect("render failed");
+    for (label, step) in [("wheel scroll", 120.0), ("page down", VIEWPORT_HEIGHT as f32 * 0.9)] {
+        let steps = ((max_scroll / step) as usize).clamp(1, 200);
+        let start = Instant::now();
+        for i in 1..=steps {
+            page = renderer.render_document_scrolled(&document, i as f32 * step, page).expect("render failed");
+        }
+        println!("{:<14}{:>8.2} ms/step over {} steps of {:.0}px", format!("{label}:"), ms(start) / steps as f64, steps, step);
+        page = renderer.render_document_scrolled(&document, 0.0, page).expect("render failed");
     }
-    println!("scroll:       {:>8.1} ms/render over {} re-renders", ms(start) / steps as f64, steps);
 
-    // Full re-renders of the whole buffer (e.g. after a DOM change)
+    // Full repaints of the buffer (e.g. after a DOM change)
+    let steps = 50;
     let start = Instant::now();
     for i in 1..=steps {
-        renderer.render_document(&document, i as f32 * VIEWPORT_HEIGHT as f32).expect("render failed");
+        renderer.render_document(&document, (i as f32 * 997.0) % max_scroll.max(1.0)).expect("render failed");
     }
     println!("full repaint: {:>8.1} ms/render", ms(start) / steps as f64);
 

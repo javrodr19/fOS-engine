@@ -19,6 +19,65 @@ use crate::{Result, TextError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FontId(pub u32);
 
+/// The bytes of a font face; dereferences to `[u8]`, and cloning is free.
+///
+/// Font files are memory-mapped rather than read: only the pages actually
+/// used (a few tables and the outlines of the glyphs drawn) become
+/// resident, and they are clean file-backed pages that the kernel can drop
+/// under memory pressure and share between processes. Decoded web fonts
+/// and fonts loaded from memory live on the heap.
+#[derive(Clone)]
+pub struct FaceData(Arc<FaceBytes>);
+
+enum FaceBytes {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl FaceData {
+    /// Face data held in memory
+    pub fn owned(data: Vec<u8>) -> Self {
+        Self(Arc::new(FaceBytes::Owned(data)))
+    }
+
+    /// Map a font file into memory
+    fn map(file: &File) -> Option<Self> {
+        // SAFETY: the mapping is read-only. As in other browsers, fonts are
+        // assumed not to be truncated while in use; a font file replaced by
+        // a package update keeps the old inode alive for this mapping.
+        let map = unsafe { memmap2::Mmap::map(file) }.ok()?;
+        Some(Self(Arc::new(FaceBytes::Mapped(map))))
+    }
+
+    /// Whether the data is a file mapping (as opposed to heap memory)
+    pub fn is_mapped(&self) -> bool {
+        matches!(*self.0, FaceBytes::Mapped(_))
+    }
+}
+
+impl std::ops::Deref for FaceData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &*self.0 {
+            FaceBytes::Mapped(map) => map,
+            FaceBytes::Owned(data) => data,
+        }
+    }
+}
+
+impl AsRef<[u8]> for FaceData {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for FaceData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaceData").field("len", &self.len()).field("mapped", &self.is_mapped()).finish()
+    }
+}
+
 /// Font entry in database
 pub struct FontEntry {
     /// Font ID
@@ -42,7 +101,7 @@ pub struct FontEntry {
     /// would otherwise render as invisible text.
     pub has_glyf: bool,
     /// Face data for file-backed fonts, loaded on first use
-    data: OnceLock<Option<Arc<Vec<u8>>>>,
+    data: OnceLock<Option<FaceData>>,
 }
 
 impl std::fmt::Debug for FontEntry {
@@ -67,7 +126,7 @@ pub enum FontSource {
     /// File path
     File(PathBuf),
     /// Embedded data (already decoded from WOFF/WOFF2)
-    Memory(Arc<Vec<u8>>),
+    Memory(FaceData),
 }
 
 /// Font database with custom implementation
@@ -220,7 +279,7 @@ impl CustomFontDatabase {
         if faces.is_empty() {
             return Err(TextError::FontParsing("No usable faces in font data".into()));
         }
-        Ok(self.add_faces(faces, FontSource::Memory(Arc::new(data))))
+        Ok(self.add_faces(faces, FontSource::Memory(FaceData::owned(data))))
     }
 
     fn add_faces(&mut self, faces: Vec<(u32, FaceMetadata)>, source: FontSource) -> Vec<FontId> {
@@ -297,13 +356,11 @@ impl CustomFontDatabase {
 
     /// Face data for a font, loaded on first use and cached for the lifetime
     /// of the database. Cloning the returned `Arc` is free.
-    pub fn face_data(&self, id: FontId) -> Option<Arc<Vec<u8>>> {
+    pub fn face_data(&self, id: FontId) -> Option<FaceData> {
         let font = self.font(id)?;
         match &font.source {
             FontSource::Memory(data) => Some(data.clone()),
-            FontSource::File(path) => font.data
-                .get_or_init(|| load_file_data(path).map(Arc::new))
-                .clone(),
+            FontSource::File(path) => font.data.get_or_init(|| load_file_data(path)).clone(),
         }
     }
 
@@ -370,14 +427,16 @@ fn fallback_score(font: &FontEntry, query: &FontQuery) -> u32 {
     score + family.len() as u32
 }
 
-/// Read and decode a font file's data
-fn load_file_data(path: &Path) -> Option<Vec<u8>> {
-    let data = std::fs::read(path).ok()?;
-    if super::woff2::is_woff2(&data) || super::woff::is_woff(&data) {
-        decode_web_font(&data).ok()
-    } else {
-        Some(data)
+/// Map a font file, or read and decode it if it is a web font
+fn load_file_data(path: &Path) -> Option<FaceData> {
+    let mut file = File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if &magic == b"wOFF" || &magic == b"wOF2" {
+        let data = std::fs::read(path).ok()?;
+        return decode_web_font(&data).ok().map(FaceData::owned);
     }
+    FaceData::map(&file).or_else(|| std::fs::read(path).ok().map(FaceData::owned))
 }
 
 fn decode_web_font(data: &[u8]) -> Result<Vec<u8>> {
@@ -768,6 +827,14 @@ mod tests {
         let len = db.with_face_data(id, |data, _| data.len()).unwrap();
         assert!(len > 0);
         assert!(db.font(id).unwrap().data.get().is_some());
+
+        // File-backed faces are mapped, and read the same as the file
+        let data = db.face_data(id).unwrap();
+        assert!(data.is_mapped());
+        assert_eq!(&*data, &std::fs::read(&path).unwrap()[..]);
+        // In-memory faces are not
+        let mem = db.load_font_data(font_bytes("Mem Sans", 400, false, true)).unwrap()[0];
+        assert!(!db.face_data(mem).unwrap().is_mapped());
 
         std::fs::remove_dir_all(&dir).ok();
     }

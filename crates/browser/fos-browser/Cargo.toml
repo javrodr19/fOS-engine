@@ -18,6 +18,7 @@ fos-text = { path = "../../engine/fos-text" }
 
 # JavaScript runtime
 fos-js = { path = "../../js/fos-js" }
+fos-jsvm = { path = "../../js/fos-jsvm" }
 
 # Networking (HTTP cache, prefetch, XHR)
 fos-net = { path = "../../engine/fos-net" }

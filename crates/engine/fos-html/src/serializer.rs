@@ -94,15 +94,13 @@ impl HtmlSerializer {
                     output.push(' ');
                     let name = tree.resolve(attr.name.local);
                     output.push_str(name);
-                    if !attr.value.is_empty() {
-                        output.push_str("=\"");
-                        escape_attribute(&attr.value, output);
-                        output.push('"');
-                    }
+                    output.push_str("=\"");
+                    escape_attribute(&attr.value, output);
+                    output.push('"');
                 }
 
                 if is_void {
-                    output.push_str(" />");
+                    output.push('>');
                 } else {
                     output.push('>');
 
@@ -207,12 +205,45 @@ impl Default for FragmentContext {
     }
 }
 
-/// Parse an HTML fragment (for innerHTML assignment)
-/// Returns a list of node IDs that were created
-pub fn parse_fragment(_html: &str, _context: FragmentContext) -> Vec<NodeId> {
-    // This would integrate with the HTML parser
-    // For now, return empty - actual implementation would use html5ever
-    Vec::new()
+/// Parse an HTML fragment (for innerHTML assignment) as the contents of
+/// a `context` element, into a detached tree; its nodes are the children
+/// of the returned tree's `<html>` element (see `fragment_root`)
+pub fn parse_fragment(html: &str, context: FragmentContext) -> fos_dom::Document {
+    crate::parser::parse_fragment(html, &context.context_element)
+}
+
+/// The node holding a parsed fragment's top-level nodes
+pub fn fragment_root(fragment: &fos_dom::Document) -> NodeId {
+    let tree = fragment.tree();
+    tree.children(tree.root()).find(|(_, n)| n.is_element()).map_or(NodeId::NONE, |(id, _)| id)
+}
+
+/// Replace the children of `node` with the nodes parsed from `html`
+/// (`element.innerHTML = html`)
+pub fn set_inner_html(tree: &mut DomTree, node: NodeId, html: &str) {
+    let context = tree
+        .get(node)
+        .and_then(|n| n.as_element())
+        .map(|e| tree.resolve(e.name.local).to_string())
+        .unwrap_or_else(|| "body".to_string());
+    let fragment = parse_fragment(html, FragmentContext { context_element: context, ..Default::default() });
+    tree.remove_children(node);
+    insert_fragment(tree, node, NodeId::NONE, &fragment);
+}
+
+/// Insert the nodes of a parsed fragment into `parent` before `before`
+/// (`NodeId::NONE`: at the end)
+pub fn insert_fragment(tree: &mut DomTree, parent: NodeId, before: NodeId, fragment: &fos_dom::Document) {
+    let src = fragment.tree();
+    let root = fragment_root(fragment);
+    if !root.is_valid() {
+        return;
+    }
+    let ids: Vec<NodeId> = src.children(root).map(|(id, _)| id).collect();
+    for id in ids {
+        let copy = tree.import_node(src, id, true);
+        tree.insert_before(parent, copy, before);
+    }
 }
 
 /// Utility: Get innerHTML of an element

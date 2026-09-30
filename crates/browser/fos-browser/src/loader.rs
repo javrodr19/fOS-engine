@@ -140,7 +140,7 @@ impl Default for Loader {
 }
 
 /// Convert a `file:` URL to a local path (percent-decoding it)
-fn file_url_to_path(url: &str) -> Option<PathBuf> {
+pub(crate) fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = url.get(5..)?; // after "file:"
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     // Drop an explicit "localhost" authority

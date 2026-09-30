@@ -1,0 +1,10 @@
+[package]
+name = "fos-jsvm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "JavaScript engine core for fOS: parser, bytecode compiler, register VM, GC"
+
+[dependencies]
+rustc-hash = "2.1"

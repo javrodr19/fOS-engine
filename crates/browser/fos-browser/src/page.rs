@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 use fos_dom::Document;
-use crate::js_runtime::PageJsRuntime;
+use crate::js_runtime::{PageJsRuntime, ScriptFetcher};
 
 /// A loaded web page
 pub struct Page {
@@ -120,61 +120,84 @@ impl Page {
         Ok(())
     }
     
-    /// Execute pending inline scripts
-    pub fn execute_scripts(&mut self) -> Result<(), String> {
+    /// Run the page's scripts in document order; `fetch` loads external
+    /// ones
+    pub fn execute_scripts_with(&mut self, fetch: &mut ScriptFetcher<'_>) -> Result<(), String> {
         if self.scripts_executed {
             return Ok(());
         }
-        
+
         if !self.js_initialized {
             self.initialize_javascript()?;
         }
-        
+
         let Some(ref mut js_runtime) = self.js_runtime else {
             return Ok(());
         };
-        
-        js_runtime.execute_inline_scripts()
-            .map_err(|e| format!("Script execution error: {}", e))?;
-        
+
+        js_runtime.execute_scripts(fetch)?;
+
         self.scripts_executed = true;
-        log::info!("Inline scripts executed for {}", self.url);
-        
+        log::info!("Scripts executed for {}", self.url);
+
         Ok(())
     }
-    
-    /// Process JavaScript timers (call periodically)
-    pub fn process_timers(&mut self) -> Result<(), String> {
-        let Some(ref js_runtime) = self.js_runtime else {
+
+    /// Run the page's inline scripts (external ones are not fetched)
+    pub fn execute_scripts(&mut self) -> Result<(), String> {
+        self.execute_scripts_with(&mut |_| None)
+    }
+
+    /// Run JavaScript timers that are due (call periodically)
+    pub fn process_timers_with(&mut self, fetch: &mut ScriptFetcher<'_>) -> Result<(), String> {
+        let Some(ref mut js_runtime) = self.js_runtime else {
             return Ok(());
         };
-        
-        js_runtime.process_timers()
-            .map_err(|e| format!("Timer error: {}", e))
+        js_runtime.process_timers(fetch)
     }
-    
+
+    /// Run JavaScript timers that are due
+    pub fn process_timers(&mut self) -> Result<(), String> {
+        self.process_timers_with(&mut |_| None)
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.js_runtime.as_ref().map(|r| r.has_pending_timers()).unwrap_or(false)
     }
-    
+
+    /// When the next JavaScript timer is due
+    pub fn next_timer_due(&self) -> Option<std::time::Instant> {
+        self.js_runtime.as_ref().and_then(|r| r.next_timer_due())
+    }
+
+    /// A navigation the page's scripts requested (taken)
+    pub fn take_script_navigation(&mut self) -> Option<String> {
+        self.js_runtime.as_mut().and_then(|r| r.take_navigation())
+    }
+
+    /// Deliver a click on DOM node `node` to the page's scripts; returns
+    /// the link to follow, if the click hit one and was not canceled
+    pub fn dispatch_click(&mut self, node: fos_dom::NodeId) -> Option<String> {
+        self.js_runtime.as_mut().and_then(|r| r.click(node))
+    }
+
     /// Get pending external script URLs
     pub fn pending_external_scripts(&self) -> Vec<String> {
         self.js_runtime.as_ref()
             .map(|r| r.pending_external_scripts())
             .unwrap_or_default()
     }
-    
+
     /// Execute an external script after fetching
     pub fn execute_external_script(&mut self, url: &str, source: &str) -> Result<(), String> {
         let Some(ref mut js_runtime) = self.js_runtime else {
             return Ok(());
         };
-        
+
         js_runtime.execute_external_script(url, source)
-            .map_err(|e| format!("External script error: {}", e))
     }
-    
+
     /// Scroll by delta
     pub fn scroll(&mut self, dx: f32, dy: f32, viewport_height: f32) {
         self.scroll_x = (self.scroll_x + dx).max(0.0);

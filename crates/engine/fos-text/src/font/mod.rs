@@ -27,7 +27,7 @@ pub mod emoji;
 pub mod optimization;
 
 // Re-export from custom implementations
-pub use custom_database::{CustomFontDatabase as FontDatabase, FontId, FontEntry, FontSource};
+pub use custom_database::{CustomFontDatabase as FontDatabase, FaceData, FontId, FontEntry, FontSource};
 pub use face::FontFace;
 pub use matching::{FontQuery, resolve_generic_family};
 pub use variable::{FontAxis, VariableFont, VariableFontInstance, NamedInstance, axis_tags};

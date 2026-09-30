@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Node, NodeId, NodeData, QualName, InternedString, StringInterner};
+use crate::{Attribute, ElementData, Node, NodeId, NodeData, QualName, InternedString, StringInterner, TextData};
 
 /// Source of process-unique tree IDs
 static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
@@ -322,6 +322,156 @@ impl DomTree {
         }
     }
     
+    /// The value of attribute `name` of element `node`
+    pub fn get_attribute(&self, node: NodeId, name: &str) -> Option<&str> {
+        let e = self.get(node)?.as_element()?;
+        e.attrs.iter().find(|a| self.resolve(a.name.local) == name).map(|a| a.value.as_str())
+    }
+
+    /// Set attribute `name` of element `node`, keeping the id and class
+    /// caches the style engine reads in step
+    pub fn set_attribute(&mut self, node: NodeId, name: &str, value: &str) {
+        let local = self.interner.intern(name);
+        let id = (name == "id").then(|| self.interner.intern(value));
+        let classes: Option<Vec<InternedString>> =
+            (name == "class").then(|| value.split_ascii_whitespace().map(|c| self.interner.intern(c)).collect());
+        let Some(e) = self.nodes.get_mut(node.index()).and_then(Node::as_element_mut) else { return };
+        if name == "id" {
+            e.id = id;
+        } else if let Some(c) = classes {
+            e.classes = c;
+        }
+        e.set_attr(QualName::new(InternedString::EMPTY, local), value.to_string());
+        self.mark_mutated();
+    }
+
+    /// Remove attribute `name` of element `node`; whether it was there
+    pub fn remove_attribute(&mut self, node: NodeId, name: &str) -> bool {
+        let Some(e) = self.nodes.get(node.index()).and_then(Node::as_element) else { return false };
+        let Some(pos) = e.attrs.iter().position(|a| self.interner.get(a.name.local) == name) else { return false };
+        let e = self.nodes[node.index()].as_element_mut().unwrap();
+        e.attrs.remove(pos);
+        if name == "id" {
+            e.id = None;
+        } else if name == "class" {
+            e.classes.clear();
+        }
+        self.mark_mutated();
+        true
+    }
+
+    /// The text of `node`'s descendant text nodes, in document order
+    pub fn text_content(&self, node: NodeId) -> String {
+        let mut out = String::new();
+        self.collect_text(node, &mut out);
+        out
+    }
+
+    fn collect_text(&self, node: NodeId, out: &mut String) {
+        let Some(n) = self.get(node) else { return };
+        match &n.data {
+            NodeData::Text(t) => out.push_str(&t.content),
+            NodeData::Comment(_) | NodeData::ProcessingInstruction { .. } => {}
+            _ => {
+                let mut c = n.first_child;
+                while c.is_valid() {
+                    self.collect_text(c, out);
+                    c = self.nodes[c.index()].next_sibling;
+                }
+            }
+        }
+    }
+
+    /// Replace `node`'s children with one text node (or none, for "")
+    pub fn set_text_content(&mut self, node: NodeId, text: &str) {
+        if let Some(NodeData::Text(t)) = self.get_mut(node).map(|n| &mut n.data) {
+            t.content = text.to_string();
+            self.mark_mutated();
+            return;
+        }
+        self.remove_children(node);
+        if !text.is_empty() {
+            let t = self.create_text(text);
+            self.append_child(node, t);
+        }
+        self.mark_mutated();
+    }
+
+    /// Detach every child of `node`
+    pub fn remove_children(&mut self, node: NodeId) {
+        while let Some(c) = self.get(node).map(|n| n.first_child).filter(|c| c.is_valid()) {
+            self.remove(c);
+        }
+    }
+
+    /// Whether `node` is `ancestor` or one of its descendants
+    pub fn is_inclusive_descendant(&self, mut node: NodeId, ancestor: NodeId) -> bool {
+        while node.is_valid() {
+            if node == ancestor {
+                return true;
+            }
+            node = match self.get(node) {
+                Some(n) => n.parent,
+                None => return false,
+            };
+        }
+        false
+    }
+
+    /// Copy node `node` of `src` (with its subtree when `deep`) into this
+    /// tree, detached; returns the copy. `src` may be this tree's own
+    /// arena contents only through `clone_node`.
+    pub fn import_node(&mut self, src: &DomTree, node: NodeId, deep: bool) -> NodeId {
+        let Some(n) = src.get(node) else { return NodeId::NONE };
+        let data = match &n.data {
+            NodeData::Element(e) => {
+                let name = QualName::new(self.interner.intern(src.resolve(e.name.ns)), self.interner.intern(src.resolve(e.name.local)));
+                let mut copy = ElementData::new(name);
+                copy.attrs = e
+                    .attrs
+                    .iter()
+                    .map(|a| Attribute {
+                        name: QualName::new(self.interner.intern(src.resolve(a.name.ns)), self.interner.intern(src.resolve(a.name.local))),
+                        value: a.value.clone(),
+                    })
+                    .collect();
+                copy.id = e.id.map(|i| self.interner.intern(src.resolve(i)));
+                copy.classes = e.classes.iter().map(|&c| self.interner.intern(src.resolve(c))).collect();
+                NodeData::Element(copy)
+            }
+            NodeData::Text(t) => NodeData::Text(TextData { content: t.content.clone() }),
+            NodeData::Comment(c) => NodeData::Comment(c.clone()),
+            NodeData::Doctype { name, public_id, system_id } => NodeData::Doctype {
+                name: self.interner.intern(src.resolve(*name)),
+                public_id: public_id.clone(),
+                system_id: system_id.clone(),
+            },
+            NodeData::ProcessingInstruction { target, data } => {
+                NodeData::ProcessingInstruction { target: self.interner.intern(src.resolve(*target)), data: data.clone() }
+            }
+            NodeData::Document => NodeData::Document,
+        };
+        let copy = self.create_node(data);
+        if deep {
+            let mut c = n.first_child;
+            while c.is_valid() {
+                let child = self.import_node(src, c, true);
+                self.append_child(copy, child);
+                c = src.nodes[c.index()].next_sibling;
+            }
+        }
+        copy
+    }
+
+    /// Copy `node` (with its subtree when `deep`) within this tree, detached
+    pub fn clone_node(&mut self, node: NodeId, deep: bool) -> NodeId {
+        // Interned strings are shared, so a snapshot of the subtree's
+        // interner is not needed: copy through a temporary tree
+        let mut tmp = DomTree::new();
+        let t = tmp.import_node(self, node, deep);
+        self.import_node(&tmp, t, deep)
+    }
+
     /// Get string interner
     #[inline]
     pub fn interner(&self) -> &StringInterner {

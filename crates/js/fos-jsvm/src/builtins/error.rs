@@ -54,7 +54,9 @@ fn error_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<Js
             vm.define_value(o, PropertyKey::Atom(atoms::cause), cause, PropFlags::HIDDEN);
         }
     }
-    let stack = vm.stack_trace();
+    // V8's format: the error's string form, then one line per frame
+    let header = error_to_string(vm, Value::object(o)).unwrap_or_default();
+    let stack = format!("{header}\n{}", vm.stack_trace());
     let stack = vm.str_value(&stack);
     vm.define_value(o, PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
     Ok(Value::object(o))

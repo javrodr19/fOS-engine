@@ -16,6 +16,7 @@ mod reflect;
 pub(crate) mod regexp;
 mod string;
 mod symbol;
+mod uri;
 pub mod typedarray;
 
 use crate::gc::Gc;
@@ -42,6 +43,7 @@ pub(crate) fn init(vm: &mut Vm) {
     date::init(vm);
     typedarray::init(vm);
     generator::init(vm);
+    uri::init(vm);
 
     let g = vm.global;
     vm.def_value(g, "globalThis", Value::object(g), PropFlags::HIDDEN);
@@ -65,36 +67,44 @@ pub(crate) fn init(vm: &mut Vm) {
 }
 
 #[inline]
-pub(crate) fn arg(args: &[Value], i: usize) -> Value {
+pub fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::UNDEFINED)
 }
 
 impl Vm {
-    pub(crate) fn def_value(&mut self, obj: Gc<JsObject>, name: &str, v: Value, flags: PropFlags) {
+    pub fn def_value(&mut self, obj: Gc<JsObject>, name: &str, v: Value, flags: PropFlags) {
         let key = self.key_from_str(name);
         self.define_value(obj, key, v, flags);
     }
 
-    pub(crate) fn def_method(&mut self, obj: Gc<JsObject>, name: &str, length: u32, f: NativeFn) -> Gc<JsObject> {
+    pub fn def_method(&mut self, obj: Gc<JsObject>, name: &str, length: u32, f: NativeFn) -> Gc<JsObject> {
         let func = self.new_native(name, length, f, None);
         self.def_value(obj, name, Value::object(func), PropFlags::HIDDEN);
         func
     }
 
-    pub(crate) fn def_method_sym(&mut self, obj: Gc<JsObject>, sym: Gc<Symbol>, name: &str, length: u32, f: NativeFn) -> Gc<JsObject> {
+    pub fn def_method_sym(&mut self, obj: Gc<JsObject>, sym: Gc<Symbol>, name: &str, length: u32, f: NativeFn) -> Gc<JsObject> {
         let func = self.new_native(name, length, f, None);
         self.define_value(obj, PropertyKey::Symbol(sym), Value::object(func), PropFlags::HIDDEN);
         func
     }
 
-    pub(crate) fn def_getter(&mut self, obj: Gc<JsObject>, name: &str, f: NativeFn) {
+    pub fn def_getter(&mut self, obj: Gc<JsObject>, name: &str, f: NativeFn) {
         let func = self.new_native(&format!("get {name}"), 0, f, None);
         let key = self.key_from_str(name);
         self.define_accessor(obj, key, Some(Value::object(func)), None, PropFlags(PropFlags::CONFIGURABLE));
     }
 
+    /// An accessor property with native getter and optional setter
+    pub fn def_accessor(&mut self, obj: Gc<JsObject>, name: &str, get: NativeFn, set: Option<NativeFn>) {
+        let g = self.new_native(&format!("get {name}"), 0, get, None);
+        let s = set.map(|f| Value::object(self.new_native(&format!("set {name}"), 1, f, None)));
+        let key = self.key_from_str(name);
+        self.define_accessor(obj, key, Some(Value::object(g)), s, PropFlags(PropFlags::CONFIGURABLE));
+    }
+
     /// A constructor with its prototype object, installed as a global
-    pub(crate) fn def_ctor(&mut self, name: &str, length: u32, call: NativeFn, construct: Option<NativeFn>, proto: Gc<JsObject>) -> Gc<JsObject> {
+    pub fn def_ctor(&mut self, name: &str, length: u32, call: NativeFn, construct: Option<NativeFn>, proto: Gc<JsObject>) -> Gc<JsObject> {
         let c = self.new_native(name, length, call, construct);
         self.define_value(c, PropertyKey::Atom(atoms::prototype), Value::object(proto), PropFlags::FROZEN);
         self.define_value(proto, PropertyKey::Atom(atoms::constructor), Value::object(c), PropFlags::HIDDEN);
@@ -113,11 +123,11 @@ impl Vm {
 
     /// Call `f` for its value without keeping temporaries of earlier
     /// iterations alive (loops over many callbacks)
-    pub(crate) fn temp_mark(&self) -> usize {
+    pub fn temp_mark(&self) -> usize {
         self.temp_roots.len()
     }
 
-    pub(crate) fn temp_reset(&mut self, mark: usize) {
+    pub fn temp_reset(&mut self, mark: usize) {
         self.temp_roots.truncate(mark);
     }
 

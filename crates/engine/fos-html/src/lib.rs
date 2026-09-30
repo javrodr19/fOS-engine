@@ -16,7 +16,7 @@ pub use incremental_parser::{
 
 pub use parser::HtmlParser;
 pub use fos_dom::{Document, DomTree, Node, NodeId};
-pub use serializer::{HtmlSerializer, get_inner_html, get_outer_html, FragmentContext, parse_fragment};
+pub use serializer::{HtmlSerializer, get_inner_html, get_outer_html, FragmentContext, parse_fragment, fragment_root, set_inner_html, insert_fragment};
 
 /// Parse an HTML string into a Document
 pub fn parse(html: &str) -> Document {

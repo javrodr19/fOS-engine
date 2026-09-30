@@ -287,12 +287,15 @@ impl BrowserApp {
             log::warn!("Failed to initialize JavaScript: {}", e);
             self.devtools.warn(&format!("JS init failed: {}", e));
         }
-        if let Err(e) = page.execute_scripts() {
+        let network = &mut self.network;
+        let page_url = page.url.clone();
+        if let Err(e) = page.execute_scripts_with(&mut |url| fetch_script(network, &page_url, url)) {
             log::warn!("Failed to execute scripts: {}", e);
             self.devtools.error(&format!("Script error: {}", e));
         }
 
         self.refresh_if_dom_changed();
+        self.follow_script_navigation();
 
         // Build accessibility tree and extract media/canvas from DOM
         let Some(doc) = self.current_document() else { return };
@@ -415,22 +418,28 @@ impl BrowserApp {
         }
     }
 
-    /// Process JavaScript timers (call periodically)
+    /// Run the page's JavaScript timers that are due
     fn process_js_timers(&mut self) {
-        if self.last_timer_check.elapsed() < TIMER_TICK {
+        let Some(page) = self.current_page.as_mut() else { return };
+        if !page.next_timer_due().is_some_and(|due| due <= Instant::now()) {
             return;
         }
         self.last_timer_check = Instant::now();
-
-        if let Some(ref mut page) = self.current_page {
-            if page.has_pending_timers() {
-                if let Err(e) = page.process_timers() {
-                    log::warn!("Timer processing error: {}", e);
-                }
-                // Timer callbacks may have changed the DOM
-                self.refresh_if_dom_changed();
-            }
+        let network = &mut self.network;
+        let page_url = page.url.clone();
+        if let Err(e) = page.process_timers_with(&mut |url| fetch_script(network, &page_url, url)) {
+            log::warn!("Timer processing error: {}", e);
         }
+        // Timer callbacks may have changed the DOM or navigated
+        self.refresh_if_dom_changed();
+        self.follow_script_navigation();
+    }
+
+    /// Go where the page's scripts asked to (`location.href = ...`)
+    fn follow_script_navigation(&mut self) {
+        let Some(url) = self.current_page.as_mut().and_then(Page::take_script_navigation) else { return };
+        log::info!("Script navigation to {}", url);
+        self.follow_link(&url);
     }
 
     /// Render the browser UI and content
@@ -755,7 +764,13 @@ impl BrowserApp {
         let lower = href.to_ascii_lowercase();
 
         if lower.starts_with("javascript:") {
-            log::debug!("Ignoring javascript: link");
+            let code = percent_decode(&href["javascript:".len()..]);
+            if let Some(page) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
+                if let Err(e) = page.eval(&code) {
+                    log::warn!("javascript: URL failed: {}", e);
+                }
+            }
+            self.refresh_if_dom_changed();
             return;
         }
         if lower.starts_with("mailto:") || lower.starts_with("tel:") {
@@ -798,6 +813,23 @@ impl BrowserApp {
         let hit_x = content_x as f32;
         let hit_y = content_y as f32 + scroll_y;
 
+        // Text under the pointer belongs to a DOM element: the page's click
+        // handlers run first and decide whether a link is followed
+        let doc_x = hit_x;
+        let doc_y = content_y as f32 + self.scroll_offset;
+        let has_js = self.current_page.as_ref().is_some_and(|p| p.js_runtime.is_some());
+        if has_js {
+            if let Some(node) = self.renderer.node_at(doc_x, doc_y) {
+                let href = self.current_page.as_mut().and_then(|p| p.dispatch_click(node));
+                self.refresh_if_dom_changed();
+                self.follow_script_navigation();
+                if let Some(href) = href {
+                    self.follow_link(&href);
+                }
+                return;
+            }
+        }
+
         let href = self.rendered_page.as_ref().and_then(|rendered| {
             rendered.links.iter()
                 .find(|link| {
@@ -817,6 +849,42 @@ impl BrowserApp {
             window.request_redraw();
         }
     }
+}
+
+/// Fetch the source of an external script of the page at `page_url`
+fn fetch_script(network: &mut NetworkManager, page_url: &str, url: &str) -> Option<String> {
+    if Loader::is_local_url(url) {
+        let path = crate::loader::file_url_to_path(url)?;
+        let bytes = std::fs::read(path).ok()?;
+        return Some(crate::charset::decode_html(bytes, Some("text/javascript")));
+    }
+    match network.fetch(url, Some(page_url)) {
+        Ok(result) => Some(crate::charset::decode_html(result.body, Some(&result.content_type))),
+        Err(e) => {
+            log::warn!("Failed to fetch script {}: {}", url, e);
+            None
+        }
+    }
+}
+
+/// Decode `%XX` escapes (javascript: URLs)
+fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Escape text for inclusion in HTML
@@ -935,11 +1003,14 @@ impl ApplicationHandler for BrowserApp {
 
         // Wake up for the next timer tick only while timers are pending;
         // otherwise sleep until the next input event (zero idle CPU)
-        let timers_pending = self.current_page.as_ref().is_some_and(|p| p.has_pending_timers());
-        if timers_pending {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TIMER_TICK));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        match self.current_page.as_ref().and_then(Page::next_timer_due) {
+            // Timers never fire more often than every TIMER_TICK, which
+            // keeps a page spinning on `setTimeout(f, 0)` from pegging a core
+            Some(due) => {
+                let earliest = self.last_timer_check + TIMER_TICK;
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due.max(earliest)));
+            }
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }

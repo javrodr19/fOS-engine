@@ -156,6 +156,9 @@ pub enum ObjectKind {
     /// Generator object or async function state
     Generator(Box<GenState>),
     Promise(Box<PromiseData>),
+    /// An object backed by embedder data (e.g. a DOM node): `class` tells
+    /// the embedder's kinds apart, `id` names the thing it wraps
+    Host { class: u32, id: u64 },
 }
 
 pub struct ProxyData {
@@ -454,6 +457,7 @@ impl Trace for JsObject {
             | ObjectKind::Array { .. }
             | ObjectKind::Error
             | ObjectKind::Boolean(_)
+            | ObjectKind::Host { .. }
             | ObjectKind::Number(_)
             | ObjectKind::Date(_)
             | ObjectKind::Arguments => {}

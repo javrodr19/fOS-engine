@@ -74,6 +74,8 @@ struct TextSegment {
     color: Color,
     /// Link href if this is a link
     href: Option<String>,
+    /// Element the text belongs to (for hit testing clicks)
+    node: NodeId,
 }
 
 /// A laid-out line of text, in document coordinates
@@ -244,6 +246,32 @@ impl PageRenderer {
     }
 
     /// Whether the cached layout reflects `document` as it is now
+    /// The element whose text is at `(x, y)` in document coordinates,
+    /// per the current layout
+    pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
+        let cached = self.cached.take()?;
+        let mut found = None;
+        // Lines are sorted by baseline; text spans the line height above it
+        let first = cached.layout.lines.partition_point(|line| line.y < y);
+        for line in cached.layout.lines[first..].iter().take(4) {
+            let mut sx = line.x;
+            for segment in &line.segments {
+                let top = line.y - segment.font_size * 1.2;
+                let width = self.measure_text(&segment.text, segment.font_size);
+                if y >= top && y <= line.y + segment.font_size * 0.3 && x >= sx && x <= sx + width {
+                    found = Some(segment.node);
+                    break;
+                }
+                sx += width;
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        self.cached = Some(cached);
+        found.filter(|n| n.is_valid())
+    }
+
     pub fn is_layout_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
     }
@@ -781,7 +809,7 @@ impl LayoutBuilder<'_> {
 
                 let font_size = self.line_buffer.current_font_size.max(14.0);
                 let text_color = self.line_buffer.current_color;
-                self.line_buffer.add_text(&collapsed, font_size, text_color);
+                self.line_buffer.add_text(&collapsed, font_size, text_color, node.parent);
             }
             return;
         }
@@ -875,7 +903,7 @@ impl LayoutBuilder<'_> {
         if (tag == "td" || tag == "th") && line_buffer.current_x > line_buffer.effective_start_x() + 5.0 {
             // Add cell separator if not first in row
             let font_size = line_buffer.current_font_size;
-            line_buffer.add_text(" | ", font_size, Color::rgb(180, 180, 180));
+            line_buffer.add_text(" | ", font_size, Color::rgb(180, 180, 180), node_id);
         }
 
         // Table headers get slightly bold look (darker color)
@@ -893,11 +921,11 @@ impl LayoutBuilder<'_> {
             if line_buffer.list_counter > 0 {
                 // Ordered list - show number
                 let marker = format!("{}. ", line_buffer.list_counter);
-                line_buffer.add_text(&marker, font_size, color);
+                line_buffer.add_text(&marker, font_size, color, node_id);
                 line_buffer.list_counter += 1;
             } else {
                 // Unordered list - show bullet
-                line_buffer.add_text("• ", font_size, color);
+                line_buffer.add_text("• ", font_size, color, node_id);
             }
         }
 
@@ -1093,7 +1121,7 @@ impl LineBuffer {
         self.start_x + (self.indent_level as f32 * 20.0)
     }
 
-    fn add_text_with_measure<F: Fn(&str, f32) -> f32>(&mut self, text: &str, font_size: f32, color: Color, measure: F) {
+    fn add_text_with_measure<F: Fn(&str, f32) -> f32>(&mut self, text: &str, font_size: f32, color: Color, node: NodeId, measure: F) {
         let effective_start = self.effective_start_x();
         let right_margin = 15.0;
         let wrap_width = self.max_width - right_margin;
@@ -1138,6 +1166,7 @@ impl LineBuffer {
                 font_size,
                 color,
                 href: self.current_href.clone(),
+                node,
             }));
 
             self.current_x += line_width + space_width;
@@ -1145,10 +1174,10 @@ impl LineBuffer {
     }
 
     // Keep fallback without measure function for backwards compatibility
-    fn add_text(&mut self, text: &str, font_size: f32, color: Color) {
+    fn add_text(&mut self, text: &str, font_size: f32, color: Color, node: NodeId) {
         // Fallback using approximate character width
         let char_width = font_size * 0.5;
-        self.add_text_with_measure(text, font_size, color, |s, _| s.chars().count() as f32 * char_width);
+        self.add_text_with_measure(text, font_size, color, node, |s, _| s.chars().count() as f32 * char_width);
     }
 
     /// Emit the buffered text as lines starting at `y_cursor`

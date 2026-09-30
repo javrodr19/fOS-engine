@@ -39,6 +39,7 @@ pub mod ui;
 pub mod renderer;
 /// JavaScript runtime integration
 pub mod js_runtime;
+pub mod dom_bindings;
 /// Network requests with HTTP cache
 pub mod network;
 /// Character encoding detection and decoding

@@ -37,6 +37,13 @@ impl HtmlParser {
     }
 }
 
+/// Parse `html` as the contents of a `context` element (innerHTML): the
+/// result's `<html>` element holds the fragment's nodes
+pub(crate) fn parse_fragment(html: &str, context: &str) -> Document {
+    let name = html5ever::QualName::new(None, html5ever::ns!(html), LocalName::from(context.to_ascii_lowercase()));
+    html5ever::parse_fragment(DomSink::new("about:blank"), Default::default(), name, Vec::new(), true).one(html)
+}
+
 impl Default for HtmlParser {
     fn default() -> Self {
         Self::new()

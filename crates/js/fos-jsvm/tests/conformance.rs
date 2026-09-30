@@ -1056,3 +1056,18 @@ fn with_statement() {
         ("new Function('obj', 'with (obj) { return typeof missing + typeof x; }')({x: 1})", "'undefinednumber'"),
     ]);
 }
+
+#[test]
+fn uri_functions() {
+    check(&[
+        ("encodeURIComponent('a b&c/d?é€😀')", "'a%20b%26c%2Fd%3F%C3%A9%E2%82%AC%F0%9F%98%80'"),
+        ("encodeURI('http://x.y/a b?q=1&r=é#h')", "'http://x.y/a%20b?q=1&r=%C3%A9#h'"),
+        ("decodeURIComponent('a%20b%26c%2Fd%3F%C3%A9%E2%82%AC%F0%9F%98%80')", "'a b&c/d?é€😀'"),
+        ("decodeURI('a%20b%26c%2F')", "'a b%26c%2F'"),
+        ("decodeURIComponent('%')", "throws URIError*"),
+        ("decodeURIComponent('%C3')", "throws URIError*"),
+        ("encodeURIComponent('\\uD800')", "throws URIError*"),
+        ("escape('a b+ü\\u0100')", "'a%20b+%FC%u0100'"),
+        ("unescape('a%20b+%FC%u0100%zz')", "'a b+üĀ%zz'"),
+    ]);
+}

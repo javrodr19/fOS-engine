@@ -909,6 +909,7 @@ dependencies = [
  "fos-engine",
  "fos-html",
  "fos-js",
+ "fos-jsvm",
  "fos-layout",
  "fos-media",
  "fos-net",

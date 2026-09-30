@@ -21,6 +21,7 @@
 pub(crate) mod generator;
 mod interp;
 pub(crate) mod ops;
+pub use ops::truthy;
 pub(crate) mod property;
 
 use std::rc::Rc;
@@ -186,6 +187,11 @@ pub struct Vm {
     pub(crate) pending_throw: Option<Value>,
     /// Set when `run` returned because a generator suspended
     pub(crate) suspended: bool,
+    /// Embedder state, reachable from native functions (`vm.host_mut()`)
+    pub host: Option<Box<dyn std::any::Any>>,
+    /// Values the embedder keeps alive (e.g. wrappers of DOM nodes,
+    /// pending timer callbacks); traced as roots
+    pub host_roots: Vec<Value>,
 }
 
 impl Drop for Vm {
@@ -310,6 +316,8 @@ impl Vm {
             jobs: Default::default(),
             pending_throw: None,
             suspended: false,
+            host: None,
+            host_roots: Vec::new(),
         };
         crate::builtins::init(&mut vm);
         vm
@@ -333,12 +341,42 @@ impl Vm {
 
     /// Run a compiled script with `this` = the global object
     pub fn run_script(&mut self, proto: Rc<FunctionProto>) -> JsResult<Value> {
+        let top = self.frames.is_empty();
+        let mark = self.temp_roots.len();
         let func = self.new_closure(proto, Box::new([]));
         let r = self.call(Value::object(func), Value::object(self.global), &[]);
-        if self.frames.is_empty() {
+        if top {
             self.run_jobs();
+            // Nothing below the embedder holds these temporaries any more.
+            // The result stays valid until the VM next runs code (only
+            // running code collects garbage).
+            self.temp_roots.truncate(mark);
         }
         r
+    }
+
+    /// Call `f` from the embedder (an event handler, a timer callback):
+    /// like `call`, then runs the microtasks it queued when nothing else
+    /// is on the stack. The result stays valid until the VM next runs code.
+    pub fn call_from_host(&mut self, f: Value, this: Value, args: &[Value]) -> JsResult<Value> {
+        let top = self.frames.is_empty();
+        let mark = self.temp_roots.len();
+        let r = self.call(f, this, args);
+        if top {
+            self.run_jobs();
+            self.temp_roots.truncate(mark);
+        }
+        r
+    }
+
+    /// The embedder state, if it is a `T`
+    pub fn host_ref<T: 'static>(&self) -> Option<&T> {
+        self.host.as_deref().and_then(|h| h.downcast_ref())
+    }
+
+    /// The embedder state, if it is a `T`
+    pub fn host_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.host.as_deref_mut().and_then(|h| h.downcast_mut())
     }
 
     /// Run queued microtasks (promise reactions) until the queue is empty
@@ -524,7 +562,17 @@ impl Vm {
         let o = self.new_object_with(Some(proto), ObjectKind::Error);
         let msg = self.str_value(message);
         self.define_value(o, crate::object::PropertyKey::Atom(atoms::message), msg, PropFlags::HIDDEN);
-        let stack = self.stack_trace();
+        let name = match kind {
+            ErrorKind::Error => "Error",
+            ErrorKind::Type => "TypeError",
+            ErrorKind::Range => "RangeError",
+            ErrorKind::Reference => "ReferenceError",
+            ErrorKind::Syntax => "SyntaxError",
+            ErrorKind::Eval => "EvalError",
+            ErrorKind::Uri => "URIError",
+        };
+        let stack = if message.is_empty() { name.to_string() } else { format!("{name}: {message}") };
+        let stack = format!("{stack}\n{}", self.stack_trace());
         let stack = self.str_value(&stack);
         self.define_value(o, crate::object::PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
         Value::object(o)
@@ -919,6 +967,7 @@ impl Vm {
             t.mark(s);
         }
         t.mark_values(&self.temp_roots);
+        t.mark_values(&self.host_roots);
         for job in &self.jobs {
             match job {
                 Job::Call(f, a) => {

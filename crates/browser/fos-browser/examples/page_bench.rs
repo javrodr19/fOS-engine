@@ -18,6 +18,7 @@ const VIEWPORT_HEIGHT: u32 = 768;
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "--synthetic".to_string());
+    let mut network = NetworkManager::new();
 
     let (html, url) = if arg == "--synthetic" {
         let paragraphs = std::env::args().nth(2).and_then(|n| n.parse().ok()).unwrap_or(2000);
@@ -31,7 +32,6 @@ fn main() {
         });
         (String::from_utf8_lossy(&bytes).into_owned(), format!("file://{}", path))
     } else {
-        let mut network = NetworkManager::new();
         let start = Instant::now();
         let page = match network.fetch_page(&arg) {
             Ok(page) => page,
@@ -55,12 +55,21 @@ fn main() {
     // Parse once into the page's DOM, as the browser does
     let start = Instant::now();
     let page = Page::from_html(&url, html);
+    let parse_ms = ms(start);
+
+    // External stylesheets, fetched as the browser does before painting
+    let start = Instant::now();
+    let sheets = fos_browser::css_loader::load_for_page(&mut network, &page);
+    let css_bytes: usize = sheets.values().map(|s| s.len()).sum();
+
     let document = page.document().expect("page has a DOM");
     let document = document.lock().unwrap();
-    println!("parse:        {:>8.1} ms  {} DOM nodes  (RSS {})", ms(start), document.tree().len(), rss());
+    println!("parse:        {:>8.1} ms  {} DOM nodes  (RSS {})", parse_ms, document.tree().len(), rss());
+    println!("stylesheets:  {:>8.1} ms  {} sheets, {} bytes of CSS", ms(start), sheets.len(), css_bytes);
 
     // The browser keeps a buffer of exactly the visible area
     let mut renderer = PageRenderer::new(VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    renderer.set_stylesheets(sheets);
 
     let start = Instant::now();
     let first = renderer.render_document(&document, 0.0).expect("render failed");

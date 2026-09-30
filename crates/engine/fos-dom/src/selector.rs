@@ -124,6 +124,26 @@ enum Pseudo {
     Never,
 }
 
+/// Kinds of keys in ancestor filters (see [`key_hash`])
+pub const KEY_ID: u8 = 1;
+pub const KEY_CLASS: u8 = 2;
+/// Tags are hashed lowercase
+pub const KEY_TAG: u8 = 3;
+
+/// Hash of an id, class or tag an element carries, for ancestor Bloom
+/// filters: a selector needing an ancestor with a key whose hash is not in
+/// the element's ancestor filter cannot match
+pub fn key_hash(kind: u8, s: &str) -> u32 {
+    // FNV-1a
+    let mut h: u32 = 0x811c9dc5 ^ kind as u32;
+    h = h.wrapping_mul(0x01000193);
+    for b in s.bytes() {
+        let b = if kind == KEY_TAG { b.to_ascii_lowercase() } else { b };
+        h = (h ^ b as u32).wrapping_mul(0x01000193);
+    }
+    h
+}
+
 /// The most selective simple selector an element must have to match a
 /// complex selector: style engines file rules under it, so an element is
 /// only tested against rules that can match it
@@ -136,6 +156,34 @@ pub enum SubjectKey {
 }
 
 impl SelectorList {
+    /// For each complex selector: key hashes (see [`key_hash`]) that its
+    /// element's ancestors must carry (from compounds joined to the subject
+    /// by descendant and child combinators only)
+    pub fn ancestor_hashes(&self) -> Vec<Vec<u32>> {
+        self.0
+            .iter()
+            .map(|c| {
+                let mut out = Vec::new();
+                for i in 1..c.parts.len() {
+                    if !matches!(c.parts[i - 1].1, Combinator::Descendant | Combinator::Child) {
+                        break;
+                    }
+                    let comp = &c.parts[i].0;
+                    if let Some(id) = &comp.id {
+                        out.push(key_hash(KEY_ID, id));
+                    }
+                    out.extend(comp.classes.iter().map(|cl| key_hash(KEY_CLASS, cl)));
+                    if let Some(t) = &comp.tag {
+                        out.push(key_hash(KEY_TAG, t));
+                    }
+                }
+                out.sort_unstable();
+                out.dedup();
+                out
+            })
+            .collect()
+    }
+
     /// Specificity (ids, classes, types) of each complex selector
     pub fn specificities(&self) -> Vec<(u32, u32, u32)> {
         self.0.iter().map(Complex::specificity).collect()
@@ -724,6 +772,17 @@ mod tests {
             SelectorList::parse("#a .x, ul > li.y.z, p, *:hover").unwrap().subject_keys(),
             vec![Some(SubjectKey::Class("x".into())), Some(SubjectKey::Class("y".into())), Some(SubjectKey::Tag("p".into())), None]
         );
+        let anc = |s: &str| SelectorList::parse(s).unwrap().ancestor_hashes()[0].clone();
+        let mut want = vec![key_hash(KEY_CLASS, "a"), key_hash(KEY_ID, "m"), key_hash(KEY_TAG, "ul")];
+        want.sort_unstable();
+        assert_eq!(anc("#m.a ul > li span"), {
+            let mut w = want.clone();
+            w.push(key_hash(KEY_TAG, "li"));
+            w.sort_unstable();
+            w
+        });
+        // Past a sibling combinator nothing is known about ancestors
+        assert_eq!(anc(".a + .b .c"), vec![key_hash(KEY_CLASS, "b")]);
         let spec = |s: &str| SelectorList::parse(s).unwrap().specificities()[0];
         assert_eq!(spec("#a .x > p:first-child"), (1, 2, 1));
         assert_eq!(spec("ul li a[href]::before"), (0, 1, 4));

@@ -270,7 +270,11 @@ impl BrowserApp {
 
     /// Make `page` the displayed page and render it.
     /// If reset_scroll is false, keeps the current scroll position.
-    fn show_page(&mut self, page: Page, reset_scroll: bool) {
+    fn show_page(&mut self, mut page: Page, reset_scroll: bool) {
+        // Stylesheets block the first render, as in other browsers:
+        // painting without them would show the page unstyled first
+        page.stylesheets = self.load_stylesheets(&page);
+        self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
         self.current_page = Some(page);
@@ -285,6 +289,11 @@ impl BrowserApp {
         if let Some(ref rendered) = self.rendered_page {
             log::info!("Rendered: {}x{} pixels", rendered.width, rendered.height);
         }
+    }
+
+    /// Fetch the page's external stylesheets
+    fn load_stylesheets(&mut self, page: &Page) -> crate::css_loader::Stylesheets {
+        crate::css_loader::load_for_page(&mut self.network, page)
     }
 
     /// Run the current page's scripts, then update everything derived from

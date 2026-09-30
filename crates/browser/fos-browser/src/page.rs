@@ -18,6 +18,8 @@ pub struct Page {
     pub document: Option<Arc<Mutex<Document>>>,
     /// JavaScript runtime for this page
     pub js_runtime: Option<PageJsRuntime>,
+    /// External stylesheets (`<link rel="stylesheet">`) by URL
+    pub stylesheets: crate::css_loader::Stylesheets,
     /// Rendered content (pixel buffer)
     pub rendered: Option<RenderedContent>,
     /// Scroll position
@@ -66,6 +68,7 @@ impl Page {
             html: Arc::from(""),
             document: None,
             js_runtime: Some(PageJsRuntime::new(url)),
+            stylesheets: Default::default(),
             rendered: None,
             scroll_x: 0.0,
             scroll_y: 0.0,

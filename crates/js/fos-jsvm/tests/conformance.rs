@@ -931,7 +931,7 @@ fn promises_and_async() {
         ("var result = Object.prototype.toString.call(Promise.resolve());", "'[object Promise]'"),
         ("var result; Promise.resolve().then(() => { throw new TypeError('in then'); }).catch(e => result = e instanceof TypeError);", "true"),
         ("var result = 0; for (let i = 0; i < 1000; i++) Promise.resolve(i).then(v => result += v);", "499500"),
-        ("var result; async function* ag() {}", "throws SyntaxError*"),
+        ("var result; async function* ag() { yield 5; } ag().next().then(r => result = r.value);", "5"),
         ("var result; queueMicrotask(() => result = 'queued');", "'queued'"),
         ("var result; new Promise(r => r()).then(() => new Promise(r => r('nested'))).then(v => result = v);", "'nested'"),
         ("var result; const p = Promise.resolve(); result = p.then() instanceof Promise;", "true"),
@@ -1069,5 +1069,86 @@ fn uri_functions() {
         ("encodeURIComponent('\\uD800')", "throws URIError*"),
         ("escape('a b+ü\\u0100')", "'a%20b+%FC%u0100'"),
         ("unescape('a%20b+%FC%u0100%zz')", "'a b+üĀ%zz'"),
+    ]);
+}
+
+#[test]
+fn async_generators() {
+    check_async(&[
+        (
+            "var result; async function* g() { yield 1; yield await Promise.resolve(2); return 3; }
+             (async () => { const it = g(); const out = []; for (let i = 0; i < 4; i++) { const r = await it.next(); out.push(r.value + ':' + r.done); } result = out.join(' '); })();",
+            "'1:false 2:false 3:true undefined:true'",
+        ),
+        (
+            "var result; async function* g() { for (let i = 0; i < 3; i++) yield i * 10; }
+             (async () => { let s = 0; for await (const v of g()) s += v; result = s; })();",
+            "30",
+        ),
+        (
+            "var result; (async () => { const out = []; for await (const v of [1, Promise.resolve(2), 3]) out.push(v); result = out.join(); })();",
+            "'1,2,3'",
+        ),
+        (
+            "var result; const src = { [Symbol.asyncIterator]() { let i = 0; return { next: () => Promise.resolve({ value: i, done: i++ >= 2 }) }; } };
+             (async () => { const out = []; for await (const v of src) out.push(v); result = out.join(); })();",
+            "'0,1'",
+        ),
+        (
+            "var result, log = []; async function* g() { try { yield 1; yield 2; } finally { log.push('cleanup'); } }
+             (async () => { for await (const v of g()) { log.push(v); break; } result = log.join(); })();",
+            "'1,cleanup'",
+        ),
+        (
+            "var result; async function* inner() { yield 'a'; yield 'b'; return 'r'; } async function* outer() { const r = yield* inner(); yield r; yield* ['x', 'y']; }
+             (async () => { const out = []; for await (const v of outer()) out.push(v); result = out.join(); })();",
+            "'a,b,r,x,y'",
+        ),
+        (
+            "var result; async function* g() { yield 1; yield 2; }
+             (async () => { const it = g(); const a = it.next(), b = it.next(), c = it.next();
+               const rs = await Promise.all([a, b, c]); result = rs.map(r => r.value + ':' + r.done).join(' '); })();",
+            "'1:false 2:false undefined:true'",
+        ),
+        (
+            "var result; async function* g() { try { yield 1; } catch (e) { yield 'caught ' + e; } }
+             (async () => { const it = g(); await it.next(); const r = await it.throw('boom'); result = r.value; })();",
+            "'caught boom'",
+        ),
+        (
+            "var result; async function* g() { yield 1; throw new Error('bad'); }
+             (async () => { const it = g(); await it.next(); try { await it.next(); } catch (e) { result = e.message + ' ' + (await it.next()).done; } })();",
+            "'bad true'",
+        ),
+        (
+            "var result; async function* g() { yield 1; }
+             (async () => { const it = g(); const r = await it.return(Promise.resolve('early')); result = [r.value, r.done, (await it.next()).done].join(); })();",
+            "'early,true,true'",
+        ),
+        (
+            "var result; class C { async *vals() { yield this.n; } constructor() { this.n = 7; } } const o = { async *m() { yield 'o'; } };
+             (async () => { const a = []; for await (const v of new C().vals()) a.push(v); for await (const v of o.m()) a.push(v); result = a.join(); })();",
+            "'7,o'",
+        ),
+        (
+            "var result; async function* g() {} const it = g();
+             result = [Object.prototype.toString.call(it), typeof it[Symbol.asyncIterator], it[Symbol.asyncIterator]() === it, typeof it.next().then].join();",
+            "'[object AsyncGenerator],function,true,function'",
+        ),
+        (
+            "var result; async function* g() { return await new Promise(r => setTimeoutLike(r)); } function setTimeoutLike(f) { Promise.resolve().then(() => f('late')); }
+             g().next().then(r => result = r.value + ' ' + r.done);",
+            "'late true'",
+        ),
+        (
+            "var result; (async () => { try { for await (const v of 5) {} } catch (e) { result = e instanceof TypeError; } })();",
+            "true",
+        ),
+        (
+            "var result; async function* g() { const x = yield 1; yield x * 2; }
+             (async () => { const it = g(); await it.next(); result = (await it.next(21)).value; })();",
+            "42",
+        ),
+        ("function f() { for await (const x of []) {} }", "throws SyntaxError*"),
     ]);
 }

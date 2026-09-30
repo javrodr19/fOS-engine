@@ -194,6 +194,12 @@ pub enum Insn {
     /// dst = array of the remaining values
     IterRest { dst: Reg, iter: Reg },
     IterClose { iter: Reg },
+    /// dst = iterator record for `for await` / async `yield*` (sync
+    /// iterables are wrapped)
+    GetAsyncIterator { dst: Reg, src: Reg },
+    /// Leaving a `for await` early: dst = result of the iterator's
+    /// `return()` (to be awaited), or undefined if it has none
+    AsyncIterReturn { dst: Reg, iter: Reg },
 
     /// dst = template strings array for tagged template `idx`
     TemplateObject { dst: Reg, idx: u16 },

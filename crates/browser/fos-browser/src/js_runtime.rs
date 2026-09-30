@@ -823,6 +823,7 @@ mod tests {
             ac.abort();
             new Response('{"k":[1]}').json().then(j => out.resp = j.k[0]);
             new Blob(['ab', new Uint8Array([99])]).text().then(t => out.blob = t);
+            (async () => { const r = await fetch('data:,abcd'); let n = 0; for await (const c of r.body) n += c.length; out.stream = n; })();
             'started'"#,
         )
         .unwrap();
@@ -834,6 +835,7 @@ mod tests {
             ("out.aborted", "AbortError"),
             ("out.resp", "1"),
             ("out.blob", "abc"),
+            ("out.stream", "4"),
             ("Array.from(new TextEncoder().encode('é€'))", "[ 195, 169, 226, 130, 172 ]"),
             ("new TextDecoder().decode(new Uint8Array([226, 130, 172]))", "€"),
             ("new TextDecoder('latin1').encoding", "windows-1252"),

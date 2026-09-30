@@ -165,6 +165,8 @@ enum TryKind<'a> {
     Finally(&'a [Stmt]),
     /// A `for-of` loop: leaving it early closes the iterator
     IterClose(Reg),
+    /// A `for await` loop: leaving it early calls and awaits `return()`
+    AsyncIterClose(Reg),
 }
 
 struct TryEntry<'a> {
@@ -953,18 +955,24 @@ impl<'a, 'h> Compiler<'a, 'h> {
     /// Compile a nested function into register `dst` as a closure.
     /// Returns whether it uses `super` (needs a home object).
     fn closure(&mut self, func: &'a Function, name: Option<Atom>, dst: Reg, is_expression: bool) -> CResult<bool> {
-        if func.is_async && func.is_generator {
-            return self.error("async generators are not supported yet");
-        }
         let (proto, uses_super) = self.function(func, name, is_expression)?;
         let idx = self.add_func(proto)?;
         self.emit(Insn::Closure { dst, idx });
         Ok(uses_super)
     }
 
-    /// `return r` (async functions settle their promise)
+    /// `return r` (async functions settle their promise; async generators
+    /// await the value first)
     pub(crate) fn emit_return(&mut self, r: Reg) {
-        if self.fr().is_async {
+        let (is_async, is_generator) = (self.fr().is_async, self.fr().is_generator);
+        if is_async && is_generator {
+            let mark = self.mark();
+            if let Ok(t) = self.alloc() {
+                self.emit(Insn::Await { dst: t, src: r });
+                self.emit(Insn::Return { src: t });
+            }
+            self.release(mark);
+        } else if is_async {
             self.emit(Insn::AsyncReturn { src: r });
         } else {
             self.emit(Insn::Return { src: r });
@@ -972,7 +980,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
     }
 
     pub(crate) fn emit_return_undef(&mut self) {
-        if self.fr().is_async {
+        if self.fr().is_async && !self.fr().is_generator {
             let mark = self.mark();
             if let Ok(t) = self.alloc() {
                 self.emit(Insn::LoadUndef { dst: t });
@@ -1145,8 +1153,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
         self.f().is_generator = func.is_generator;
         self.f().is_async = func.is_async;
-        // Async functions settle their promise instead of throwing
-        let async_exc = if func.is_async {
+        // Async functions settle their promise instead of throwing (async
+        // generators settle the promise of each call instead)
+        let async_exc = if func.is_async && !func.is_generator {
             self.emit(Insn::AsyncStart);
             let r = self.alloc()?;
             self.open_try(TryKind::Catch, r);
@@ -1453,11 +1462,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
             self.close_segment(&mut exited[k]);
             match exited[k].kind {
                 TryKind::Catch => {}
-                TryKind::IterClose(reg) => {
+                TryKind::IterClose(reg) | TryKind::AsyncIterClose(reg) => {
                     // Still protected by the outer entries
                     let outer: Vec<TryEntry<'a>> = exited.drain(..k).collect();
                     self.f().tries.extend(outer);
-                    self.emit(Insn::IterClose { iter: reg });
+                    if matches!(exited[0].kind, TryKind::AsyncIterClose(_)) {
+                        let mark = self.mark();
+                        let t = self.alloc()?;
+                        self.emit(Insn::AsyncIterReturn { dst: t, iter: reg });
+                        self.emit(Insn::Await { dst: t, src: t });
+                        self.release(mark);
+                    } else {
+                        self.emit(Insn::IterClose { iter: reg });
+                    }
                     let n = self.fr().tries.len();
                     let outer: Vec<TryEntry<'a>> = self.f().tries.drain(n - k..).collect();
                     exited.splice(0..0, outer);

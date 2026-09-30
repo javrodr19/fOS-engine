@@ -255,7 +255,14 @@ impl<'a, 'h> Compiler<'a, 'h> {
                         t
                     }
                 };
-                self.emit(Insn::Yield { dst, src: v });
+                if self.fr().is_async {
+                    // Async generators yield the awaited value
+                    let t = self.alloc()?;
+                    self.emit(Insn::Await { dst: t, src: v });
+                    self.emit(Insn::Yield { dst, src: t });
+                } else {
+                    self.emit(Insn::Yield { dst, src: v });
+                }
             }
             Expr::Yield { arg, delegate: true } => self.yield_star(arg.as_deref(), dst)?,
             Expr::Await(arg) => {
@@ -276,10 +283,18 @@ impl<'a, 'h> Compiler<'a, 'h> {
         let res = self.alloc()?;
         let tmp = self.alloc()?;
         let src = self.expr_any(arg)?;
-        self.emit(Insn::GetIterator { dst: it, src });
+        let is_async = self.fr().is_async;
+        if is_async {
+            self.emit(Insn::GetAsyncIterator { dst: it, src });
+        } else {
+            self.emit(Insn::GetIterator { dst: it, src });
+        }
         self.emit(Insn::LoadUndef { dst: recv });
         let top = self.pc();
         self.emit(Insn::IterSend { dst: res, iter: it, val: recv });
+        if is_async {
+            self.emit(Insn::Await { dst: res, src: res });
+        }
         let done_ic = self.new_ic(atoms::done)?;
         self.emit(Insn::GetProp { dst: tmp, obj: res, ic: done_ic });
         let exit = self.emit(Insn::JmpTrue { cond: tmp, off: 0 });

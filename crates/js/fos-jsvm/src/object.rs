@@ -184,8 +184,18 @@ pub struct TypedArrayData {
 pub enum GenStatus {
     SuspendedStart,
     SuspendedYield,
+    /// Suspended at an `await` (async functions and async generators)
+    SuspendedAwait,
     Running,
     Done,
+}
+
+/// A pending `next`/`throw`/`return` call on an async generator
+pub struct AsyncGenRequest {
+    pub mode: crate::vm::generator::ResumeMode,
+    pub value: Value,
+    /// Settled with the call's iterator result
+    pub promise: Gc<JsObject>,
 }
 
 /// A suspended function activation
@@ -204,6 +214,8 @@ pub struct GenState {
     pub promise: Option<Gc<JsObject>>,
     /// Value of a pending `return()`
     pub return_value: Value,
+    /// Async generators: calls waiting for the generator, oldest first
+    pub queue: Option<Box<std::collections::VecDeque<AsyncGenRequest>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -446,6 +458,12 @@ impl Trace for JsObject {
                     tracer.mark(p);
                 }
                 tracer.mark_value(g.return_value);
+                if let Some(q) = &g.queue {
+                    for r in q.iter() {
+                        tracer.mark_value(r.value);
+                        tracer.mark(r.promise);
+                    }
+                }
             }
             ObjectKind::Promise(p) => {
                 tracer.mark_value(p.value);

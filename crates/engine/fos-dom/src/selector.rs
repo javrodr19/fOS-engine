@@ -26,6 +26,39 @@ struct Complex {
     parts: Vec<(Compound, Combinator)>,
 }
 
+impl Complex {
+    fn specificity(&self) -> (u32, u32, u32) {
+        let mut total = (0, 0, 0);
+        for (c, _) in &self.parts {
+            let s = c.specificity();
+            total = (total.0 + s.0, total.1 + s.1, total.2 + s.2);
+        }
+        total
+    }
+}
+
+impl Compound {
+    fn specificity(&self) -> (u32, u32, u32) {
+        let mut a = self.id.is_some() as u32;
+        let mut b = (self.classes.len() + self.attrs.len()) as u32;
+        let mut c = self.tag.is_some() as u32 + self.pseudo_elements as u32;
+        for p in &self.pseudos {
+            match p {
+                Pseudo::Where(_) => {}
+                Pseudo::Not(list) | Pseudo::Is(list) | Pseudo::Has(list, _) => {
+                    let s = list.max_specificity();
+                    a += s.0;
+                    b += s.1;
+                    c += s.2;
+                }
+                Pseudo::Never if self.pseudo_elements > 0 => {}
+                _ => b += 1,
+            }
+        }
+        (a, b, c)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Combinator {
     /// The subject (no selector to its left)
@@ -43,6 +76,8 @@ struct Compound {
     classes: Vec<String>,
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
+    /// `::before` and friends (count as type selectors for specificity)
+    pseudo_elements: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +111,8 @@ enum Pseudo {
     Nth { a: i32, b: i32, from_end: bool, of_type: bool },
     Not(SelectorList),
     Is(SelectorList),
+    /// Like `Is`, but adds no specificity
+    Where(SelectorList),
     /// `:has(x)`, or `:has(> x)` when `direct`
     Has(SelectorList, bool),
     Root,
@@ -87,7 +124,46 @@ enum Pseudo {
     Never,
 }
 
+/// The most selective simple selector an element must have to match a
+/// complex selector: style engines file rules under it, so an element is
+/// only tested against rules that can match it
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SubjectKey {
+    Id(String),
+    Class(String),
+    /// Lowercase tag name
+    Tag(String),
+}
+
 impl SelectorList {
+    /// Specificity (ids, classes, types) of each complex selector
+    pub fn specificities(&self) -> Vec<(u32, u32, u32)> {
+        self.0.iter().map(Complex::specificity).collect()
+    }
+
+    /// The highest specificity of the list (what `:is()` and `:not()` add)
+    fn max_specificity(&self) -> (u32, u32, u32) {
+        self.0.iter().map(Complex::specificity).max().unwrap_or((0, 0, 0))
+    }
+
+    /// The key of each complex selector of the list (`None`: it can match
+    /// any element)
+    pub fn subject_keys(&self) -> Vec<Option<SubjectKey>> {
+        self.0
+            .iter()
+            .map(|c| {
+                let (subject, _) = c.parts.first()?;
+                if let Some(id) = &subject.id {
+                    Some(SubjectKey::Id(id.clone()))
+                } else if let Some(class) = subject.classes.first() {
+                    Some(SubjectKey::Class(class.clone()))
+                } else {
+                    subject.tag.clone().map(SubjectKey::Tag)
+                }
+            })
+            .collect()
+    }
+
     /// Parse a selector list; `None` if it is not valid (`querySelector`
     /// then throws a SyntaxError)
     pub fn parse(src: &str) -> Option<SelectorList> {
@@ -306,7 +382,7 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo) -> bo
         Pseudo::OnlyOfType => position(tree, node, false, true) == 1 && position(tree, node, true, true) == 1,
         Pseudo::Nth { a, b, from_end, of_type } => nth(*a, *b, position(tree, node, *from_end, *of_type)),
         Pseudo::Not(list) => !list.matches(tree, node),
-        Pseudo::Is(list) => list.matches(tree, node),
+        Pseudo::Is(list) | Pseudo::Where(list) => list.matches(tree, node),
         Pseudo::Has(list, false) => list.query_first(tree, node).is_some(),
         Pseudo::Has(list, true) => tree.children(node).any(|(c, n)| n.is_element() && list.matches(tree, c)),
         Pseudo::Root => !parent_element(tree, node).is_some(),
@@ -467,6 +543,7 @@ impl Parser<'_> {
                         // Pseudo-elements are never elements in the tree
                         self.ident()?;
                         c.pseudos.push(Pseudo::Never);
+                        c.pseudo_elements += 1;
                     } else {
                         c.pseudos.push(self.pseudo()?);
                     }
@@ -519,7 +596,8 @@ impl Parser<'_> {
             self.ws();
             let p = match name.as_str() {
                 "not" => Pseudo::Not(self.list()?),
-                "is" | "where" | "matches" | "-webkit-any" => Pseudo::Is(self.list()?),
+                "is" | "matches" | "-webkit-any" | "-moz-any" => Pseudo::Is(self.list()?),
+                "where" => Pseudo::Where(self.list()?),
                 "has" => {
                     let direct = self.eat(b'>');
                     Pseudo::Has(self.list()?, direct)
@@ -642,6 +720,16 @@ mod tests {
         assert_eq!(all(&t, "div :not(p)"), vec![span]);
         assert_eq!(all(&t, "div:has(> span)"), vec![div]);
         assert_eq!(all(&t, "*:hover"), Vec::<NodeId>::new());
+        assert_eq!(
+            SelectorList::parse("#a .x, ul > li.y.z, p, *:hover").unwrap().subject_keys(),
+            vec![Some(SubjectKey::Class("x".into())), Some(SubjectKey::Class("y".into())), Some(SubjectKey::Tag("p".into())), None]
+        );
+        let spec = |s: &str| SelectorList::parse(s).unwrap().specificities()[0];
+        assert_eq!(spec("#a .x > p:first-child"), (1, 2, 1));
+        assert_eq!(spec("ul li a[href]::before"), (0, 1, 4));
+        assert_eq!(spec(":is(#a, .b) span"), (1, 0, 1));
+        assert_eq!(spec(":where(#a, .b) span"), (0, 0, 1));
+        assert_eq!(spec("*"), (0, 0, 0));
         assert!(SelectorList::parse("div >").is_none());
         assert!(SelectorList::parse("..x").is_none());
     }

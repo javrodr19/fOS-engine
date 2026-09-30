@@ -21,6 +21,8 @@ use fos_jsvm::object::{JsObject, ObjectKind, PropFlags};
 use fos_jsvm::vm::NativeFn;
 use fos_jsvm::{JsResult, Value, Vm};
 
+use crate::script_fetch::{Completion, Credentials, FetchPool, RedirectMode, RequestMode, ScriptRequest, ScriptResponse};
+
 /// `ObjectKind::Host` class of node wrappers
 const NODE_CLASS: u32 = 1;
 
@@ -70,6 +72,11 @@ pub struct DomHost {
     free_slots: Vec<usize>,
     pub console: Vec<(ConsoleLevel, String)>,
     start: Instant,
+    /// Network requests of `fetch` and `XMLHttpRequest`
+    pub fetch: FetchPool,
+    /// Request id -> index in `vm.host_roots` of its completion callback
+    fetch_callbacks: HashMap<u32, usize>,
+    next_fetch_id: u32,
 }
 
 impl DomHost {
@@ -84,6 +91,9 @@ impl DomHost {
             free_slots: Vec::new(),
             console: Vec::new(),
             start: Instant::now(),
+            fetch: FetchPool::new(),
+            fetch_callbacks: HashMap::new(),
+            next_fetch_id: 1,
         }
     }
 }
@@ -844,6 +854,25 @@ fn document_url(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult
     Ok(string(vm, &url))
 }
 
+/// Keep `v` alive in a `vm.host_roots` slot until `free_slot`
+fn alloc_slot(vm: &mut Vm, v: Value) -> usize {
+    match host(vm).free_slots.pop() {
+        Some(s) => {
+            vm.host_roots[s] = v;
+            s
+        }
+        None => {
+            vm.host_roots.push(v);
+            vm.host_roots.len() - 1
+        }
+    }
+}
+
+fn free_slot(vm: &mut Vm, slot: usize) {
+    vm.host_roots[slot] = Value::UNDEFINED;
+    host(vm).free_slots.push(slot);
+}
+
 // ---- timers ----
 
 fn add_timer(vm: &mut Vm, args: &[Value], repeat: bool) -> JsResult<Value> {
@@ -853,16 +882,7 @@ fn add_timer(vm: &mut Vm, args: &[Value], repeat: bool) -> JsResult<Value> {
     let mut entry = vec![cb];
     entry.extend(args.iter().skip(2).copied());
     let entry = Value::object(vm.new_array(entry));
-    let slot = match host(vm).free_slots.pop() {
-        Some(s) => {
-            vm.host_roots[s] = entry;
-            s
-        }
-        None => {
-            vm.host_roots.push(entry);
-            vm.host_roots.len() - 1
-        }
-    };
+    let slot = alloc_slot(vm, entry);
     let delay = Duration::from_micros((ms * 1000.0) as u64);
     let h = host(vm);
     let id = h.next_timer_id;
@@ -1056,6 +1076,176 @@ fn atob(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Valu
     Ok(Value::string(s))
 }
 
+// ---- network (fetch, XMLHttpRequest) ----
+
+/// The bytes of an ArrayBuffer, typed array or DataView
+pub fn buffer_bytes(v: Value) -> Option<Vec<u8>> {
+    let o = v.as_object()?;
+    match &o.get().kind {
+        ObjectKind::ArrayBuffer(b) => Some(b.to_vec()),
+        ObjectKind::TypedArray(view) | ObjectKind::DataView(view) => {
+            let size = if matches!(o.get().kind, ObjectKind::DataView(_)) { 1 } else { view.kind.size() };
+            let ObjectKind::ArrayBuffer(b) = &view.buffer.get().kind else { return None };
+            let start = view.offset as usize;
+            b.get(start..start + view.length as usize * size).map(<[u8]>::to_vec)
+        }
+        _ => None,
+    }
+}
+
+/// A new ArrayBuffer holding `bytes`
+pub fn new_array_buffer(vm: &mut Vm, bytes: Vec<u8>) -> Value {
+    let len = bytes.len();
+    let proto = vm.realm_extra.array_buffer_proto;
+    let o = vm.new_object_with(proto, ObjectKind::ArrayBuffer(Box::new(bytes)));
+    vm.heap.note_growth(len);
+    Value::object(o)
+}
+
+/// `[[name, value], ...]` from a JS array of pairs
+fn header_list(vm: &mut Vm, v: Value) -> JsResult<Vec<(String, String)>> {
+    let Some(arr) = v.as_object() else { return Ok(Vec::new()) };
+    let pairs = arr.get().elements.clone();
+    let mut out = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        let Some(pair) = p.as_object() else { continue };
+        let kv = pair.get().elements.clone();
+        let name = vm.to_rust_string(kv.first().copied().unwrap_or(Value::UNDEFINED))?;
+        let value = vm.to_rust_string(kv.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
+/// The response as the object `dom_bootstrap.js` turns into a `Response`
+fn response_object(vm: &mut Vm, r: ScriptResponse) -> JsResult<Value> {
+    let o = vm.new_object();
+    let status = Value::int(r.status as i32);
+    vm.def_value(o, "status", status, PropFlags::DEFAULT);
+    let text = vm.str_value(&r.status_text);
+    vm.def_value(o, "statusText", text, PropFlags::DEFAULT);
+    let url = vm.str_value(&r.url);
+    vm.def_value(o, "url", url, PropFlags::DEFAULT);
+    vm.def_value(o, "redirected", Value::bool(r.redirected), PropFlags::DEFAULT);
+    let kind = vm.str_value(r.kind.as_str());
+    vm.def_value(o, "type", kind, PropFlags::DEFAULT);
+    let mut pairs = Vec::with_capacity(r.headers.len());
+    for (n, v) in &r.headers {
+        let n = vm.str_value(&n.to_ascii_lowercase());
+        let v = vm.str_value(v);
+        pairs.push(Value::object(vm.new_array(vec![n, v])));
+    }
+    let headers = Value::object(vm.new_array(pairs));
+    vm.def_value(o, "headers", headers, PropFlags::DEFAULT);
+    let body = new_array_buffer(vm, r.body);
+    vm.def_value(o, "body", body, PropFlags::DEFAULT);
+    Ok(Value::object(o))
+}
+
+/// `__fosFetch(method, url, headers, body, mode, credentials, redirect,
+/// callback)`: start a request; `callback(error, response)` runs when it
+/// finishes. With no callback the request runs synchronously and its
+/// response is returned (synchronous XMLHttpRequest).
+fn fetch_start(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let method = arg_string(vm, args, 0)?;
+    let url = arg_string(vm, args, 1)?;
+    let headers = header_list(vm, arg(args, 2))?;
+    let body_arg = arg(args, 3);
+    let body = if body_arg.is_nullish() {
+        None
+    } else if let Some(bytes) = buffer_bytes(body_arg) {
+        Some(bytes)
+    } else {
+        Some(vm.to_rust_string(body_arg)?.into_bytes())
+    };
+    let mode = match arg_string(vm, args, 4)?.as_str() {
+        "no-cors" => RequestMode::NoCors,
+        "same-origin" => RequestMode::SameOrigin,
+        _ => RequestMode::Cors,
+    };
+    let credentials = match arg_string(vm, args, 5)?.as_str() {
+        "omit" => Credentials::Omit,
+        "include" => Credentials::Include,
+        _ => Credentials::SameOrigin,
+    };
+    let redirect = match arg_string(vm, args, 6)?.as_str() {
+        "error" => RedirectMode::Error,
+        "manual" => RedirectMode::Manual,
+        _ => RedirectMode::Follow,
+    };
+    let callback = arg(args, 7);
+    let h = host(vm);
+    let id = h.next_fetch_id;
+    h.next_fetch_id += 1;
+    let request = ScriptRequest { id, method, url, headers, body, mode, credentials, redirect, page_url: h.url.clone() };
+    if !vm.is_callable(callback) {
+        let done = host(vm).fetch.run_sync(request);
+        return match done.result {
+            Ok(r) => response_object(vm, r),
+            Err(e) => Err(vm.type_error(&format!("Failed to fetch: {e}"))),
+        };
+    }
+    let slot = alloc_slot(vm, callback);
+    let h = host(vm);
+    h.fetch_callbacks.insert(id, slot);
+    h.fetch.start(request);
+    Ok(Value::int(id as i32))
+}
+
+/// Whether requests are in flight
+pub fn has_pending_fetches(vm: &Vm) -> bool {
+    vm.host_ref::<DomHost>().is_some_and(|h| h.fetch.pending() > 0)
+}
+
+/// Block until a request finishes or `timeout` passes
+pub fn wait_for_fetch(vm: &mut Vm, timeout: std::time::Duration) -> bool {
+    vm.host_mut::<DomHost>().is_some_and(|h| h.fetch.wait(timeout))
+}
+
+/// Run the callbacks of the requests that finished; how many there were
+pub fn deliver_fetches(vm: &mut Vm) -> usize {
+    let Some(h) = vm.host_mut::<DomHost>() else { return 0 };
+    let done: Vec<Completion> = h.fetch.poll();
+    let n = done.len();
+    for c in done {
+        let Some(slot) = host(vm).fetch_callbacks.remove(&c.id) else { continue };
+        let callback = vm.host_roots[slot];
+        free_slot(vm, slot);
+        let args = match c.result {
+            Ok(r) => match response_object(vm, r) {
+                Ok(o) => [Value::NULL, o],
+                Err(e) => [e, Value::UNDEFINED],
+            },
+            Err(e) => {
+                log::info!("fetch failed: {e}");
+                [vm.str_value(&e), Value::UNDEFINED]
+            }
+        };
+        let global = Value::object(vm.global);
+        if let Err(e) = vm.call_from_host(callback, global, &args) {
+            report_exception(vm, e);
+        }
+    }
+    n
+}
+
+/// `__fosDecode(bytes, label)`: text from an ArrayBuffer or view
+fn decode_text(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let bytes = buffer_bytes(arg(args, 0)).unwrap_or_default();
+    let label = if arg(args, 1).is_nullish() { "utf-8".to_string() } else { arg_string(vm, args, 1)? };
+    let encoding = crate::charset::encoding_for_label(&label)
+        .ok_or_else(|| vm.range_error(&format!("The encoding label provided ('{label}') is invalid.")))?;
+    let text = crate::charset::decode(bytes, encoding);
+    Ok(string(vm, &text))
+}
+
+/// `__fosEncode(string)`: its UTF-8 bytes as an ArrayBuffer
+fn encode_text(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let v = arg(args, 0);
+    let s = if v.is_undefined() { String::new() } else { vm.to_rust_string(v)? };
+    Ok(new_array_buffer(vm, s.into_bytes()))
+}
+
 // ---- installation ----
 
 fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
@@ -1222,6 +1412,9 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
         ("btoa", 1, btoa),
         ("atob", 1, atob),
         ("__fosResolveURL", 2, resolve_url),
+        ("__fosFetch", 8, fetch_start),
+        ("__fosDecode", 2, decode_text),
+        ("__fosEncode", 1, encode_text),
     ]);
     let console = vm.new_object();
     methods(vm, console, &[

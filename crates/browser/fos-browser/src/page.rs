@@ -161,6 +161,27 @@ impl Page {
         self.process_timers_with(&mut |_| None)
     }
 
+    /// Deliver finished network requests to the page's scripts; whether
+    /// any finished
+    pub fn process_network_with(&mut self, fetch: &mut ScriptFetcher<'_>) -> Result<bool, String> {
+        let Some(ref mut js_runtime) = self.js_runtime else {
+            return Ok(false);
+        };
+        js_runtime.process_network(fetch)
+    }
+
+    /// Whether the page's scripts have network requests in flight
+    pub fn has_pending_network(&self) -> bool {
+        self.js_runtime.as_ref().is_some_and(|r| r.has_pending_network())
+    }
+
+    /// Call `waker` whenever one of the page's network requests finishes
+    pub fn set_network_waker(&mut self, waker: crate::script_fetch::Waker) {
+        if let Some(r) = self.js_runtime.as_mut() {
+            r.set_network_waker(waker);
+        }
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.js_runtime.as_ref().map(|r| r.has_pending_timers()).unwrap_or(false)

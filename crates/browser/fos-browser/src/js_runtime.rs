@@ -308,6 +308,36 @@ impl PageJsRuntime {
         self.execute_scripts(fetch)
     }
 
+    /// Run the callbacks of network requests that finished, then any
+    /// scripts they inserted; whether any finished
+    pub fn process_network(&mut self, fetch: &mut ScriptFetcher<'_>) -> Result<bool, JsError> {
+        let Some(vm) = self.vm.as_mut() else { return Ok(false) };
+        if dom_bindings::deliver_fetches(vm) == 0 {
+            return Ok(false);
+        }
+        self.after_task();
+        self.execute_scripts(fetch)?;
+        Ok(true)
+    }
+
+    /// Whether network requests are in flight
+    pub fn has_pending_network(&self) -> bool {
+        self.vm.as_ref().is_some_and(dom_bindings::has_pending_fetches)
+    }
+
+    /// Block until a network request finishes or `timeout` passes (for
+    /// callers without an event loop)
+    pub fn wait_for_network(&mut self, timeout: std::time::Duration) -> bool {
+        self.vm.as_mut().is_some_and(|vm| dom_bindings::wait_for_fetch(vm, timeout))
+    }
+
+    /// Call `waker` (from a network thread) whenever a request finishes
+    pub fn set_network_waker(&mut self, waker: crate::script_fetch::Waker) {
+        if let Some(host) = self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()) {
+            host.fetch.set_waker(waker);
+        }
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.vm.as_ref().is_some_and(dom_bindings::has_timers)
@@ -562,6 +592,265 @@ mod tests {
         let d = doc.lock().unwrap();
         let p = d.get_element_by_id("p").unwrap();
         assert_eq!(d.tree().text_content(p), "3");
+    }
+
+    /// A tiny HTTP server for network tests; returns its base URL
+    fn test_server() -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let mut headers = Vec::new();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.trim_end().split_once(':') {
+                            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                        }
+                    }
+                    let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()).unwrap_or_default();
+                    let len: usize = get("content-length").parse().unwrap_or(0);
+                    let mut body = vec![0; len];
+                    let _ = reader.read_exact(&mut body);
+                    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\r', "\\r").replace('\n', "\\n");
+                    let (status, extra, ctype, payload): (&str, Vec<String>, &str, Vec<u8>) = match (method.as_str(), path.as_str()) {
+                        (_, "/data.json") => ("200 OK", vec![], "application/json", br#"{"a":1,"list":[1,2]}"#.to_vec()),
+                        (_, "/text") => ("200 OK", vec![], "text/plain; charset=utf-8", "héllo".as_bytes().to_vec()),
+                        (_, "/latin1") => ("200 OK", vec![], "text/plain; charset=iso-8859-1", vec![b'c', 0xE9]),
+                        (_, "/redirect") => ("302 Found", vec!["Location: /data.json".into()], "text/plain", vec![]),
+                        (_, "/setcookie") => ("200 OK", vec!["Set-Cookie: sid=42; Path=/".into()], "text/plain", b"ok".to_vec()),
+                        (_, "/cors-ok") => (
+                            "200 OK",
+                            vec!["Access-Control-Allow-Origin: *".into(), "X-Secret: s".into(), "X-Public: p".into(), "Access-Control-Expose-Headers: X-Public".into()],
+                            "text/plain",
+                            b"shared".to_vec(),
+                        ),
+                        (_, "/cors-no") => ("200 OK", vec![], "text/plain", b"private".to_vec()),
+                        ("OPTIONS", "/preflight") => (
+                            "204 No Content",
+                            vec!["Access-Control-Allow-Origin: *".into(), "Access-Control-Allow-Methods: PUT".into(), "Access-Control-Allow-Headers: x-token".into()],
+                            "text/plain",
+                            vec![],
+                        ),
+                        (_, "/preflight") => ("200 OK", vec!["Access-Control-Allow-Origin: *".into()], "text/plain", format!("{method} ok").into_bytes()),
+                        (_, "/missing") => ("404 Not Found", vec![], "text/plain", b"nope".to_vec()),
+                        _ => {
+                            let json = format!(
+                                r#"{{"method":"{}","path":"{}","body":"{}","origin":"{}","cookie":"{}","type":"{}","token":"{}","referer":"{}"}}"#,
+                                method,
+                                esc(&path),
+                                esc(&String::from_utf8_lossy(&body)),
+                                esc(&get("origin")),
+                                esc(&get("cookie")),
+                                esc(&get("content-type")),
+                                esc(&get("x-token")),
+                                esc(&get("referer")),
+                            );
+                            ("200 OK", vec!["Access-Control-Allow-Origin: *".into()], "application/json", json.into_bytes())
+                        }
+                    };
+                    let mut out = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n", payload.len());
+                    for e in extra {
+                        out.push_str(&e);
+                        out.push_str("\r\n");
+                    }
+                    out.push_str("\r\n");
+                    let mut stream = stream;
+                    let _ = stream.write_all(out.as_bytes());
+                    let _ = stream.write_all(&payload);
+                });
+            }
+        });
+        base
+    }
+
+    /// Wait for every network request of the page and deliver it
+    fn drain_network(rt: &mut PageJsRuntime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while rt.has_pending_network() && std::time::Instant::now() < deadline {
+            rt.wait_for_network(std::time::Duration::from_millis(100));
+            rt.process_network(&mut |_| None).unwrap();
+        }
+        assert!(!rt.has_pending_network(), "requests still pending");
+    }
+
+    fn page_at(url: &str) -> PageJsRuntime {
+        let doc = Arc::new(Mutex::new(fos_html::parse_with_url("<html><body></body></html>", url)));
+        let mut rt = PageJsRuntime::new(url);
+        rt.initialize(doc.clone()).unwrap();
+        rt.execute_scripts(&mut |_| None).unwrap();
+        rt
+    }
+
+    #[test]
+    fn fetch_same_origin() {
+        let base = test_server();
+        let mut rt = page_at(&format!("{base}/dir/page.html"));
+        rt.eval(
+            r#"window.out = {};
+            fetch('/data.json').then(r => { out.json = [r.status, r.ok, r.headers.get('Content-Type'), r.type, r.redirected]; return r.json(); }).then(j => out.a = j.a);
+            fetch('../redirect').then(r => { out.redir = [r.redirected, new URL(r.url).pathname]; });
+            fetch('/text').then(r => r.text()).then(t => out.text = t);
+            fetch('/latin1').then(r => r.arrayBuffer()).then(b => out.latin1 = new TextDecoder('latin1').decode(b));
+            fetch('/missing').then(r => out.missing = [r.status, r.ok, r.statusText]);
+            fetch('/setcookie').then(() => fetch('/echo', { method: 'POST', body: JSON.stringify({x: 1}), headers: { 'Content-Type': 'application/json', 'X-Token': 't1', 'Cookie': 'forged=1' } }))
+              .then(r => r.json()).then(e => out.echo = [e.method, e.body, e.type, e.token, e.cookie, e.origin, e.referer]);
+            fetch('http://unreachable.invalid/').catch(e => out.err = e instanceof TypeError);
+            'started'"#,
+        )
+        .unwrap();
+        drain_network(&mut rt);
+        let origin = base.clone();
+        assert_eq!(rt.eval("JSON.stringify(out.json)").unwrap(), r#"[200,true,"application/json","basic",false]"#);
+        assert_eq!(rt.eval("out.a").unwrap(), "1");
+        assert_eq!(rt.eval("JSON.stringify(out.redir)").unwrap(), r#"[true,"/data.json"]"#);
+        assert_eq!(rt.eval("out.text").unwrap(), "héllo");
+        assert_eq!(rt.eval("out.latin1").unwrap(), "cé");
+        assert_eq!(rt.eval("JSON.stringify(out.missing)").unwrap(), r#"[404,false,"Not Found"]"#);
+        assert_eq!(
+            rt.eval("JSON.stringify(out.echo)").unwrap(),
+            format!(r#"["POST","{{\"x\":1}}","application/json","t1","sid=42","{origin}","{origin}/dir/page.html"]"#)
+        );
+        assert_eq!(rt.eval("out.err").unwrap(), "true");
+    }
+
+    #[test]
+    fn fetch_cross_origin_follows_cors() {
+        let base = test_server();
+        let mut rt = page_at("http://page.test/index.html");
+        rt.eval(&format!(
+            r#"window.out = {{}};
+            const b = '{base}';
+            fetch(b + '/cors-ok').then(r => {{ out.ok = [r.type, r.headers.get('x-secret'), r.headers.get('x-public'), r.headers.get('content-type')]; return r.text(); }}).then(t => out.okText = t);
+            fetch(b + '/cors-no').then(() => out.no = 'readable', e => out.no = e.name);
+            fetch(b + '/cors-no', {{ mode: 'no-cors' }}).then(r => out.opaque = [r.type, r.status]);
+            fetch(b + '/cors-no', {{ mode: 'same-origin' }}).catch(e => out.same = e.name);
+            fetch(b + '/preflight', {{ method: 'PUT', headers: {{ 'X-Token': '1' }} }}).then(r => r.text()).then(t => out.pre = t);
+            fetch(b + '/preflight', {{ method: 'PUT', headers: {{ 'X-Other': '1' }} }}).catch(e => out.preNo = e.name);
+            fetch(b + '/echo', {{ credentials: 'include' }}).catch(e => out.creds = e.name);
+            fetch(b + '/echo').then(r => r.json()).then(e => out.echo = [e.origin, e.referer]);
+            'started'"#
+        ))
+        .unwrap();
+        drain_network(&mut rt);
+        assert_eq!(rt.eval("JSON.stringify(out.ok)").unwrap(), r#"["cors",null,"p","text/plain"]"#);
+        assert_eq!(rt.eval("out.okText").unwrap(), "shared");
+        assert_eq!(rt.eval("out.no").unwrap(), "TypeError");
+        assert_eq!(rt.eval("JSON.stringify(out.opaque)").unwrap(), r#"["opaque",0]"#);
+        assert_eq!(rt.eval("out.same").unwrap(), "TypeError");
+        assert_eq!(rt.eval("out.pre").unwrap(), "PUT ok");
+        assert_eq!(rt.eval("out.preNo").unwrap(), "TypeError");
+        // `*` is not enough for a credentialed request
+        assert_eq!(rt.eval("out.creds").unwrap(), "TypeError");
+        assert_eq!(rt.eval("JSON.stringify(out.echo)").unwrap(), r#"["http://page.test","http://page.test/"]"#);
+    }
+
+    #[test]
+    fn xml_http_request() {
+        let base = test_server();
+        let mut rt = page_at(&format!("{base}/page.html"));
+        rt.eval(
+            r#"window.out = {};
+            const x = new XMLHttpRequest();
+            const states = [];
+            x.onreadystatechange = () => states.push(x.readyState);
+            x.onload = () => { out.load = [x.status, x.statusText, x.responseText, x.getResponseHeader('content-type'), states.join('')]; };
+            x.addEventListener('loadend', e => out.loadend = e.type);
+            x.open('GET', '/data.json');
+            x.send();
+            const j = new XMLHttpRequest();
+            j.responseType = 'json';
+            j.onload = () => out.json = j.response.list.length;
+            j.open('GET', '/data.json');
+            j.send();
+            const p = new XMLHttpRequest();
+            p.open('POST', '/echo');
+            p.setRequestHeader('X-Token', 'a');
+            p.setRequestHeader('X-Token', 'b');
+            p.onload = () => out.post = JSON.parse(p.responseText);
+            const fd = new FormData(); fd.append('name', 'Ann'); fd.append('file', new Blob(['xyz'], { type: 'text/plain' }), 'f.txt');
+            p.send(fd);
+            const a = new XMLHttpRequest();
+            a.onabort = () => out.abort = a.readyState;
+            a.onload = () => out.abortLoaded = true;
+            a.open('GET', '/text'); a.send(); a.abort();
+            const e = new XMLHttpRequest();
+            e.onerror = () => out.error = [e.status, e.readyState];
+            e.open('GET', 'http://unreachable.invalid/'); e.send();
+            const s = new XMLHttpRequest();
+            s.open('GET', '/text', false); s.send();
+            out.sync = [s.readyState, s.status, s.responseText];
+            'started'"#,
+        )
+        .unwrap();
+        drain_network(&mut rt);
+        assert_eq!(rt.eval("JSON.stringify(out.load)").unwrap(), r#"[200,"OK","{\"a\":1,\"list\":[1,2]}","application/json","1234"]"#);
+        assert_eq!(rt.eval("out.loadend").unwrap(), "loadend");
+        assert_eq!(rt.eval("out.json").unwrap(), "2");
+        assert_eq!(rt.eval("out.post.token").unwrap(), "a, b");
+        assert!(rt.eval("out.post.type").unwrap().starts_with("multipart/form-data; boundary="));
+        let body = rt.eval("out.post.body").unwrap();
+        assert!(body.contains("name=\"name\"\r\n\r\nAnn\r\n") && body.contains("filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz"), "{body}");
+        assert_eq!(rt.eval("out.abort").unwrap(), "4");
+        assert_eq!(rt.eval("out.abortLoaded").unwrap(), "undefined");
+        assert_eq!(rt.eval("JSON.stringify(out.error)").unwrap(), "[0,4]");
+        assert_eq!(rt.eval("JSON.stringify(out.sync)").unwrap(), r#"[4,200,"héllo"]"#);
+    }
+
+    #[test]
+    fn binary_data_and_local_urls() {
+        let mut rt = page_at("https://example.com/");
+        rt.eval(
+            r#"window.out = {};
+            fetch('data:text/plain;base64,aGk=').then(r => r.text()).then(t => out.data = t);
+            fetch('http://insecure.example/').catch(e => out.mixed = e.name);
+            fetch('file:///etc/hostname').catch(e => out.file = e.name);
+            const ac = new AbortController();
+            fetch('data:,x', { signal: ac.signal }).catch(e => out.aborted = e.name);
+            ac.abort();
+            new Response('{"k":[1]}').json().then(j => out.resp = j.k[0]);
+            new Blob(['ab', new Uint8Array([99])]).text().then(t => out.blob = t);
+            'started'"#,
+        )
+        .unwrap();
+        drain_network(&mut rt);
+        let cases = [
+            ("out.data", "hi"),
+            ("out.mixed", "TypeError"),
+            ("out.file", "TypeError"),
+            ("out.aborted", "AbortError"),
+            ("out.resp", "1"),
+            ("out.blob", "abc"),
+            ("Array.from(new TextEncoder().encode('é€'))", "[ 195, 169, 226, 130, 172 ]"),
+            ("new TextDecoder().decode(new Uint8Array([226, 130, 172]))", "€"),
+            ("new TextDecoder('latin1').encoding", "windows-1252"),
+            ("try { new TextDecoder('nope') } catch (e) { e.name }", "RangeError"),
+            ("new Headers([['B', '2'], ['a', '1'], ['b', '3']]).get('b')", "2, 3"),
+            ("[...new Headers({B: '2', a: '1'}).keys()].join()", "a,b"),
+            ("try { new Headers({'bad name': 1}) } catch (e) { e.name }", "TypeError"),
+            ("new Request('/x', { method: 'post', body: 'b' }).headers.get('content-type')", "text/plain;charset=UTF-8"),
+            ("try { new Request('/x', { body: 'b' }) } catch (e) { e.name }", "TypeError"),
+            ("Response.json({a: 1}).headers.get('content-type')", "application/json"),
+            ("new DOMException('m', 'AbortError').code", "20"),
+            ("class T extends EventTarget {}; const t = new T(); let n = 0; t.addEventListener('x', () => n++); t.dispatchEvent(new Event('x')); n", "1"),
+            ("new File(['a'], 'n.txt').name", "n.txt"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
     }
 
     #[test]

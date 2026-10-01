@@ -734,6 +734,7 @@ dependencies = [
  "fos-security",
  "fos-text",
  "log",
+ "serde_json",
  "smol",
  "softbuffer",
  "thiserror 1.0.69",

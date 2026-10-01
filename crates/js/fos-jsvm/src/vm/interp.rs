@@ -801,6 +801,11 @@ impl Vm {
                     }
 
                     // ---- functions ----
+                    Insn::DynamicImport { dst, spec, referrer } => {
+                        let (spec, referrer) = (r!(spec), r!(referrer));
+                        let p = self.dynamic_import(spec, referrer);
+                        w!(dst, Value::object(p));
+                    }
                     Insn::Closure { dst, idx } => {
                         let p = unsafe { (*cp).funcs[idx as usize].clone() };
                         let mut ups = Vec::with_capacity(p.upvals.len());

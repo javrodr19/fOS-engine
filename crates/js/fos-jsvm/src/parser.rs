@@ -9,6 +9,7 @@
 use std::rc::Rc;
 
 use crate::ast::*;
+use crate::compiler::pattern_names;
 use crate::lexer::{Kw, Lexer, Span, SyntaxError, Tok, Token, Utf16, P};
 
 type PResult<T> = Result<T, SyntaxError>;
@@ -20,6 +21,47 @@ pub fn parse_script(src: &str) -> PResult<Program> {
     Ok(Program { body, strict })
 }
 
+/// Parse a module
+pub fn parse_module(src: &str) -> PResult<Module> {
+    parse_module_with(src, false)
+}
+
+/// Parse a module keeping only lazy stubs for its functions' bodies
+pub fn parse_module_lazy(src: &str) -> PResult<Module> {
+    parse_module_with(src, true)
+}
+
+fn parse_module_with(src: &str, lazy: bool) -> PResult<Module> {
+    let mut p = Parser::new(src)?;
+    p.set_lazy(lazy);
+    // Module code is strict, and `await` works at its top level
+    p.strict = true;
+    p.in_async = true;
+    p.module = Some(ModuleDecls::default());
+    let mut body = Vec::new();
+    while p.tok.tok != Tok::Eof {
+        p.parse_module_item(&mut body)?;
+    }
+    let decls = p.module.take().unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    for e in &decls.exports {
+        if let Some(name) = e.export_name() {
+            if !seen.insert(name.clone()) {
+                return Err(SyntaxError { message: format!("Duplicate export of '{name}'"), pos: 0 });
+            }
+        }
+    }
+    Ok(Module { body, requests: decls.requests, imports: decls.imports, exports: decls.exports, has_await: p.top_level_await })
+}
+
+/// The imports and exports of the module being parsed
+#[derive(Default)]
+struct ModuleDecls {
+    requests: Vec<ModuleRequest>,
+    imports: Vec<ImportEntry>,
+    exports: Vec<ExportEntry>,
+}
+
 /// What re-parsing a lazily compiled function needs to know
 pub struct ReparseInfo {
     pub params_start: u32,
@@ -29,6 +71,8 @@ pub struct ReparseInfo {
     pub is_generator: bool,
     /// Strictness of the enclosing code
     pub outer_strict: bool,
+    /// Defined in a module (`import.meta` is valid, `await` is reserved)
+    pub in_module: bool,
 }
 
 /// Parse a function again from its source (for lazy compilation); its
@@ -41,6 +85,9 @@ pub fn reparse_function(src: &str, info: &ReparseInfo) -> PResult<Function> {
     p.strict = info.outer_strict;
     p.in_function = true;
     p.lazy_depth = Some(1);
+    if info.in_module {
+        p.module = Some(ModuleDecls::default());
+    }
     if info.kind == FunctionKind::Arrow {
         match p.parse_assign()? {
             Expr::Function(f) => Ok(*f),
@@ -99,6 +146,10 @@ pub struct Parser<'a> {
     eager_function: Option<u32>,
     /// Interned identifier names (one allocation per distinct name)
     names: std::cell::RefCell<std::collections::HashSet<Name>>,
+    /// Parsing a module: its imports and exports so far
+    module: Option<ModuleDecls>,
+    /// `await` was used outside any function of the module
+    top_level_await: bool,
 }
 
 
@@ -120,6 +171,8 @@ impl<'a> Parser<'a> {
             lazy_depth: None,
             eager_function: None,
             names: Default::default(),
+            module: None,
+            top_level_await: false,
         })
     }
 
@@ -284,7 +337,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(n) => Some(self.name(n)),
             Tok::Keyword(Kw::Let) | Tok::Keyword(Kw::Static) if !self.strict => Some(Rc::from(self.kw_text())),
             Tok::Keyword(Kw::Yield) if !self.in_generator && !self.strict => Some(Rc::from("yield")),
-            Tok::Keyword(Kw::Await) if !self.in_async => Some(Rc::from("await")),
+            Tok::Keyword(Kw::Await) if !self.in_async && self.module.is_none() => Some(Rc::from("await")),
             _ => None,
         }
     }
@@ -318,6 +371,264 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
         Ok(name)
+    }
+
+    // ---- modules ----
+
+    /// `await` outside any function makes a module asynchronous
+    fn note_await(&mut self) {
+        if self.depth == 0 && self.module.is_some() {
+            self.top_level_await = true;
+        }
+    }
+
+    fn eat_ident(&mut self, name: &str) -> PResult<bool> {
+        if self.at_ident(name) {
+            self.advance()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn expect_ident(&mut self, name: &str) -> PResult<()> {
+        if self.eat_ident(name)? {
+            Ok(())
+        } else {
+            self.unexpected(&format!("expected '{name}'"))
+        }
+    }
+
+    fn decls(&mut self) -> &mut ModuleDecls {
+        self.module.get_or_insert_with(Default::default)
+    }
+
+    /// A module item: an import or export declaration, or a statement
+    fn parse_module_item(&mut self, body: &mut Vec<Stmt>) -> PResult<()> {
+        if self.at_kw(Kw::Import) {
+            let next = self.peek()?;
+            if !matches!(next.tok, Tok::Punct(P::LParen) | Tok::Punct(P::Dot)) {
+                return self.parse_import_declaration();
+            }
+        } else if self.at_kw(Kw::Export) {
+            return self.parse_export_declaration(body);
+        }
+        body.push(self.parse_statement_list_item()?);
+        Ok(())
+    }
+
+    /// An export or import name: an identifier, a keyword, or a string.
+    /// Also returns whether it may be a local binding name.
+    fn parse_module_export_name(&mut self) -> PResult<(Rc<str>, bool)> {
+        if let Tok::Str(units) = &self.tok.tok {
+            let name = String::from_utf16(units).map_err(|_| SyntaxError {
+                message: "an export name must be valid Unicode".into(),
+                pos: self.tok.span.start,
+            })?;
+            self.advance()?;
+            return Ok((Rc::from(name), false));
+        }
+        let bindable = self.ident_reference().is_some();
+        let name = self.parse_identifier_name()?;
+        Ok((name, bindable))
+    }
+
+    /// `"specifier"` and any `with { type: "json" }` after it
+    fn parse_module_request(&mut self) -> PResult<usize> {
+        let Tok::Str(units) = &self.tok.tok else { return self.unexpected("expected a module specifier") };
+        let specifier: Rc<str> = Rc::from(String::from_utf16_lossy(units));
+        self.advance()?;
+        let mut json = false;
+        // Import attributes (`assert` is their older spelling)
+        if self.at_kw(Kw::With) || (self.at_ident("assert") && !self.tok.newline_before) {
+            self.advance()?;
+            self.expect(P::LBrace)?;
+            while !self.eat(P::RBrace)? {
+                let (key, _) = self.parse_module_export_name()?;
+                self.expect(P::Colon)?;
+                let Tok::Str(value) = &self.tok.tok else { return self.unexpected("expected a string") };
+                let value = String::from_utf16_lossy(value);
+                self.advance()?;
+                match (&*key, value.as_str()) {
+                    ("type", "json") => json = true,
+                    ("type", other) => return self.error(format!("unsupported module type '{other}'")),
+                    _ => return self.error(format!("unsupported import attribute '{key}'")),
+                }
+                if !self.eat(P::Comma)? {
+                    self.expect(P::RBrace)?;
+                    break;
+                }
+            }
+        }
+        let request = ModuleRequest { specifier, json };
+        let decls = self.decls();
+        Ok(match decls.requests.iter().position(|r| *r == request) {
+            Some(i) => i,
+            None => {
+                decls.requests.push(request);
+                decls.requests.len() - 1
+            }
+        })
+    }
+
+    fn parse_import_declaration(&mut self) -> PResult<()> {
+        self.expect_kw(Kw::Import)?;
+        let mut bindings: Vec<(ImportName, Name)> = Vec::new();
+        if !matches!(self.tok.tok, Tok::Str(_)) {
+            let mut more = true;
+            if !self.at(P::Star) && !self.at(P::LBrace) {
+                let local = self.parse_binding_identifier()?;
+                bindings.push((ImportName::Name(Rc::from("default")), local));
+                more = self.eat(P::Comma)?;
+            }
+            if more {
+                if self.eat(P::Star)? {
+                    self.expect_ident("as")?;
+                    let local = self.parse_binding_identifier()?;
+                    bindings.push((ImportName::Namespace, local));
+                } else {
+                    self.expect(P::LBrace)?;
+                    while !self.eat(P::RBrace)? {
+                        let (name, bindable) = self.parse_module_export_name()?;
+                        let local = if self.eat_ident("as")? {
+                            self.parse_binding_identifier()?
+                        } else if bindable {
+                            self.name(&name)
+                        } else {
+                            return self.error(format!("'{name}' cannot be imported without 'as'"));
+                        };
+                        bindings.push((ImportName::Name(name), local));
+                        if !self.eat(P::Comma)? {
+                            self.expect(P::RBrace)?;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.expect_ident("from")?;
+        }
+        let request = self.parse_module_request()?;
+        self.consume_semicolon()?;
+        let decls = self.decls();
+        for (import, local) in bindings {
+            decls.imports.push(ImportEntry { request, import, local });
+        }
+        Ok(())
+    }
+
+    fn parse_export_declaration(&mut self, body: &mut Vec<Stmt>) -> PResult<()> {
+        self.expect_kw(Kw::Export)?;
+        // export * from "m" / export * as ns from "m"
+        if self.eat(P::Star)? {
+            let export = if self.eat_ident("as")? { Some(self.parse_module_export_name()?.0) } else { None };
+            self.expect_ident("from")?;
+            let request = self.parse_module_request()?;
+            self.consume_semicolon()?;
+            let entry = match export {
+                Some(export) => ExportEntry::Indirect { export, request, import: ImportName::Namespace },
+                None => ExportEntry::Star { request },
+            };
+            self.decls().exports.push(entry);
+            return Ok(());
+        }
+        let default: Rc<str> = Rc::from("default");
+        if self.eat_kw(Kw::Default)? {
+            let async_function = self.at_ident("async") && {
+                let next = self.peek()?;
+                next.tok == Tok::Keyword(Kw::Function) && !next.newline_before
+            };
+            let local: Name = if self.at_kw(Kw::Function) || async_function {
+                if async_function {
+                    self.advance()?;
+                }
+                // A declaration, whose name is optional here
+                let mut f = self.parse_function(async_function, false)?;
+                let local = f.name.clone().unwrap_or_else(|| self.name(DEFAULT_EXPORT));
+                f.name = Some(local.clone());
+                body.push(Stmt::Function(Box::new(f)));
+                local
+            } else if self.at_kw(Kw::Class) {
+                let c = self.parse_class(false)?;
+                match c.name.clone() {
+                    Some(name) => {
+                        body.push(Stmt::Class(Box::new(c)));
+                        name
+                    }
+                    None => {
+                        let local = self.name(DEFAULT_EXPORT);
+                        body.push(Stmt::Var {
+                            kind: VarKind::Const,
+                            decls: vec![VarDecl { target: Pattern::Ident(local.clone()), init: Some(Expr::Class(Box::new(c))) }],
+                        });
+                        local
+                    }
+                }
+            } else {
+                let value = self.parse_assign()?;
+                self.consume_semicolon()?;
+                let local = self.name(DEFAULT_EXPORT);
+                body.push(Stmt::Var { kind: VarKind::Const, decls: vec![VarDecl { target: Pattern::Ident(local.clone()), init: Some(value) }] });
+                local
+            };
+            self.decls().exports.push(ExportEntry::Local { export: default, local });
+            return Ok(());
+        }
+        // export { a, b as c } [from "m"]
+        if self.eat(P::LBrace)? {
+            let mut specs: Vec<(Rc<str>, bool, Rc<str>)> = Vec::new();
+            while !self.eat(P::RBrace)? {
+                let (name, bindable) = self.parse_module_export_name()?;
+                let export = if self.eat_ident("as")? { self.parse_module_export_name()?.0 } else { name.clone() };
+                specs.push((name, bindable, export));
+                if !self.eat(P::Comma)? {
+                    self.expect(P::RBrace)?;
+                    break;
+                }
+            }
+            if self.eat_ident("from")? {
+                let request = self.parse_module_request()?;
+                self.consume_semicolon()?;
+                for (name, _, export) in specs {
+                    self.decls().exports.push(ExportEntry::Indirect { export, request, import: ImportName::Name(name) });
+                }
+            } else {
+                self.consume_semicolon()?;
+                for (name, bindable, export) in specs {
+                    if !bindable {
+                        return self.error(format!("'{name}' is not a local binding to export"));
+                    }
+                    let local = self.name(&name);
+                    self.decls().exports.push(ExportEntry::Local { export, local });
+                }
+            }
+            return Ok(());
+        }
+        // export var/let/const/function/class
+        let declaration = match &self.tok.tok {
+            Tok::Keyword(Kw::Var | Kw::Let | Kw::Const | Kw::Function | Kw::Class) => true,
+            Tok::Ident(n) if &**n == "async" => true,
+            _ => false,
+        };
+        if !declaration {
+            return self.unexpected("expected a declaration to export");
+        }
+        let stmt = if self.at_kw(Kw::Var) { self.parse_statement()? } else { self.parse_statement_list_item()? };
+        let mut names = Vec::new();
+        match &stmt {
+            Stmt::Var { decls, .. } => {
+                for d in decls {
+                    pattern_names(&d.target, &mut names);
+                }
+            }
+            Stmt::Function(f) => names.extend(f.name.clone()),
+            Stmt::Class(c) => names.extend(c.name.clone()),
+            _ => return self.error("expected a declaration to export"),
+        }
+        body.push(stmt);
+        for name in names {
+            self.decls().exports.push(ExportEntry::Local { export: name.clone(), local: name });
+        }
+        Ok(())
     }
 
     // ---- statements ----
@@ -569,6 +880,7 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::For)?;
         let is_await = if self.at_kw(Kw::Await) && self.in_async {
             self.advance()?;
+            self.note_await();
             true
         } else {
             false
@@ -1427,6 +1739,7 @@ impl<'a> Parser<'a> {
         }
         if self.at_kw(Kw::Await) && self.in_async {
             self.advance()?;
+            self.note_await();
             let arg = self.parse_unary()?;
             return Ok(Expr::Await(Box::new(arg)));
         }
@@ -1467,10 +1780,23 @@ impl<'a> Parser<'a> {
             self.parse_super()?
         } else if self.at_kw(Kw::Import) {
             self.advance()?;
-            self.expect(P::LParen)?;
-            let spec = self.parse_assign()?;
-            self.expect(P::RParen)?;
-            Expr::Import(Box::new(spec))
+            if self.eat(P::Dot)? {
+                if !self.at_ident("meta") || self.module.is_none() {
+                    return self.error("import.meta is only valid in modules");
+                }
+                self.advance()?;
+                Expr::ImportMeta
+            } else {
+                self.expect(P::LParen)?;
+                let spec = self.parse_assign()?;
+                let mut options = None;
+                if self.eat(P::Comma)? && !self.at(P::RParen) {
+                    options = Some(Box::new(self.parse_assign()?));
+                    self.eat(P::Comma)?;
+                }
+                self.expect(P::RParen)?;
+                Expr::Import { spec: Box::new(spec), options }
+            }
         } else {
             self.parse_primary()?
         };

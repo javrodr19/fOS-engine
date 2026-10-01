@@ -39,6 +39,8 @@ pub mod ui;
 pub mod renderer;
 /// JavaScript runtime integration
 pub mod js_runtime;
+/// Import maps (module specifier resolution)
+pub mod import_map;
 pub mod dom_bindings;
 pub mod script_fetch;
 pub mod page_styles;

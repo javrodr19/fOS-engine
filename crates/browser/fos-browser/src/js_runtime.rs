@@ -4,6 +4,12 @@
 //! `dom_bindings`. Scripts run in document order, external ones fetched
 //! through the fetcher the browser passes in; scripts that other scripts
 //! insert run once the inserting script (or timer callback) finishes.
+//!
+//! Module scripts (`type="module"`) are deferred: they run in document
+//! order once the classic scripts have, before `DOMContentLoaded`, with
+//! their imports resolved through the page's import maps. Classic scripts
+//! marked `nomodule` (fallbacks for browsers without modules) never run.
+//! `import()` calls are answered between tasks, with the same fetcher.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -43,6 +49,8 @@ pub enum ScriptType {
     Classic,
     /// ES Module
     Module,
+    /// `<script type="importmap">`
+    ImportMap,
 }
 
 /// JavaScript runtime for a page
@@ -64,6 +72,12 @@ pub struct PageJsRuntime {
     /// Navigation a script requested (`location.href = ...`)
     navigation: Option<String>,
     loaded: bool,
+    /// The page's import maps
+    import_map: crate::import_map::ImportMap,
+    /// Module scripts waiting for the classic scripts to finish
+    modules_waiting: Vec<Script>,
+    /// Module graphs still running (top-level await), checked for errors
+    modules_running: Vec<fos_jsvm::ModuleId>,
     /// The browser's cookies, which the page's scripts and requests use
     cookies: fos_net::SharedCookieJar,
 }
@@ -83,6 +97,9 @@ impl PageJsRuntime {
             page_url: page_url.to_string(),
             navigation: None,
             loaded: false,
+            import_map: Default::default(),
+            modules_waiting: Vec::new(),
+            modules_running: Vec::new(),
             cookies: fos_net::CookieJar::shared(),
         }
     }
@@ -143,18 +160,36 @@ impl PageJsRuntime {
         }
         // Bounded, in case every script inserts another
         for _ in 0..64 {
+            self.process_dynamic_imports(fetch);
             if self.pending_scripts.is_empty() {
                 self.rescan();
             }
             if self.pending_scripts.is_empty() {
-                break;
+                if self.modules_waiting.is_empty() {
+                    break;
+                }
+                // The classic scripts have run: now the module scripts
+                for script in std::mem::take(&mut self.modules_waiting) {
+                    self.run_module_script(script, fetch);
+                }
+                continue;
             }
             let scripts = std::mem::take(&mut self.pending_scripts);
             for mut script in scripts {
                 self.started.insert(script.node.0);
-                if script.script_type == ScriptType::Module {
-                    log::info!("Skipping module script {}", script.source_url.as_deref().unwrap_or("(inline)"));
-                    continue;
+                match script.script_type {
+                    ScriptType::Module => {
+                        self.modules_waiting.push(script);
+                        continue;
+                    }
+                    ScriptType::ImportMap => {
+                        let base = self.document_base();
+                        if let Err(e) = self.import_map.add(&script.source, &base) {
+                            self.console_error(&e);
+                        }
+                        continue;
+                    }
+                    ScriptType::Classic => {}
                 }
                 if let Some(url) = script.source_url.clone() {
                     match fetch(&url) {
@@ -172,6 +207,7 @@ impl PageJsRuntime {
                 }
             }
         }
+        self.process_dynamic_imports(fetch);
         if !self.loaded {
             self.loaded = true;
             self.eval_quiet("__fosSetReadyState('interactive'); document.dispatchEvent(new Event('DOMContentLoaded', {bubbles: true}));");
@@ -219,6 +255,108 @@ impl PageJsRuntime {
         self.after_task();
     }
 
+    /// The document's base URL (`<base href>`, else the page URL)
+    fn document_base(&self) -> String {
+        let Some(doc) = self.document.as_ref() else { return self.page_url.clone() };
+        let doc = doc.lock().unwrap_or_else(|p| p.into_inner());
+        let tree = doc.tree();
+        fos_dom::SelectorList::parse("base[href]")
+            .and_then(|s| s.query_first(tree, tree.root()))
+            .and_then(|b| tree.get_attribute(b, "href"))
+            .map_or_else(|| self.page_url.clone(), |href| fos_net::url_util::resolve(&self.page_url, href.trim()))
+    }
+
+    /// Fetch, link and run a module script with the modules it imports
+    fn run_module_script(&mut self, script: Script, fetch: &mut ScriptFetcher<'_>) {
+        let name = script.source_url.clone().unwrap_or_else(|| "inline module".into());
+        let start = std::time::Instant::now();
+        // An inline module's imports resolve against the document
+        let (url, source) = match &script.source_url {
+            Some(url) => match fetch(url) {
+                Some(src) => (url.clone(), Some(src)),
+                None => {
+                    self.console_error(&format!("Failed to load module script {url}"));
+                    self.dispatch_on_node(script.node, "error");
+                    return;
+                }
+            },
+            None => (self.document_base(), None),
+        };
+        let map = self.import_map.clone();
+        let Some(vm) = self.vm.as_mut() else { return };
+        let compiled = match &source {
+            // The same module may already be loaded (imported earlier)
+            Some(src) => match vm.find_module(&url, false) {
+                Some(id) => Ok(id),
+                None => vm.compile_module(&url, src, true),
+            },
+            None => vm.compile_module(&url, &script.source, false),
+        };
+        let mut resolve = |spec: &str, referrer: &str| map.resolve(spec, referrer);
+        let mut fetch_all = |urls: &[String]| -> Vec<Result<String, String>> {
+            urls.iter().map(|u| fetch(u).ok_or_else(|| "network error".to_string())).collect()
+        };
+        let loaded = compiled.and_then(|id| vm.load_module_graph(id, &mut resolve, &mut fetch_all).map(|()| id));
+        let id = match loaded.and_then(|id| vm.run_module(id).map(|_| id)) {
+            Ok(id) => id,
+            Err(e) => {
+                dom_bindings::report_exception(vm, e);
+                self.dispatch_on_node(script.node, "error");
+                self.after_task();
+                return;
+            }
+        };
+        self.modules_running.push(id);
+        log::debug!("{name} ran in {:?}", start.elapsed());
+        if script.is_external {
+            self.dispatch_on_node(script.node, "load");
+        }
+        self.after_task();
+    }
+
+    /// Answer the `import()` calls scripts made: load each module graph
+    /// (fetching with `fetch`), then run it
+    fn process_dynamic_imports(&mut self, fetch: &mut ScriptFetcher<'_>) {
+        let base = self.document_base();
+        let map = self.import_map.clone();
+        let Some(vm) = self.vm.as_mut() else { return };
+        if !vm.has_dynamic_imports() {
+            return;
+        }
+        // Bounded: modules loaded here may import more
+        for _ in 0..16 {
+            let calls = vm.take_dynamic_imports();
+            if calls.is_empty() {
+                break;
+            }
+            for call in calls {
+                let referrer = call.referrer.clone().unwrap_or_else(|| base.clone());
+                let mut resolve = |spec: &str, referrer: &str| map.resolve(spec, referrer);
+                let result = match map.resolve(&call.specifier, &referrer) {
+                    Err(e) => Err(vm.type_error(&e)),
+                    Ok(url) => match vm.find_module(&url, false) {
+                        Some(id) => Ok(id),
+                        None => match fetch(&url) {
+                            Some(src) => vm.compile_module(&url, &src, true),
+                            None => Err(vm.type_error(&format!("Failed to fetch dynamically imported module: {url}"))),
+                        },
+                    },
+                };
+                let mut fetch_all = |urls: &[String]| -> Vec<Result<String, String>> {
+                    urls.iter().map(|u| fetch(u).ok_or_else(|| "network error".to_string())).collect()
+                };
+                let result = result.and_then(|id| vm.load_module_graph(id, &mut resolve, &mut fetch_all).map(|()| id));
+                vm.finish_dynamic_import(call.ticket, result);
+            }
+        }
+        self.after_task();
+    }
+
+    /// Whether `import()` calls are waiting to be loaded
+    pub fn has_pending_imports(&self) -> bool {
+        self.vm.as_ref().is_some_and(|vm| vm.has_dynamic_imports())
+    }
+
     /// Insert what the script wrote with `document.write` after it
     fn flush_document_write(&mut self, script: NodeId) {
         let Some(vm) = self.vm.as_mut() else { return };
@@ -246,6 +384,21 @@ impl PageJsRuntime {
     /// and copy console output to the devtools console
     fn after_task(&mut self) {
         let Some(vm) = self.vm.as_mut() else { return };
+        // Module graphs that failed after a top-level await
+        if !self.modules_running.is_empty() {
+            let mut failed = Vec::new();
+            self.modules_running.retain(|&id| match vm.module_status(id) {
+                fos_jsvm::ModuleStatus::Evaluating => true,
+                fos_jsvm::ModuleStatus::Errored => {
+                    failed.extend(vm.module_error(id));
+                    false
+                }
+                _ => false,
+            });
+            for e in failed {
+                dom_bindings::report_exception(vm, e);
+            }
+        }
         if let Ok(state) = vm.eval("__fosPageState()") {
             let navigate = vm.get_str(state, "navigate").ok().and_then(|w| w.as_object()).map(|a| a.get().elements.clone()).unwrap_or_default();
             if let Some(&url) = navigate.last() {
@@ -365,8 +518,12 @@ impl PageJsRuntime {
         self.vm.as_ref().is_some_and(dom_bindings::has_timers)
     }
 
-    /// When the next timer is due
+    /// When the next timer is due (now, when `import()` calls are
+    /// waiting: the timer pass loads them)
     pub fn next_timer_due(&self) -> Option<std::time::Instant> {
+        if self.has_pending_imports() {
+            return Some(std::time::Instant::now());
+        }
         self.vm.as_ref().and_then(dom_bindings::next_timer_due)
     }
 
@@ -445,9 +602,14 @@ fn collect_scripts(tree: &DomTree, page_url: &str, scripts: &mut Vec<Script>) {
         }
         let script_type = match tree.get_attribute(id, "type") {
             Some(t) if t.trim().eq_ignore_ascii_case("module") => ScriptType::Module,
+            Some(t) if t.trim().eq_ignore_ascii_case("importmap") => ScriptType::ImportMap,
             Some(t) if !is_javascript_type(t) => return true,
             _ => ScriptType::Classic,
         };
+        // Fallbacks for browsers without modules
+        if script_type == ScriptType::Classic && tree.get_attribute(id, "nomodule").is_some() {
+            return true;
+        }
         match tree.get_attribute(id, "src") {
             Some(src) if !src.trim().is_empty() => scripts.push(Script {
                 source: String::new(),
@@ -483,6 +645,75 @@ mod tests {
     fn body_html(doc: &Arc<Mutex<Document>>) -> String {
         let d = doc.lock().unwrap();
         fos_html::get_inner_html(d.tree(), d.body())
+    }
+
+    #[test]
+    fn module_scripts() {
+        let files: std::collections::HashMap<&str, &str> = [
+            ("https://example.com/mods/lib.js", "export function greet() { return 'hi'; } export let calls = 0; export function bump() { calls++; }"),
+            ("https://example.com/mods/data.json", r#"{"n": 7}"#),
+            (
+                "https://example.com/mods/main.js",
+                "import { bump, calls } from 'lib';
+                 bump();
+                 const later = await import('./later.js');
+                 log.push('main:' + calls + ':' + later.value + ':' + import.meta.url);",
+            ),
+            ("https://example.com/mods/later.js", "export const value = 'later';"),
+        ]
+        .into_iter()
+        .collect();
+        let (mut rt, doc) = page(
+            r#"<html><body>
+            <script>window.log = []; document.addEventListener('DOMContentLoaded', () => log.push('DOMContentLoaded'));</script>
+            <script type="importmap">{"imports": {"lib": "/mods/lib.js"}}</script>
+            <script type="module">
+              import { greet } from 'lib';
+              import data from '/mods/data.json' with { type: 'json' };
+              log.push('inline:' + greet() + data.n + ':' + (this === undefined));
+            </script>
+            <script type="module" src="/mods/main.js"></script>
+            <script>log.push('classic');</script>
+            <script nomodule>log.push('legacy fallback');</script>
+            <script type="module">import 'missing-bare';</script>
+            </body></html>"#,
+        );
+        let mut fetched = Vec::new();
+        rt.execute_scripts(&mut |url| {
+            fetched.push(url.to_string());
+            files.get(url).map(|s| s.to_string())
+        })
+        .unwrap();
+        // The top-level await finishes in later turns
+        for _ in 0..5 {
+            rt.process_timers(&mut |url| files.get(url).map(|s| s.to_string())).unwrap();
+        }
+        // Classic scripts first, then modules in order; modules start before
+        // DOMContentLoaded (main.js's `await import()` loads at once here,
+        // as fetches are synchronous)
+        assert_eq!(
+            rt.eval("log.join(' | ')").unwrap(),
+            "classic | inline:hi7:true | main:1:later:https://example.com/mods/main.js | DOMContentLoaded"
+        );
+        // Each module is fetched once
+        assert_eq!(fetched.iter().filter(|u| u.ends_with("lib.js")).count(), 1, "{fetched:?}");
+        // Errors are reported, not fatal
+        let messages = rt.console_messages();
+        assert!(messages.iter().any(|m| m.message.contains("Failed to resolve module specifier \"missing-bare\"")), "{messages:?}");
+        drop(doc);
+    }
+
+    #[test]
+    fn dynamic_import_in_classic_scripts() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><script>
+              window.out = 'waiting';
+              import('./m.js').then(m => out = m.default, e => out = 'failed: ' + e.message);
+            </script></body></html>"#,
+        );
+        let fetch = |url: &str| (url == "https://example.com/dir/m.js").then(|| "export default 'loaded relative to the page'".to_string());
+        rt.execute_scripts(&mut |u| fetch(u)).unwrap();
+        assert_eq!(rt.eval("out").unwrap(), "loaded relative to the page");
     }
 
     #[test]

@@ -19,4 +19,4 @@ pub mod value;
 pub mod vm;
 
 pub use value::Value;
-pub use vm::{JsResult, Vm};
+pub use vm::{DynamicImport, JsResult, ModuleId, ModuleStatus, Vm};

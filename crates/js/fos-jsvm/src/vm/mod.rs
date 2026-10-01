@@ -20,6 +20,8 @@
 
 pub(crate) mod generator;
 mod interp;
+pub mod module;
+pub use module::{DynamicImport, ModuleId, ModuleStatus};
 pub(crate) mod ops;
 pub use ops::truthy;
 pub(crate) mod property;
@@ -198,6 +200,8 @@ pub struct Vm {
     /// Values the embedder keeps alive (e.g. wrappers of DOM nodes,
     /// pending timer callbacks); traced as roots
     pub host_roots: Vec<Value>,
+    /// ES modules
+    pub(crate) modules: module::Modules,
 }
 
 impl Drop for Vm {
@@ -328,6 +332,7 @@ impl Vm {
             suspended: false,
             host: None,
             host_roots: Vec::new(),
+            modules: Default::default(),
         };
         crate::builtins::init(&mut vm);
         vm
@@ -978,6 +983,7 @@ impl Vm {
         }
         t.mark_values(&self.temp_roots);
         t.mark_values(&self.host_roots);
+        self.modules.trace(t);
         for job in &self.jobs {
             match job {
                 Job::Call(f, a) => {

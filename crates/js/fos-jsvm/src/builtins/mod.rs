@@ -7,7 +7,7 @@ mod error;
 mod function;
 pub(crate) mod generator;
 pub(crate) mod promise;
-mod json;
+pub(crate) mod json;
 mod math;
 mod number;
 mod object;

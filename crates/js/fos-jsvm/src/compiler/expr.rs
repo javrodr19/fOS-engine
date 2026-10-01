@@ -270,7 +270,25 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.emit(Insn::Await { dst, src: v });
             }
             Expr::Paren(inner) => self.expr_to(inner, dst)?,
-            Expr::Import(_) => return self.error("dynamic import is not supported"),
+            Expr::Import { spec, options } => {
+                let mark = self.mark();
+                let spec = self.expr_any(spec)?;
+                if let Some(options) = options {
+                    self.expr_effect(options)?;
+                }
+                let referrer = self.alloc()?;
+                match self.resolve(MODULE_REFERRER) {
+                    Res::Upval(idx) => {
+                        self.emit(Insn::GetUpval { dst: referrer, idx });
+                    }
+                    _ => {
+                        self.emit(Insn::LoadUndef { dst: referrer });
+                    }
+                }
+                self.emit(Insn::DynamicImport { dst, spec, referrer });
+                self.release(mark);
+            }
+            Expr::ImportMeta => self.load_var_static(MODULE_META, dst)?,
         }
         Ok(())
     }

@@ -208,7 +208,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
         }
         let mark = self.mark();
         let t = self.alloc()?;
-        self.expr_named(value, t, Some(name))?;
+        // `export default <anonymous function or class>` is named "default"
+        let hint: &str = if &**name == DEFAULT_EXPORT { "default" } else { name };
+        self.expr_named(value, t, Some(hint))?;
         self.store_var(name, t, init)?;
         self.release(mark);
         Ok(())

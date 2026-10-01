@@ -227,6 +227,19 @@ impl Parser<'_> {
     }
 }
 
+/// Parse JSON text (JSON modules)
+pub(crate) fn parse_value(vm: &mut Vm, text: Value) -> JsResult<Value> {
+    let s = vm.to_string(text)?;
+    let units = s.get().units();
+    let mut p = Parser { s: units, pos: 0 };
+    let v = p.value(vm, 0)?;
+    p.ws();
+    if p.pos != p.s.len() {
+        return Err(p.error(vm));
+    }
+    Ok(v)
+}
+
 fn parse(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let s = vm.to_string(arg(args, 0))?;
     let units = s.get().units();

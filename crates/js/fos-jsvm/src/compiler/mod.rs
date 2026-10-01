@@ -40,7 +40,7 @@ use crate::value::Value;
 /// function returns the value of the script's last top-level expression
 /// statement.
 pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: false };
     let mut no_fused = false;
     loop {
         match c.script(program, no_fused) {
@@ -55,10 +55,107 @@ pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Progr
     }
 }
 
+/// How a module-scope binding starts out
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleBindingKind {
+    /// `var` and function declarations: undefined until set
+    Var,
+    /// `let`, `const` and `class`: in their dead zone until initialized
+    Lexical,
+    /// An import: bound to the exporting module's binding when linked
+    Import,
+    /// `import.meta` and the module's URL: set when linked
+    Hidden,
+}
+
+/// A compiled module. Its scope is a list of cells (closed upvalues) that
+/// the modules importing from it share, which makes imports live
+/// bindings and lets modules in an import cycle see each other.
+pub struct CompiledModule {
+    /// Creates the module's function declarations; run when the module is
+    /// linked, so modules in a cycle can call them before this one runs
+    pub init: Rc<FunctionProto>,
+    /// The module's code (an async function when it uses top-level await)
+    pub body: Rc<FunctionProto>,
+    /// The module scope: upvalue `i` of `init` and `body` is binding `i`
+    pub bindings: Vec<(Name, ModuleBindingKind)>,
+}
+
+/// Compile a module
+pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, module: &Module) -> Result<CompiledModule, SyntaxError> {
+    let mut scope: Vec<(Name, ModuleBindingKind, BindKind)> = Vec::new();
+    let mut add = |name: &Name, kind: ModuleBindingKind, bind: BindKind| -> Result<(), SyntaxError> {
+        if let Some(existing) = scope.iter().find(|b| b.0 == *name) {
+            if existing.1 == ModuleBindingKind::Var && kind == ModuleBindingKind::Var {
+                return Ok(());
+            }
+            return Err(SyntaxError { message: format!("Identifier '{name}' has already been declared"), pos: 0 });
+        }
+        scope.push((name.clone(), kind, bind));
+        Ok(())
+    };
+    // `var`s and function declarations
+    let mut vars = Vec::new();
+    collect_vars(&module.body, &mut vars, false);
+    for name in &vars {
+        add(name, ModuleBindingKind::Var, BindKind::Var)?;
+    }
+    for stmt in &module.body {
+        match stmt {
+            Stmt::Var { kind, decls } if *kind != VarKind::Var => {
+                let bind = if *kind == VarKind::Const { BindKind::Const } else { BindKind::Let };
+                let mut names = Vec::new();
+                for d in decls {
+                    pattern_names(&d.target, &mut names);
+                }
+                for name in &names {
+                    add(name, ModuleBindingKind::Lexical, bind)?;
+                }
+            }
+            Stmt::Class(c) => {
+                if let Some(name) = &c.name {
+                    add(name, ModuleBindingKind::Lexical, BindKind::Class)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    for import in &module.imports {
+        add(&import.local, ModuleBindingKind::Import, BindKind::Const)?;
+    }
+    add(&Rc::from(MODULE_META), ModuleBindingKind::Hidden, BindKind::Const)?;
+    add(&Rc::from(MODULE_REFERRER), ModuleBindingKind::Hidden, BindKind::Const)?;
+    for export in &module.exports {
+        if let ExportEntry::Local { local, .. } = export {
+            if !scope.iter().any(|b| b.0 == *local) {
+                return Err(SyntaxError { message: format!("Export '{local}' is not defined in module"), pos: 0 });
+            }
+        }
+    }
+    if scope.len() > u16::MAX as usize {
+        return Err(SyntaxError { message: "too many module bindings".into(), pos: 0 });
+    }
+
+    let names: Vec<Name> = scope.iter().map(|b| b.0.clone()).collect();
+    let upvals: Vec<UpvalInfo> = scope
+        .iter()
+        .enumerate()
+        .map(|(i, b)| UpvalInfo {
+            desc: UpvalDesc { from_parent_reg: false, index: i as u16 },
+            checked: matches!(b.1, ModuleBindingKind::Lexical | ModuleBindingKind::Import),
+            kind: b.2,
+        })
+        .collect();
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: true };
+    let init = c.with_retry(|c, no_fused| c.module_init(module, &upvals, &names, no_fused))?;
+    let body = c.with_retry(|c, no_fused| c.module_body(module, &upvals, &names, no_fused))?;
+    Ok(CompiledModule { init, body, bindings: scope.into_iter().map(|b| (b.0, b.1)).collect() })
+}
+
 /// Compile a function created by the `Function` constructor (its scope is
 /// the global scope)
 pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: &Function) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: false };
     // An empty script level to resolve names against (all globals)
     c.fs.push(FuncState::new(true, false, func.strict, FunctionKind::Normal, false));
     let name = c.atoms.intern_str(heap, "anonymous");
@@ -225,6 +322,8 @@ pub(crate) struct FuncState<'a> {
     withs: Vec<(Reg, usize)>,
     /// Lazily compiled function: names of the precomputed upvalues
     lazy_names: Option<Vec<Name>>,
+    /// A module's top-level code (its declarations are module bindings)
+    is_module: bool,
 }
 
 impl<'a> FuncState<'a> {
@@ -265,6 +364,7 @@ impl<'a> FuncState<'a> {
             completion: None,
             withs: Vec::new(),
             lazy_names: None,
+            is_module: false,
         }
     }
 }
@@ -287,6 +387,8 @@ pub(crate) struct Compiler<'a, 'h> {
     /// Compiling a lazy function: its upvalues (by name) and the
     /// strictness of its definition
     lazy_root: Option<(Vec<UpvalInfo>, Vec<Name>, bool)>,
+    /// Compiling module code
+    in_module: bool,
 }
 
 /// Compile the body of a lazy function (on its first call)
@@ -299,6 +401,7 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         is_async: proto.is_async,
         is_generator: proto.is_generator,
         outer_strict: info.outer_strict,
+        in_module: info.in_module,
     };
     let src: &str = &info.source;
     let mut func = crate::parser::reparse_function(src, &reparse)?;
@@ -310,7 +413,15 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         .map(|(&desc, (_, checked, kind))| UpvalInfo { desc, checked: *checked, kind: BindKind::from_u8(*kind) })
         .collect();
     let names: Vec<Name> = info.upval_names.iter().map(|(n, _, _)| n.clone()).collect();
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: Some(info.source.clone()), lazy_root: Some((upvals, names, info.outer_strict)) };
+    let mut c = Compiler {
+        heap,
+        atoms,
+        src,
+        fs: Vec::new(),
+        src_rc: Some(info.source.clone()),
+        lazy_root: Some((upvals, names, info.outer_strict)),
+        in_module: info.in_module,
+    };
     // The function borrows from `func`, which lives until the end
     let func: &Function = unsafe { &*(&func as *const Function) };
     match c.function(func, Some(proto.name), info.is_expression) {
@@ -837,6 +948,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
                     self.f().bindings[b].initialized = true;
                 }
             }
+            Res::Upval(idx) if init => {
+                // A module-scope declaration initializing its binding
+                self.emit(Insn::SetUpval { src, idx });
+            }
             Res::Upval(idx) => {
                 let u = self.fr().upvals[idx as usize];
                 let n = self.name_index(name)?;
@@ -879,9 +994,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
         f.scopes.iter().rev().find(|s| s.first_binding <= b).is_some_and(|s| s.switch_like)
     }
 
-    /// Compiling the script's top-level scope (not inside a block)
+    /// Compiling the script's or module's top-level scope (not inside a
+    /// block), whose declarations are not registers of the function
     fn at_script_top(&self) -> bool {
-        self.fs.len() == 1 && self.fr().is_script && self.fr().scopes.len() == 1
+        self.fs.len() == 1 && (self.fr().is_script || self.fr().is_module) && self.fr().scopes.len() == 1
     }
 
     fn is_global_lexical(&self, _name: &str) -> bool {
@@ -890,6 +1006,82 @@ impl<'a, 'h> Compiler<'a, 'h> {
         // `init` only for those (a top-level `var` initializer is an
         // assignment)
         true
+    }
+
+    // ---- modules ----
+
+    /// Run `f`, again without fused short jumps if one overflowed
+    fn with_retry<T>(&mut self, mut f: impl FnMut(&mut Self, bool) -> CResult<T>) -> Result<T, SyntaxError> {
+        match f(self, false) {
+            Ok(v) => Ok(v),
+            Err(CErr::Retry) => {
+                self.fs.clear();
+                match f(self, true) {
+                    Ok(v) => Ok(v),
+                    Err(CErr::Retry) => Err(SyntaxError { message: "function too large".into(), pos: 0 }),
+                    Err(CErr::Syntax(e)) => Err(e),
+                }
+            }
+            Err(CErr::Syntax(e)) => Err(e),
+        }
+    }
+
+    /// Start a function whose upvalues are the module scope
+    fn push_module_function(&mut self, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<()> {
+        self.fs.push(FuncState::new(false, false, true, FunctionKind::Normal, no_fused));
+        let f = self.f();
+        f.upvals = upvals.to_vec();
+        f.lazy_names = Some(names.to_vec());
+        f.is_module = true;
+        self.push_scope(false);
+        // `this` is undefined at the top level of a module
+        let this = self.alloc()?;
+        self.add_binding(Rc::from("this"), this, BindKind::This);
+        Ok(())
+    }
+
+    fn module_init(&mut self, module: &'a Module, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<Rc<FunctionProto>> {
+        self.push_module_function(upvals, names, no_fused)?;
+        for stmt in &module.body {
+            let Stmt::Function(func) = stmt else { continue };
+            let Some(name) = &func.name else { continue };
+            let shown = if &**name == DEFAULT_EXPORT { "default" } else { name };
+            let atom = self.intern(shown);
+            let mark = self.mark();
+            let t = self.alloc()?;
+            self.closure(func, Some(atom), t, false)?;
+            let idx = names.iter().position(|n| n == name).unwrap_or(0) as u16;
+            self.emit(Insn::SetUpval { src: t, idx });
+            self.release(mark);
+        }
+        self.emit(Insn::ReturnUndef);
+        let f = self.fs.pop().unwrap();
+        Ok(self.finish(f, atoms::empty, 0, (0, self.src.len() as u32)))
+    }
+
+    fn module_body(&mut self, module: &'a Module, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<Rc<FunctionProto>> {
+        self.push_module_function(upvals, names, no_fused)?;
+        self.f().is_async = module.has_await;
+        let async_exc = if module.has_await {
+            self.emit(Insn::AsyncStart);
+            let r = self.alloc()?;
+            self.open_try(TryKind::Catch, r);
+            Some(r)
+        } else {
+            None
+        };
+        for stmt in &module.body {
+            self.stmt(stmt)?;
+        }
+        self.emit_return_undef();
+        if let Some(r) = async_exc {
+            let entry = self.close_try();
+            let target = self.pc();
+            self.set_handler_target(&entry, target);
+            self.emit(Insn::AsyncThrow { src: r });
+        }
+        let f = self.fs.pop().unwrap();
+        Ok(self.finish(f, atoms::empty, 0, (0, self.src.len() as u32)))
     }
 
     // ---- functions ----
@@ -1258,6 +1450,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 is_expression,
                 outer_strict,
                 upval_names,
+                in_module: self.in_module,
             })),
             compiled: std::cell::OnceCell::new(),
         };

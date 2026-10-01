@@ -154,6 +154,9 @@ pub enum Insn {
 
     /// Create a closure from nested function `idx`
     Closure { dst: Reg, idx: u16 },
+    /// `import(spec)`: a promise for the module namespace; `referrer` is
+    /// the importing module's URL (undefined in scripts)
+    DynamicImport { dst: Reg, spec: Reg, referrer: Reg },
     /// Set a function's home object (methods that use `super`)
     SetHomeObject { func: Reg, obj: Reg },
     /// Create a class: dst = constructor from closure `ctor` (already
@@ -355,6 +358,8 @@ pub struct LazyInfo {
     /// Names reachable through upvalues, parallel to `upvals`, with
     /// dead-zone check and binding kind flags
     pub upval_names: Vec<(crate::ast::Name, bool, u8)>,
+    /// Defined in a module
+    pub in_module: bool,
 }
 
 impl FunctionProto {

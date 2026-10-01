@@ -64,6 +64,8 @@ pub struct PageJsRuntime {
     /// Navigation a script requested (`location.href = ...`)
     navigation: Option<String>,
     loaded: bool,
+    /// The browser's cookies, which the page's scripts and requests use
+    cookies: fos_net::SharedCookieJar,
 }
 
 impl PageJsRuntime {
@@ -81,7 +83,14 @@ impl PageJsRuntime {
             page_url: page_url.to_string(),
             navigation: None,
             loaded: false,
+            cookies: fos_net::CookieJar::shared(),
         }
+    }
+
+    /// Use the browser's cookie jar (by default a page has its own). Takes
+    /// effect when the context is initialized.
+    pub fn set_cookie_jar(&mut self, cookies: fos_net::SharedCookieJar) {
+        self.cookies = cookies;
     }
 
     /// Initialize the JavaScript context with the document
@@ -94,7 +103,7 @@ impl PageJsRuntime {
         if std::env::var_os("FOS_GC_STRESS").is_some() {
             vm.heap.set_stress(true);
         }
-        if let Err(e) = dom_bindings::install(&mut vm, document.clone(), &self.page_url) {
+        if let Err(e) = dom_bindings::install(&mut vm, document.clone(), &self.page_url, self.cookies.clone()) {
             return Err(vm.display(e));
         }
         self.vm = Some(vm);
@@ -645,6 +654,12 @@ mod tests {
                         (_, "/latin1") => ("200 OK", vec![], "text/plain; charset=iso-8859-1", vec![b'c', 0xE9]),
                         (_, "/redirect") => ("302 Found", vec!["Location: /data.json".into()], "text/plain", vec![]),
                         (_, "/setcookie") => ("200 OK", vec!["Set-Cookie: sid=42; Path=/".into()], "text/plain", b"ok".to_vec()),
+                        (_, "/login") => (
+                            "200 OK",
+                            vec!["Set-Cookie: sid=s1; HttpOnly; Path=/".into(), "Set-Cookie: theme=dark; Path=/".into()],
+                            "text/html",
+                            b"<html></html>".to_vec(),
+                        ),
                         (_, "/cors-ok") => (
                             "200 OK",
                             vec!["Access-Control-Allow-Origin: *".into(), "X-Secret: s".into(), "X-Public: p".into(), "Access-Control-Expose-Headers: X-Public".into()],
@@ -738,6 +753,44 @@ mod tests {
             format!(r#"["POST","{{\"x\":1}}","application/json","t1","sid=42","{origin}","{origin}/dir/page.html"]"#)
         );
         assert_eq!(rt.eval("out.err").unwrap(), "true");
+    }
+
+    #[test]
+    fn cookies_shared_with_page_loads() {
+        let base = test_server();
+        let jar = fos_net::CookieJar::shared();
+        // A page load on the browser's client sets the session cookie
+        let mut client = fos_net::HttpClient::builder().cookie_jar(jar.clone()).build();
+        assert_eq!(client.get(&format!("{base}/login")).unwrap().status, 200);
+
+        let url = format!("{base}/app/page.html");
+        let doc = Arc::new(Mutex::new(fos_html::parse_with_url("<html><body></body></html>", &url)));
+        let mut rt = PageJsRuntime::new(&url);
+        rt.set_cookie_jar(jar.clone());
+        rt.initialize(doc).unwrap();
+        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.eval(
+            r#"window.out = {};
+            out.before = document.cookie;
+            document.cookie = 'lang=en; path=/';
+            document.cookie = 'sid=forged';
+            document.cookie = 'x=1; HttpOnly';
+            out.after = document.cookie;
+            fetch('/echo').then(r => r.json()).then(e => out.sent = e.cookie);
+            fetch('/echo', { credentials: 'omit' }).then(r => r.json()).then(e => out.omitted = e.cookie);
+            'started'"#,
+        )
+        .unwrap();
+        drain_network(&mut rt);
+        // Scripts never see the HttpOnly session cookie, nor overwrite it
+        assert_eq!(rt.eval("out.before").unwrap(), "theme=dark");
+        assert_eq!(rt.eval("out.after").unwrap(), "theme=dark; lang=en");
+        // ...but the page's requests carry it, with the cookie the script set
+        assert_eq!(rt.eval("out.sent").unwrap(), "sid=s1; theme=dark; lang=en");
+        assert_eq!(rt.eval("out.omitted").unwrap(), "");
+        // And so does the browser's next request
+        let echo = client.get(&format!("{base}/echo")).unwrap();
+        assert!(String::from_utf8_lossy(&echo.body).contains(r#""cookie":"sid=s1; theme=dark; lang=en""#));
     }
 
     #[test]

@@ -81,8 +81,6 @@ pub mod form_history;
 pub mod contenteditable;
 /// Input mode and virtual keyboard
 pub mod input_mode;
-/// Cookie management
-pub mod cookies;
 /// Advanced networking (WebSocket, XHR, SSE)
 pub mod advanced_net;
 /// Profiling and performance metrics
@@ -271,7 +269,7 @@ pub use file_upload::{FileUploadManager, FileList, FileEntry, AcceptFilter};
 pub use form_history::{FormHistoryManager, FieldKey};
 pub use contenteditable::{ContentEditor, EditCommand, EditSelection};
 pub use input_mode::{InputMode, EnterKeyHint, VirtualKeyboardManager};
-pub use cookies::{Cookie, CookieJar};
+pub use fos_net::{Cookie, CookieJar, SharedCookieJar};
 pub use service_worker::{ServiceWorkerManager, CacheStorage};
 pub use indexeddb::{IDBFactory, IDBDatabase};
 

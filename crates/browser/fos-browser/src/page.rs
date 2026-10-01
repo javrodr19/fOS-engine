@@ -185,6 +185,14 @@ impl Page {
         }
     }
 
+    /// Give the page's scripts the browser's cookie jar (before
+    /// `initialize_javascript`)
+    pub fn set_cookie_jar(&mut self, cookies: fos_net::SharedCookieJar) {
+        if let Some(r) = self.js_runtime.as_mut() {
+            r.set_cookie_jar(cookies);
+        }
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.js_runtime.as_ref().map(|r| r.has_pending_timers()).unwrap_or(false)

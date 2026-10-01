@@ -113,6 +113,9 @@ struct BrowserApp {
     last_timer_check: Instant,
     /// Wakes the event loop when a page script's network request finishes
     network_waker: Option<crate::script_fetch::Waker>,
+    /// The page the next load was started from (a link followed); None
+    /// when the user started it. Decides its SameSite cookies and Referer.
+    navigation_initiator: Option<String>,
     /// Developer tools
     devtools: DevTools,
     /// Accessibility manager
@@ -154,6 +157,7 @@ impl BrowserApp {
             current_page: None,
             last_timer_check: Instant::now(),
             network_waker: None,
+            navigation_initiator: None,
             devtools: DevTools::new(),
             a11y: AccessibilityManager::new(),
             media: MediaManager::new(),
@@ -176,6 +180,8 @@ impl BrowserApp {
 
     /// Load the current tab's page
     fn load_current_page(&mut self) {
+        // Only the load right after a link is followed comes from it
+        let initiator = self.navigation_initiator.take();
         // Get tab info
         let (url, needs_network, cached_html) = match self.tabs.active_tab() {
             Some(tab) => (tab.url.clone(), tab.needs_network_load, tab.cached_html.clone()),
@@ -204,7 +210,7 @@ impl BrowserApp {
                 .map(|page| (page, 200))
                 .map_err(|e| e.to_string())
         } else {
-            self.network.fetch_page(&url)
+            self.network.fetch_page_from(&url, initiator.as_deref())
                 .map(|fetched| (Page::from_html(&fetched.url, fetched.html), fetched.status))
                 .map_err(|e| e.to_string())
         };
@@ -301,6 +307,7 @@ impl BrowserApp {
     fn run_page_scripts(&mut self) {
         let Some(page) = self.current_page.as_mut() else { return };
 
+        page.set_cookie_jar(self.network.cookie_jar().clone());
         if let Err(e) = page.initialize_javascript() {
             log::warn!("Failed to initialize JavaScript: {}", e);
             self.devtools.warn(&format!("JS init failed: {}", e));
@@ -805,6 +812,7 @@ impl BrowserApp {
     /// Navigate to a URL or search typed by the user
     fn navigate_to(&mut self, input: &str) {
         let normalized = crate::navigation::omnibox_to_url(input);
+        self.navigation_initiator = None;
 
         // Update URL bar to show the URL we're navigating to
         self.chrome.url_bar.set_url(&normalized);
@@ -857,6 +865,7 @@ impl BrowserApp {
 
         log::info!("Navigating to: {}", target);
         self.navigate_to(&target);
+        self.navigation_initiator = Some(self.current_url.clone());
     }
 
     /// Handle a click inside the page area

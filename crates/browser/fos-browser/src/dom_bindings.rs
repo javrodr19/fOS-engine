@@ -85,10 +85,12 @@ pub struct DomHost {
     boxes: Option<HashMap<u32, [f32; 4]>>,
     /// A scroll position a script asked for
     pub scroll_request: Option<f32>,
+    /// The browser's cookies (`document.cookie`; `fetch` shares them)
+    cookies: fos_net::SharedCookieJar,
 }
 
 impl DomHost {
-    pub fn new(doc: Arc<Mutex<Document>>, url: &str) -> Self {
+    pub fn new(doc: Arc<Mutex<Document>>, url: &str, cookies: fos_net::SharedCookieJar) -> Self {
         Self {
             doc,
             url: url.to_string(),
@@ -99,7 +101,7 @@ impl DomHost {
             free_slots: Vec::new(),
             console: Vec::new(),
             start: Instant::now(),
-            fetch: FetchPool::new(),
+            fetch: FetchPool::new(cookies.clone()),
             fetch_callbacks: HashMap::new(),
             next_fetch_id: 1,
             layout: None,
@@ -107,6 +109,7 @@ impl DomHost {
             scroll: (0.0, 0.0),
             boxes: None,
             scroll_request: None,
+            cookies,
         }
     }
 }
@@ -1032,6 +1035,21 @@ fn performance_now(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsRes
     Ok(Value::number(host(vm).start.elapsed().as_secs_f64() * 1000.0))
 }
 
+/// `__fosCookie()`: what `document.cookie` reads (no HttpOnly cookies)
+fn get_cookie(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let h = host(vm);
+    let cookies = h.cookies.lock().unwrap_or_else(|p| p.into_inner()).document_cookie(&h.url);
+    Ok(string(vm, &cookies))
+}
+
+/// `__fosSetCookie(value)`: assign to `document.cookie`
+fn set_cookie(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let value = arg_string(vm, args, 0)?;
+    let h = host(vm);
+    h.cookies.lock().unwrap_or_else(|p| p.into_inner()).set_document_cookie(&h.url, &value);
+    Ok(Value::UNDEFINED)
+}
+
 fn resolve_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let url = arg_string(vm, args, 0)?;
     let base = if arg(args, 1).is_nullish() { host(vm).url.clone() } else { arg_string(vm, args, 1)? };
@@ -1378,8 +1396,8 @@ fn methods(vm: &mut Vm, o: Gc<JsObject>, list: &[(&str, u32, NativeFn)]) {
 }
 
 /// Install the DOM, `window` and friends into `vm` for `doc`
-pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()> {
-    vm.host = Some(Box::new(DomHost::new(doc, url)));
+pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_net::SharedCookieJar) -> JsResult<()> {
+    vm.host = Some(Box::new(DomHost::new(doc, url, cookies)));
     let object_proto = vm.realm.object_proto;
 
     let event_target = proto_object(vm, object_proto);
@@ -1511,6 +1529,8 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
         ("btoa", 1, btoa),
         ("atob", 1, atob),
         ("__fosResolveURL", 2, resolve_url),
+        ("__fosCookie", 0, get_cookie),
+        ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),
         ("__fosViewport", 0, viewport),

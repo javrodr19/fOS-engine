@@ -500,15 +500,8 @@
     },
     get location() { return global.location; },
     set location(v) { global.location.href = v; },
-    get cookie() { return cookieJar; },
-    set cookie(v) {
-      const [pair] = String(v).split(';');
-      const i = pair.indexOf('=');
-      if (i < 0) return;
-      const jar = new Map(cookieJar ? cookieJar.split('; ').map(c => { const j = c.indexOf('='); return [c.slice(0, j), c.slice(j + 1)]; }) : []);
-      jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
-      cookieJar = [...jar].map(([k, v]) => k + '=' + v).join('; ');
-    },
+    get cookie() { return __fosCookie(); },
+    set cookie(v) { __fosSetCookie(String(v)); },
     get forms() { return this.querySelectorAll('form'); },
     get images() { return this.querySelectorAll('img'); },
     get links() { return this.querySelectorAll('a[href], area[href]'); },
@@ -572,7 +565,6 @@
     escape(s) { return String(s).replace(/([\0-\x1f\x7f]|^-?\d)|^-$|[^\0-\x1f\x7f-\uFFFF\w-]/g, (m, ctl) => ctl ? (m === '\0' ? '\uFFFD' : m.slice(0, -1) + '\\' + m.slice(-1).charCodeAt(0).toString(16) + ' ') : '\\' + m); },
     supports: () => false,
   };
-  let cookieJar = '';
   let currentScript = null;
   // document.write output, inserted after the running script by the browser
   const writeBuffer = [];

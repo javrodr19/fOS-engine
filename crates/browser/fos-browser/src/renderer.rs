@@ -78,6 +78,8 @@ struct TextSegment {
     href: Option<String>,
     /// Element the text belongs to (for hit testing clicks)
     node: NodeId,
+    /// Advance of the text as laid out (including its trailing space)
+    width: f32,
 }
 
 /// A laid-out line of text, in document coordinates
@@ -100,7 +102,7 @@ struct Rule {
 
 /// Display list for a page at one viewport width
 #[derive(Debug, Default)]
-struct PageLayout {
+pub struct PageLayout {
     /// Lines in document order (ascending `y`)
     lines: Vec<LaidOutLine>,
     /// Horizontal rules in document order
@@ -111,6 +113,25 @@ struct PageLayout {
     content_height: f32,
     /// Largest font size used (bounds how far glyphs reach above a baseline)
     max_font_size: f32,
+}
+
+impl PageLayout {
+    /// The laid-out text, as `(element, x, top, width, height)` boxes in
+    /// document coordinates, in document order
+    pub fn text_boxes(&self) -> impl Iterator<Item = (NodeId, f32, f32, f32, f32)> + '_ {
+        self.lines.iter().flat_map(|line| {
+            line.segments.iter().scan(line.x, move |x, s| {
+                let b = (s.node, *x, line.y - s.font_size, s.width, s.font_size * 1.2);
+                *x += s.width;
+                Some(b)
+            })
+        })
+    }
+
+    /// Height of the laid-out document
+    pub fn content_height(&self) -> f32 {
+        self.content_height
+    }
 }
 
 /// What a cached layout was built from
@@ -128,7 +149,8 @@ struct CachedLayout {
     source: LayoutSource,
     /// Viewport width the layout was built for
     width: u32,
-    layout: PageLayout,
+    /// Shared with the page's scripts (element geometry)
+    layout: Arc<PageLayout>,
 }
 
 /// Page renderer - integrates HTML, CSS, layout, and painting
@@ -293,7 +315,7 @@ impl PageRenderer {
         let styler = Styler::new(self, document.tree(), self.page_stylesheet(document));
         let layout = build_layout(document, &styler, width);
         // Only the display list is kept
-        self.cached = Some(CachedLayout { source, width, layout });
+        self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
     }
 
@@ -380,6 +402,11 @@ impl PageRenderer {
         let styles = PageStyles::new(fos_css::parse_stylesheet_for(&css_text, media));
         log::debug!("Parsed {} CSS rules from page", styles.rule_count());
         Some(styles)
+    }
+
+    /// The current layout, for element geometry (`getBoundingClientRect`)
+    pub fn layout_snapshot(&self) -> Option<Arc<PageLayout>> {
+        self.cached.as_ref().map(|c| c.layout.clone())
     }
 
     /// Use `sheets` for the page's `<link rel="stylesheet">` elements
@@ -1055,6 +1082,7 @@ impl LineBuffer {
                 color,
                 href: self.current_href.clone(),
                 node,
+                width: line_width + space_width,
             }));
 
             self.current_x += line_width + space_width;

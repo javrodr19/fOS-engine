@@ -338,6 +338,19 @@ impl PageJsRuntime {
         }
     }
 
+    /// Give the page's scripts the current layout (element geometry), the
+    /// viewport size and the scroll position
+    pub fn set_layout(&mut self, layout: Option<Arc<crate::renderer::PageLayout>>, viewport: (f32, f32), scroll: (f32, f32)) {
+        if let Some(vm) = self.vm.as_mut() {
+            dom_bindings::set_layout(vm, layout, viewport, scroll);
+        }
+    }
+
+    /// A scroll position the page's scripts asked for (taken)
+    pub fn take_scroll_request(&mut self) -> Option<f32> {
+        self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()).and_then(|h| h.scroll_request.take())
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.vm.as_ref().is_some_and(dom_bindings::has_timers)
@@ -853,6 +866,41 @@ mod tests {
         for (code, want) in cases {
             assert_eq!(rt.eval(code).unwrap(), want, "{code}");
         }
+    }
+
+    #[test]
+    fn element_geometry_from_layout() {
+        let (mut rt, doc) = page(
+            r#"<html><body><p id=a>first paragraph</p><p id=b>second <span id=s>inner</span> text</p>
+            <div id=h style="display: none">hidden</div><div id=e></div></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+        let cases = [
+            ("const r = id => document.getElementById(id).getBoundingClientRect(); window.A = r('a'); A.width > 0 && A.height > 0", "true"),
+            ("r('b').top > A.top", "true"),
+            ("const s = r('s'), b = r('b'); s.left >= b.left && s.right <= b.right + 0.5 && s.top >= b.top && s.width < b.width", "true"),
+            ("const h = document.getElementById('h'); [h.offsetWidth, h.offsetParent, h.getClientRects().length]", "[ 0, null, 0 ]"),
+            ("document.getElementById('e').offsetHeight", "0"),
+            ("const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); [vis(document.getElementById('a')), vis(document.getElementById('h'))]", "[ true, false ]"),
+            ("[innerWidth, innerHeight, document.documentElement.clientWidth]", "[ 800, 600, 800 ]"),
+            ("document.body.scrollHeight >= 600", "true"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
+        // Scrolling moves client rects, not offsets
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 50.0));
+        assert_eq!(rt.eval("[Math.round(A.top - r('a').top), scrollY, document.getElementById('a').offsetTop === Math.round(A.top)]").unwrap(), "[ 50, 50, true ]");
+        // Scripts can scroll the page
+        rt.eval("document.getElementById('b').scrollIntoView()").unwrap();
+        let b_top: f32 = rt.eval("document.getElementById('b').offsetTop").unwrap().parse().unwrap();
+        assert!((rt.take_scroll_request().unwrap() - b_top).abs() < 1.0);
+        rt.eval("window.scrollTo(0, 123)").unwrap();
+        assert_eq!(rt.take_scroll_request(), Some(123.0));
+        assert_eq!(rt.take_scroll_request(), None);
     }
 
     #[test]

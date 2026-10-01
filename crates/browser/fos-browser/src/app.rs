@@ -377,6 +377,7 @@ impl BrowserApp {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
         }
+        self.sync_page_geometry();
     }
 
     /// Move the page buffer to document position `start_y`, repainting only
@@ -393,6 +394,7 @@ impl BrowserApp {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
         }
+        self.sync_page_geometry();
     }
 
     /// Height of the page pixel buffer: exactly the visible area. Scrolling
@@ -475,8 +477,26 @@ impl BrowserApp {
         }
     }
 
-    /// Go where the page's scripts asked to (`location.href = ...`)
+    /// Give the page's scripts the current layout, viewport and scroll
+    /// position (`getBoundingClientRect`, `innerWidth`, `scrollY`, ...)
+    fn sync_page_geometry(&mut self) {
+        let layout = self.renderer.layout_snapshot();
+        let viewport = (self.content_width() as f32, self.viewport_height());
+        let scroll = (0.0, self.scroll_offset);
+        if let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
+            rt.set_layout(layout, viewport, scroll);
+        }
+    }
+
+    /// Go where the page's scripts asked to (`location.href = ...`), and
+    /// scroll where they asked to (`scrollTo`, `scrollIntoView`)
     fn follow_script_navigation(&mut self) {
+        let scroll = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).and_then(|r| r.take_scroll_request());
+        if let Some(y) = scroll {
+            self.scroll_offset = y;
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
         let Some(url) = self.current_page.as_mut().and_then(Page::take_script_navigation) else { return };
         log::info!("Script navigation to {}", url);
         self.follow_link(&url);

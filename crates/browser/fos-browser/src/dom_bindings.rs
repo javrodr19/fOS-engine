@@ -77,6 +77,14 @@ pub struct DomHost {
     /// Request id -> index in `vm.host_roots` of its completion callback
     fetch_callbacks: HashMap<u32, usize>,
     next_fetch_id: u32,
+    /// The page's current layout and where the viewport is
+    layout: Option<Arc<crate::renderer::PageLayout>>,
+    viewport: (f32, f32),
+    scroll: (f32, f32),
+    /// Element boxes from `layout` (built on the first query after a layout)
+    boxes: Option<HashMap<u32, [f32; 4]>>,
+    /// A scroll position a script asked for
+    pub scroll_request: Option<f32>,
 }
 
 impl DomHost {
@@ -94,6 +102,11 @@ impl DomHost {
             fetch: FetchPool::new(),
             fetch_callbacks: HashMap::new(),
             next_fetch_id: 1,
+            layout: None,
+            viewport: (1024.0, 768.0),
+            scroll: (0.0, 0.0),
+            boxes: None,
+            scroll_request: None,
         }
     }
 }
@@ -1246,6 +1259,92 @@ fn encode_text(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResu
     Ok(new_array_buffer(vm, s.into_bytes()))
 }
 
+// ---- geometry ----
+
+/// Tell the page about a new layout, the viewport size and its scroll
+/// position
+pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>, viewport: (f32, f32), scroll: (f32, f32)) {
+    let h = host(vm);
+    let same = match (&h.layout, &layout) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        h.layout = layout;
+        h.boxes = None;
+    }
+    h.viewport = viewport;
+    h.scroll = scroll;
+}
+
+/// Boxes of all rendered elements: each laid-out text box is unioned into
+/// its element and the element's ancestors
+fn element_boxes(tree: &DomTree, layout: &crate::renderer::PageLayout) -> HashMap<u32, [f32; 4]> {
+    let mut boxes: HashMap<u32, [f32; 4]> = HashMap::new();
+    for (node, x, y, w, h) in layout.text_boxes() {
+        let (x1, y1) = (x + w, y + h);
+        let mut n = node;
+        while n.is_valid() {
+            match boxes.get_mut(&n.0) {
+                Some(b) => {
+                    if b[0] <= x && b[1] <= y && b[0] + b[2] >= x1 && b[1] + b[3] >= y1 {
+                        // Ancestors' boxes contain this one, so they
+                        // contain the text box too
+                        break;
+                    }
+                    let (nx, ny) = (b[0].min(x), b[1].min(y));
+                    let (nx1, ny1) = ((b[0] + b[2]).max(x1), (b[1] + b[3]).max(y1));
+                    *b = [nx, ny, nx1 - nx, ny1 - ny];
+                }
+                None => {
+                    boxes.insert(n.0, [x, y, w, h]);
+                }
+            }
+            n = tree.get(n).map_or(NodeId::NONE, |p| p.parent);
+        }
+    }
+    boxes
+}
+
+/// `__fosGeometry(node)`: `[x, y, width, height]` in document coordinates,
+/// or null when the element is not rendered
+fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    if host(vm).layout.is_none() {
+        return Ok(Value::NULL);
+    }
+    if host(vm).boxes.is_none() {
+        let layout = host(vm).layout.clone().unwrap();
+        let boxes = with_tree(vm, |t| element_boxes(t, &layout));
+        host(vm).boxes = Some(boxes);
+    }
+    let Some(b) = host(vm).boxes.as_ref().unwrap().get(&id.0).copied() else { return Ok(Value::NULL) };
+    let vals: Vec<Value> = b.iter().map(|&v| Value::number(v as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+/// `__fosViewport()`: `[width, height, scrollX, scrollY, documentHeight]`
+fn viewport(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let h = host(vm);
+    let doc_height = h.layout.as_ref().map_or(h.viewport.1, |l| l.content_height().max(h.viewport.1));
+    let v = [h.viewport.0, h.viewport.1, h.scroll.0, h.scroll.1, doc_height];
+    let vals: Vec<Value> = v.iter().map(|&x| Value::number(x as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+/// `__fosScrollTo(y)`: ask the browser to scroll the page
+fn scroll_to(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let y = vm.to_number(arg(args, 0))?;
+    if y.is_finite() {
+        let h = host(vm);
+        let y = y.max(0.0) as f32;
+        h.scroll_request = Some(y);
+        h.scroll.1 = y;
+    }
+    Ok(Value::UNDEFINED)
+}
+
 // ---- installation ----
 
 fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
@@ -1413,6 +1512,9 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
         ("atob", 1, atob),
         ("__fosResolveURL", 2, resolve_url),
         ("__fosFetch", 8, fetch_start),
+        ("__fosGeometry", 1, geometry),
+        ("__fosViewport", 0, viewport),
+        ("__fosScrollTo", 1, scroll_to),
         ("__fosDecode", 2, decode_text),
         ("__fosEncode", 1, encode_text),
     ]);

@@ -283,16 +283,45 @@
       return el;
     },
     insertAdjacentText(where, text) { this.insertAdjacentElement(where, document.createTextNode(text)); },
+    // Geometry from the browser's layout: [x, y, width, height] in
+    // document coordinates, or null when the element is not rendered
     getBoundingClientRect() {
-      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON() { return this; } };
+      const g = __fosGeometry(this);
+      const v = __fosViewport();
+      return g ? domRect(g[0] - v[2], g[1] - v[3], g[2], g[3]) : domRect(0, 0, 0, 0);
     },
-    getClientRects() { return []; },
-    get offsetWidth() { return 0; }, get offsetHeight() { return 0; },
-    get offsetTop() { return 0; }, get offsetLeft() { return 0; }, get offsetParent() { return this.parentElement; },
-    get clientWidth() { return 0; }, get clientHeight() { return 0; },
-    get scrollWidth() { return 0; }, get scrollHeight() { return 0; },
-    scrollTop: 0, scrollLeft: 0,
-    scrollIntoView() {}, scrollTo() {}, scrollBy() {},
+    getClientRects() { return __fosGeometry(this) ? [this.getBoundingClientRect()] : []; },
+    get offsetWidth() { const g = __fosGeometry(this); return g ? Math.round(g[2]) : 0; },
+    get offsetHeight() { const g = __fosGeometry(this); return g ? Math.round(g[3]) : 0; },
+    get offsetTop() { const g = __fosGeometry(this); return g ? Math.round(g[1]) : 0; },
+    get offsetLeft() { const g = __fosGeometry(this); return g ? Math.round(g[0]) : 0; },
+    get offsetParent() {
+      if (this.localName === 'body' || this.localName === 'html' || !__fosGeometry(this)) return null;
+      return document.body;
+    },
+    get clientWidth() {
+      if (this === document.documentElement) return __fosViewport()[0];
+      const g = __fosGeometry(this); return g ? Math.round(g[2]) : 0;
+    },
+    get clientHeight() {
+      if (this === document.documentElement) return __fosViewport()[1];
+      const g = __fosGeometry(this); return g ? Math.round(g[3]) : 0;
+    },
+    get clientTop() { return 0; }, get clientLeft() { return 0; },
+    get scrollWidth() {
+      if (this === document.documentElement || this === document.body) return __fosViewport()[0];
+      return this.clientWidth;
+    },
+    get scrollHeight() {
+      if (this === document.documentElement || this === document.body) return Math.round(__fosViewport()[4]);
+      return this.clientHeight;
+    },
+    get scrollTop() { return this === document.documentElement || this === document.body ? __fosViewport()[3] : 0; },
+    set scrollTop(v) { if (this === document.documentElement || this === document.body) __fosScrollTo(+v || 0); },
+    get scrollLeft() { return 0; },
+    set scrollLeft(v) {},
+    scrollIntoView() { const g = __fosGeometry(this); if (g) __fosScrollTo(g[1]); },
+    scrollTo() {}, scrollBy() {},
     focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus')); },
     blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur')); },
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); },
@@ -300,6 +329,13 @@
     animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; },
   });
   let activeElement = null;
+  function domRect(x, y, width, height) {
+    return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height,
+      toJSON() { return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height }; } };
+  }
+  global.DOMRect = class DOMRect {
+    constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, domRect(x, y, width, height)); }
+  };
 
   // classList
   const tokenLists = new WeakMap();
@@ -1253,8 +1289,12 @@
   define(global, {
     self: global, top: global, parent: global, frames: global, opener: null, closed: false,
     frameElement: null, length: 0, name: '', origin: '', isSecureContext: true,
-    innerWidth: 1024, innerHeight: 768, outerWidth: 1024, outerHeight: 768, devicePixelRatio: 1,
-    scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0, screenX: 0, screenY: 0,
+    get innerWidth() { return __fosViewport()[0]; }, get innerHeight() { return __fosViewport()[1]; },
+    get outerWidth() { return __fosViewport()[0]; }, get outerHeight() { return __fosViewport()[1]; },
+    devicePixelRatio: 1,
+    get scrollX() { return __fosViewport()[2]; }, get scrollY() { return __fosViewport()[3]; },
+    get pageXOffset() { return __fosViewport()[2]; }, get pageYOffset() { return __fosViewport()[3]; },
+    screenX: 0, screenY: 0,
     screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080, colorDepth: 24, pixelDepth: 24 },
     navigator: {
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) fOS/0.1 (KHTML, like Gecko)',
@@ -1297,7 +1337,10 @@
     matchMedia,
     getComputedStyle(el) { return el.style; },
     getSelection() { return { rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }; },
-    scrollTo() {}, scrollBy() {}, scroll() {}, focus() {}, blur() {}, print() {}, stop() {},
+    scrollTo(x, y) { __fosScrollTo(typeof x === 'object' && x ? (+x.top || 0) : (+y || 0)); },
+    scroll(x, y) { global.scrollTo(x, y); },
+    scrollBy(x, y) { __fosScrollTo(__fosViewport()[3] + (typeof x === 'object' && x ? (+x.top || 0) : (+y || 0))); },
+    focus() {}, blur() {}, print() {}, stop() {},
     alert(msg) { console.info('[alert]', msg); },
     confirm(msg) { console.info('[confirm]', msg); return false; },
     prompt(msg) { console.info('[prompt]', msg); return null; },

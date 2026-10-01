@@ -148,7 +148,7 @@ impl Page {
 
     /// Run the page's inline scripts (external ones are not fetched)
     pub fn execute_scripts(&mut self) -> Result<(), String> {
-        self.execute_scripts_with(&mut |_| None)
+        self.execute_scripts_with(&mut |_: &str| None)
     }
 
     /// Run JavaScript timers that are due (call periodically)
@@ -161,7 +161,7 @@ impl Page {
 
     /// Run JavaScript timers that are due
     pub fn process_timers(&mut self) -> Result<(), String> {
-        self.process_timers_with(&mut |_| None)
+        self.process_timers_with(&mut |_: &str| None)
     }
 
     /// Deliver finished network requests to the page's scripts; whether

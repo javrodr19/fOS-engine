@@ -11,7 +11,7 @@
 //! marked `nomodule` (fallbacks for browsers without modules) never run.
 //! `import()` calls are answered between tasks, with the same fetcher.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use fos_devtools::{Console, ConsoleMessage};
@@ -23,8 +23,25 @@ use crate::dom_bindings::{self, ConsoleLevel};
 /// Errors are reported as their message
 pub type JsError = String;
 
-/// Fetches the source of an external script (`None`: failed)
-pub type ScriptFetcher<'a> = dyn FnMut(&str) -> Option<String> + 'a;
+/// Where a page's external scripts and modules come from
+pub trait ScriptSource {
+    /// The source of the script at `url` (`None`: it failed)
+    fn fetch(&mut self, url: &str) -> Option<String>;
+
+    /// Several sources at once, in parallel where the source can
+    fn fetch_many(&mut self, urls: &[String]) -> Vec<Option<String>> {
+        urls.iter().map(|u| self.fetch(u)).collect()
+    }
+}
+
+impl<F: FnMut(&str) -> Option<String>> ScriptSource for F {
+    fn fetch(&mut self, url: &str) -> Option<String> {
+        self(url)
+    }
+}
+
+/// Fetches the sources of external scripts
+pub type ScriptFetcher<'a> = dyn ScriptSource + 'a;
 
 /// Script to execute
 #[derive(Debug, Clone)]
@@ -78,6 +95,8 @@ pub struct PageJsRuntime {
     modules_waiting: Vec<Script>,
     /// Module graphs still running (top-level await), checked for errors
     modules_running: Vec<fos_jsvm::ModuleId>,
+    /// Sources fetched ahead of their scripts, all at once (`None`: failed)
+    prefetched: HashMap<String, Option<String>>,
     /// The browser's cookies, which the page's scripts and requests use
     cookies: fos_net::SharedCookieJar,
 }
@@ -100,6 +119,7 @@ impl PageJsRuntime {
             import_map: Default::default(),
             modules_waiting: Vec::new(),
             modules_running: Vec::new(),
+            prefetched: HashMap::new(),
             cookies: fos_net::CookieJar::shared(),
         }
     }
@@ -174,6 +194,7 @@ impl PageJsRuntime {
                 }
                 continue;
             }
+            self.prefetch_pending(fetch);
             let scripts = std::mem::take(&mut self.pending_scripts);
             for mut script in scripts {
                 self.started.insert(script.node.0);
@@ -192,7 +213,7 @@ impl PageJsRuntime {
                     ScriptType::Classic => {}
                 }
                 if let Some(url) = script.source_url.clone() {
-                    match fetch(&url) {
+                    match self.take_source(&url, fetch) {
                         Some(src) => script.source = src,
                         None => {
                             self.console_error(&format!("Failed to load script {url}"));
@@ -219,7 +240,7 @@ impl PageJsRuntime {
 
     /// Run inline scripts only (external ones cannot be fetched here)
     pub fn execute_inline_scripts(&mut self) -> Result<(), JsError> {
-        self.execute_scripts(&mut |_| None)
+        self.execute_scripts(&mut |_: &str| None)
     }
 
     /// Execute an external script (after fetching its source)
@@ -255,6 +276,35 @@ impl PageJsRuntime {
         self.after_task();
     }
 
+    /// Fetch the sources of the pending external scripts in one batch (a
+    /// preload pass: the fetcher can request them in parallel), so each
+    /// script then runs without waiting for its own round trip
+    fn prefetch_pending(&mut self, fetch: &mut ScriptFetcher<'_>) {
+        let mut urls: Vec<String> = Vec::new();
+        for s in &self.pending_scripts {
+            if let Some(u) = &s.source_url {
+                if !self.prefetched.contains_key(u) && !urls.contains(u) {
+                    urls.push(u.clone());
+                }
+            }
+        }
+        if urls.len() < 2 {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let sources = fetch.fetch_many(&urls);
+        log::debug!("Prefetched {} scripts in {:?}", urls.len(), start.elapsed());
+        self.prefetched.extend(urls.into_iter().zip(sources));
+    }
+
+    /// The source of the script at `url`: prefetched, or fetched now
+    fn take_source(&mut self, url: &str, fetch: &mut ScriptFetcher<'_>) -> Option<String> {
+        match self.prefetched.remove(url) {
+            Some(source) => source,
+            None => fetch.fetch(url),
+        }
+    }
+
     /// The document's base URL (`<base href>`, else the page URL)
     fn document_base(&self) -> String {
         let Some(doc) = self.document.as_ref() else { return self.page_url.clone() };
@@ -272,7 +322,7 @@ impl PageJsRuntime {
         let start = std::time::Instant::now();
         // An inline module's imports resolve against the document
         let (url, source) = match &script.source_url {
-            Some(url) => match fetch(url) {
+            Some(url) => match self.take_source(url, fetch) {
                 Some(src) => (url.clone(), Some(src)),
                 None => {
                     self.console_error(&format!("Failed to load module script {url}"));
@@ -294,7 +344,7 @@ impl PageJsRuntime {
         };
         let mut resolve = |spec: &str, referrer: &str| map.resolve(spec, referrer);
         let mut fetch_all = |urls: &[String]| -> Vec<Result<String, String>> {
-            urls.iter().map(|u| fetch(u).ok_or_else(|| "network error".to_string())).collect()
+            fetch.fetch_many(urls).into_iter().map(|r| r.ok_or_else(|| "network error".to_string())).collect()
         };
         let loaded = compiled.and_then(|id| vm.load_module_graph(id, &mut resolve, &mut fetch_all).map(|()| id));
         let id = match loaded.and_then(|id| vm.run_module(id).map(|_| id)) {
@@ -336,14 +386,14 @@ impl PageJsRuntime {
                     Err(e) => Err(vm.type_error(&e)),
                     Ok(url) => match vm.find_module(&url, false) {
                         Some(id) => Ok(id),
-                        None => match fetch(&url) {
+                        None => match fetch.fetch(&url) {
                             Some(src) => vm.compile_module(&url, &src, true),
                             None => Err(vm.type_error(&format!("Failed to fetch dynamically imported module: {url}"))),
                         },
                     },
                 };
                 let mut fetch_all = |urls: &[String]| -> Vec<Result<String, String>> {
-                    urls.iter().map(|u| fetch(u).ok_or_else(|| "network error".to_string())).collect()
+                    fetch.fetch_many(urls).into_iter().map(|r| r.ok_or_else(|| "network error".to_string())).collect()
                 };
                 let result = result.and_then(|id| vm.load_module_graph(id, &mut resolve, &mut fetch_all).map(|()| id));
                 vm.finish_dynamic_import(call.ticket, result);
@@ -679,14 +729,14 @@ mod tests {
             </body></html>"#,
         );
         let mut fetched = Vec::new();
-        rt.execute_scripts(&mut |url| {
+        rt.execute_scripts(&mut |url: &str| {
             fetched.push(url.to_string());
             files.get(url).map(|s| s.to_string())
         })
         .unwrap();
         // The top-level await finishes in later turns
         for _ in 0..5 {
-            rt.process_timers(&mut |url| files.get(url).map(|s| s.to_string())).unwrap();
+            rt.process_timers(&mut |url: &str| files.get(url).map(|s| s.to_string())).unwrap();
         }
         // Classic scripts first, then modules in order; modules start before
         // DOMContentLoaded (main.js's `await import()` loads at once here,
@@ -704,6 +754,41 @@ mod tests {
     }
 
     #[test]
+    fn external_scripts_are_fetched_in_one_batch() {
+        struct Counting {
+            single: Vec<String>,
+            batches: Vec<Vec<String>>,
+        }
+        impl ScriptSource for Counting {
+            fn fetch(&mut self, url: &str) -> Option<String> {
+                self.single.push(url.to_string());
+                Some(format!("log.push('{url}')"))
+            }
+            fn fetch_many(&mut self, urls: &[String]) -> Vec<Option<String>> {
+                self.batches.push(urls.to_vec());
+                urls.iter().map(|u| (!u.ends_with("missing.js")).then(|| format!("log.push('{}')", u.rsplit('/').next().unwrap()))).collect()
+            }
+        }
+        let (mut rt, _doc) = page(
+            r#"<html><body><script>window.log = []</script>
+            <script src="a.js"></script><script src="missing.js" onerror="log.push('error')"></script>
+            <script>log.push('inline')</script><script src="b.js"></script><script src="a.js"></script>
+            </body></html>"#,
+        );
+        let mut source = Counting { single: Vec::new(), batches: Vec::new() };
+        rt.execute_scripts(&mut source).unwrap();
+        // One parallel batch, in document order, without duplicates; the
+        // second a.js is fetched again when its turn comes
+        assert_eq!(source.batches.len(), 1);
+        assert_eq!(
+            source.batches[0],
+            ["https://example.com/dir/a.js", "https://example.com/dir/missing.js", "https://example.com/dir/b.js"]
+        );
+        assert_eq!(source.single, ["https://example.com/dir/a.js"]);
+        assert_eq!(rt.eval("log.join()").unwrap(), "a.js,error,inline,b.js,https://example.com/dir/a.js");
+    }
+
+    #[test]
     fn dynamic_import_in_classic_scripts() {
         let (mut rt, _doc) = page(
             r#"<html><body><script>
@@ -712,7 +797,7 @@ mod tests {
             </script></body></html>"#,
         );
         let fetch = |url: &str| (url == "https://example.com/dir/m.js").then(|| "export default 'loaded relative to the page'".to_string());
-        rt.execute_scripts(&mut |u| fetch(u)).unwrap();
+        rt.execute_scripts(&mut |u: &str| fetch(u)).unwrap();
         assert_eq!(rt.eval("out").unwrap(), "loaded relative to the page");
     }
 
@@ -745,7 +830,7 @@ mod tests {
               document.querySelector('b').dataset.n++;
             </script></body></html>"#,
         );
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         let html = body_html(&doc);
         assert!(html.contains(r#"<p id="a" class="x y" style="color: red;">changed</p>"#), "{html}");
         assert!(html.contains("<ul><li>one</li><li>two</li></ul>"), "{html}");
@@ -794,7 +879,7 @@ mod tests {
               window.addEventListener('load', () => log.push('load'));
             </script></body></html>"#,
         );
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         let link = doc.lock().unwrap().get_element_by_id("link").unwrap();
         assert_eq!(rt.click(link).as_deref(), Some("https://example.com/next"));
         assert_eq!(rt.eval("log.join()").unwrap(), "ready,load,capture,outer:link");
@@ -811,7 +896,7 @@ mod tests {
             <script>document.write('<p id=w>written</p>')</script></body></html>"#,
         );
         let mut fetched = Vec::new();
-        rt.execute_scripts(&mut |url| {
+        rt.execute_scripts(&mut |url: &str| {
             fetched.push(url.to_string());
             Some(if url.ends_with("lib.js") { "order.push('b')".into() } else { "order.push('late')".into() })
         })
@@ -831,14 +916,14 @@ mod tests {
               Promise.resolve().then(() => { window.micro = true; });
             </script></body></html>"#,
         );
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         assert_eq!(rt.eval("window.micro").unwrap(), "true");
         for _ in 0..10 {
             if !rt.has_pending_timers() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
-            rt.process_timers(&mut |_| None).unwrap();
+            rt.process_timers(&mut |_: &str| None).unwrap();
         }
         assert!(!rt.has_pending_timers());
         assert_eq!(rt.eval("args").unwrap(), "3");
@@ -941,7 +1026,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while rt.has_pending_network() && std::time::Instant::now() < deadline {
             rt.wait_for_network(std::time::Duration::from_millis(100));
-            rt.process_network(&mut |_| None).unwrap();
+            rt.process_network(&mut |_: &str| None).unwrap();
         }
         assert!(!rt.has_pending_network(), "requests still pending");
     }
@@ -950,7 +1035,7 @@ mod tests {
         let doc = Arc::new(Mutex::new(fos_html::parse_with_url("<html><body></body></html>", url)));
         let mut rt = PageJsRuntime::new(url);
         rt.initialize(doc.clone()).unwrap();
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         rt
     }
 
@@ -999,7 +1084,7 @@ mod tests {
         let mut rt = PageJsRuntime::new(&url);
         rt.set_cookie_jar(jar.clone());
         rt.initialize(doc).unwrap();
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         rt.eval(
             r#"window.out = {};
             out.before = document.cookie;
@@ -1158,7 +1243,7 @@ mod tests {
             r#"<html><body><p id=a>first paragraph</p><p id=b>second <span id=s>inner</span> text</p>
             <div id=h style="display: none">hidden</div><div id=e></div></body></html>"#,
         );
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         let mut renderer = crate::renderer::PageRenderer::new(800, 600);
         renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
         rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
@@ -1190,7 +1275,7 @@ mod tests {
     #[test]
     fn errors_do_not_stop_later_scripts() {
         let (mut rt, _doc) = page("<html><body><script>undefinedFn()</script><script>window.ok = 1</script></body></html>");
-        rt.execute_scripts(&mut |_| None).unwrap();
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
         assert_eq!(rt.eval("ok").unwrap(), "1");
         let msgs = rt.console_messages();
         assert!(msgs.iter().any(|m| format!("{m:?}").contains("undefinedFn")), "{msgs:?}");

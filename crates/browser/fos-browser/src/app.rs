@@ -317,7 +317,7 @@ impl BrowserApp {
         }
         let network = &mut self.network;
         let page_url = page.url.clone();
-        if let Err(e) = page.execute_scripts_with(&mut |url| fetch_script(network, &page_url, url)) {
+        if let Err(e) = page.execute_scripts_with(&mut PageFetcher { network, page_url: &page_url }) {
             log::warn!("Failed to execute scripts: {}", e);
             self.devtools.error(&format!("Script error: {}", e));
         }
@@ -457,7 +457,7 @@ impl BrowserApp {
         self.last_timer_check = Instant::now();
         let network = &mut self.network;
         let page_url = page.url.clone();
-        if let Err(e) = page.process_timers_with(&mut |url| fetch_script(network, &page_url, url)) {
+        if let Err(e) = page.process_timers_with(&mut PageFetcher { network, page_url: &page_url }) {
             log::warn!("Timer processing error: {}", e);
         }
         // Timer callbacks may have changed the DOM or navigated
@@ -473,7 +473,7 @@ impl BrowserApp {
         }
         let network = &mut self.network;
         let page_url = page.url.clone();
-        match page.process_network_with(&mut |url| fetch_script(network, &page_url, url)) {
+        match page.process_network_with(&mut PageFetcher { network, page_url: &page_url }) {
             Ok(true) => {
                 // Callbacks may have changed the DOM or navigated
                 self.refresh_if_dom_changed();
@@ -920,20 +920,57 @@ impl BrowserApp {
     }
 }
 
-/// Fetch the source of an external script of the page at `page_url`
-fn fetch_script(network: &mut NetworkManager, page_url: &str, url: &str) -> Option<String> {
-    if Loader::is_local_url(url) {
-        let path = crate::loader::file_url_to_path(url)?;
-        let bytes = std::fs::read(path).ok()?;
-        return Some(crate::charset::decode_html(bytes, Some("text/javascript")));
-    }
-    match network.fetch(url, Some(page_url)) {
-        Ok(result) => Some(crate::charset::decode_html(result.body, Some(&result.content_type))),
-        Err(e) => {
-            log::warn!("Failed to fetch script {}: {}", url, e);
-            None
+/// Fetches the scripts and modules of the page at `page_url` through the
+/// browser's network stack (HTTP cache, cookies, parallel connections)
+struct PageFetcher<'a> {
+    network: &'a mut NetworkManager,
+    page_url: &'a str,
+}
+
+impl crate::js_runtime::ScriptSource for PageFetcher<'_> {
+    fn fetch(&mut self, url: &str) -> Option<String> {
+        if Loader::is_local_url(url) {
+            return fetch_local_script(self.page_url, url);
+        }
+        match self.network.fetch(url, Some(self.page_url)) {
+            Ok(result) => Some(crate::charset::decode_html(result.body, Some(&result.content_type))),
+            Err(e) => {
+                log::warn!("Failed to fetch script {}: {}", url, e);
+                None
+            }
         }
     }
+
+    fn fetch_many(&mut self, urls: &[String]) -> Vec<Option<String>> {
+        let mut out = vec![None; urls.len()];
+        let mut remote = Vec::new();
+        for (i, url) in urls.iter().enumerate() {
+            if Loader::is_local_url(url) {
+                out[i] = fetch_local_script(self.page_url, url);
+            } else {
+                remote.push(i);
+            }
+        }
+        let remote_urls: Vec<String> = remote.iter().map(|&i| urls[i].clone()).collect();
+        for (&i, result) in remote.iter().zip(self.network.fetch_many(&remote_urls, Some(self.page_url))) {
+            match result {
+                Ok(r) => out[i] = Some(crate::charset::decode_html(r.body, Some(&r.content_type))),
+                Err(e) => log::warn!("Failed to fetch script {}: {}", urls[i], e),
+            }
+        }
+        out
+    }
+}
+
+/// A script from a local file: only local pages may load them
+fn fetch_local_script(page_url: &str, url: &str) -> Option<String> {
+    if !Loader::is_local_url(page_url) {
+        log::warn!("Not allowed to load local resource {url} from {page_url}");
+        return None;
+    }
+    let path = crate::loader::file_url_to_path(url)?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(crate::charset::decode_html(bytes, Some("text/javascript")))
 }
 
 /// Decode `%XX` escapes (javascript: URLs)
@@ -1092,5 +1129,17 @@ mod tests {
     #[test]
     fn test_escape_html() {
         assert_eq!(escape_html("<script>&\""), "&lt;script&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn only_local_pages_load_local_scripts() {
+        let dir = std::env::temp_dir().join(format!("fos-local-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.json");
+        std::fs::write(&file, r#"{"secret": 1}"#).unwrap();
+        let url = format!("file://{}", file.display());
+        assert_eq!(fetch_local_script(&format!("file://{}/page.html", dir.display()), &url).as_deref(), Some(r#"{"secret": 1}"#));
+        assert_eq!(fetch_local_script("https://evil.example/", &url), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

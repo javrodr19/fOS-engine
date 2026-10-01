@@ -20,6 +20,9 @@ use crate::charset;
 /// servers expect from browsers; some reject clients without it.
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; fOS-Browser/0.1; +https://github.com/fosproject)";
 
+/// Most subresource requests `fetch_many` runs at once
+const MAX_PARALLEL_FETCHES: usize = 6;
+
 /// Accept header for document navigations
 const ACCEPT_DOCUMENT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
@@ -277,22 +280,31 @@ impl NetworkManager {
                     .map_err(|e| NetworkError::RequestFailed(e.to_string())),
             );
         } else if !pending.is_empty() {
+            // A few connections at a time (as browsers limit them per
+            // host); each worker reuses its connection for the next URL
             let cookies = &self.cookies;
+            let workers = pending.len().min(MAX_PARALLEL_FETCHES);
+            let queue = std::sync::Mutex::new(pending.into_iter().collect::<std::collections::VecDeque<_>>());
             let responses: Vec<(usize, String, Result<fos_net::Response, String>)> = std::thread::scope(|scope| {
-                let handles: Vec<_> = pending
-                    .into_iter()
-                    .map(|(i, url)| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let queue = &queue;
                         scope.spawn(move || {
-                            let context = CookieContext::subresource(page_url, "GET");
-                            let headers = request_headers(page_url, &url);
-                            let result = Self::new_client(cookies)
-                                .request_in("GET", &url, Some(headers), None, &context)
-                                .map_err(|e| e.to_string());
-                            (i, url, result)
+                            let mut client = Self::new_client(cookies);
+                            let mut done = Vec::new();
+                            loop {
+                                let next = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+                                let Some((i, url)) = next else { break };
+                                let context = CookieContext::subresource(page_url, "GET");
+                                let headers = request_headers(page_url, &url);
+                                let result = client.request_in("GET", &url, Some(headers), None, &context).map_err(|e| e.to_string());
+                                done.push((i, url, result));
+                            }
+                            done
                         })
                     })
                     .collect();
-                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
             });
             for (i, url, result) in responses {
                 out[i] = Some(match result {

@@ -57,6 +57,12 @@ impl Browser {
         event_loop.set_control_flow(ControlFlow::Wait);
 
         let mut app = BrowserApp::new(self.initial_url.clone());
+        // Page scripts' network requests finish on other threads; each
+        // completion wakes the loop, so none waits for the next input event
+        let proxy = Mutex::new(event_loop.create_proxy());
+        app.network_waker = Some(Arc::new(move || {
+            let _ = proxy.lock().unwrap_or_else(|p| p.into_inner()).send_event(());
+        }));
         event_loop.run_app(&mut app)?;
 
         Ok(())
@@ -105,6 +111,8 @@ struct BrowserApp {
     current_page: Option<Page>,
     /// Last timer check time
     last_timer_check: Instant,
+    /// Wakes the event loop when a page script's network request finishes
+    network_waker: Option<crate::script_fetch::Waker>,
     /// Developer tools
     devtools: DevTools,
     /// Accessibility manager
@@ -145,6 +153,7 @@ impl BrowserApp {
             network: NetworkManager::new(),
             current_page: None,
             last_timer_check: Instant::now(),
+            network_waker: None,
             devtools: DevTools::new(),
             a11y: AccessibilityManager::new(),
             media: MediaManager::new(),
@@ -261,7 +270,11 @@ impl BrowserApp {
 
     /// Make `page` the displayed page and render it.
     /// If reset_scroll is false, keeps the current scroll position.
-    fn show_page(&mut self, page: Page, reset_scroll: bool) {
+    fn show_page(&mut self, mut page: Page, reset_scroll: bool) {
+        // Stylesheets block the first render, as in other browsers:
+        // painting without them would show the page unstyled first
+        page.stylesheets = self.load_stylesheets(&page);
+        self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
         self.current_page = Some(page);
@@ -278,6 +291,11 @@ impl BrowserApp {
         }
     }
 
+    /// Fetch the page's external stylesheets
+    fn load_stylesheets(&mut self, page: &Page) -> crate::css_loader::Stylesheets {
+        crate::css_loader::load_for_page(&mut self.network, page)
+    }
+
     /// Run the current page's scripts, then update everything derived from
     /// its DOM, which the scripts may have changed
     fn run_page_scripts(&mut self) {
@@ -286,6 +304,9 @@ impl BrowserApp {
         if let Err(e) = page.initialize_javascript() {
             log::warn!("Failed to initialize JavaScript: {}", e);
             self.devtools.warn(&format!("JS init failed: {}", e));
+        }
+        if let Some(waker) = self.network_waker.clone() {
+            page.set_network_waker(waker);
         }
         let network = &mut self.network;
         let page_url = page.url.clone();
@@ -433,6 +454,25 @@ impl BrowserApp {
         // Timer callbacks may have changed the DOM or navigated
         self.refresh_if_dom_changed();
         self.follow_script_navigation();
+    }
+
+    /// Hand the page's finished network requests to its scripts
+    fn process_js_network(&mut self) {
+        let Some(page) = self.current_page.as_mut() else { return };
+        if !page.has_pending_network() {
+            return;
+        }
+        let network = &mut self.network;
+        let page_url = page.url.clone();
+        match page.process_network_with(&mut |url| fetch_script(network, &page_url, url)) {
+            Ok(true) => {
+                // Callbacks may have changed the DOM or navigated
+                self.refresh_if_dom_changed();
+                self.follow_script_navigation();
+            }
+            Ok(false) => {}
+            Err(e) => log::warn!("Network callback error: {}", e),
+        }
     }
 
     /// Go where the page's scripts asked to (`location.href = ...`)
@@ -998,7 +1038,8 @@ impl ApplicationHandler for BrowserApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Process JavaScript timers during idle time
+        // Deliver finished network requests, then run due timers
+        self.process_js_network();
         self.process_js_timers();
 
         // Wake up for the next timer tick only while timers are pending;

@@ -54,19 +54,28 @@ fn main() {
     let deadline = Instant::now() + run_for;
     let mut ticks = 0;
     while Instant::now() < deadline {
-        match page.next_timer_due() {
-            Some(due) => {
-                let now = Instant::now();
-                if due > now {
-                    std::thread::sleep((due - now).min(deadline - now));
-                }
-                page.process_timers_with(&mut fetch).expect("timers");
-                ticks += 1;
-            }
-            None => break,
+        let now = Instant::now();
+        let timer = page.next_timer_due();
+        let network = page.has_pending_network();
+        if timer.is_none() && !network {
+            break;
         }
+        // Sleep until the next timer, waking early for network completions
+        let until = timer.unwrap_or(deadline).min(deadline);
+        if network {
+            if let Some(rt) = page.js_runtime.as_mut() {
+                rt.wait_for_network(until.saturating_duration_since(now));
+            }
+            page.process_network_with(&mut fetch).expect("network");
+        } else if until > now {
+            std::thread::sleep(until - now);
+        }
+        if page.next_timer_due().is_some_and(|d| d <= Instant::now()) {
+            page.process_timers_with(&mut fetch).expect("timers");
+        }
+        ticks += 1;
     }
-    println!("{ticks} timer rounds; timers still pending: {}", page.has_pending_timers());
+    println!("{ticks} event rounds; timers pending: {}, requests pending: {}", page.has_pending_timers(), page.has_pending_network());
     drop(fetch);
     for f in &fetched {
         println!("  fetched {f}");

@@ -133,6 +133,12 @@ realm! {
     weakmap_proto, weakset_proto, date_proto, regexp_proto, promise_proto,
     /// %GeneratorPrototype%
     generator_proto,
+    /// %AsyncIteratorPrototype%
+    async_iterator_proto,
+    /// %AsyncGeneratorPrototype%
+    async_generator_proto,
+    /// %AsyncFromSyncIteratorPrototype%
+    async_from_sync_iterator_proto,
     /// %GeneratorPrototype%.next (recognized to step generators natively)
     generator_next,
     /// Internal exception value that unwinds a generator for `return()`
@@ -232,6 +238,7 @@ impl Vm {
         let function_proto = mk(object_proto, native(noop));
         let error_proto = mk(object_proto, ObjectKind::Ordinary);
         let iterator_proto = mk(object_proto, ObjectKind::Ordinary);
+        let async_iterator_proto = mk(object_proto, ObjectKind::Ordinary);
         let realm = Realm {
             object_proto,
             function_proto,
@@ -260,6 +267,9 @@ impl Vm {
             regexp_proto: mk(object_proto, ObjectKind::Ordinary),
             promise_proto: mk(object_proto, ObjectKind::Ordinary),
             generator_proto: mk(iterator_proto, ObjectKind::Ordinary),
+            async_iterator_proto,
+            async_generator_proto: mk(async_iterator_proto, ObjectKind::Ordinary),
+            async_from_sync_iterator_proto: mk(async_iterator_proto, ObjectKind::Ordinary),
             generator_next: mk(function_proto, native(noop)),
             generator_return: mk(object_proto, ObjectKind::Ordinary),
             array_values: mk(function_proto, native(noop)),

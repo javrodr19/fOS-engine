@@ -124,61 +124,70 @@ impl NetworkManager {
         page_url: Option<&str>,
         accept: Option<&str>,
     ) -> Result<FetchResult, NetworkError> {
-        // Check cache first
-        if let Some(entry) = self.cache.get(url) {
-            log::debug!("Cache hit for {}", url);
-            return Ok(FetchResult {
-                body: entry.body.clone(),
-                content_type: entry.content_type.clone(),
-                from_cache: true,
-                status: 200,
-                url: url.to_string(),
-            });
+        if let Some(hit) = self.cached(url) {
+            return Ok(hit);
         }
-
-        // Check mixed content if we have a page context
-        if let Some(page) = page_url {
-            let page_secure = SecureContext::is_potentially_trustworthy(page);
-            if page_secure {
-                let content_type = MixedContentChecker::get_content_type("fetch");
-                let result = self.mixed_content.should_block(page, url, content_type);
-
-                match result {
-                    MixedContentResult::Block => {
-                        log::warn!("Mixed content blocked: {}", url);
-                        return Err(NetworkError::MixedContentBlocked(url.to_string()));
-                    }
-                    MixedContentResult::Upgrade => {
-                        // Upgrade to HTTPS
-                        if let Some(upgraded) = url.strip_prefix("http://") {
-                            let new_url = format!("https://{}", upgraded);
-                            log::info!("Upgraded to HTTPS: {}", new_url);
-                            return self.fetch_any_status(&new_url, page_url, accept);
-                        }
-                    }
-                    MixedContentResult::Warn => {
-                        log::warn!("Mixed content warning: {}", url);
-                        // Continue with fetch but warn
-                    }
-                    MixedContentResult::Allow => {}
-                }
-            }
-        }
-
-        // Prefetch DNS for this host (learns patterns)
-        if let Ok(parsed) = fos_engine::url::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                self.predictive_dns.prefetch(host);
-            }
+        let url = self.admit(url, page_url)?;
+        if let Some(hit) = self.cached(&url) {
+            return Ok(hit);
         }
 
         // Fetch from network
         log::debug!("Fetching from network: {}", url);
-
         let headers = accept.map(|a| vec![("Accept".to_string(), a.to_string())]);
-        let response = self.client.request("GET", url, headers, None)
+        let response = self.client.request("GET", &url, headers, None)
             .map_err(|e| NetworkError::RequestFailed(format!("{}", e)))?;
+        Ok(self.store(&url, response))
+    }
 
+    /// A cached response for `url`
+    fn cached(&mut self, url: &str) -> Option<FetchResult> {
+        let entry = self.cache.get(url)?;
+        log::debug!("Cache hit for {}", url);
+        Some(FetchResult {
+            body: entry.body.clone(),
+            content_type: entry.content_type.clone(),
+            from_cache: true,
+            status: 200,
+            url: url.to_string(),
+        })
+    }
+
+    /// Decide whether the page at `page_url` may load `url`: the URL to
+    /// fetch (possibly upgraded to HTTPS), or why not
+    fn admit(&mut self, url: &str, page_url: Option<&str>) -> Result<String, NetworkError> {
+        let mut url = url.to_string();
+        // Check mixed content if we have a page context
+        if let Some(page) = page_url {
+            if SecureContext::is_potentially_trustworthy(page) {
+                let content_type = MixedContentChecker::get_content_type("fetch");
+                match self.mixed_content.should_block(page, &url, content_type) {
+                    MixedContentResult::Block => {
+                        log::warn!("Mixed content blocked: {}", url);
+                        return Err(NetworkError::MixedContentBlocked(url));
+                    }
+                    MixedContentResult::Upgrade => {
+                        if let Some(upgraded) = url.strip_prefix("http://") {
+                            url = format!("https://{}", upgraded);
+                            log::info!("Upgraded to HTTPS: {}", url);
+                        }
+                    }
+                    MixedContentResult::Warn => log::warn!("Mixed content warning: {}", url),
+                    MixedContentResult::Allow => {}
+                }
+            }
+        }
+        // Prefetch DNS for this host (learns patterns)
+        if let Ok(parsed) = fos_engine::url::Url::parse(&url) {
+            if let Some(host) = parsed.host_str() {
+                self.predictive_dns.prefetch(host);
+            }
+        }
+        Ok(url)
+    }
+
+    /// Turn a response into a result, caching it when allowed
+    fn store(&mut self, url: &str, response: fos_net::Response) -> FetchResult {
         let status = response.status;
         let cache_control = response.header("cache-control").unwrap_or_default().to_ascii_lowercase();
         let etag = response.header("etag").map(str::to_owned);
@@ -200,13 +209,79 @@ impl NetworkManager {
             log::debug!("Cached response for {} ({} bytes, TTL {:?})", url, body.len(), max_age);
         }
 
-        Ok(FetchResult {
+        FetchResult {
             body,
             content_type,
             from_cache: false,
             status,
             url: final_url,
-        })
+        }
+    }
+
+    /// Fetch several subresources of the page at `page_url` (stylesheets)
+    /// at once: cache hits are answered directly, the rest are requested
+    /// in parallel. Non-2xx responses are errors.
+    pub fn fetch_many(&mut self, urls: &[String], page_url: Option<&str>) -> Vec<Result<FetchResult, NetworkError>> {
+        let mut out: Vec<Option<Result<FetchResult, NetworkError>>> = urls.iter().map(|u| self.cached(u).map(Ok)).collect();
+        let mut pending: Vec<(usize, String)> = Vec::new();
+        for (i, url) in urls.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
+            }
+            match self.admit(url, page_url) {
+                Ok(u) => match self.cached(&u) {
+                    Some(hit) => out[i] = Some(Ok(hit)),
+                    None => pending.push((i, u)),
+                },
+                Err(e) => out[i] = Some(Err(e)),
+            }
+        }
+
+        if pending.len() == 1 {
+            // One request: the session client can reuse a connection
+            let (i, url) = pending.pop().unwrap();
+            out[i] = Some(
+                self.client.request("GET", &url, None, None)
+                    .map(|r| self.store(&url, r))
+                    .map_err(|e| NetworkError::RequestFailed(e.to_string())),
+            );
+        } else if !pending.is_empty() {
+            let user_agent = self.user_agent.clone();
+            let responses: Vec<(usize, String, Result<fos_net::Response, String>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = pending
+                    .into_iter()
+                    .map(|(i, url)| {
+                        let user_agent = user_agent.clone();
+                        scope.spawn(move || {
+                            let result = Client::builder()
+                                .user_agent(&user_agent)
+                                .connect_timeout(Duration::from_secs(15))
+                                .timeout(Duration::from_secs(30))
+                                .default_header("Accept-Language", "en-US,en;q=0.9")
+                                .build()
+                                .map_err(|e| e.to_string())
+                                .and_then(|mut c| c.request("GET", &url, None, None).map_err(|e| e.to_string()));
+                            (i, url, result)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            for (i, url, result) in responses {
+                out[i] = Some(match result {
+                    Ok(r) => Ok(self.store(&url, r)),
+                    Err(e) => Err(NetworkError::RequestFailed(e)),
+                });
+            }
+        }
+
+        out.into_iter()
+            .map(|r| match r {
+                Some(Ok(r)) if !(200..300).contains(&r.status) => Err(NetworkError::HttpError(r.status)),
+                Some(r) => r,
+                None => Err(NetworkError::RequestFailed("request did not complete".into())),
+            })
+            .collect()
     }
 
     /// Fetch HTML page (convenience method)

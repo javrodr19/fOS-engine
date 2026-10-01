@@ -33,14 +33,28 @@ impl Vm {
     pub(crate) fn new_gen_state(&mut self, generator: bool) -> JsResult<Gc<JsObject>> {
         let f = self.frames.last().unwrap();
         let (func, new_target) = (f.func, f.new_target);
+        let is_async = unsafe { (&*f.proto).is_async };
         let proto = if generator {
             let p = self.get(Value::object(func), PropertyKey::Atom(atoms::prototype))?;
-            Some(p.as_object().unwrap_or(self.realm.generator_proto))
+            let default = if is_async { self.realm.async_generator_proto } else { self.realm.generator_proto };
+            Some(p.as_object().unwrap_or(default))
         } else {
             None
         };
         let promise = if generator { None } else { Some(self.new_promise()) };
-        let state = GenState { func, regs: Vec::new(), pc: 0, resume_reg: u16::MAX, upvals: Vec::new(), new_target, status: GenStatus::Running, promise, return_value: Value::UNDEFINED };
+        let queue = (generator && is_async).then(Default::default);
+        let state = GenState {
+            func,
+            regs: Vec::new(),
+            pc: 0,
+            resume_reg: u16::MAX,
+            upvals: Vec::new(),
+            new_target,
+            status: GenStatus::Running,
+            promise,
+            return_value: Value::UNDEFINED,
+            queue,
+        };
         let o = self.new_object_with(proto, ObjectKind::Generator(Box::new(state)));
         self.frames.last_mut().unwrap().activation = Some(o);
         Ok(o)
@@ -158,6 +172,79 @@ impl Vm {
         }
     }
 
+    // ---- async generators ----
+
+    /// Queue a `next`/`throw`/`return` call on an async generator; the
+    /// returned promise settles with its iterator result
+    pub(crate) fn async_gen_enqueue(&mut self, genobj: Gc<JsObject>, mode: ResumeMode, value: Value) -> Gc<JsObject> {
+        let promise = self.new_promise();
+        let st = Self::gen_state(genobj);
+        st.queue.as_mut().expect("not an async generator").push_back(AsyncGenRequest { mode, value, promise });
+        self.async_gen_drain(genobj);
+        promise
+    }
+
+    /// Run the generator for the queued calls, until the queue is empty or
+    /// the generator waits on a promise
+    pub(crate) fn async_gen_drain(&mut self, genobj: Gc<JsObject>) {
+        loop {
+            let st = Self::gen_state(genobj);
+            let Some(req) = st.queue.as_ref().and_then(|q| q.front()) else { return };
+            let (mode, value) = (req.mode, req.value);
+            match st.status {
+                // Busy: the call is taken up when the generator yields or ends
+                GenStatus::Running | GenStatus::SuspendedAwait => return,
+                GenStatus::SuspendedStart if mode != ResumeMode::Next => {
+                    st.status = GenStatus::Done;
+                    st.regs = Vec::new();
+                }
+                GenStatus::Done => {
+                    let req = st.queue.as_mut().unwrap().pop_front().unwrap();
+                    match mode {
+                        ResumeMode::Next => {
+                            let r = crate::builtins::array::iter_result(self, Value::UNDEFINED, true);
+                            self.resolve_promise(req.promise, r);
+                        }
+                        ResumeMode::Throw => self.reject_promise(req.promise, value),
+                        // `return(v)` on a finished generator awaits v
+                        ResumeMode::Return => self.resolve_with_done_result(req.promise, value),
+                    }
+                }
+                GenStatus::SuspendedStart | GenStatus::SuspendedYield => {
+                    let r = self.resume(genobj, mode, value);
+                    self.async_gen_settle(genobj, r);
+                }
+            }
+        }
+    }
+
+    /// Settle the front call with what one step of the generator produced
+    fn async_gen_settle(&mut self, genobj: Gc<JsObject>, r: JsResult<(Value, bool)>) {
+        let st = Self::gen_state(genobj);
+        if r.is_ok() && st.status == GenStatus::SuspendedAwait {
+            // Waiting on a promise: its reaction continues the generator
+            return;
+        }
+        let Some(req) = st.queue.as_mut().and_then(|q| q.pop_front()) else { return };
+        match r {
+            Ok((v, done)) => {
+                let result = crate::builtins::array::iter_result(self, v, done);
+                self.resolve_promise(req.promise, result);
+            }
+            Err(e) => self.reject_promise(req.promise, e),
+        }
+    }
+
+    /// Resolve `p` with `{ value: await v, done: true }`
+    fn resolve_with_done_result(&mut self, p: Gc<JsObject>, v: Value) {
+        let inner = self.promise_resolve(v);
+        let wrap = self.new_native("", 1, crate::builtins::generator::done_result, None);
+        self.add_reaction(
+            inner,
+            Reaction { kind: ReactionKind::Then, on_fulfilled: Value::object(wrap), on_rejected: Value::UNDEFINED, derived: Some(p) },
+        );
+    }
+
     // ---- promises ----
 
     pub fn new_promise(&mut self) -> Gc<JsObject> {
@@ -269,8 +356,14 @@ impl Vm {
             Job::Reaction { reaction, arg, rejected } => match reaction.kind {
                 ReactionKind::Await(state) => {
                     let mode = if rejected { ResumeMode::Throw } else { ResumeMode::Next };
-                    // Errors are settled into the async function's promise
-                    let _ = self.resume(state, mode, arg);
+                    if Self::gen_state(state).queue.is_some() {
+                        let r = self.resume(state, mode, arg);
+                        self.async_gen_settle(state, r);
+                        self.async_gen_drain(state);
+                    } else {
+                        // Errors are settled into the async function's promise
+                        let _ = self.resume(state, mode, arg);
+                    }
                 }
                 ReactionKind::Then => {
                     let handler = if rejected { reaction.on_rejected } else { reaction.on_fulfilled };

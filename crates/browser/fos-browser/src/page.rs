@@ -18,6 +18,8 @@ pub struct Page {
     pub document: Option<Arc<Mutex<Document>>>,
     /// JavaScript runtime for this page
     pub js_runtime: Option<PageJsRuntime>,
+    /// External stylesheets (`<link rel="stylesheet">`) by URL
+    pub stylesheets: crate::css_loader::Stylesheets,
     /// Rendered content (pixel buffer)
     pub rendered: Option<RenderedContent>,
     /// Scroll position
@@ -66,6 +68,7 @@ impl Page {
             html: Arc::from(""),
             document: None,
             js_runtime: Some(PageJsRuntime::new(url)),
+            stylesheets: Default::default(),
             rendered: None,
             scroll_x: 0.0,
             scroll_y: 0.0,
@@ -159,6 +162,27 @@ impl Page {
     /// Run JavaScript timers that are due
     pub fn process_timers(&mut self) -> Result<(), String> {
         self.process_timers_with(&mut |_| None)
+    }
+
+    /// Deliver finished network requests to the page's scripts; whether
+    /// any finished
+    pub fn process_network_with(&mut self, fetch: &mut ScriptFetcher<'_>) -> Result<bool, String> {
+        let Some(ref mut js_runtime) = self.js_runtime else {
+            return Ok(false);
+        };
+        js_runtime.process_network(fetch)
+    }
+
+    /// Whether the page's scripts have network requests in flight
+    pub fn has_pending_network(&self) -> bool {
+        self.js_runtime.as_ref().is_some_and(|r| r.has_pending_network())
+    }
+
+    /// Call `waker` whenever one of the page's network requests finishes
+    pub fn set_network_waker(&mut self, waker: crate::script_fetch::Waker) {
+        if let Some(r) = self.js_runtime.as_mut() {
+            r.set_network_waker(waker);
+        }
     }
 
     /// Check if there are pending timers

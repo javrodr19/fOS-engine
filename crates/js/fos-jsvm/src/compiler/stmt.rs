@@ -58,7 +58,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
             Stmt::ForIn { head, object, body } => self.for_in_of(head, object, body, false),
             Stmt::ForOf { head, iterable, body, is_await } => {
                 if *is_await {
-                    return self.error("for await is not supported yet");
+                    if !self.fr().is_async {
+                        return self.error("for await is only valid in async functions");
+                    }
+                    return self.for_await(head, iterable, body);
                 }
                 self.for_in_of(head, iterable, body, true)
             }
@@ -376,6 +379,61 @@ impl<'a, 'h> Compiler<'a, 'h> {
             self.emit(Insn::Throw { src: exc });
             self.patch_here(vec![skip])?;
         }
+        self.pop_control()
+    }
+
+    /// `for await (head of iterable) body`
+    fn for_await(&mut self, head: &'a ForHead, iterable: &'a Expr, body: &'a Stmt) -> CResult<()> {
+        let it = self.alloc()?;
+        {
+            let mark = self.mark();
+            let obj = self.expr_any(iterable)?;
+            self.emit(Insn::GetAsyncIterator { dst: it, src: obj });
+            self.release(mark);
+        }
+        let v = self.alloc()?;
+        let res = self.alloc()?;
+        let undef = self.alloc()?;
+        self.emit(Insn::LoadUndef { dst: undef });
+        let exc = self.alloc()?;
+        self.open_try(TryKind::AsyncIterClose(it), exc);
+        self.push_loop(0, true);
+        let j = self.jump();
+        let top = self.pc();
+        self.push_scope(false);
+        match head {
+            ForHead::Decl(VarKind::Var, pat) => self.bind_pattern(pat, v, None)?,
+            ForHead::Decl(kind, pat) => {
+                let bk = if *kind == VarKind::Const { BindKind::Const } else { BindKind::Let };
+                self.declare_pattern(pat, bk)?;
+                self.bind_pattern(pat, v, Some(bk))?;
+            }
+            ForHead::Target(pat) => self.bind_pattern(pat, v, None)?,
+        }
+        self.stmt(body)?;
+        self.pop_scope();
+        self.patch_continues()?;
+        self.patch_here(vec![j])?;
+        // res = await it.next(); stop when done, else v = res.value
+        self.emit(Insn::IterSend { dst: res, iter: it, val: undef });
+        self.emit(Insn::Await { dst: res, src: res });
+        let done_ic = self.new_ic(atoms::done)?;
+        self.emit(Insn::GetProp { dst: v, obj: res, ic: done_ic });
+        let exit = self.emit(Insn::JmpTrue { cond: v, off: 0 });
+        let value_ic = self.new_ic(atoms::value)?;
+        self.emit(Insn::GetProp { dst: v, obj: res, ic: value_ic });
+        self.jump_to(top)?;
+        self.patch_here(vec![exit])?;
+        // Exceptions in the body close the iterator
+        let entry = self.close_try();
+        let skip = self.jump();
+        let target = self.pc();
+        self.set_handler_target(&entry, target);
+        self.emit(Insn::CloseUpvals { from: exc + 1 });
+        self.emit(Insn::AsyncIterReturn { dst: res, iter: it });
+        self.emit(Insn::Await { dst: res, src: res });
+        self.emit(Insn::Throw { src: exc });
+        self.patch_here(vec![skip])?;
         self.pop_control()
     }
 

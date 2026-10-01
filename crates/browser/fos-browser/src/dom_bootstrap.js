@@ -158,7 +158,8 @@
     'mouseenter', 'mouseleave', 'contextmenu', 'wheel', 'keydown', 'keyup', 'keypress', 'input', 'change',
     'submit', 'reset', 'focus', 'blur', 'load', 'error', 'scroll', 'resize', 'touchstart', 'touchend',
     'touchmove', 'pointerdown', 'pointerup', 'pointermove', 'animationend', 'transitionend', 'select',
-    'DOMContentLoaded', 'beforeunload', 'unload', 'hashchange', 'popstate', 'message', 'toggle'];
+    'DOMContentLoaded', 'beforeunload', 'unload', 'hashchange', 'popstate', 'message', 'toggle',
+    'abort', 'timeout', 'loadstart', 'progress', 'loadend', 'readystatechange'];
   for (const type of eventTypes) {
     const desc = {
       get() { return handlerProps.get(this)?.[type] ?? null; },
@@ -667,21 +668,570 @@
     clear() { this._m.clear(); }
   }
 
-  function makeSignal() {
-    const s = Object.create(EventTarget.prototype);
-    s.aborted = false;
-    s.reason = undefined;
-    s.throwIfAborted = function () { if (this.aborted) throw this.reason; };
-    return s;
+  // ---- networking and binary data ----
+
+  class DOMException extends Error {
+    constructor(message = '', name = 'Error') { super(message); this.name = String(name); }
+    get code() {
+      return ({ IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8, NotSupportedError: 9,
+        InvalidStateError: 11, SyntaxError: 12, InvalidAccessError: 15, SecurityError: 18,
+        NetworkError: 19, AbortError: 20, TimeoutError: 23, DataCloneError: 25 })[this.name] || 0;
+    }
+  }
+
+  // EventTarget can be constructed and extended by scripts
+  const EventTargetCtor = function EventTarget() {
+    if (!new.target) throw new TypeError("Failed to construct 'EventTarget': Please use the 'new' operator");
+  };
+  EventTargetCtor.prototype = EventTargetProto;
+  Object.defineProperty(EventTargetProto, 'constructor', { value: EventTargetCtor, writable: true, configurable: true });
+
+  class AbortSignal extends EventTargetCtor {
+    constructor() { super(); this.aborted = false; this.reason = undefined; }
+    throwIfAborted() { if (this.aborted) throw this.reason; }
+    _abort(reason) {
+      if (this.aborted) return;
+      this.aborted = true;
+      this.reason = reason === undefined ? new DOMException('signal is aborted without reason', 'AbortError') : reason;
+      this.dispatchEvent(new Event('abort'));
+    }
+    static abort(reason) { const s = new AbortSignal(); s._abort(reason); return s; }
+    static timeout(ms) {
+      const s = new AbortSignal();
+      setTimeout(() => s._abort(new DOMException('signal timed out', 'TimeoutError')), ms);
+      return s;
+    }
+    static any(signals) {
+      const s = new AbortSignal();
+      for (const t of signals) {
+        if (t.aborted) { s._abort(t.reason); break; }
+        t.addEventListener('abort', () => s._abort(t.reason));
+      }
+      return s;
+    }
   }
   class AbortController {
-    constructor() { this.signal = makeSignal(); }
-    abort(reason) {
-      if (this.signal.aborted) return;
-      this.signal.aborted = true;
-      this.signal.reason = reason ?? new Error('AbortError');
-      this.signal.dispatchEvent(new Event('abort'));
+    constructor() { this.signal = new AbortSignal(); }
+    abort(reason) { this.signal._abort(reason); }
+  }
+
+  class ProgressEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.lengthComputable = !!init.lengthComputable;
+      this.loaded = init.loaded || 0;
+      this.total = init.total || 0;
     }
+  }
+
+  const labelName = l => {
+    l = String(l).trim().toLowerCase();
+    if (/16be|unicodefffe/.test(l)) return 'utf-16be';
+    if (/utf-16|ucs-2|^unicode$|csunicode|iso-10646/.test(l)) return 'utf-16le';
+    if (/8859-1|1252|latin1|ascii|^l1$|819|iso-ir-100|x3\.4/.test(l)) return 'windows-1252';
+    return 'utf-8';
+  };
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') { return new Uint8Array(__fosEncode(String(s))); }
+    encodeInto(s, dest) {
+      const b = this.encode(s);
+      const n = Math.min(b.length, dest.length);
+      dest.set(n === b.length ? b : b.subarray(0, n));
+      return { read: n === b.length ? String(s).length : __fosDecode(b.subarray(0, n)).length, written: n };
+    }
+  }
+  class TextDecoder {
+    constructor(label = 'utf-8', options = {}) {
+      __fosDecode(new ArrayBuffer(0), String(label)); // throws RangeError for unknown labels
+      this._label = String(label);
+      this.fatal = !!options.fatal;
+      this.ignoreBOM = !!options.ignoreBOM;
+    }
+    get encoding() { return labelName(this._label); }
+    decode(input) { return input === undefined ? '' : __fosDecode(input, this._label); }
+  }
+
+  // Bytes as a fresh ArrayBuffer
+  const toArrayBuffer = b =>
+    b == null ? new ArrayBuffer(0)
+      : typeof b === 'string' ? __fosEncode(b)
+      : b instanceof ArrayBuffer ? b.slice(0)
+      : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+
+  class Blob {
+    constructor(parts = [], options = {}) {
+      const chunks = [];
+      let size = 0;
+      for (const p of parts) {
+        const c = p instanceof Blob ? new Uint8Array(p._buf)
+          : p instanceof ArrayBuffer ? new Uint8Array(p)
+          : ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength)
+          : new Uint8Array(__fosEncode(String(p)));
+        chunks.push(c);
+        size += c.length;
+      }
+      const all = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) { all.set(c, at); at += c.length; }
+      this._buf = all.buffer;
+      this.type = options.type ? String(options.type).toLowerCase() : '';
+    }
+    get size() { return this._buf.byteLength; }
+    slice(start = 0, end = this.size, type = '') {
+      const clamp = v => v < 0 ? Math.max(this.size + v, 0) : Math.min(v, this.size);
+      const b = new Blob([], { type });
+      b._buf = this._buf.slice(clamp(start), clamp(end));
+      return b;
+    }
+    text() { return Promise.resolve(__fosDecode(this._buf, 'utf-8')); }
+    arrayBuffer() { return Promise.resolve(this._buf.slice(0)); }
+    bytes() { return Promise.resolve(new Uint8Array(this._buf.slice(0))); }
+    stream() { const buf = this._buf; return new ReadableStream(() => new Uint8Array(buf.slice(0))); }
+    get [Symbol.toStringTag]() { return 'Blob'; }
+  }
+  class File extends Blob {
+    constructor(parts, name, options = {}) {
+      super(parts, options);
+      this.name = String(name);
+      this.lastModified = options.lastModified ?? Date.now();
+    }
+    get [Symbol.toStringTag]() { return 'File'; }
+  }
+
+  // Only what reading a whole body at once needs: one chunk, then done
+  class ReadableStream {
+    constructor(pull) { this._pull = typeof pull === 'function' ? pull : () => null; this.locked = false; }
+    getReader() {
+      if (this.locked) throw new TypeError('ReadableStream is locked');
+      this.locked = true;
+      let done = false;
+      return {
+        read: () => {
+          if (done) return Promise.resolve({ value: undefined, done: true });
+          done = true;
+          return Promise.resolve(this._pull()).then(v => v == null ? { value: undefined, done: true } : { value: v, done: false });
+        },
+        releaseLock: () => { this.locked = false; },
+        cancel: () => Promise.resolve(),
+        closed: Promise.resolve(),
+      };
+    }
+    cancel() { return Promise.resolve(); }
+    [Symbol.asyncIterator]() {
+      const r = this.getReader();
+      return { next: () => r.read(), return: () => Promise.resolve({ value: undefined, done: true }), [Symbol.asyncIterator]() { return this; } };
+    }
+  }
+
+  class FormData {
+    constructor(form) {
+      this._list = [];
+      if (!form || typeof form.querySelectorAll !== 'function') return;
+      for (const el of form.querySelectorAll('input[name], select[name], textarea[name], button[name]')) {
+        if (el.disabled) continue;
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        if (el.localName === 'button' || ['submit', 'button', 'reset', 'image', 'file'].includes(type)) continue;
+        if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+        this._list.push([el.getAttribute('name'), el.value]);
+      }
+    }
+    _entry(v, filename) {
+      if (v instanceof Blob) return filename !== undefined || !(v instanceof File) ? new File([v], filename ?? 'blob', { type: v.type }) : v;
+      return String(v);
+    }
+    append(name, value, filename) { this._list.push([String(name), this._entry(value, filename)]); }
+    set(name, value, filename) {
+      name = String(name);
+      const i = this._list.findIndex(([n]) => n === name);
+      const e = [name, this._entry(value, filename)];
+      if (i < 0) this._list.push(e);
+      else { this._list[i] = e; this._list = this._list.filter(([n], j) => n !== name || j === i); }
+    }
+    get(name) { const e = this._list.find(([n]) => n === String(name)); return e ? e[1] : null; }
+    getAll(name) { return this._list.filter(([n]) => n === String(name)).map(e => e[1]); }
+    has(name) { return this._list.some(([n]) => n === String(name)); }
+    delete(name) { this._list = this._list.filter(([n]) => n !== String(name)); }
+    forEach(f, thisArg) { for (const [n, v] of this._list) f.call(thisArg, v, n, this); }
+    keys() { return this._list.map(e => e[0])[Symbol.iterator](); }
+    values() { return this._list.map(e => e[1])[Symbol.iterator](); }
+    entries() { return this._list.map(e => [e[0], e[1]])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+    // multipart/form-data encoding
+    _encode() {
+      const boundary = '----fOSFormBoundary' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      const esc = s => String(s).replace(/"/g, '%22').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+      const parts = [];
+      for (const [name, value] of this._list) {
+        parts.push('--' + boundary + '\r\nContent-Disposition: form-data; name="' + esc(name) + '"');
+        if (value instanceof File) {
+          parts.push('; filename="' + esc(value.name) + '"\r\nContent-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n', value, '\r\n');
+        } else {
+          parts.push('\r\n\r\n' + value.replace(/\r?\n/g, '\r\n') + '\r\n');
+        }
+      }
+      parts.push('--' + boundary + '--\r\n');
+      return { data: new Blob(parts)._buf, type: 'multipart/form-data; boundary=' + boundary };
+    }
+  }
+
+  const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+  class Headers {
+    constructor(init) {
+      this._list = [];
+      if (init == null) return;
+      if (init instanceof Headers) { for (const [k, v] of init._list) this._list.push([k, v]); return; }
+      if (typeof init !== 'object') throw new TypeError("Failed to construct 'Headers': The provided value is not of type 'HeadersInit'");
+      if (Symbol.iterator in init) {
+        for (const pair of init) {
+          const p = [...pair];
+          if (p.length !== 2) throw new TypeError("Failed to construct 'Headers': Invalid value");
+          this.append(p[0], p[1]);
+        }
+      } else {
+        for (const k of Object.keys(init)) this.append(k, init[k]);
+      }
+    }
+    _name(n) {
+      n = String(n);
+      if (!TOKEN.test(n)) throw new TypeError(`'${n}' is not a valid HTTP header field name.`);
+      return n.toLowerCase();
+    }
+    _value(v) {
+      v = String(v).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+      if (/[\0\r\n]/.test(v)) throw new TypeError(`'${v}' is not a valid HTTP header field value.`);
+      return v;
+    }
+    append(n, v) { this._list.push([this._name(n), this._value(v)]); }
+    delete(n) { n = this._name(n); this._list = this._list.filter(([k]) => k !== n); }
+    get(n) {
+      n = this._name(n);
+      const vals = this._list.filter(([k]) => k === n).map(e => e[1]);
+      return vals.length ? vals.join(', ') : null;
+    }
+    getSetCookie() { return []; }
+    has(n) { n = this._name(n); return this._list.some(([k]) => k === n); }
+    set(n, v) { n = this._name(n); v = this._value(v); this._list = this._list.filter(([k]) => k !== n); this._list.push([n, v]); }
+    _sorted() { return [...new Set(this._list.map(e => e[0]))].sort().map(k => [k, this.get(k)]); }
+    forEach(f, thisArg) { for (const [k, v] of this._sorted()) f.call(thisArg, v, k, this); }
+    keys() { return this._sorted().map(e => e[0])[Symbol.iterator](); }
+    values() { return this._sorted().map(e => e[1])[Symbol.iterator](); }
+    entries() { return this._sorted()[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+
+  // A body given to Request, Response or XMLHttpRequest: its bytes (or
+  // string) and the content type it implies
+  function extractBody(body) {
+    if (body == null) return { data: null, type: null };
+    if (typeof body === 'string') return { data: body, type: 'text/plain;charset=UTF-8' };
+    if (body instanceof URLSearchParams) return { data: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+    if (body instanceof FormData) return body._encode();
+    if (body instanceof Blob) return { data: body._buf, type: body.type || null };
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return { data: body, type: null };
+    return { data: String(body), type: 'text/plain;charset=UTF-8' };
+  }
+
+  const bodyMixin = {
+    _consume() {
+      if (this.bodyUsed) return Promise.reject(new TypeError('Failed to execute: body stream already read'));
+      this.bodyUsed = true;
+      return Promise.resolve(this._body);
+    },
+    text() { return this._consume().then(b => b == null ? '' : typeof b === 'string' ? b : __fosDecode(b, 'utf-8')); },
+    json() { return this.text().then(t => JSON.parse(t)); },
+    arrayBuffer() { return this._consume().then(toArrayBuffer); },
+    bytes() { return this.arrayBuffer().then(b => new Uint8Array(b)); },
+    blob() { return this.arrayBuffer().then(b => new Blob([b], { type: this.headers.get('content-type') || '' })); },
+    formData() {
+      return this.text().then(t => {
+        const fd = new FormData();
+        for (const [k, v] of new URLSearchParams(t)) fd.append(k, v);
+        return fd;
+      });
+    },
+    get body() {
+      if (this._body == null) return null;
+      if (!this._stream) {
+        this._stream = new ReadableStream(() => {
+          if (this.bodyUsed) return null;
+          this.bodyUsed = true;
+          return new Uint8Array(toArrayBuffer(this._body));
+        });
+      }
+      return this._stream;
+    },
+  };
+
+  const METHODS = /^(delete|get|head|options|post|put|patch)$/i;
+  class Request {
+    constructor(input, init = {}) {
+      init = init || {};
+      const src = input instanceof Request ? input : null;
+      this.url = src ? src.url : new URL(String(input), document.baseURI).href;
+      let method = String(init.method ?? (src ? src.method : 'GET'));
+      if (!TOKEN.test(method)) throw new TypeError(`'${method}' is not a valid HTTP method.`);
+      this.method = METHODS.test(method) ? method.toUpperCase() : method;
+      this.headers = new Headers(init.headers ?? (src ? src.headers : undefined));
+      this.mode = init.mode ?? (src ? src.mode : 'cors');
+      this.credentials = init.credentials ?? (src ? src.credentials : 'same-origin');
+      this.redirect = init.redirect ?? (src ? src.redirect : 'follow');
+      this.cache = init.cache ?? (src ? src.cache : 'default');
+      this.referrer = src ? src.referrer : 'about:client';
+      this.referrerPolicy = init.referrerPolicy ?? (src ? src.referrerPolicy : '');
+      this.integrity = init.integrity ?? (src ? src.integrity : '');
+      this.keepalive = !!(init.keepalive ?? (src ? src.keepalive : false));
+      this.signal = init.signal ?? (src ? src.signal : new AbortController().signal);
+      this.destination = '';
+      this.bodyUsed = false;
+      if (init.body != null) {
+        if (this.method === 'GET' || this.method === 'HEAD') throw new TypeError('Request with GET/HEAD method cannot have body.');
+        const b = extractBody(init.body);
+        this._body = b.data;
+        if (b.type && !this.headers.has('content-type')) this.headers.set('content-type', b.type);
+      } else {
+        this._body = src ? src._body : null;
+      }
+    }
+    clone() {
+      if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
+      return new Request(this);
+    }
+  }
+  define(Request.prototype, bodyMixin);
+
+  class Response {
+    constructor(body = null, init = {}) {
+      init = init || {};
+      const status = init.status === undefined ? 200 : Number(init.status);
+      if (!(status >= 200 && status <= 599)) throw new RangeError(`Failed to construct 'Response': The status provided (${status}) is outside the range [200, 599].`);
+      this.status = status;
+      this.statusText = init.statusText === undefined ? '' : String(init.statusText);
+      this.headers = new Headers(init.headers);
+      this.type = 'default';
+      this.url = '';
+      this.redirected = false;
+      this.bodyUsed = false;
+      const b = extractBody(body);
+      this._body = b.data;
+      if (b.type && !this.headers.has('content-type')) this.headers.set('content-type', b.type);
+    }
+    get ok() { return this.status >= 200 && this.status < 300; }
+    clone() {
+      if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+      const r = Object.create(Response.prototype);
+      Object.assign(r, this, { headers: new Headers(this.headers), bodyUsed: false, _stream: undefined });
+      return r;
+    }
+    static error() {
+      const r = Object.create(Response.prototype);
+      Object.assign(r, { status: 0, statusText: '', headers: new Headers(), type: 'error', url: '', redirected: false, bodyUsed: false, _body: null });
+      return r;
+    }
+    static redirect(url, status = 302) {
+      if (![301, 302, 303, 307, 308].includes(status)) throw new RangeError('Invalid status code');
+      return new Response(null, { status, headers: { location: new URL(url, document.baseURI).href } });
+    }
+    static json(data, init = {}) {
+      const headers = new Headers(init.headers);
+      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+      return new Response(JSON.stringify(data), { ...init, headers });
+    }
+  }
+  define(Response.prototype, bodyMixin);
+
+  // A Response from what __fosFetch delivers
+  function hostResponse(r) {
+    const res = Object.create(Response.prototype);
+    const headers = new Headers();
+    headers._list = r.headers;
+    Object.assign(res, { status: r.status, statusText: r.statusText, url: r.url, redirected: r.redirected,
+      type: r.type, headers, bodyUsed: false, _body: r.body });
+    return res;
+  }
+
+  function fetch(input, init) {
+    return new Promise((resolve, reject) => {
+      const req = new Request(input, init);
+      const signal = req.signal;
+      if (signal && signal.aborted) { reject(signal.reason); return; }
+      let settled = false;
+      const onAbort = () => { if (!settled) { settled = true; reject(signal.reason); } };
+      if (signal) signal.addEventListener('abort', onAbort);
+      __fosFetch(req.method, req.url, [...req.headers], req._body, req.mode, req.credentials, req.redirect, (err, r) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (settled) return;
+        settled = true;
+        if (err !== null) reject(new TypeError('Failed to fetch'));
+        else resolve(hostResponse(r));
+      });
+    });
+  }
+
+  class XMLHttpRequestEventTarget extends EventTargetCtor {}
+  class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {}
+  class XMLHttpRequest extends XMLHttpRequestEventTarget {
+    constructor() {
+      super();
+      this.upload = new XMLHttpRequestUpload();
+      this.timeout = 0;
+      this.withCredentials = false;
+      this._responseType = '';
+      this._gen = 0;
+      this._clear();
+      this.readyState = 0;
+    }
+    _clear() {
+      this.status = 0;
+      this.statusText = '';
+      this.responseURL = '';
+      this._resp = null;
+      this._text = null;
+      this._json = undefined;
+      this._sent = false;
+    }
+    get responseType() { return this._responseType; }
+    set responseType(t) {
+      if (this.readyState >= 3) throw new DOMException('The response type cannot be set if the object\'s state is LOADING or DONE.', 'InvalidStateError');
+      if (['', 'text', 'json', 'arraybuffer', 'blob', 'document'].includes(t)) this._responseType = t;
+    }
+    open(method, url, async = true) {
+      method = String(method);
+      if (!TOKEN.test(method)) throw new DOMException(`'${method}' is not a valid HTTP method.`, 'SyntaxError');
+      let abs;
+      try { abs = new URL(String(url), document.baseURI).href; } catch { throw new DOMException(`Invalid URL`, 'SyntaxError'); }
+      this._gen++;
+      clearTimeout(this._timer);
+      this._clear();
+      this._method = METHODS.test(method) ? method.toUpperCase() : method;
+      this._url = abs;
+      this._async = async !== false;
+      this._headers = new Headers();
+      this._set(1);
+    }
+    _set(state) { this.readyState = state; this.dispatchEvent(new Event('readystatechange')); }
+    _progress(type, target = this, loaded = 0, total = 0) {
+      target.dispatchEvent(new ProgressEvent(type, { lengthComputable: total > 0, loaded, total }));
+    }
+    setRequestHeader(name, value) {
+      if (this.readyState !== 1 || this._sent) throw new DOMException("Failed to execute 'setRequestHeader': The object's state must be OPENED.", 'InvalidStateError');
+      const n = String(name).toLowerCase();
+      const prev = this._headers.get(n);
+      this._headers.set(n, prev === null ? value : prev + ', ' + value);
+    }
+    send(body = null) {
+      if (this.readyState !== 1 || this._sent) throw new DOMException("Failed to execute 'send': The object's state must be OPENED.", 'InvalidStateError');
+      if (this._method === 'GET' || this._method === 'HEAD') body = null;
+      const b = extractBody(body);
+      if (b.type && !this._headers.has('content-type')) this._headers.set('content-type', b.type);
+      this._sent = true;
+      const credentials = this.withCredentials ? 'include' : 'same-origin';
+      if (!this._async) {
+        let r;
+        try {
+          r = __fosFetch(this._method, this._url, [...this._headers], b.data, 'cors', credentials, 'follow');
+        } catch (e) {
+          this._clear();
+          this._set(4);
+          throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': Failed to load '" + this._url + "'.", 'NetworkError');
+        }
+        this._receive(r);
+        this._set(4);
+        const n = r.body.byteLength;
+        this._progress('load', this, n, n);
+        this._progress('loadend', this, n, n);
+        return;
+      }
+      const gen = this._gen;
+      this._progress('loadstart');
+      if (b.data != null) this._progress('loadstart', this.upload);
+      if (this.timeout > 0) {
+        this._timer = setTimeout(() => { if (gen === this._gen) { this._gen++; this._fail('timeout'); } }, this.timeout);
+      }
+      __fosFetch(this._method, this._url, [...this._headers], b.data, 'cors', credentials, 'follow', (err, r) => {
+        if (gen !== this._gen) return; // aborted, timed out or reopened
+        clearTimeout(this._timer);
+        if (err !== null) { this._fail('error'); return; }
+        if (b.data != null) { this._progress('load', this.upload); this._progress('loadend', this.upload); }
+        this._receive(r);
+        this._set(2);
+        const n = r.body.byteLength;
+        this._set(3);
+        this._progress('progress', this, n, n);
+        if (gen !== this._gen) return;
+        this._set(4);
+        this._progress('load', this, n, n);
+        this._progress('loadend', this, n, n);
+      });
+    }
+    _receive(r) {
+      this._resp = r;
+      this.status = r.status;
+      this.statusText = r.statusText;
+      this.responseURL = r.url;
+    }
+    _fail(kind) {
+      this._clear();
+      this._set(4);
+      this._progress(kind);
+      this._progress('loadend');
+    }
+    abort() {
+      const active = (this.readyState === 1 && this._sent) || this.readyState === 2 || this.readyState === 3;
+      this._gen++;
+      clearTimeout(this._timer);
+      if (active) this._fail('abort');
+      if (this.readyState === 4) { this._clear(); this.readyState = 0; }
+    }
+    getResponseHeader(name) {
+      if (!this._resp) return null;
+      const n = String(name).toLowerCase();
+      const vals = this._resp.headers.filter(([k]) => k === n).map(e => e[1]);
+      return vals.length ? vals.join(', ') : null;
+    }
+    getAllResponseHeaders() {
+      if (!this._resp) return '';
+      const h = new Headers();
+      h._list = this._resp.headers;
+      let out = '';
+      for (const [k, v] of h) out += k + ': ' + v + '\r\n';
+      return out;
+    }
+    overrideMimeType(mime) { this._mime = String(mime); }
+    _charset() {
+      const ct = this._mime || this.getResponseHeader('content-type') || '';
+      const m = /charset\s*=\s*"?([^";\s]+)/i.exec(ct);
+      return m ? m[1] : 'utf-8';
+    }
+    get responseText() {
+      if (this._responseType !== '' && this._responseType !== 'text') {
+        throw new DOMException("The value is only accessible if the object's 'responseType' is '' or 'text'.", 'InvalidStateError');
+      }
+      if (!this._resp || this.readyState < 3) return '';
+      if (this._text === null) {
+        try { this._text = __fosDecode(this._resp.body, this._charset()); } catch { this._text = __fosDecode(this._resp.body, 'utf-8'); }
+      }
+      return this._text;
+    }
+    get response() {
+      const t = this._responseType;
+      if (t === '' || t === 'text') return this.responseText;
+      if (this.readyState !== 4 || !this._resp) return null;
+      if (t === 'json') {
+        if (this._json === undefined) {
+          try { this._json = JSON.parse(__fosDecode(this._resp.body, 'utf-8')); } catch { this._json = null; }
+        }
+        return this._json;
+      }
+      if (t === 'arraybuffer') return this._resp.body;
+      if (t === 'blob') return new Blob([this._resp.body], { type: this.getResponseHeader('content-type') || '' });
+      return null;
+    }
+    get responseXML() { return null; }
+  }
+  for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
+    Object.defineProperty(XMLHttpRequest, k, { value: v });
+    Object.defineProperty(XMLHttpRequest.prototype, k, { value: v });
   }
 
   const noopObserver = class { constructor(cb) { this._cb = cb; } observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
@@ -711,7 +1261,11 @@
       appName: 'Netscape', appVersion: '5.0', appCodeName: 'Mozilla', product: 'Gecko',
       platform: 'Linux x86_64', vendor: '', language: 'en-US', languages: ['en-US', 'en'],
       onLine: true, cookieEnabled: true, doNotTrack: null, hardwareConcurrency: 4, maxTouchPoints: 0,
-      webdriver: false, javaEnabled: () => false, sendBeacon: () => true,
+      webdriver: false, javaEnabled: () => false,
+      sendBeacon(url, data) {
+        fetch(url, { method: 'POST', body: data ?? null, mode: 'no-cors', credentials: 'include', keepalive: true }).catch(() => {});
+        return true;
+      },
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
     },
     history: {
@@ -724,9 +1278,12 @@
     Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, FocusEvent, InputEvent, ErrorEvent,
     PointerEvent: MouseEvent, TouchEvent: UIEvent, WheelEvent: MouseEvent, AnimationEvent: Event,
     TransitionEvent: Event, PopStateEvent: Event, HashChangeEvent: Event, MessageEvent: Event,
-    ProgressEvent: Event,
-    URL, URLSearchParams, Storage, DOMTokenList, AbortController,
-    AbortSignal: { abort(reason) { const c = new AbortController(); c.abort(reason); return c.signal; }, timeout() { return makeSignal(); } },
+    ProgressEvent,
+    URL, URLSearchParams, Storage, DOMTokenList, AbortController, AbortSignal, DOMException,
+    EventTarget: EventTargetCtor,
+    fetch, Headers, Request, Response, Blob, File, FormData, ReadableStream,
+    XMLHttpRequest, XMLHttpRequestUpload, XMLHttpRequestEventTarget,
+    TextEncoder, TextDecoder,
     MutationObserver: noopObserver, IntersectionObserver: noopObserver, ResizeObserver: noopObserver,
     PerformanceObserver: noopObserver,
     requestAnimationFrame(cb) {
@@ -748,24 +1305,6 @@
     postMessage(data) { setTimeout(() => global.dispatchEvent(Object.assign(new Event('message'), { data, origin: global.location.origin, source: global })), 0); },
     structuredClone(v) { return v === undefined ? v : JSON.parse(JSON.stringify(v)); },
     reportError,
-    fetch() { return Promise.reject(new TypeError('Failed to fetch')); },
-    XMLHttpRequest: class XMLHttpRequest {
-      constructor() { this.readyState = 0; this.status = 0; this.responseText = ''; this.response = ''; this._h = {}; }
-      open(method, url) { this._url = url; this.readyState = 1; }
-      setRequestHeader() {} getResponseHeader() { return null; } getAllResponseHeaders() { return ''; }
-      overrideMimeType() {} abort() {}
-      addEventListener(t, f) { this._h[t] = f; } removeEventListener() {}
-      send() {
-        setTimeout(() => {
-          this.readyState = 4;
-          const ev = new Event('error');
-          if (this.onreadystatechange) this.onreadystatechange(ev);
-          if (this.onerror) this.onerror(ev);
-          if (this._h.error) this._h.error(ev);
-          if (this.onloadend) this.onloadend(ev);
-        }, 0);
-      }
-    },
     __fosPageState() {
       return { navigate: pendingNavigation.splice(0), written: writeBuffer.splice(0) };
     },

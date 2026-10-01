@@ -959,6 +959,14 @@ impl Vm {
                     Insn::IterClose { iter } => {
                         tri!(self.iter_close(r!(iter)));
                     }
+                    Insn::GetAsyncIterator { dst, src } => {
+                        let it = tri!(self.get_async_iterator(r!(src)));
+                        w!(dst, it);
+                    }
+                    Insn::AsyncIterReturn { dst, iter } => {
+                        let v = tri!(self.async_iter_return(r!(iter)));
+                        w!(dst, v);
+                    }
                     Insn::TemplateObject { dst, idx } => {
                         let site = unsafe { &(*cp).templates[idx as usize] };
                         let v = self.template_object(site);
@@ -1004,7 +1012,7 @@ impl Vm {
                         let state = self.frames.last().unwrap().activation.unwrap();
                         let p = self.promise_resolve(v);
                         self.add_reaction(p, Reaction { kind: ReactionKind::Await(state), on_fulfilled: Value::UNDEFINED, on_rejected: Value::UNDEFINED, derived: None });
-                        let (ret, flags) = self.suspend(pc, dst, GenStatus::SuspendedYield);
+                        let (ret, flags) = self.suspend(pc, dst, GenStatus::SuspendedAwait);
                         if flags & F_RESUMED != 0 {
                             self.suspended = true;
                             self.temp_roots.truncate(temp_base);

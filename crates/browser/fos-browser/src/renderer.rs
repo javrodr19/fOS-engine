@@ -14,11 +14,13 @@
 //! for example) is picked up by the next render.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 use fos_dom::{Document, NodeId, DomTree, DomRevision};
 use fos_css::computed::{ComputedStyle, Display, SizeValue, EdgeSizes};
 use fos_css::properties::LengthUnit;
-use fos_css::{Stylesheet, Selector, SelectorPart, parse_stylesheet, StyleResolver};
+use fos_css::StyleResolver;
+use crate::page_styles::PageStyles;
 use fos_render::{Canvas, Color, TextRenderer};
 use fos_text::{FontId, LineBreaker};
 
@@ -144,6 +146,8 @@ pub struct PageRenderer {
     /// Incremented for every new layout, to tell whether a rendered
     /// buffer was painted from the current one
     layout_generation: u64,
+    /// The current page's external stylesheets
+    stylesheets: crate::css_loader::Stylesheets,
 }
 
 impl PageRenderer {
@@ -165,6 +169,7 @@ impl PageRenderer {
             default_font,
             cached: None,
             layout_generation: 0,
+            stylesheets: Default::default(),
         }
     }
 
@@ -285,11 +290,7 @@ impl PageRenderer {
         // Free the old layout first, so two are never alive at once
         self.cached = None;
         let width = self.viewport_width;
-        let styler = Styler {
-            renderer: self,
-            tree: document.tree(),
-            stylesheet: self.page_stylesheet(document),
-        };
+        let styler = Styler::new(self, document.tree(), self.page_stylesheet(document));
         let layout = build_layout(document, &styler, width);
         // Only the display list is kept
         self.cached = Some(CachedLayout { source, width, layout });
@@ -368,77 +369,67 @@ impl PageRenderer {
         Some(page)
     }
 
-    /// Parse the page's own CSS (`<style>` elements)
-    fn page_stylesheet(&self, document: &Document) -> Option<Stylesheet> {
+    /// Parse the page's own CSS (`<style>` elements) and compile it for
+    /// matching
+    fn page_stylesheet(&self, document: &Document) -> Option<PageStyles> {
         let css_text = self.extract_css_from_document(document);
         if css_text.is_empty() {
             return None;
         }
-        match parse_stylesheet(&css_text) {
-            Ok(ss) => {
-                log::debug!("Parsed {} CSS rules from page", ss.rules.len());
-                Some(ss)
-            }
-            Err(e) => {
-                log::warn!("CSS parse error: {}", e);
-                None
-            }
+        let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
+        let styles = PageStyles::new(fos_css::parse_stylesheet_for(&css_text, media));
+        log::debug!("Parsed {} CSS rules from page", styles.rule_count());
+        Some(styles)
+    }
+
+    /// Use `sheets` for the page's `<link rel="stylesheet">` elements
+    /// (fetched by the browser); the layout is redone if they changed
+    pub fn set_stylesheets(&mut self, sheets: crate::css_loader::Stylesheets) {
+        if !Arc::ptr_eq(&self.stylesheets, &sheets) {
+            self.stylesheets = sheets;
+            self.cached = None;
         }
     }
 
-    /// Extract CSS text from <style> tags in document
+    /// The page's CSS: `<style>` contents and fetched `<link>` sheets, in
+    /// document order (cascade order), skipping those whose `media`
+    /// attribute does not match the viewport
     fn extract_css_from_document(&self, document: &Document) -> String {
-        let mut css = String::new();
         let tree = document.tree();
-        let head = document.head();
-
-        if !head.is_valid() {
-            return css;
-        }
-
-        // Find all <style> tags in <head>
-        for (style_id, style_node) in tree.children(head) {
-            if let Some(element) = style_node.as_element() {
-                let tag = tree.resolve(element.name.local);
-                if tag.eq_ignore_ascii_case("style") {
-                    // Get text content of style element
-                    for (_, child) in tree.children(style_id) {
-                        if let Some(text) = child.as_text() {
-                            css.push_str(text);
-                            css.push('\n');
-                        }
-                    }
+        let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
+        let mut base: Option<String> = None;
+        let mut css = String::new();
+        fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
+            let Some(e) = tree.get(id).and_then(|n| n.as_element()) else { return true };
+            let tag = tree.resolve(e.name.local);
+            let is_style = tag.eq_ignore_ascii_case("style");
+            let is_link = !is_style && crate::css_loader::is_stylesheet_link(tree, id);
+            if !is_style && !is_link {
+                return true;
+            }
+            if let Some(m) = tree.get_attribute(id, "media") {
+                if !fos_css::media_matches(m, &media) {
+                    return true;
                 }
             }
-        }
-
-        // Also look for style tags in body (non-standard but common)
-        self.collect_style_text(tree, document.body(), &mut css);
-
+            if is_style {
+                for (_, child) in tree.children(id) {
+                    if let Some(text) = child.as_text() {
+                        css.push_str(text);
+                        css.push('\n');
+                    }
+                }
+            } else if let Some(href) = tree.get_attribute(id, "href") {
+                let base = base.get_or_insert_with(|| crate::css_loader::base_url(document));
+                let url = fos_net::url_util::resolve(base, href.trim());
+                if let Some(text) = self.stylesheets.get(&url) {
+                    css.push_str(text);
+                    css.push('\n');
+                }
+            }
+            true
+        });
         css
-    }
-
-    /// Recursively collect style tag text (for style tags in body)
-    fn collect_style_text(&self, tree: &DomTree, node_id: NodeId, css: &mut String) {
-        if !node_id.is_valid() {
-            return;
-        }
-
-        for (child_id, child_node) in tree.children(node_id) {
-            if let Some(element) = child_node.as_element() {
-                let tag = tree.resolve(element.name.local);
-                if tag.eq_ignore_ascii_case("style") {
-                    for (_, text_node) in tree.children(child_id) {
-                        if let Some(text) = text_node.as_text() {
-                            css.push_str(text);
-                            css.push('\n');
-                        }
-                    }
-                }
-            }
-            // Recurse
-            self.collect_style_text(tree, child_id, css);
-        }
     }
 
     /// Compute styles using the StyleResolver (proper CSS cascade)
@@ -464,127 +455,36 @@ impl PageRenderer {
         }
     }
 
-    /// Compute an element's style: browser defaults, then the page's
-    /// matching rules, then its `style` attribute
+    /// Compute an element's style: inherited values, browser defaults,
+    /// the page's matching rules, then its `style` attribute
     fn compute_element_style(
         &self,
         tree: &DomTree,
         node_id: NodeId,
         element: &fos_dom::ElementData,
-        stylesheet: Option<&Stylesheet>,
+        styles: Option<&PageStyles>,
+        inherited: &Inherited,
+        filter: Option<&crate::page_styles::AncestorFilter>,
     ) -> ComputedStyle {
         let mut style = ComputedStyle::default();
+        style.font_size = inherited.font_size;
+        style.parent_font_size = inherited.font_size;
+        style.font_weight = inherited.font_weight;
+        style.color = fos_css::properties::Color::rgba(inherited.color.r, inherited.color.g, inherited.color.b, inherited.color.a);
         let tag_name = tree.resolve(element.name.local);
 
-        apply_default_styles(&mut style, tag_name);
-        if let Some(ss) = stylesheet {
-            self.apply_matching_rules(tree, node_id, element, tag_name, ss, &mut style);
+        apply_default_styles(&mut style, tag_name, element, tree);
+        if let Some(styles) = styles {
+            styles.apply(tree, node_id, element, &mut style, filter);
         }
         for attr in element.attrs.iter() {
             if tree.resolve(attr.name.local) == "style" {
-                self.apply_inline_style(&attr.value, &mut style);
+                for decl in fos_css::parse_declarations(&attr.value) {
+                    style.apply_declaration(&decl);
+                }
             }
         }
         style
-    }
-
-    /// Apply matching CSS rules to element style
-    fn apply_matching_rules(
-        &self,
-        tree: &DomTree,
-        _node_id: NodeId,
-        element: &fos_dom::ElementData,
-        tag_name: &str,
-        stylesheet: &Stylesheet,
-        style: &mut ComputedStyle,
-    ) {
-        // Get element classes and ID for matching
-        let element_id = element.id.map(|id| tree.resolve(id));
-        let element_classes: Vec<&str> = element.classes.iter()
-            .map(|c| tree.resolve(*c))
-            .collect();
-
-        // Check each rule in stylesheet
-        for rule in &stylesheet.rules {
-            for selector in &rule.selectors {
-                if self.selector_matches(selector, tag_name, element_id, &element_classes) {
-                    // Apply declarations from this rule
-                    for decl in &rule.declarations {
-                        style.apply_declaration(decl);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check if a selector matches an element
-    fn selector_matches(
-        &self,
-        selector: &Selector,
-        tag_name: &str,
-        element_id: Option<&str>,
-        classes: &[&str],
-    ) -> bool {
-        // Safety check: empty selector parts shouldn't match
-        if selector.parts.is_empty() {
-            return false;
-        }
-
-        // Track if we've matched at least one meaningful part
-        let mut has_match = false;
-
-        // Simple matching: check selector parts
-        for part in &selector.parts {
-            match part {
-                SelectorPart::Type(t) => {
-                    if !t.eq_ignore_ascii_case(tag_name) {
-                        return false;
-                    }
-                    has_match = true;
-                }
-                SelectorPart::Class(c) => {
-                    if !classes.iter().any(|ec| ec.eq_ignore_ascii_case(c)) {
-                        return false;
-                    }
-                    has_match = true;
-                }
-                SelectorPart::Id(id) => {
-                    if element_id != Some(id.as_str()) {
-                        return false;
-                    }
-                    has_match = true;
-                }
-                SelectorPart::Universal => {
-                    // Universal selector matches everything
-                    has_match = true;
-                }
-                SelectorPart::Combinator(_) => {
-                    // Stop at combinators - we don't support parent chain matching
-                    // Only count as match if we had something before the combinator
-                    break;
-                }
-                SelectorPart::PseudoClass(_) | SelectorPart::PseudoElement(_) | SelectorPart::Attribute { .. } => {
-                    // Skip pseudo-classes/elements and attribute selectors
-                    // Don't count as match, but don't reject either
-                    // (This means `:hover` alone won't match, but `div:hover` will match div)
-                }
-            }
-        }
-
-        has_match
-    }
-
-    /// Apply inline style declarations
-    fn apply_inline_style(&self, style_text: &str, style: &mut ComputedStyle) {
-        // Parse inline CSS as if it were a rule body
-        let wrapped = format!("*{{{}}}", style_text);
-        if let Ok(ss) = parse_stylesheet(&wrapped) {
-            for rule in &ss.rules {
-                for decl in &rule.declarations {
-                    style.apply_declaration(decl);
-                }
-            }
-        }
     }
 
     /// Paint the part of `layout` starting at document y `scroll_offset`.
@@ -724,15 +624,43 @@ fn anchors_from(layout: &PageLayout, origin: f32) -> Vec<AnchorPosition> {
 struct Styler<'a> {
     renderer: &'a PageRenderer,
     tree: &'a DomTree,
-    stylesheet: Option<Stylesheet>,
+    stylesheet: Option<PageStyles>,
+    /// Ancestors of the element being laid out
+    ancestors: std::cell::RefCell<crate::page_styles::AncestorFilter>,
 }
 
-impl Styler<'_> {
+impl<'a> Styler<'a> {
     /// Style of an element (`None` for other nodes)
-    fn style(&self, node_id: NodeId) -> Option<ComputedStyle> {
-        let element = self.tree.get(node_id)?.as_element()?;
-        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref()))
+    fn new(renderer: &'a PageRenderer, tree: &'a DomTree, stylesheet: Option<PageStyles>) -> Self {
+        Self { renderer, tree, stylesheet, ancestors: Default::default() }
     }
+
+    fn style(&self, node_id: NodeId, inherited: &Inherited) -> Option<ComputedStyle> {
+        let element = self.tree.get(node_id)?.as_element()?;
+        let filter = self.ancestors.borrow();
+        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), inherited, Some(&filter)))
+    }
+
+    /// Descend into element `node`'s children
+    fn enter(&self, node: NodeId) {
+        if self.stylesheet.is_some() {
+            self.ancestors.borrow_mut().push(self.tree, node);
+        }
+    }
+
+    /// Come back up from the children of the element entered last
+    fn leave(&self) {
+        if self.stylesheet.is_some() {
+            self.ancestors.borrow_mut().pop();
+        }
+    }
+}
+
+/// The inherited properties layout tracks while descending the tree
+struct Inherited {
+    font_size: f32,
+    font_weight: u16,
+    color: Color,
 }
 
 /// Lay out the document body into lines for a viewport of `width` pixels
@@ -742,16 +670,35 @@ fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLay
 
     log::debug!("DOM tree size: {}, body valid: {}", tree.len(), body.is_valid());
 
+    // Style the body's ancestors first (usually just <html>): their rules
+    // set the inherited font and color, and they are the first entries of
+    // the ancestor filter
+    let mut chain = Vec::new();
+    let mut up = tree.get(body).map_or(NodeId::NONE, |n| n.parent);
+    while up.is_valid() {
+        chain.push(up);
+        up = tree.get(up).map_or(NodeId::NONE, |n| n.parent);
+    }
+    let mut inherited = Inherited { font_size: 16.0, font_weight: 400, color: Color::BLACK };
+    for &ancestor in chain.iter().rev() {
+        if let Some(style) = styler.style(ancestor, &inherited) {
+            let c = style.color;
+            inherited = Inherited { font_size: style.font_size, font_weight: style.font_weight, color: Color::rgba(c.r, c.g, c.b, c.a) };
+        }
+        styler.enter(ancestor);
+    }
+
     let mut builder = LayoutBuilder {
         tree,
         styler,
         // Leave margin for the right edge
-        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, 16.0),
+        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, inherited.font_size),
         // Document y of the first line
         y: 20.0,
         layout: PageLayout::default(),
     };
 
+    builder.line_buffer.current_color = inherited.color;
     if body.is_valid() {
         builder.layout_node(body);
         builder.flush();
@@ -789,7 +736,12 @@ impl LayoutBuilder<'_> {
         };
 
         // Get style
-        let style = self.styler.style(node_id);
+        let inherited = Inherited {
+            font_size: self.line_buffer.current_font_size,
+            font_weight: 400,
+            color: self.line_buffer.current_color,
+        };
+        let style = self.styler.style(node_id, &inherited);
 
         // Check if hidden
         if style.as_ref().is_some_and(|s| matches!(s.display, Display::None)) {
@@ -807,7 +759,7 @@ impl LayoutBuilder<'_> {
                     collapsed.push_str(word);
                 }
 
-                let font_size = self.line_buffer.current_font_size.max(14.0);
+                let font_size = self.line_buffer.current_font_size.max(8.0);
                 let text_color = self.line_buffer.current_color;
                 self.line_buffer.add_text(&collapsed, font_size, text_color, node.parent);
             }
@@ -931,19 +883,14 @@ impl LayoutBuilder<'_> {
 
         let line_buffer = &mut self.line_buffer;
 
-        // Set font size based on heading
-        match tag {
-            "h1" => line_buffer.current_font_size = 28.0,
-            "h2" => line_buffer.current_font_size = 24.0,
-            "h3" => line_buffer.current_font_size = 20.0,
-            "h4" => line_buffer.current_font_size = 18.0,
-            "h5" => line_buffer.current_font_size = 16.0,
-            "h6" => line_buffer.current_font_size = 14.0,
-            "small" => line_buffer.current_font_size = (saved_font_size * 0.8).max(12.0),
-            _ => {}
-        };
+        // Inherited properties for the element's contents
+        if let Some(style) = &style {
+            line_buffer.current_font_size = style.font_size;
+            let c = style.color;
+            line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
+        }
 
-        // Single pass over attributes: link target, anchor id, inline color
+        // Single pass over attributes: link target, anchor id
         for attr in element.attrs.iter() {
             match tree.resolve(attr.name.local) {
                 "href" if tag == "a" => {
@@ -956,24 +903,16 @@ impl LayoutBuilder<'_> {
                         y: self.y,
                     });
                 }
-                "style" => {
-                    if let Some(color) = parse_color_from_style(&attr.value) {
-                        line_buffer.current_color = color;
-                    }
-                }
                 _ => {}
             }
         }
 
-        // Links get blue color (unless styled inline)
-        if tag == "a" && line_buffer.current_color == saved_color {
-            line_buffer.current_color = Color::rgb(51, 102, 204); // Wikipedia link blue
-        }
-
         // Recurse into children
+        self.styler.enter(node_id);
         for (child_id, _) in tree.children(node_id) {
             self.layout_node(child_id);
         }
+        self.styler.leave();
 
         // Restore state
         let line_buffer = &mut self.line_buffer;
@@ -1001,88 +940,6 @@ impl LayoutBuilder<'_> {
     }
 }
 
-/// Parse color from inline style attribute
-fn parse_color_from_style(style: &str) -> Option<Color> {
-    for part in style.split(';') {
-        let Some((name, value)) = part.split_once(':') else { continue };
-        if name.trim().eq_ignore_ascii_case("color") {
-            return parse_css_color(value.trim());
-        }
-    }
-    None
-}
-
-/// Parse background-color from inline style attribute
-#[allow(dead_code)]
-fn parse_background_from_style(style: &str) -> Option<Color> {
-    for part in style.split(';') {
-        let part = part.trim();
-        if let Some(value) = part.strip_prefix("background-color:").or_else(|| part.strip_prefix("background:")) {
-            // Background can have multiple values, just take the color part
-            let value = value.trim().split_whitespace().next()?;
-            return parse_css_color(value);
-        }
-    }
-    None
-}
-
-/// Parse a CSS color value
-fn parse_css_color(value: &str) -> Option<Color> {
-    let value = value.trim().trim_end_matches("!important").trim().to_ascii_lowercase();
-
-    // Named colors (common web colors)
-    match value.as_str() {
-        "black" => return Some(Color::rgb(0, 0, 0)),
-        "white" => return Some(Color::rgb(255, 255, 255)),
-        "red" => return Some(Color::rgb(255, 0, 0)),
-        "green" => return Some(Color::rgb(0, 128, 0)),
-        "blue" => return Some(Color::rgb(0, 0, 255)),
-        "gray" | "grey" => return Some(Color::rgb(128, 128, 128)),
-        "lightgray" | "lightgrey" => return Some(Color::rgb(211, 211, 211)),
-        "darkgray" | "darkgrey" => return Some(Color::rgb(169, 169, 169)),
-        "silver" => return Some(Color::rgb(192, 192, 192)),
-        "navy" => return Some(Color::rgb(0, 0, 128)),
-        "teal" => return Some(Color::rgb(0, 128, 128)),
-        "orange" => return Some(Color::rgb(255, 165, 0)),
-        "yellow" => return Some(Color::rgb(255, 255, 0)),
-        "purple" => return Some(Color::rgb(128, 0, 128)),
-        "pink" => return Some(Color::rgb(255, 192, 203)),
-        "brown" => return Some(Color::rgb(165, 42, 42)),
-        "transparent" => return None, // Skip transparent
-        _ => {}
-    }
-
-    // Hex colors #rgb or #rrggbb
-    if let Some(hex) = value.strip_prefix('#') {
-        if !hex.is_ascii() {
-            return None;
-        }
-        if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
-            return Some(Color::rgb(r, g, b));
-        } else if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color::rgb(r, g, b));
-        }
-    }
-
-    // rgb(r, g, b)
-    if let Some(rgb) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        let parts: Vec<&str> = rgb.split(',').collect();
-        if parts.len() == 3 {
-            let r = parts[0].trim().parse().ok()?;
-            let g = parts[1].trim().parse().ok()?;
-            let b = parts[2].trim().parse().ok()?;
-            return Some(Color::rgb(r, g, b));
-        }
-    }
-
-    None
-}
 
 /// Line buffer for accumulating inline text
 struct LineBuffer {
@@ -1216,7 +1073,8 @@ impl LineBuffer {
 }
 
 /// Apply default user-agent styles based on element type
-fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
+fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str, element: &fos_dom::ElementData, tree: &DomTree) {
+    let parent = style.font_size;
     let lowered;
     let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
         lowered = tag_name.to_ascii_lowercase();
@@ -1235,7 +1093,7 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
         // Headings
         "h1" => {
             style.display = Display::Block;
-            style.font_size = 32.0;
+            style.font_size = parent * 2.0;
             style.font_weight = 700;
             style.margin = EdgeSizes {
                 top: SizeValue::Length(21.44, LengthUnit::Px),
@@ -1246,7 +1104,7 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
         }
         "h2" => {
             style.display = Display::Block;
-            style.font_size = 24.0;
+            style.font_size = parent * 1.5;
             style.font_weight = 700;
             style.margin = EdgeSizes {
                 top: SizeValue::Length(19.92, LengthUnit::Px),
@@ -1257,28 +1115,44 @@ fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str) {
         }
         "h3" => {
             style.display = Display::Block;
-            style.font_size = 18.72;
+            style.font_size = parent * 1.17;
             style.font_weight = 700;
         }
         "h4" => {
             style.display = Display::Block;
-            style.font_size = 16.0;
+            style.font_size = parent * 1.0;
             style.font_weight = 700;
         }
         "h5" => {
             style.display = Display::Block;
-            style.font_size = 13.28;
+            style.font_size = parent * 0.83;
             style.font_weight = 700;
         }
         "h6" => {
             style.display = Display::Block;
-            style.font_size = 10.72;
+            style.font_size = parent * 0.67;
             style.font_weight = 700;
         }
 
-        // Inline elements
-        "span" | "a" | "em" | "i" | "u" | "code" | "kbd" | "samp" => {
+        // Links (`:link`: with an href)
+        "a" => {
             style.display = Display::Inline;
+            if element.attrs.iter().any(|a| tree.resolve(a.name.local) == "href") {
+                style.color = fos_css::properties::Color::rgb(51, 102, 204);
+            }
+        }
+
+        // Inline elements
+        "span" | "em" | "i" | "u" | "code" | "kbd" | "samp" => {
+            style.display = Display::Inline;
+        }
+        "small" | "sub" | "sup" => {
+            style.display = Display::Inline;
+            style.font_size = parent * 0.83;
+        }
+        "big" => {
+            style.display = Display::Inline;
+            style.font_size = parent * 1.2;
         }
 
         // Bold
@@ -1543,7 +1417,7 @@ mod tests {
     fn test_layout_lines_are_ordered() {
         let document = fos_html::parse_with_url(PAGE, "https://example.com/");
         let renderer = PageRenderer::new(320, 240);
-        let styler = Styler { renderer: &renderer, tree: document.tree(), stylesheet: renderer.page_stylesheet(&document) };
+        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
         let layout = build_layout(&document, &styler, 320);
 
         assert!(!layout.lines.is_empty());
@@ -1560,11 +1434,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_color_from_style() {
-        assert_eq!(parse_color_from_style("color: red"), Some(Color::rgb(255, 0, 0)));
-        assert_eq!(parse_color_from_style("font-weight:bold; COLOR:#00f"), Some(Color::rgb(0, 0, 255)));
-        assert_eq!(parse_color_from_style("background-color: red"), None);
-        assert_eq!(parse_color_from_style("color: #ff0000 !important"), Some(Color::rgb(255, 0, 0)));
-        assert_eq!(parse_color_from_style("color: #é1"), None);
+    fn test_page_css_reaches_layout() {
+        let html = r#"<html><head><style>
+            .big { color: red; font-size: 32px }
+            nav a { color: #008000 }
+            .rel { font-size: 1.5em }
+            @media (max-width: 100px) { .big { color: blue } }
+            </style></head><body>
+            <p style="color: #00f">inline</p>
+            <p class="big">big <span class="rel">rel</span></p>
+            <nav><a href="/x">nav link</a></nav><a href="/y">plain link</a>
+            <p style="display: none">hidden</p>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let renderer = PageRenderer::new(640, 480);
+        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
+        let layout = build_layout(&document, &styler, 640);
+        let seg = |text: &str| {
+            layout.lines.iter().flat_map(|l| &l.segments).find(|s| s.text.trim() == text).unwrap_or_else(|| panic!("no segment {text}")).clone()
+        };
+        assert_eq!(seg("inline").color, Color::rgb(0, 0, 255));
+        assert_eq!(seg("big").color, Color::rgb(255, 0, 0));
+        assert_eq!(seg("big").font_size, 32.0);
+        // Inherited color, em relative to the parent's size
+        assert_eq!(seg("rel").color, Color::rgb(255, 0, 0));
+        assert_eq!(seg("rel").font_size, 48.0);
+        assert_eq!(seg("nav link").color, Color::rgb(0, 128, 0));
+        assert_eq!(seg("plain link").color, Color::rgb(51, 102, 204));
+        assert!(layout.lines.iter().flat_map(|l| &l.segments).all(|s| s.text.trim() != "hidden"));
     }
 }

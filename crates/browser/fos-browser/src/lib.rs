@@ -40,6 +40,9 @@ pub mod renderer;
 /// JavaScript runtime integration
 pub mod js_runtime;
 pub mod dom_bindings;
+pub mod script_fetch;
+pub mod page_styles;
+pub mod css_loader;
 /// Network requests with HTTP cache
 pub mod network;
 /// Character encoding detection and decoding

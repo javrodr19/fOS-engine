@@ -43,7 +43,7 @@ pub mod selector;
 pub use node::{Node, NodeData, ElementData, TextData, Attribute};
 pub use tree::{DomTree, DomRevision};
 pub use document::Document;
-pub use selector::SelectorList;
+pub use selector::{SelectorList, SubjectKey, key_hash, KEY_ID, KEY_CLASS, KEY_TAG};
 pub use interner::{StringInterner, InternedString};
 pub use forms::{
     FormControl, InputElement, InputType, InputValue, 

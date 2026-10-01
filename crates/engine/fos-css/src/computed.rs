@@ -34,6 +34,9 @@ pub struct ComputedStyle {
     
     // Text
     pub font_size: f32,        // in pixels
+    /// The parent's font size (what `em` and `%` font sizes resolve
+    /// against); 0 when unknown
+    pub parent_font_size: f32,
     pub font_weight: u16,      // 100-900
     pub line_height: f32,      // multiplier
     
@@ -180,7 +183,13 @@ impl ComputedStyle {
             }
             PropertyId::FontSize => {
                 if let PropertyValue::Length(len) = &decl.value {
-                    self.font_size = Self::length_to_px(len, self.font_size);
+                    let parent = if self.parent_font_size > 0.0 { self.parent_font_size } else { self.font_size };
+                    self.font_size = Self::length_to_px(len, parent);
+                }
+            }
+            PropertyId::FontWeight => {
+                if let PropertyValue::Integer(w) = &decl.value {
+                    self.font_weight = (*w).clamp(1, 1000) as u16;
                 }
             }
             PropertyId::Opacity => {

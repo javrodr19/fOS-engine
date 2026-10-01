@@ -1,6 +1,6 @@
 //! fOS CSS Parser & Style System
 //!
-//! CSS parsing using lightningcss with style cascade implementation.
+//! CSS parsing and style cascade.
 //! Designed for memory efficiency with computed style sharing.
 //! Includes CSS Custom Properties (variables), calc(), and math functions.
 //!
@@ -50,7 +50,7 @@ pub mod view_transitions;
 // Phase 5: Surpassing Chromium
 pub mod predictive;
 
-pub use parser::CssParser;
+pub use parser::{CssParser, MediaContext, parse_declarations, parse_color, parse_length, media_matches};
 pub use cascade::StyleResolver;
 pub use properties::{PropertyId, PropertyValue};
 pub use computed::ComputedStyle;
@@ -158,6 +158,11 @@ pub use jit_selector::{
 /// Parse a CSS stylesheet
 pub fn parse_stylesheet(css: &str) -> Result<Stylesheet, CssError> {
     CssParser::new().parse(css)
+}
+
+/// Parse a CSS stylesheet, evaluating `@media` queries against `media`
+pub fn parse_stylesheet_for(css: &str, media: MediaContext) -> Stylesheet {
+    CssParser::with_media(media).parse(css).unwrap_or_default()
 }
 
 /// Parsed stylesheet

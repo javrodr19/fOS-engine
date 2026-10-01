@@ -353,67 +353,72 @@ impl<T> StealQueue<T> {
         if bottom == 0 {
             return None;
         }
-        
+
         let new_bottom = bottom.wrapping_sub(1);
         self.bottom.store(new_bottom, Ordering::SeqCst);
-        
+
         let top = self.top.load(Ordering::SeqCst);
-        
+
         if top > new_bottom {
             // Queue was empty after we decremented
             self.bottom.store(top, Ordering::Relaxed);
             return None;
         }
-        
-        // Read item
+
+        // Copy the slot out; it only becomes ours once no thief can take it
         let idx = new_bottom & self.mask;
-        let item = unsafe { (*self.buffer[idx].get()).assume_init_read() };
-        
+        let item: MaybeUninit<T> = unsafe { std::ptr::read(self.buffer[idx].get()) };
+
         if top == new_bottom {
-            // Was the last item, need CAS to prevent steal conflict
-            if self.top.compare_exchange(
+            // The last item: race the thieves for it
+            let won = self.top.compare_exchange(
                 top,
                 top.wrapping_add(1),
                 Ordering::SeqCst,
                 Ordering::Relaxed,
-            ).is_err() {
-                // Thief got it
-                self.bottom.store(top.wrapping_add(1), Ordering::Relaxed);
+            ).is_ok();
+            self.bottom.store(top.wrapping_add(1), Ordering::Relaxed);
+            if !won {
+                // A thief took it: the copy is not ours to drop
                 return None;
             }
-            self.bottom.store(top.wrapping_add(1), Ordering::Relaxed);
         }
-        
-        Some(item)
+
+        Some(unsafe { item.assume_init() })
     }
-    
+
     /// Steal from top (thieves)
     pub fn steal(&self) -> Option<T> {
         loop {
             let top = self.top.load(Ordering::Acquire);
+            // Order the read of `top` before the read of `bottom` against
+            // the owner's `pop` (Chase-Lev)
+            std::sync::atomic::fence(Ordering::SeqCst);
             let bottom = self.bottom.load(Ordering::Acquire);
-            
+
             if top >= bottom {
                 return None; // Empty
             }
-            
-            // Read item
+
+            // Copy the slot out; it only becomes ours if we advance `top`.
+            // A volatile read, as the slot may be reused by the owner once
+            // another thief has taken it (the CAS below then fails).
             let idx = top & self.mask;
-            let item = unsafe { (*self.buffer[idx].get()).assume_init_read() };
-            
-            // Try to advance top
+            let item: MaybeUninit<T> = unsafe { std::ptr::read_volatile(self.buffer[idx].get()) };
+
             if self.top.compare_exchange(
                 top,
                 top.wrapping_add(1),
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             ).is_ok() {
-                return Some(item);
+                return Some(unsafe { item.assume_init() });
             }
-            // CAS failed, retry
+            // Lost the race: the copy belongs to whoever won, so it is
+            // forgotten (MaybeUninit never drops), not dropped
         }
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         let top = self.top.load(Ordering::Relaxed);
@@ -572,9 +577,12 @@ mod tests {
     
     #[test]
     fn test_steal_queue_concurrent() {
+        use std::sync::atomic::AtomicBool;
         let queue = Arc::new(StealQueue::new(256));
         let queue2 = Arc::clone(&queue);
-        
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = Arc::clone(&done);
+
         // Owner pushes
         let owner = thread::spawn(move || {
             for i in 0..100 {
@@ -582,30 +590,99 @@ mod tests {
                     thread::yield_now();
                 }
             }
+            done2.store(true, Ordering::Release);
         });
-        
-        // Thief steals
+
+        // Thief steals until it has half of them (the owner never pops, so
+        // they are all there to be stolen eventually)
         let thief = thread::spawn(move || {
             let mut stolen = vec![];
-            for _ in 0..50 {
-                while let Some(v) = queue.steal() {
-                    stolen.push(v);
-                    if stolen.len() >= 50 {
-                        break;
-                    }
+            while stolen.len() < 50 {
+                match queue.steal() {
+                    Some(v) => stolen.push(v),
+                    None if done.load(Ordering::Acquire) && queue.is_empty() => break,
+                    None => thread::yield_now(),
                 }
-                if stolen.len() >= 50 {
-                    break;
-                }
-                thread::yield_now();
             }
             stolen
         });
-        
+
         owner.join().unwrap();
         let stolen = thief.join().unwrap();
-        
-        // Should have stolen some items
-        assert!(!stolen.is_empty());
+
+        // Stealing takes the oldest items, in order, each once
+        assert_eq!(stolen, (0..50).collect::<Vec<_>>());
+    }
+
+    /// Owner pushing and popping against several thieves: every item is
+    /// taken exactly once, and none is dropped twice
+    #[test]
+    fn test_steal_queue_every_item_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Item(usize, Box<u64>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        const N: usize = 20_000;
+        for _round in 0..5 {
+            DROPS.store(0, Ordering::Relaxed);
+            let queue: Arc<StealQueue<Item>> = Arc::new(StealQueue::new(64));
+            let done = Arc::new(AtomicBool::new(false));
+            let thieves: Vec<_> = (0..3)
+                .map(|_| {
+                    let q = Arc::clone(&queue);
+                    let done = Arc::clone(&done);
+                    thread::spawn(move || {
+                        let mut got: Vec<usize> = Vec::new();
+                        loop {
+                            match q.steal() {
+                                Some(item) => {
+                                    assert_eq!(*item.1, item.0 as u64);
+                                    got.push(item.0);
+                                }
+                                None if done.load(Ordering::Acquire) => return got,
+                                None => thread::yield_now(),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let mut mine = Vec::new();
+            for i in 0..N {
+                let mut item = Item(i, Box::new(i as u64));
+                loop {
+                    match queue.push(item) {
+                        Ok(()) => break,
+                        Err(back) => {
+                            item = back;
+                            if let Some(item) = queue.pop() {
+                                assert_eq!(*item.1, item.0 as u64);
+                                mine.push(item.0);
+                            }
+                        }
+                    }
+                }
+                if i % 3 == 0 {
+                    if let Some(item) = queue.pop() {
+                        assert_eq!(*item.1, item.0 as u64);
+                        mine.push(item.0);
+                    }
+                }
+            }
+            while let Some(item) = queue.pop() {
+                mine.push(item.0);
+            }
+            done.store(true, Ordering::Release);
+            for t in thieves {
+                mine.extend(t.join().unwrap());
+            }
+            mine.sort_unstable();
+            assert_eq!(mine, (0..N).collect::<Vec<_>>(), "items lost or duplicated");
+            assert_eq!(DROPS.load(Ordering::Relaxed), N, "an item was dropped twice or not at all");
+        }
     }
 }

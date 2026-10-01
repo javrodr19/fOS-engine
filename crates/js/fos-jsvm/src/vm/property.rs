@@ -54,10 +54,13 @@ impl Vm {
             self.add_prop(o, PropertyKey::Atom(atoms::name), v, PropFlags::READONLY_HIDDEN);
         }
         if lazy & LAZY_PROTOTYPE != 0 {
-            let is_gen = matches!(&o.get().kind, ObjectKind::Function(c) if c.proto.is_generator);
-            if is_gen {
+            let gen_kind = match &o.get().kind {
+                ObjectKind::Function(c) if c.proto.is_generator => Some(c.proto.is_async),
+                _ => None,
+            };
+            if let Some(is_async) = gen_kind {
                 // Generator functions: prototype of their generator objects
-                let gp = self.realm.generator_proto;
+                let gp = if is_async { self.realm.async_generator_proto } else { self.realm.generator_proto };
                 let p = self.new_object_with(Some(gp), ObjectKind::Ordinary);
                 self.add_prop(o, PropertyKey::Atom(atoms::prototype), Value::object(p), PropFlags(PropFlags::WRITABLE));
             } else {
@@ -1045,6 +1048,48 @@ impl Vm {
         }
         let r = self.iter_step(it)?;
         Ok(crate::builtins::array::iter_result(self, r.unwrap_or(Value::UNDEFINED), r.is_none()))
+    }
+
+    /// GetIterator(v, async): an iterator record over `v[Symbol.asyncIterator]`,
+    /// or over its sync iterator wrapped to produce promises
+    pub fn get_async_iterator(&mut self, v: Value) -> JsResult<Value> {
+        let method = self.get(v, PropertyKey::Symbol(self.sym.async_iterator))?;
+        let it = if method.is_nullish() {
+            let sync = self.get_iterator(v)?;
+            let proto = self.realm.async_from_sync_iterator_proto;
+            let w = self.new_object_with(Some(proto), ObjectKind::Ordinary);
+            w.get_mut().elements = vec![sync];
+            Value::object(w)
+        } else {
+            if !self.is_callable(method) {
+                return Err(self.type_error("Symbol.asyncIterator is not a function"));
+            }
+            let it = self.call(method, v, &[])?;
+            if !it.is_object() {
+                return Err(self.type_error("Result of the Symbol.asyncIterator method is not an object"));
+            }
+            it
+        };
+        let next = self.get(it, PropertyKey::Atom(atoms::next))?;
+        let rec = self.new_object_with(None, ObjectKind::IterRecord { iter: it, next, done: false });
+        Ok(Value::object(rec))
+    }
+
+    /// Call the `return()` of an async iterator record being left early
+    pub(crate) fn async_iter_return(&mut self, it: Value) -> JsResult<Value> {
+        let o = it.as_object().unwrap();
+        if let ObjectKind::IterRecord { iter, done, .. } = &mut o.get_mut().kind {
+            if *done {
+                return Ok(Value::UNDEFINED);
+            }
+            *done = true;
+            let iter = *iter;
+            let ret = self.get(iter, PropertyKey::Atom(atoms::return_))?;
+            if !ret.is_nullish() {
+                return self.call(ret, iter, &[]);
+            }
+        }
+        Ok(Value::UNDEFINED)
     }
 
     pub fn iter_close(&mut self, it: Value) -> JsResult<()> {

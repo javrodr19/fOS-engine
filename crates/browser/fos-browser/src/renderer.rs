@@ -465,25 +465,26 @@ impl PageRenderer {
         styles: Option<&PageStyles>,
         inherited: &Inherited,
         filter: Option<&crate::page_styles::AncestorFilter>,
+        cache: &mut fos_css::ResolveCache,
     ) -> ComputedStyle {
         let mut style = ComputedStyle::default();
         style.font_size = inherited.font_size;
         style.parent_font_size = inherited.font_size;
+        style.root_font_size = inherited.root_font_size;
         style.font_weight = inherited.font_weight;
+        style.custom_properties = inherited.custom.clone();
         style.color = fos_css::properties::Color::rgba(inherited.color.r, inherited.color.g, inherited.color.b, inherited.color.a);
         let tag_name = tree.resolve(element.name.local);
 
         apply_default_styles(&mut style, tag_name, element, tree);
-        if let Some(styles) = styles {
-            styles.apply(tree, node_id, element, &mut style, filter);
-        }
-        for attr in element.attrs.iter() {
-            if tree.resolve(attr.name.local) == "style" {
-                for decl in fos_css::parse_declarations(&attr.value) {
-                    style.apply_declaration(&decl);
-                }
-            }
-        }
+        let inline: Vec<fos_css::Declaration> = element
+            .attrs
+            .iter()
+            .filter(|a| tree.resolve(a.name.local) == "style")
+            .flat_map(|a| fos_css::parse_declarations(&a.value))
+            .collect();
+        let viewport = (self.viewport_width as f32, self.viewport_height as f32);
+        crate::page_styles::cascade(styles, tree, node_id, element, filter, &inline, &mut style, viewport, cache);
         style
     }
 
@@ -627,18 +628,21 @@ struct Styler<'a> {
     stylesheet: Option<PageStyles>,
     /// Ancestors of the element being laid out
     ancestors: std::cell::RefCell<crate::page_styles::AncestorFilter>,
+    /// `var()` and math resolutions shared across elements
+    resolved: std::cell::RefCell<fos_css::ResolveCache>,
 }
 
 impl<'a> Styler<'a> {
     /// Style of an element (`None` for other nodes)
     fn new(renderer: &'a PageRenderer, tree: &'a DomTree, stylesheet: Option<PageStyles>) -> Self {
-        Self { renderer, tree, stylesheet, ancestors: Default::default() }
+        Self { renderer, tree, stylesheet, ancestors: Default::default(), resolved: Default::default() }
     }
 
     fn style(&self, node_id: NodeId, inherited: &Inherited) -> Option<ComputedStyle> {
         let element = self.tree.get(node_id)?.as_element()?;
         let filter = self.ancestors.borrow();
-        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), inherited, Some(&filter)))
+        let mut cache = self.resolved.borrow_mut();
+        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), inherited, Some(&filter), &mut cache))
     }
 
     /// Descend into element `node`'s children
@@ -661,6 +665,10 @@ struct Inherited {
     font_size: f32,
     font_weight: u16,
     color: Color,
+    /// Custom properties (`--name`)
+    custom: Option<std::sync::Arc<HashMap<String, String>>>,
+    /// The root element's font size (`rem`)
+    root_font_size: f32,
 }
 
 /// Lay out the document body into lines for a viewport of `width` pixels
@@ -679,11 +687,21 @@ fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLay
         chain.push(up);
         up = tree.get(up).map_or(NodeId::NONE, |n| n.parent);
     }
-    let mut inherited = Inherited { font_size: 16.0, font_weight: 400, color: Color::BLACK };
+    let mut inherited = Inherited { font_size: 16.0, font_weight: 400, color: Color::BLACK, custom: None, root_font_size: 16.0 };
+    let mut root_styled = false;
     for &ancestor in chain.iter().rev() {
         if let Some(style) = styler.style(ancestor, &inherited) {
             let c = style.color;
-            inherited = Inherited { font_size: style.font_size, font_weight: style.font_weight, color: Color::rgba(c.r, c.g, c.b, c.a) };
+            // The root element's font size is what `rem` means
+            let root_font_size = if root_styled { inherited.root_font_size } else { style.font_size };
+            root_styled = true;
+            inherited = Inherited {
+                font_size: style.font_size,
+                font_weight: style.font_weight,
+                color: Color::rgba(c.r, c.g, c.b, c.a),
+                custom: style.custom_properties.clone(),
+                root_font_size,
+            };
         }
         styler.enter(ancestor);
     }
@@ -696,9 +714,13 @@ fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLay
         // Document y of the first line
         y: 20.0,
         layout: PageLayout::default(),
+        custom: None,
+        root_font_size: 16.0,
     };
 
     builder.line_buffer.current_color = inherited.color;
+    builder.custom = inherited.custom.clone();
+    builder.root_font_size = inherited.root_font_size;
     if body.is_valid() {
         builder.layout_node(body);
         builder.flush();
@@ -719,6 +741,10 @@ struct LayoutBuilder<'a> {
     /// Current document y (baseline of the next line)
     y: f32,
     layout: PageLayout,
+    /// Custom properties of the element being laid out
+    custom: Option<std::sync::Arc<HashMap<String, String>>>,
+    /// The root element's font size (`rem`)
+    root_font_size: f32,
 }
 
 impl LayoutBuilder<'_> {
@@ -740,6 +766,8 @@ impl LayoutBuilder<'_> {
             font_size: self.line_buffer.current_font_size,
             font_weight: 400,
             color: self.line_buffer.current_color,
+            custom: self.custom.clone(),
+            root_font_size: self.root_font_size,
         };
         let style = self.styler.style(node_id, &inherited);
 
@@ -884,10 +912,12 @@ impl LayoutBuilder<'_> {
         let line_buffer = &mut self.line_buffer;
 
         // Inherited properties for the element's contents
+        let saved_custom = self.custom.clone();
         if let Some(style) = &style {
             line_buffer.current_font_size = style.font_size;
             let c = style.color;
             line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
+            self.custom = style.custom_properties.clone();
         }
 
         // Single pass over attributes: link target, anchor id
@@ -913,6 +943,7 @@ impl LayoutBuilder<'_> {
             self.layout_node(child_id);
         }
         self.styler.leave();
+        self.custom = saved_custom;
 
         // Restore state
         let line_buffer = &mut self.line_buffer;
@@ -1440,7 +1471,12 @@ mod tests {
             nav a { color: #008000 }
             .rel { font-size: 1.5em }
             @media (max-width: 100px) { .big { color: blue } }
+            html { font-size: 20px }
+            :root { --accent: #00f; --pad: 2px }
+            .var { color: var(--accent); font-size: calc(1rem + var(--pad)) }
+            .fallback { color: var(--missing, #f0f) }
             </style></head><body>
+            <p class="var">vars</p><p class="fallback">fallback</p>
             <p style="color: #00f">inline</p>
             <p class="big">big <span class="rel">rel</span></p>
             <nav><a href="/x">nav link</a></nav><a href="/y">plain link</a>
@@ -1462,5 +1498,11 @@ mod tests {
         assert_eq!(seg("nav link").color, Color::rgb(0, 128, 0));
         assert_eq!(seg("plain link").color, Color::rgb(51, 102, 204));
         assert!(layout.lines.iter().flat_map(|l| &l.segments).all(|s| s.text.trim() != "hidden"));
+        // Custom properties from :root, calc() with rem of the root's 20px
+        assert_eq!(seg("vars").color, Color::rgb(0, 0, 255));
+        assert_eq!(seg("vars").font_size, 22.0);
+        assert_eq!(seg("fallback").color, Color::rgb(255, 0, 255));
+        // The root's font size is inherited
+        assert_eq!(seg("inline").font_size, 20.0);
     }
 }

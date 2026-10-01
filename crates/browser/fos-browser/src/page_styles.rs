@@ -161,6 +161,11 @@ impl PageStyles {
     /// Apply the declarations of the rules matching element `node`;
     /// `filter`, if given, holds the element's ancestors
     pub fn apply(&self, tree: &DomTree, node: NodeId, element: &ElementData, style: &mut ComputedStyle, filter: Option<&AncestorFilter>) {
+        cascade(Some(self), tree, node, element, filter, &[], style, (1024.0, 768.0), &mut Default::default());
+    }
+
+    /// The rules matching element `node`, lowest priority first (each once)
+    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>) -> Vec<u32> {
         let mut candidates: Vec<u32> = Vec::new();
         if let Some(id) = element.id {
             if let Some(list) = self.by_id.get(tree.resolve(id)) {
@@ -183,7 +188,7 @@ impl PageStyles {
         }
         candidates.extend_from_slice(&self.universal);
         if candidates.is_empty() {
-            return;
+            return Vec::new();
         }
         // A selector is filed once, but an element may repeat a class
         candidates.sort_unstable();
@@ -196,9 +201,6 @@ impl PageStyles {
             .filter(|c| c.selector.matches(tree, node))
             .map(|c| (c.specificity, c.rule))
             .collect();
-        if matched.is_empty() {
-            return;
-        }
         matched.sort_unstable();
         // Several selectors of one rule may match: the rule applies once,
         // at its highest specificity
@@ -209,16 +211,42 @@ impl PageStyles {
             }
         }
         rules.reverse();
-        for important in [false, true] {
+        rules
+    }
+}
+
+/// Style element `node`: its matching rules (if there is a stylesheet)
+/// and its `style` attribute declarations (`inline`), in cascade order:
+/// normal declarations by specificity and source order, inline ones above
+/// them, then the `!important` ones in the same order. Custom properties,
+/// `var()` and math functions are computed against the element and
+/// `viewport`.
+#[allow(clippy::too_many_arguments)]
+pub fn cascade(
+    styles: Option<&PageStyles>,
+    tree: &DomTree,
+    node: NodeId,
+    element: &ElementData,
+    filter: Option<&AncestorFilter>,
+    inline: &[fos_css::Declaration],
+    style: &mut ComputedStyle,
+    viewport: (f32, f32),
+    cache: &mut fos_css::ResolveCache,
+) {
+    let rules = styles.map_or(Vec::new(), |s| s.matching_rules(tree, node, element, filter));
+    if rules.is_empty() && inline.is_empty() {
+        return;
+    }
+    let mut ordered: Vec<&fos_css::Declaration> = Vec::new();
+    for important in [false, true] {
+        if let Some(s) = styles {
             for &rule in &rules {
-                for decl in &self.stylesheet.rules[rule as usize].declarations {
-                    if decl.important == important {
-                        style.apply_declaration(decl);
-                    }
-                }
+                ordered.extend(s.stylesheet.rules[rule as usize].declarations.iter().filter(|d| d.important == important));
             }
         }
+        ordered.extend(inline.iter().filter(|d| d.important == important));
     }
+    style.apply_cascade_cached(&ordered, viewport, cache);
 }
 
 #[cfg(test)]
@@ -259,6 +287,39 @@ mod tests {
         assert_ne!(style_of(css, HTML, "out").font_size, 30.0);
         assert_ne!(style_of(css, HTML, "out").font_size, 50.0);
         assert_ne!(style_of(css, HTML, "p").font_size, 60.0);
+    }
+
+    #[test]
+    fn custom_properties_and_calc() {
+        let css = ":root { --big: 30px; --unit: 4px } #p { --big: 40px; font-size: var(--big) } .a { margin-top: calc(var(--unit) * 3) } #in { font-size: calc(1em + var(--unit)) }";
+        let html = r#"<html><body><nav><a id="in" class="l">x</a></nav><p id="p" class="a b">z</p></body></html>"#;
+        let doc = fos_html::parse(html);
+        let styles = PageStyles::new(parse_stylesheet(css).unwrap());
+        let tree = doc.tree();
+        // Style down the tree as layout does: parent first, values inherited
+        let style_for = |id: &str| {
+            let target = doc.get_element_by_id(id).unwrap();
+            let mut chain = vec![target];
+            while let Some(p) = tree.get(*chain.last().unwrap()).map(|n| n.parent).filter(|p| tree.get(*p).is_some_and(|n| n.is_element())) {
+                chain.push(p);
+            }
+            let mut parent: Option<ComputedStyle> = None;
+            for &n in chain.iter().rev() {
+                let e = tree.get(n).unwrap().as_element().unwrap();
+                let mut s = ComputedStyle::default();
+                let (fs, custom) = parent.as_ref().map_or((16.0, None), |p| (p.font_size, p.custom_properties.clone()));
+                s.font_size = fs;
+                s.parent_font_size = fs;
+                s.custom_properties = custom;
+                cascade(Some(&styles), tree, n, e, None, &[], &mut s, (1024.0, 768.0), &mut Default::default());
+                parent = Some(s);
+            }
+            parent.unwrap()
+        };
+        assert_eq!(style_for("p").font_size, 40.0);
+        assert_eq!(style_for("in").font_size, 20.0);
+        let p = style_for("p");
+        assert!(matches!(p.margin.top, fos_css::computed::SizeValue::Length(v, _) if v == 12.0));
     }
 
     #[test]

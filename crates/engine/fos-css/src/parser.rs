@@ -466,7 +466,20 @@ pub fn parse_declarations(block: &str) -> Vec<Declaration> {
         }
         let Some((name, value)) = chunk.split_once(':') else { continue };
         let name = name.trim();
-        if name.is_empty() || name.starts_with("--") {
+        if name.is_empty() {
+            continue;
+        }
+        if name.starts_with("--") {
+            // Custom properties: case-sensitive names, values kept as text
+            let mut value = value.trim();
+            let mut important = false;
+            if let Some(bang) = value.rfind('!') {
+                if value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+                    important = true;
+                    value = value[..bang].trim_end();
+                }
+            }
+            out.push(decl(PropertyId::Custom, PropertyValue::Custom(Box::new((name.to_string(), value.to_string()))), important));
             continue;
         }
         let name = name.to_ascii_lowercase();
@@ -526,9 +539,14 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
     }) else {
         return;
     };
-    // Values depending on custom properties or math cannot be computed here
+    // Values depending on custom properties or math functions are computed
+    // per element, during the cascade
     let lower = value.to_ascii_lowercase();
-    if lower.contains("var(") || lower.contains("calc(") || lower.contains("env(") || lower.contains("attr(") {
+    if lower.contains("var(") || ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&lower, f)) {
+        out.push(decl(id, PropertyValue::Unresolved(Box::new((name.to_string(), value.to_string()))), important));
+        return;
+    }
+    if lower.contains("env(") || lower.contains("attr(") {
         return;
     }
     if let Some(kw) = global_keyword(value) {
@@ -950,6 +968,9 @@ mod tests {
     fn inline_style() {
         let d = parse_declarations("color: blue; font-size: 2em; display: none");
         assert_eq!(d.len(), 3);
-        assert!(parse_declarations("width: calc(100% - 2px); color: var(--x)").is_empty());
+        let d = parse_declarations("width: calc(100% - 2px); color: var(--x); --Brand: #fff !important");
+        assert!(matches!(&d[0].value, PropertyValue::Unresolved(b) if b.0 == "width"));
+        assert!(matches!(&d[1].value, PropertyValue::Unresolved(b) if b.1 == "var(--x)"));
+        assert!(matches!(&d[2].value, PropertyValue::Custom(b) if b.0 == "--Brand" && b.1 == "#fff") && d[2].important);
     }
 }

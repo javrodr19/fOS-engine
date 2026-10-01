@@ -85,6 +85,9 @@ pub enum PropertyId {
     // Transition & Animation
     Transition,
     Animation,
+
+    /// A custom property (`--name`); the name is in the value
+    Custom,
 }
 
 impl PropertyId {
@@ -185,6 +188,11 @@ pub enum PropertyValue {
     List(Vec<PropertyValue>),
     /// Raw CSS (for complex values we don't fully parse)
     Raw(String),
+    /// A value using `var()` or math functions, computed per element
+    /// (property name, value text)
+    Unresolved(Box<(String, String)>),
+    /// A custom property declaration (name with `--`, value text)
+    Custom(Box<(String, String)>),
 }
 
 /// CSS keyword values

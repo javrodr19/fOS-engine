@@ -504,6 +504,15 @@ impl BrowserApp {
             self.ensure_render_covers_scroll();
             self.request_redraw();
         }
+        // history.pushState: same page, new URL (links resolve against it)
+        if let Some(url) = self.current_page.as_mut().and_then(Page::take_url_change) {
+            self.current_url = url.clone();
+            self.chrome.url_bar.set_url(&url);
+            if let Some(tab) = self.tabs.active_tab_mut() {
+                tab.set_final_url(&url);
+            }
+            self.request_redraw();
+        }
         let Some(url) = self.current_page.as_mut().and_then(Page::take_script_navigation) else { return };
         log::info!("Script navigation to {}", url);
         self.follow_link(&url);

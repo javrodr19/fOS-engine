@@ -1166,6 +1166,10 @@ impl Vm {
 #[inline]
 fn set_state(cell: &Cell<Ic>, state: IcState) {
     let mut ic = cell.get();
+    // Megamorphic caches never cache: sites of any kind may share them
+    if matches!(ic.state, IcState::Megamorphic) {
+        return;
+    }
     ic.state = state;
     cell.set(ic);
 }

@@ -124,7 +124,7 @@ impl Vm {
                         let callee = r!($func);
                         let argc = $argc as usize;
                         let Some(o) = callee.as_object() else {
-                            let e = self.not_a_function(callee);
+                            let e = self.not_callable_at(unsafe { &*cp }, pc - 1, $func, callee);
                             break 'inner e;
                         };
                         match &o.get().kind {
@@ -144,6 +144,10 @@ impl Vm {
                                 w!($dst, v);
                             }
                             _ => {
+                                if !self.is_callable(callee) {
+                                    let e = self.not_callable_at(unsafe { &*cp }, pc - 1, $func, callee);
+                                    break 'inner e;
+                                }
                                 let this = r!($func + 1);
                                 let args: Vec<Value> = unsafe { std::slice::from_raw_parts(regs.add($func as usize + 2), argc) }.to_vec();
                                 self.frames.last_mut().unwrap().pc = pc as u32;
@@ -1143,6 +1147,35 @@ impl Vm {
         self.sp = f.base + unsafe { (&*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         None
+    }
+
+    /// "x.y is not a function" for the call at `call_pc`, naming the
+    /// callee after the instruction that loaded it (work done only when
+    /// the error happens)
+    fn not_callable_at(&mut self, code: &Code, call_pc: usize, func: Reg, callee: Value) -> Value {
+        match self.reg_source(code, call_pc, func, 2) {
+            Some(name) => self.type_error(&format!("{name} is not a function")),
+            None => self.not_a_function(callee),
+        }
+    }
+
+    /// A name for what register `reg` holds at `pc`: the global or
+    /// property it was loaded from (`depth` levels of receivers)
+    fn reg_source(&self, code: &Code, pc: usize, reg: Reg, depth: u32) -> Option<String> {
+        let at = (pc.saturating_sub(256)..pc).rev().find(|&i| code.code[i].dst() == Some(reg))?;
+        let atom_name = |ic: u16| self.atoms.string(code.ics[ic as usize].get().atom).get().to_rust_string();
+        match code.code[at] {
+            Insn::GetGlobal { ic, .. } => Some(atom_name(ic)),
+            Insn::GetProp { obj, ic, .. } => {
+                let receiver = if depth > 0 { self.reg_source(code, at, obj, depth - 1) } else { None };
+                Some(match receiver {
+                    Some(r) => format!("{r}.{}", atom_name(ic)),
+                    None => atom_name(ic),
+                })
+            }
+            Insn::Mov { src, .. } if depth > 0 => self.reg_source(code, at, src, depth - 1),
+            _ => None,
+        }
     }
 
     fn tdz_error(&mut self, name: crate::string::Atom) -> Value {

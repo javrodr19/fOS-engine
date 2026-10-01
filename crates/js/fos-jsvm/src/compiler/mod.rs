@@ -166,6 +166,9 @@ pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: 
     }
 }
 
+/// Inline caches a function gets before further sites share them by name
+const SHARED_ICS_FROM: usize = 49_152;
+
 pub(crate) enum CErr {
     Syntax(SyntaxError),
     /// A short jump overflowed: compile the function again without them
@@ -324,6 +327,8 @@ pub(crate) struct FuncState<'a> {
     lazy_names: Option<Vec<Name>>,
     /// A module's top-level code (its declarations are module bindings)
     is_module: bool,
+    /// Inline caches shared by name once a function has very many
+    shared_ics: FxHashMap<Atom, u16>,
 }
 
 impl<'a> FuncState<'a> {
@@ -365,6 +370,7 @@ impl<'a> FuncState<'a> {
             withs: Vec::new(),
             lazy_names: None,
             is_module: false,
+            shared_ics: FxHashMap::default(),
         }
     }
 }
@@ -582,8 +588,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
     fn new_ic(&mut self, atom: Atom) -> CResult<u16> {
         let f = self.f();
         let i = f.ics.len();
-        if i >= u16::MAX as usize {
-            return self.error("too many property accesses in one function");
+        // Huge functions (whole bundles wrapped in one function, mostly
+        // run once) share an uncached inline cache per name past this
+        // many sites, so an index still fits in an instruction
+        if i >= SHARED_ICS_FROM {
+            if let Some(&shared) = f.shared_ics.get(&atom) {
+                return Ok(shared);
+            }
+            if i >= u16::MAX as usize {
+                return self.error("too many property names in one function");
+            }
+            f.ics.push(Ic { atom, state: IcState::Megamorphic });
+            f.shared_ics.insert(atom, i as u16);
+            return Ok(i as u16);
         }
         f.ics.push(Ic { atom, state: IcState::Empty });
         Ok(i as u16)

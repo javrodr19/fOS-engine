@@ -389,7 +389,12 @@ fn objects_and_properties() {
         ("Symbol() + ''", "throws TypeError: Cannot convert a Symbol value to a string"),
         ("null.x", "throws TypeError: Cannot read properties of null (reading 'x')"),
         ("undefined.x = 1", "throws TypeError: Cannot set properties of undefined (setting 'x')"),
-        ("let o = {}; o.f()", "throws TypeError: undefined is not a function"),
+        ("let o = {}; o.f()", "throws TypeError: o.f is not a function"),
+        ("function local() { let o = {}; return o.f(); } local()", "throws TypeError: f is not a function"),
+        ("var g = {a: {}}; g.a.b(1, 2)", "throws TypeError: g.a.b is not a function"),
+        ("var h = 5; h()", "throws TypeError: h is not a function"),
+        ("var k = {}; k.m.n()", "throws TypeError: Cannot read properties of undefined (reading 'n')*"),
+        ("(1, 2)()", "throws TypeError: 2 is not a function"),
         ("'use strict'; 'str'.x = 1", "throws TypeError*"),
         ("'str'.x = 1; 'ok'", "'ok'"),
     ]);
@@ -1151,4 +1156,15 @@ fn async_generators() {
         ),
         ("function f() { for await (const x of []) {} }", "throws SyntaxError*"),
     ]);
+}
+
+#[test]
+fn huge_functions_compile() {
+    // More property accesses than inline caches fit in an instruction
+    let mut src = String::from("var o = {a: 1, b: 2}, s = 0; (function () {\n");
+    for i in 0..70_000 {
+        src.push_str(if i % 2 == 0 { "s += o.a;\n" } else { "o.b = s;\n" });
+    }
+    src.push_str("})(); [s, o.b]");
+    assert_eq!(run(&src), "[ 35000, 35000 ]");
 }

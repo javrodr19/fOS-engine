@@ -208,6 +208,14 @@ impl Page {
         self.js_runtime.as_mut().and_then(|r| r.take_navigation())
     }
 
+    /// The page's new URL after `history.pushState`/`replaceState`, if it
+    /// changed (taken); the page itself stays
+    pub fn take_url_change(&mut self) -> Option<String> {
+        let url = self.js_runtime.as_mut().and_then(|r| r.take_url_change())?;
+        self.url = url.clone();
+        Some(url)
+    }
+
     /// Deliver a click on DOM node `node` to the page's scripts; returns
     /// the link to follow, if the click hit one and was not canceled
     pub fn dispatch_click(&mut self, node: fos_dom::NodeId) -> Option<String> {

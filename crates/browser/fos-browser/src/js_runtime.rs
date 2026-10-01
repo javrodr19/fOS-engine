@@ -577,6 +577,18 @@ impl PageJsRuntime {
         self.vm.as_ref().and_then(dom_bindings::next_timer_due)
     }
 
+    /// The page's new URL, if a script changed it without navigating
+    /// (`history.pushState`; taken)
+    pub fn take_url_change(&mut self) -> Option<String> {
+        let host = self.vm.as_mut()?.host_mut::<dom_bindings::DomHost>()?;
+        if !std::mem::take(&mut host.url_changed) {
+            return None;
+        }
+        let url = host.url.clone();
+        self.page_url = url.clone();
+        Some(url)
+    }
+
     /// A navigation a script requested, if any (taken)
     pub fn take_navigation(&mut self) -> Option<String> {
         self.navigation.take()
@@ -786,6 +798,57 @@ mod tests {
         );
         assert_eq!(source.single, ["https://example.com/dir/a.js"]);
         assert_eq!(rt.eval("log.join()").unwrap(), "a.js,error,inline,b.js,https://example.com/dir/a.js");
+    }
+
+    #[test]
+    fn timing_history_and_node_apis() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><ul id="a"><li class="x">1</li></ul><ul id="b"><li class="x">1</li></ul><ul id="c"><li>1</li></ul>
+            <script>
+              window.out = {};
+              // User Timing
+              const seen = [];
+              new PerformanceObserver(list => seen.push(...list.getEntries().map(e => e.entryType + ':' + e.name)))
+                .observe({ entryTypes: ['mark', 'measure'] });
+              performance.mark('start', { detail: 7 });
+              performance.mark('end');
+              const m = performance.measure('span', 'start', 'end');
+              out.timing = [m.entryType, m.duration >= 0, performance.getEntriesByName('start')[0].detail,
+                performance.getEntriesByType('mark').length, performance.getEntriesByType('navigation').length,
+                typeof performance.timeOrigin].join();
+              setTimeout(() => out.observed = seen.join(), 0);
+              try { performance.measure('bad', 'nope'); } catch (e) { out.badMark = e.name; }
+              // Node equality
+              const [a, b, c] = ['a', 'b', 'c'].map(id => document.getElementById(id));
+              b.id = 'a';
+              out.equal = [a.isEqualNode(b), a.isEqualNode(c), a.isSameNode(a), a.isSameNode(b)].join();
+              b.id = 'b';
+              // Legacy constructors
+              const img = new Image(10, 20);
+              out.ctors = [img.tagName, img.getAttribute('width'), img instanceof HTMLElement, new Option('t', 'v').getAttribute('value')].join();
+              // History
+              history.pushState({ page: 2 }, '', '/app/list?q=1');
+              out.pushed = [location.pathname, location.search, document.URL, history.state.page, history.length].join();
+              try { history.pushState(null, '', 'https://other.example/'); } catch (e) { out.cross = e.name; }
+              addEventListener('popstate', e => out.popped = [JSON.stringify(e.state), location.pathname].join());
+              history.back();
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // The page's URL followed pushState (and then back())
+        assert_eq!(rt.take_url_change().as_deref(), Some("https://example.com/dir/page.html"));
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("out.timing").unwrap(), "measure,true,7,2,1,number");
+        assert_eq!(rt.eval("out.observed").unwrap(), "mark:start,mark:end,measure:span");
+        assert_eq!(rt.eval("out.badMark").unwrap(), "SyntaxError");
+        assert_eq!(rt.eval("out.equal").unwrap(), "true,false,true,false");
+        assert_eq!(rt.eval("out.ctors").unwrap(), "IMG,10,true,v");
+        assert_eq!(rt.eval("out.pushed").unwrap(), "/app/list,?q=1,https://example.com/app/list?q=1,2,2");
+        assert_eq!(rt.eval("out.cross").unwrap(), "SecurityError");
+        assert_eq!(rt.eval("out.popped").unwrap(), "null,/dir/page.html");
     }
 
     #[test]

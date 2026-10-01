@@ -231,6 +231,16 @@ pub enum Insn {
     Debugger,
 }
 
+impl Insn {
+    /// The register the instruction writes its result to, if any
+    pub fn dst(self) -> Option<Reg> {
+        match self {
+            Insn::Mov { dst, .. } | Insn::LoadInt { dst, .. } | Insn::LoadConst { dst, .. } | Insn::LoadUndef { dst, .. } | Insn::LoadNull { dst, .. } | Insn::LoadTrue { dst, .. } | Insn::LoadFalse { dst, .. } | Insn::LoadHole { dst, .. } | Insn::GetUpval { dst, .. } | Insn::GetUpvalChecked { dst, .. } | Insn::GetGlobal { dst, .. } | Insn::TypeofGlobal { dst, .. } | Insn::Add { dst, .. } | Insn::Sub { dst, .. } | Insn::Mul { dst, .. } | Insn::Div { dst, .. } | Insn::Mod { dst, .. } | Insn::Exp { dst, .. } | Insn::BitAnd { dst, .. } | Insn::BitOr { dst, .. } | Insn::BitXor { dst, .. } | Insn::Shl { dst, .. } | Insn::Sar { dst, .. } | Insn::Shr { dst, .. } | Insn::AddImm { dst, .. } | Insn::SubImm { dst, .. } | Insn::Eq { dst, .. } | Insn::Ne { dst, .. } | Insn::StrictEq { dst, .. } | Insn::StrictNe { dst, .. } | Insn::Lt { dst, .. } | Insn::Le { dst, .. } | Insn::Gt { dst, .. } | Insn::Ge { dst, .. } | Insn::In { dst, .. } | Insn::Instanceof { dst, .. } | Insn::Neg { dst, .. } | Insn::Plus { dst, .. } | Insn::ToNumeric { dst, .. } | Insn::Not { dst, .. } | Insn::BitNot { dst, .. } | Insn::Typeof { dst, .. } | Insn::Inc { dst, .. } | Insn::Dec { dst, .. } | Insn::ToStr { dst, .. } | Insn::ToPropertyKey { dst, .. } | Insn::NewObject { dst, .. } | Insn::NewArray { dst, .. } | Insn::GetProp { dst, .. } | Insn::GetElem { dst, .. } | Insn::CopyRest { dst, .. } | Insn::DeleteProp { dst, .. } | Insn::DeleteElem { dst, .. } | Insn::Closure { dst, .. } | Insn::DynamicImport { dst, .. } | Insn::Call { dst, .. } | Insn::CallSpread { dst, .. } | Insn::New { dst, .. } | Insn::NewSpread { dst, .. } | Insn::SuperCall { dst, .. } | Insn::SuperCallSpread { dst, .. } | Insn::GetSuperBase { dst, .. } | Insn::LoadNewTarget { dst, .. } | Insn::LoadCallee { dst, .. } | Insn::ForInInit { dst, .. } | Insn::ForInNext { dst, .. } | Insn::GetIterator { dst, .. } | Insn::IterNext { dst, .. } | Insn::IterValue { dst, .. } | Insn::IterRest { dst, .. } | Insn::GetAsyncIterator { dst, .. } | Insn::AsyncIterReturn { dst, .. } | Insn::TemplateObject { dst, .. } | Insn::RegExp { dst, .. } | Insn::NewPrivateName { dst, .. } | Insn::WithHas { dst, .. } | Insn::Yield { dst, .. } | Insn::IterSend { dst, .. } | Insn::Await { dst, .. } => Some(dst),
+            _ => None,
+        }
+    }
+}
+
 /// Kinds for `ThrowError`
 pub const ERR_TYPE: u8 = 0;
 pub const ERR_REFERENCE: u8 = 1;

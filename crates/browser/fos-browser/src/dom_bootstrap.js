@@ -36,6 +36,12 @@
     composedPath() { return this._path ? this._path.slice() : []; }
   }
   Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+  class PopStateEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.state = init.state ?? null; }
+  }
+  class HashChangeEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.oldURL = String(init.oldURL ?? ''); this.newURL = String(init.newURL ?? ''); }
+  }
   class CustomEvent extends Event {
     constructor(type, init = {}) { super(type, init); this.detail = init.detail === undefined ? null : init.detail; }
   }
@@ -68,8 +74,10 @@
   // Listeners of each target, by type: [{callback, capture, once, passive}]
   const listeners = new WeakMap();
   const EventTargetProto = EventTarget.prototype;
+  // Called bare (`addEventListener('load', f)`), they act on the window
   const eventTargetMethods = {
     addEventListener(type, callback, options) {
+      if (this == null) return global.addEventListener(type, callback, options);
       if (callback == null) return;
       const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
       const once = !!(options && typeof options === 'object' && options.once);
@@ -83,6 +91,7 @@
       if (signal) signal.addEventListener('abort', () => this.removeEventListener(type, callback, options));
     },
     removeEventListener(type, callback, options) {
+      if (this == null) return global.removeEventListener(type, callback, options);
       const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
       const list = listeners.get(this)?.get(type);
       if (!list) return;
@@ -90,6 +99,7 @@
       if (i >= 0) { list[i].removed = true; list.splice(i, 1); }
     },
     dispatchEvent(event) {
+      if (this == null) return global.dispatchEvent(event);
       event.target = this;
       event.isTrusted = !!event.isTrusted;
       const path = [];
@@ -472,6 +482,30 @@
     configurable: true,
   });
 
+  // Node comparison (DOM "equals")
+  define(Node.prototype, {
+    isSameNode(other) { return this === other; },
+    isEqualNode(other) {
+      if (!other || this.nodeType !== other.nodeType || this.nodeName !== other.nodeName) return false;
+      if (this.nodeType === 1) {
+        const names = this.getAttributeNames();
+        const otherNames = other.getAttributeNames();
+        if (names.length !== otherNames.length) return false;
+        for (const n of names) {
+          if (other.getAttribute(n) !== this.getAttribute(n)) return false;
+        }
+      } else if (this.nodeType === 3 || this.nodeType === 8) {
+        if (this.nodeValue !== other.nodeValue) return false;
+      }
+      const a = this.childNodes, b = other.childNodes;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!a[i].isEqualNode(b[i])) return false;
+      }
+      return true;
+    },
+  });
+
   // NodeList helpers (query results are arrays with NodeList.prototype)
   define(NodeList.prototype, { item(i) { return this[i] ?? null; } });
   global.HTMLCollection = NodeList;
@@ -486,6 +520,29 @@
     'SVGElement', 'SVGSVGElement']) {
     global[name] = HTMLElement;
   }
+  // Legacy factory constructors
+  function Image(width, height) {
+    const img = document.createElement('img');
+    if (width !== undefined) img.setAttribute('width', String(width));
+    if (height !== undefined) img.setAttribute('height', String(height));
+    return img;
+  }
+  function Audio(src) {
+    const audio = document.createElement('audio');
+    audio.setAttribute('preload', 'auto');
+    if (src !== undefined) audio.setAttribute('src', String(src));
+    return audio;
+  }
+  function Option(text = '', value, defaultSelected = false, selected = false) {
+    const option = document.createElement('option');
+    option.textContent = String(text);
+    if (value !== undefined) option.setAttribute('value', String(value));
+    if (defaultSelected) option.setAttribute('selected', '');
+    if (selected) option.selected = true;
+    return option;
+  }
+  for (const f of [Image, Audio, Option]) f.prototype = HTMLElement.prototype;
+  Object.assign(global, { Image, Audio, Option });
 
   // ---- document ----
 
@@ -685,6 +742,64 @@
   }
   const pendingNavigation = [];
   function __fosNavigate(url) { pendingNavigation.push(url); }
+
+  // Session history of the page: pushState/replaceState change the URL
+  // (the browser shows it) without loading anything
+  class History {
+    constructor() {
+      Object.defineProperties(this, {
+        _entries: { value: [{ state: null, url: document.URL }] },
+        _index: { value: 0, writable: true },
+      });
+      this.scrollRestoration = 'auto';
+    }
+    get length() { return this._entries.length; }
+    get state() { return this._entries[this._index].state; }
+    _target(url) {
+      if (url === undefined || url === null) return global.location.href;
+      const u = new URL(String(url), global.location.href);
+      if (u.origin !== global.location.origin) {
+        throw new DOMException(`A history state object with URL '${u.href}' cannot be created in a document with origin '${global.location.origin}'.`, 'SecurityError');
+      }
+      return u.href;
+    }
+    pushState(state, _title, url) {
+      const target = this._target(url);
+      this._entries.splice(this._index + 1);
+      this._entries.push({ state: structuredCloneState(state), url: target });
+      this._index++;
+      setDocumentURL(target);
+    }
+    replaceState(state, _title, url) {
+      const target = this._target(url);
+      this._entries[this._index] = { state: structuredCloneState(state), url: target };
+      setDocumentURL(target);
+    }
+    back() { this.go(-1); }
+    forward() { this.go(1); }
+    go(delta = 0) {
+      delta = Math.trunc(+delta) || 0;
+      if (delta === 0) { global.location.reload(); return; }
+      const index = this._index + delta;
+      if (index < 0 || index >= this._entries.length) return;
+      const oldURL = global.location.href;
+      this._index = index;
+      const entry = this._entries[index];
+      setDocumentURL(entry.url);
+      setTimeout(() => {
+        global.dispatchEvent(new PopStateEvent('popstate', { state: entry.state }));
+        if (oldURL.split('#')[0] === entry.url.split('#')[0] && oldURL !== entry.url) {
+          global.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: entry.url }));
+        }
+      }, 0);
+    }
+  }
+  const structuredCloneState = (v) => (v === undefined ? null : v);
+  // The URL changes, the page stays (the browser picks it up after the task)
+  function setDocumentURL(url) {
+    if (global.location) global.location._url = new URL(url);
+    __fosSetURL(url);
+  }
 
   class Storage {
     constructor() { Object.defineProperty(this, '_m', { value: new Map() }); }
@@ -1264,6 +1379,124 @@
 
   const noopObserver = class { constructor(cb) { this._cb = cb; } observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
 
+  // ---- performance timeline (User Timing) ----
+
+  class PerformanceEntry {
+    constructor(name, entryType, startTime, duration) {
+      Object.assign(this, { name: String(name), entryType, startTime, duration });
+    }
+    toJSON() { return { ...this }; }
+  }
+  class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      super(name, 'mark', options.startTime ?? performance.now(), 0);
+      this.detail = options.detail ?? null;
+    }
+  }
+  class PerformanceMeasure extends PerformanceEntry {}
+  const perfEntries = [];
+  const perfObservers = new Set();
+  const navigationEntry = new PerformanceEntry(document.URL, 'navigation', 0, 0);
+  Object.assign(navigationEntry, { type: 'navigate', redirectCount: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, loadEventStart: 0, loadEventEnd: 0 });
+  function recordEntry(entry) {
+    perfEntries.push(entry);
+    for (const o of perfObservers) {
+      if (o._types.has(entry.entryType)) {
+        o._queue.push(entry);
+        scheduleObserver(o);
+      }
+    }
+    return entry;
+  }
+  // Observers get their entries in a later task, batched
+  function scheduleObserver(o) {
+    if (o._scheduled) return;
+    o._scheduled = true;
+    setTimeout(() => {
+      o._scheduled = false;
+      const list = o.takeRecords();
+      if (list.length) o._cb(new PerformanceObserverEntryList(list), o);
+    }, 0);
+  }
+  function entriesOf(type) {
+    return type === 'navigation' ? [navigationEntry] : perfEntries.filter(e => e.entryType === type);
+  }
+  function markTime(v) {
+    if (v === undefined) return undefined;
+    if (typeof v === 'number') return v;
+    if (v === 'navigationStart' || v === 'fetchStart') return 0;
+    const marks = perfEntries.filter(e => e.entryType === 'mark' && e.name === String(v));
+    if (!marks.length) throw new DOMException(`The mark '${v}' does not exist.`, 'SyntaxError');
+    return marks[marks.length - 1].startTime;
+  }
+  const timeOrigin = Date.now() - performance.now();
+  Object.assign(performance, {
+    timeOrigin,
+    timing: { navigationStart: timeOrigin, fetchStart: timeOrigin, responseEnd: timeOrigin, domLoading: timeOrigin, domInteractive: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+    navigation: { type: 0, redirectCount: 0 },
+    eventCounts: new Map(),
+    mark(name, options) { return recordEntry(new PerformanceMark(name, options)); },
+    measure(name, start, end) {
+      let startTime, endTime, detail = null;
+      if (start && typeof start === 'object') {
+        detail = start.detail ?? null;
+        startTime = markTime(start.start);
+        endTime = markTime(start.end);
+        if (start.duration !== undefined) {
+          if (startTime === undefined) startTime = endTime - start.duration;
+          else endTime = startTime + start.duration;
+        }
+      } else {
+        startTime = markTime(start);
+        endTime = markTime(end);
+      }
+      startTime ??= 0;
+      endTime ??= performance.now();
+      const m = new PerformanceMeasure(name, 'measure', startTime, endTime - startTime);
+      m.detail = detail;
+      return recordEntry(m);
+    },
+    getEntries() { return [navigationEntry, ...perfEntries]; },
+    getEntriesByType(type) { return entriesOf(String(type)); },
+    getEntriesByName(name, type) {
+      return (type ? entriesOf(String(type)) : this.getEntries()).filter(e => e.name === String(name));
+    },
+    clearMarks(name) { removeEntries('mark', name); },
+    clearMeasures(name) { removeEntries('measure', name); },
+    clearResourceTimings() {},
+    setResourceTimingBufferSize() {},
+    toJSON() { return { timeOrigin, timing: this.timing, navigation: this.navigation }; },
+  });
+  function removeEntries(type, name) {
+    for (let i = perfEntries.length - 1; i >= 0; i--) {
+      if (perfEntries[i].entryType === type && (name === undefined || perfEntries[i].name === String(name))) perfEntries.splice(i, 1);
+    }
+  }
+  class PerformanceObserverEntryList {
+    constructor(list) { this._list = list; }
+    getEntries() { return this._list.slice(); }
+    getEntriesByType(t) { return this._list.filter(e => e.entryType === t); }
+    getEntriesByName(n, t) { return this._list.filter(e => e.name === n && (!t || e.entryType === t)); }
+  }
+  class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function.");
+      Object.assign(this, { _cb: callback, _types: new Set(), _queue: [], _scheduled: false });
+    }
+    observe(options = {}) {
+      const types = options.entryTypes || (options.type ? [options.type] : []);
+      for (const t of types) this._types.add(String(t));
+      perfObservers.add(this);
+      if (options.buffered) {
+        for (const t of types) for (const e of entriesOf(String(t))) this._queue.push(e);
+        if (this._queue.length) scheduleObserver(this);
+      }
+    }
+    disconnect() { perfObservers.delete(this); this._queue = []; }
+    takeRecords() { return this._queue.splice(0); }
+    static get supportedEntryTypes() { return ['mark', 'measure', 'navigation']; }
+  }
+
   function matchMedia(query) {
     const q = String(query);
     let matches = false;
@@ -1300,16 +1533,12 @@
       },
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
     },
-    history: {
-      length: 1, state: null, scrollRestoration: 'auto',
-      pushState(state) { this.state = state; }, replaceState(state) { this.state = state; },
-      back() {}, forward() {}, go() {},
-    },
+    history: new History(),
     localStorage: new Storage(),
     sessionStorage: new Storage(),
     Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, FocusEvent, InputEvent, ErrorEvent,
     PointerEvent: MouseEvent, TouchEvent: UIEvent, WheelEvent: MouseEvent, AnimationEvent: Event,
-    TransitionEvent: Event, PopStateEvent: Event, HashChangeEvent: Event, MessageEvent: Event,
+    TransitionEvent: Event, PopStateEvent, HashChangeEvent, MessageEvent: Event,
     ProgressEvent,
     URL, URLSearchParams, Storage, DOMTokenList, AbortController, AbortSignal, DOMException,
     EventTarget: EventTargetCtor,
@@ -1317,7 +1546,7 @@
     XMLHttpRequest, XMLHttpRequestUpload, XMLHttpRequestEventTarget,
     TextEncoder, TextDecoder,
     MutationObserver: noopObserver, IntersectionObserver: noopObserver, ResizeObserver: noopObserver,
-    PerformanceObserver: noopObserver,
+    PerformanceObserver, PerformanceEntry, PerformanceMark, PerformanceMeasure,
     requestAnimationFrame(cb) {
       const id = ++rafId;
       rafs.set(id, setTimeout(() => { rafs.delete(id); cb(performance.now()); }, 16));

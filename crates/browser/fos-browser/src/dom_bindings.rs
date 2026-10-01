@@ -87,6 +87,8 @@ pub struct DomHost {
     pub scroll_request: Option<f32>,
     /// The browser's cookies (`document.cookie`; `fetch` shares them)
     cookies: fos_net::SharedCookieJar,
+    /// The URL changed without a navigation (`history.pushState`)
+    pub url_changed: bool,
 }
 
 impl DomHost {
@@ -110,6 +112,7 @@ impl DomHost {
             boxes: None,
             scroll_request: None,
             cookies,
+            url_changed: false,
         }
     }
 }
@@ -1035,6 +1038,18 @@ fn performance_now(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsRes
     Ok(Value::number(host(vm).start.elapsed().as_secs_f64() * 1000.0))
 }
 
+/// `__fosSetURL(url)`: the document's URL changed (`history.pushState`);
+/// the caller checked it is same-origin
+fn set_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let url = arg_string(vm, args, 0)?;
+    let h = host(vm);
+    if crate::script_fetch::serialize_origin(&url) == crate::script_fetch::serialize_origin(&h.url) {
+        h.url = url;
+        h.url_changed = true;
+    }
+    Ok(Value::UNDEFINED)
+}
+
 /// `__fosCookie()`: what `document.cookie` reads (no HttpOnly cookies)
 fn get_cookie(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let h = host(vm);
@@ -1530,6 +1545,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("atob", 1, atob),
         ("__fosResolveURL", 2, resolve_url),
         ("__fosCookie", 0, get_cookie),
+        ("__fosSetURL", 1, set_url),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

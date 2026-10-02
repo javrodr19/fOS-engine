@@ -1172,6 +1172,70 @@ mod tests {
     }
 
     #[test]
+    fn mutation_and_geometry_observers() {
+        let spacer = "<p>line</p>".repeat(120);
+        let html = format!(r#"<html><body><div id=r><p id=a class=x>one</p><p id=b>two</p></div><div id=s>{spacer}</div><p id=far>far away</p></body></html>"#);
+        let (mut rt, doc) = page(&html);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // Records are delivered after the script, in a microtask
+        let got = rt.eval(r#"
+            const r = document.getElementById('r'), a = document.getElementById('a'), b = document.getElementById('b');
+            const log = [];
+            const fmt = m => m.type + ':' + (m.target.id || m.target.nodeName) + (m.type === 'childList' ? `+${[...m.addedNodes].map(n => n.id || n.nodeName).join('/')}-${[...m.removedNodes].map(n => n.id || n.nodeName).join('/')}@${m.previousSibling ? m.previousSibling.id || m.previousSibling.nodeName : ''},${m.nextSibling ? m.nextSibling.id || m.nextSibling.nodeName : ''}` : '') + (m.attributeName ? '[' + m.attributeName + ']' : '') + (m.oldValue !== null ? '=' + m.oldValue : '');
+            const mo = new MutationObserver(records => { for (const m of records) log.push(fmt(m)); });
+            mo.observe(r, { childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true, characterDataOldValue: true });
+            const c = document.createElement('p'); c.id = 'c';
+            r.appendChild(c);             // childList on r
+            r.insertBefore(c, a);         // a move: removal, then insertion
+            a.classList.add('y');         // attribute, with old value
+            a.firstChild.data = 'uno';    // characterData
+            b.remove();
+            a.setAttribute('class', 'x y'); // still recorded (same value)
+            a.removeAttribute('nope');    // nothing: no such attribute
+            r.appendChild(r.lastChild);   // re-appending the last child
+            window.log = log;
+            log.length"#).unwrap();
+        assert_eq!(got, "0");
+        // takeRecords empties the queue before delivery
+        assert_eq!(rt.eval("a.id = 'a'; window.taken = mo.takeRecords().map(fmt).join(' '); taken").unwrap(), "attributes:a[id]=a");
+        assert_eq!(
+            rt.eval("log.join(' ')").unwrap(),
+            "childList:r+c-@b, childList:r+-c@b, childList:r+c-@,a attributes:a[class]=x characterData:#text=one childList:r+-b@a, attributes:a[class]=x y childList:r+-a@c, childList:r+a-@c,"
+        );
+        // Filters, non-subtree registration, disconnect, innerHTML
+        assert_eq!(
+            rt.eval(r#"window.log2 = [];
+                const mo2 = new MutationObserver(rs => rs.forEach(m => log2.push(m.type + ':' + (m.attributeName || m.addedNodes.length + '/' + m.removedNodes.length))));
+                mo2.observe(r, { attributeFilter: ['data-k'], childList: true });
+                r.setAttribute('data-k', 1); r.setAttribute('title', 't'); a.setAttribute('data-k', 2); r.innerHTML = '<i></i><b></b>';
+                const errs = [];
+                try { mo2.observe(r, {}); } catch (e) { errs.push(e.name); }
+                try { mo2.observe(r, { attributeOldValue: true, attributes: false }); } catch (e) { errs.push(e.name); }
+                errs.join()"#).unwrap(),
+            "TypeError,TypeError"
+        );
+        assert_eq!(rt.eval("log2.join(' ')").unwrap(), "attributes:data-k childList:2/2");
+        rt.eval("window.before = [log.length, log2.length]; mo.disconnect(); mo2.disconnect(); r.append('x');").unwrap();
+        assert_eq!(rt.eval("[before.join(), log.length, log2.length].join('|')").unwrap(), "13,2|13|2");
+        // Intersection and resize observers report from the layout
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+        rt.eval(r#"window.io = [];
+            const obs = new IntersectionObserver(es => es.forEach(e => io.push((e.target.id || e.target.nodeName) + ':' + e.isIntersecting + ':' + (e.intersectionRatio > 0))), { threshold: [0, 1] });
+            obs.observe(document.getElementById('s').firstChild); obs.observe(document.getElementById('far'));
+            new IntersectionObserver(es => es.forEach(e => io.push('margin:' + e.isIntersecting)), { rootMargin: '20000px 0px' }).observe(document.getElementById('far'));
+            window.ro = [];
+            new ResizeObserver(es => es.forEach(e => ro.push(e.target.nodeName + ':' + (e.contentRect.width > 0) + ':' + (e.borderBoxSize[0].blockSize > 0)))).observe(document.getElementById('far'));"#).unwrap();
+        for _ in 0..2 {
+            rt.process_timers(&mut |_: &str| None).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(rt.eval("io.join(' ')").unwrap(), "P:true:true far:false:false margin:true");
+        assert_eq!(rt.eval("ro.join(' ')").unwrap(), "P:true:true");
+    }
+
+    #[test]
     fn broadcast_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();

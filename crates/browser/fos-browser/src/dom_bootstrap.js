@@ -4455,4 +4455,405 @@
     connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'unknown', addEventListener() {}, removeEventListener() {} },
   });
   Object.assign(global, { Permissions, PermissionStatus, Geolocation, GeolocationPositionError, Notification, Clipboard, ClipboardItem });
+
+  // ---- MutationObserver (DOM §4.3) ----
+  //
+  // DOM operations are wrapped to queue mutation records for the
+  // observers interested in them, delivered in a microtask. Nothing is
+  // recorded (or computed) while no observer is registered.
+  class MutationRecord {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const makeRecord = (fields) => {
+    const r = Object.create(MutationRecord.prototype);
+    Object.assign(r, { type: '', target: null, addedNodes: nodeList([]), removedNodes: nodeList([]), previousSibling: null, nextSibling: null,
+      attributeName: null, attributeNamespace: null, oldValue: null }, fields);
+    return r;
+  };
+  const nodeList = (nodes) => Object.setPrototypeOf(nodes, NodeList.prototype);
+  const registrations = new Map(); // node -> [{ observer, options }]
+  let observedCount = 0;
+  const pendingObservers = new Set();
+  let deliveryQueued = false;
+  function deliverMutations() {
+    deliveryQueued = false;
+    const observers = [...pendingObservers];
+    pendingObservers.clear();
+    for (const mo of observers) {
+      const records = mo._records.splice(0);
+      if (records.length) {
+        try { mo._callback.call(mo, records, mo); } catch (e) { reportError(e); }
+      }
+    }
+  }
+  // Queue a record for every observer interested in a change to `target`
+  function queueMutation(type, target, fields, name, oldValue) {
+    const interested = new Map(); // observer -> oldValue to record
+    for (let node = target; node; node = node.parentNode) {
+      const regs = registrations.get(node);
+      if (!regs) continue;
+      for (const { observer, options } of regs) {
+        if (node !== target && !options.subtree) continue;
+        if (type === 'attributes') {
+          if (!options.attributes || (options.attributeFilter && !options.attributeFilter.includes(name))) continue;
+        } else if (type === 'characterData') {
+          if (!options.characterData) continue;
+        } else if (!options.childList) continue;
+        const wantsOld = (type === 'attributes' && options.attributeOldValue) || (type === 'characterData' && options.characterDataOldValue);
+        if (!interested.has(observer) || wantsOld) interested.set(observer, wantsOld ? oldValue : interested.get(observer) ?? null);
+      }
+    }
+    for (const [observer, old] of interested) {
+      observer._records.push(makeRecord({ type, target, ...fields, oldValue: old }));
+      pendingObservers.add(observer);
+    }
+    if (interested.size && !deliveryQueued) {
+      deliveryQueued = true;
+      queueMicrotask(deliverMutations);
+    }
+  }
+  class MutationObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'MutationObserver': The callback provided as parameter 1 is not a function.");
+      Object.defineProperties(this, { _callback: { value: callback }, _records: { value: [] }, _targets: { value: new Set() } });
+    }
+    observe(target, options = {}) {
+      if (!(target instanceof Node)) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+      const o = {
+        childList: !!options.childList, subtree: !!options.subtree,
+        attributes: options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined ? true : false),
+        characterData: options.characterData ?? (options.characterDataOldValue !== undefined ? true : false),
+        attributeOldValue: !!options.attributeOldValue, characterDataOldValue: !!options.characterDataOldValue,
+        attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
+      };
+      if (!o.childList && !o.attributes && !o.characterData) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      if (o.attributeOldValue && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+      if (o.attributeFilter && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+      if (o.characterDataOldValue && !o.characterData) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+      let regs = registrations.get(target);
+      if (!regs) registrations.set(target, regs = []);
+      const existing = regs.find(r => r.observer === this);
+      if (existing) existing.options = o;
+      else { regs.push({ observer: this, options: o }); observedCount++; this._targets.add(target); }
+    }
+    disconnect() {
+      for (const t of this._targets) {
+        const regs = registrations.get(t);
+        if (!regs) continue;
+        const i = regs.findIndex(r => r.observer === this);
+        if (i >= 0) { regs.splice(i, 1); observedCount--; }
+        if (!regs.length) registrations.delete(t);
+      }
+      this._targets.clear();
+      this._records.length = 0;
+    }
+    takeRecords() { return this._records.splice(0); }
+  }
+
+  // The hooks. Each runs the original operation; only with observers does
+  // it work out what changed.
+  const argNodes = (args) => args.flatMap(a => a instanceof Node ? (a.nodeType === 11 ? Array.from(a.childNodes) : [a]) : [null]);
+  // Records for nodes leaving their old parents (moves, fragments)
+  const removalsOf = (nodes) => nodes.filter(n => n && n.parentNode).map(n => [n.parentNode, { removedNodes: nodeList([n]), previousSibling: n.previousSibling, nextSibling: n.nextSibling }]);
+  const childListHook = (proto, name, plan) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    define(proto, { [name](...args) {
+      if (!observedCount) return original.apply(this, args);
+      const p = plan.call(this, args);
+      const r = original.apply(this, args);
+      for (const [target, fields] of p.before) queueMutation('childList', target, fields);
+      const after = p.after();
+      if (after && (after.addedNodes.length || after.removedNodes.length)) queueMutation('childList', after.target, after);
+      return r;
+    } });
+  };
+  // Added nodes found after the operation, as the run between two siblings
+  const runBetween = (parent, prev, next) => {
+    const nodes = [];
+    for (let n = prev ? prev.nextSibling : parent.firstChild; n && n !== next; n = n.nextSibling) nodes.push(n);
+    return nodes;
+  };
+  const insertionPlan = (parentOf, prevOf, nextOf, nodesOf) => function (args) {
+    const nodes = argNodes(nodesOf(args));
+    const before = removalsOf(nodes.filter(Boolean));
+    const parent = parentOf.call(this, args);
+    // The siblings the inserted run will have, skipping nodes being moved
+    let prev = prevOf.call(this, args), next = nextOf.call(this, args);
+    while (prev && nodes.includes(prev)) prev = prev.previousSibling;
+    while (next && nodes.includes(next)) next = next.nextSibling;
+    return {
+      before,
+      after: () => parent && ({ target: parent, addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([]), previousSibling: prev, nextSibling: next }),
+    };
+  };
+  const self = function () { return this; };
+  childListHook(NodeP, 'appendChild', insertionPlan(self, function () { return this.lastChild; }, () => null, a => a.slice(0, 1)));
+  childListHook(NodeP, 'insertBefore', insertionPlan(self, function (a) { return a[1] ? a[1].previousSibling : this.lastChild; }, a => a[1] ?? null, a => a.slice(0, 1)));
+  for (const proto of [NodeP, ElementP]) {
+    childListHook(proto, 'append', insertionPlan(self, function () { return this.lastChild; }, () => null, a => a));
+    childListHook(proto, 'prepend', insertionPlan(self, () => null, function () { return this.firstChild; }, a => a));
+  }
+  for (const proto of [ElementP, CharacterData.prototype]) {
+    childListHook(proto, 'before', insertionPlan(function () { return this.parentNode; }, function () { return this.previousSibling; }, self, a => a));
+    childListHook(proto, 'after', insertionPlan(function () { return this.parentNode; }, self, function () { return this.nextSibling; }, a => a));
+  }
+  childListHook(NodeP, 'removeChild', function (args) {
+    const node = args[0];
+    const fields = node instanceof Node && node.parentNode === this ? removalsOf([node]) : [];
+    return { before: [], after: () => fields.length ? { target: this, ...fields[0][1], addedNodes: nodeList([]) } : null };
+  });
+  for (const proto of [ElementP, CharacterData.prototype]) {
+    childListHook(proto, 'remove', function () {
+      const parent = this.parentNode;
+      const fields = parent ? removalsOf([this]) : [];
+      return { before: [], after: () => fields.length ? { target: parent, ...fields[0][1], addedNodes: nodeList([]) } : null };
+    });
+    childListHook(proto, 'replaceWith', function (args) {
+      const parent = this.parentNode;
+      if (!parent) return { before: [], after: () => null };
+      const prev = this.previousSibling, next = this.nextSibling;
+      const nodes = argNodes(args).filter(Boolean);
+      const before = removalsOf(nodes.filter(n => n !== this));
+      return { before, after: () => ({ target: parent, addedNodes: nodeList(runBetween(parent, nodes.includes(prev) ? null : prev, nodes.includes(next) ? null : next)), removedNodes: nodeList([this]), previousSibling: prev, nextSibling: next }) };
+    });
+  }
+  childListHook(NodeP, 'replaceChild', function (args) {
+    const [node, child] = args;
+    if (!(child instanceof Node) || child.parentNode !== this) return { before: [], after: () => null };
+    const prev = child.previousSibling === node ? node.previousSibling : child.previousSibling;
+    const next = child.nextSibling === node ? node.nextSibling : child.nextSibling;
+    const before = removalsOf(argNodes([node]).filter(n => n && n !== child));
+    return { before, after: () => ({ target: this, addedNodes: nodeList(runBetween(this, prev, next)), removedNodes: nodeList([child]), previousSibling: prev, nextSibling: next }) };
+  });
+  childListHook(ElementP, 'insertAdjacentHTML', function (args) {
+    const where = String(args[0]).toLowerCase();
+    const outside = where === 'beforebegin' || where === 'afterend';
+    const parent = outside ? this.parentNode : this;
+    const prev = where === 'beforebegin' ? this.previousSibling : where === 'afterbegin' ? null : where === 'beforeend' ? this.lastChild : this;
+    const next = where === 'beforebegin' ? this : where === 'afterbegin' ? this.firstChild : where === 'beforeend' ? null : this.nextSibling;
+    return { before: [], after: () => parent && ({ target: parent, addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([]), previousSibling: prev, nextSibling: next }) };
+  });
+  // Setters that replace children (innerHTML, textContent) or the element itself (outerHTML)
+  const wrapSetter = (proto, name, hook) => {
+    let owner = proto, d;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+    if (!d || !d.set) return;
+    Object.defineProperty(owner, name, { configurable: true, enumerable: d.enumerable, get: d.get, set(v) {
+      if (!observedCount) return d.set.call(this, v);
+      hook.call(this, () => d.set.call(this, v));
+    } });
+  };
+  const replaceChildrenHook = function (run) {
+    if (this.nodeType === 3 || this.nodeType === 8) return characterDataHook.call(this, run);
+    const removed = Array.from(this.childNodes);
+    run();
+    const added = Array.from(this.childNodes);
+    if (removed.length || added.length) queueMutation('childList', this, { addedNodes: nodeList(added), removedNodes: nodeList(removed) });
+  };
+  wrapSetter(ElementP, 'innerHTML', replaceChildrenHook);
+  wrapSetter(NodeP, 'textContent', replaceChildrenHook);
+  wrapSetter(ElementP, 'outerHTML', function (run) {
+    const parent = this.parentNode;
+    if (!parent) return run();
+    const prev = this.previousSibling, next = this.nextSibling;
+    run();
+    queueMutation('childList', parent, { addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([this]), previousSibling: prev, nextSibling: next });
+  });
+  // Character data
+  const characterDataHook = function (run) {
+    const old = this.data;
+    run();
+    queueMutation('characterData', this, {}, null, old);
+  };
+  for (const name of ['data', 'nodeValue']) wrapSetter(CharacterData.prototype, name, characterDataHook);
+  // Attributes
+  const attributeHook = (name, el, run) => {
+    const old = el.getAttribute(name);
+    const r = run();
+    queueMutation('attributes', el, { attributeName: name }, name, old);
+    return r;
+  };
+  for (const name of ['setAttribute', 'removeAttribute', 'toggleAttribute', 'setAttributeNS', 'removeAttributeNS']) {
+    let owner = ElementP;
+    while (owner && !Object.getOwnPropertyDescriptor(owner, name)) owner = Object.getPrototypeOf(owner);
+    if (!owner) continue;
+    const original = owner[name];
+    const ns = name.endsWith('NS');
+    define(owner, { [name](...args) {
+      if (!observedCount || !(this instanceof Element)) return original.apply(this, args);
+      let attr = String(ns ? args[1] : args[0]);
+      if (ns && attr.includes(':')) attr = attr.slice(attr.indexOf(':') + 1);
+      attr = this.namespaceURI === 'http://www.w3.org/1999/xhtml' ? attr.toLowerCase() : attr;
+      if ((name === 'removeAttribute' || name === 'removeAttributeNS') && !this.hasAttribute(attr)) return original.apply(this, args);
+      if (name === 'toggleAttribute') {
+        const had = this.hasAttribute(attr);
+        const want = args[1] === undefined ? !had : !!args[1];
+        if (want === had) return original.apply(this, args);
+      }
+      return attributeHook(attr, this, () => original.apply(this, args));
+    } });
+  }
+  for (const [prop, attr] of [['id', 'id'], ['className', 'class']]) {
+    wrapSetter(ElementP, prop, function (run) { attributeHook(attr, this, run); });
+  }
+
+  // CharacterData editing methods, as the DOM standard defines them
+  define(CharacterData.prototype, {
+    appendData(s) { this.data += String(s); },
+    insertData(offset, s) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'insertData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + String(s) + this.data.slice(offset);
+    },
+    deleteData(offset, count) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'deleteData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + this.data.slice(offset + (count >>> 0));
+    },
+    replaceData(offset, count, s) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'replaceData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + String(s) + this.data.slice(offset + (count >>> 0));
+    },
+    substringData(offset, count) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'substringData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      return this.data.substr(offset, count >>> 0);
+    },
+  });
+  define(Text.prototype, {
+    splitText(offset) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'splitText' on 'Text': The offset is greater than the Text node's length.", 'IndexSizeError');
+      const tail = document.createTextNode(this.data.slice(offset));
+      if (this.parentNode) this.parentNode.insertBefore(tail, this.nextSibling);
+      this.data = this.data.slice(0, offset);
+      return tail;
+    },
+    get wholeText() {
+      let first = this, s = '';
+      while (first.previousSibling && first.previousSibling.nodeType === 3) first = first.previousSibling;
+      for (let n = first; n && n.nodeType === 3; n = n.nextSibling) s += n.data;
+      return s;
+    },
+  });
+
+  // ---- IntersectionObserver and ResizeObserver, from layout geometry ----
+  //
+  // Observations are checked when they start, on scroll and resize, and
+  // a few times a second while any are active (to follow layout changes),
+  // and notified when an element crosses a threshold or changes size.
+  const geometryObservers = new Set();
+  let geometryTimer = 0;
+  function scheduleGeometry() {
+    if (geometryTimer || !geometryObservers.size) return;
+    geometryTimer = setTimeout(() => {
+      geometryTimer = 0;
+      for (const o of [...geometryObservers]) o._check();
+      if (geometryObservers.size) geometryTimer = setTimeout(function again() {
+        geometryTimer = 0;
+        scheduleGeometry();
+      }, 250);
+    }, 0);
+  }
+  global.addEventListener('scroll', () => { for (const o of geometryObservers) o._check(); });
+  global.addEventListener('resize', () => { for (const o of geometryObservers) o._check(); });
+  const rectOf = (el) => el.getBoundingClientRect();
+  const parseMargin = (s) => {
+    const parts = String(s || '0px').trim().split(/\s+/).map(v => ({ v: parseFloat(v) || 0, pct: v.endsWith('%') }));
+    while (parts.length < 4) parts.push(parts[parts.length === 3 ? 1 : parts.length === 2 ? 0 : 0]);
+    return parts.slice(0, 4);
+  };
+  class IntersectionObserverEntry {
+    constructor(init) { Object.assign(this, init); }
+  }
+  class IntersectionObserver {
+    constructor(callback, options = {}) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+      let thresholds = options.threshold ?? 0;
+      thresholds = (Array.isArray(thresholds) ? thresholds : [thresholds]).map(Number);
+      if (thresholds.some(t => !(t >= 0 && t <= 1))) throw new RangeError("Failed to construct 'IntersectionObserver': Threshold values must be numbers between 0 and 1");
+      Object.defineProperties(this, {
+        _callback: { value: callback }, _targets: { value: new Map() }, _records: { value: [] },
+        root: { value: options.root ?? null, enumerable: true }, rootMargin: { value: String(options.rootMargin ?? '0px'), enumerable: true },
+        thresholds: { value: Object.freeze(thresholds.sort((a, b) => a - b)), enumerable: true },
+        scrollMargin: { value: String(options.scrollMargin ?? '0px'), enumerable: true },
+      });
+    }
+    observe(target) {
+      if (!(target instanceof Element)) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+      if (this._targets.has(target)) return;
+      this._targets.set(target, { index: -1, intersecting: null });
+      geometryObservers.add(this);
+      scheduleGeometry();
+    }
+    unobserve(target) { this._targets.delete(target); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
+    takeRecords() { return this._records.splice(0); }
+    _check() {
+      const [vw, vh] = [global.innerWidth, global.innerHeight];
+      const rootRect = this.root && this.root.getBoundingClientRect ? this.root.getBoundingClientRect() : new DOMRect(0, 0, vw, vh);
+      const m = parseMargin(this.rootMargin);
+      const px = (x, base) => x.pct ? x.v * base / 100 : x.v;
+      const root = new DOMRect(rootRect.left - px(m[3], rootRect.width), rootRect.top - px(m[0], rootRect.height),
+        rootRect.width + px(m[1], rootRect.width) + px(m[3], rootRect.width), rootRect.height + px(m[0], rootRect.height) + px(m[2], rootRect.height));
+      for (const [target, state] of this._targets) {
+        const rendered = target.isConnected && target.getClientRects().length > 0;
+        const b = rectOf(target);
+        const left = Math.max(b.left, root.left), top = Math.max(b.top, root.top);
+        const right = Math.min(b.right, root.right), bottom = Math.min(b.bottom, root.bottom);
+        // Edge-adjacent counts as intersecting (zero-area sentinels work)
+        const intersecting = rendered && right >= left && bottom >= top;
+        const area = b.width * b.height;
+        const inter = intersecting ? new DOMRect(left, top, right - left, bottom - top) : new DOMRect(0, 0, 0, 0);
+        const ratio = !intersecting ? 0 : area > 0 ? (inter.width * inter.height) / area : 1;
+        let index = -1;
+        for (let i = 0; i < this.thresholds.length; i++) if (ratio >= this.thresholds[i] && (intersecting || this.thresholds[i] > 0)) index = i;
+        if (index === state.index && intersecting === state.intersecting) continue;
+        state.index = index;
+        state.intersecting = intersecting;
+        this._records.push(new IntersectionObserverEntry({ time: performance.now(), rootBounds: root, boundingClientRect: b, intersectionRect: inter, isIntersecting: intersecting, isVisible: false, intersectionRatio: ratio, target }));
+      }
+      if (this._records.length) {
+        const entries = this._records.splice(0);
+        try { this._callback.call(this, entries, this); } catch (e) { reportError(e); }
+      }
+    }
+  }
+  class ResizeObserverSize {
+    constructor(inline, block) { Object.assign(this, { inlineSize: inline, blockSize: block }); }
+  }
+  class ResizeObserverEntry {
+    constructor(target, rect) {
+      const size = [new ResizeObserverSize(rect.width, rect.height)];
+      Object.assign(this, { target, contentRect: new DOMRect(0, 0, rect.width, rect.height), borderBoxSize: size, contentBoxSize: size, devicePixelContentBoxSize: size });
+    }
+  }
+  class ResizeObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+      Object.defineProperties(this, { _callback: { value: callback }, _targets: { value: new Map() } });
+    }
+    observe(target) {
+      if (!(target instanceof Element)) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+      // The first check always reports (from an initial size of -1 x -1)
+      this._targets.set(target, { w: -1, h: -1 });
+      geometryObservers.add(this);
+      scheduleGeometry();
+    }
+    unobserve(target) { this._targets.delete(target); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
+    _check() {
+      const entries = [];
+      for (const [target, last] of this._targets) {
+        const r = target.isConnected ? rectOf(target) : new DOMRect(0, 0, 0, 0);
+        if (r.width === last.w && r.height === last.h) continue;
+        last.w = r.width; last.h = r.height;
+        entries.push(new ResizeObserverEntry(target, r));
+      }
+      if (entries.length) { try { this._callback.call(this, entries, this); } catch (e) { reportError(e); } }
+    }
+  }
+  Object.assign(global, { MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
 })(globalThis);

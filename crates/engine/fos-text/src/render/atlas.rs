@@ -12,7 +12,14 @@ pub struct GlyphKey {
     pub glyph_id: u16,
     /// Font size in pixels (quantized to avoid cache explosion)
     pub size_px: u16,
+    /// Synthesized styles ([`SYNTH_OBLIQUE`], [`SYNTH_BOLD`])
+    pub synthesis: u8,
 }
+
+/// Slant the glyph (the face has no italic)
+pub const SYNTH_OBLIQUE: u8 = 1;
+/// Thicken the glyph (the face has no bold)
+pub const SYNTH_BOLD: u8 = 2;
 
 impl GlyphKey {
     /// Create a new glyph key
@@ -22,7 +29,13 @@ impl GlyphKey {
             glyph_id,
             // Quantize to nearest pixel to reduce cache entries
             size_px: font_size.round() as u16,
+            synthesis: 0,
         }
+    }
+
+    /// A key for a glyph drawn with synthesized styles
+    pub fn synthesized(font_id: u32, glyph_id: u16, font_size: f32, synthesis: u8) -> Self {
+        Self { synthesis, ..Self::new(font_id, glyph_id, font_size) }
     }
 }
 

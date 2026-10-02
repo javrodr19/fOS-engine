@@ -53,6 +53,9 @@ pub struct ResolvedFont {
     pub id: Option<FontId>,
     pub size: f32,
     pub metrics: FontMetrics,
+    /// Styles the face lacks, to synthesize when drawing
+    /// (`fos_text::SYNTH_OBLIQUE`, `SYNTH_BOLD`)
+    pub synthesis: u8,
 }
 
 impl ResolvedFont {
@@ -72,7 +75,7 @@ pub struct FontContext {
     db: Arc<FontDatabase>,
     shaper: TextShaper,
     /// (families, weight, italic) -> face
-    selection: HashMap<(Arc<[Arc<str>]>, u16, bool), Option<FontId>>,
+    selection: HashMap<(Arc<[Arc<str>]>, u16, bool), (Option<FontId>, u8)>,
     metrics: HashMap<FontId, FontMetrics>,
     /// Shaped words by (face, size bits), then text
     words: HashMap<(Option<FontId>, u32), HashMap<Box<str>, Arc<ShapedWord>>>,
@@ -98,8 +101,8 @@ impl FontContext {
     pub fn resolve(&mut self, style: &Style) -> ResolvedFont {
         let i = &style.inherited;
         let key = (i.font_family.clone(), i.font_weight, i.font_style != FontStyle::Normal);
-        let id = match self.selection.get(&key) {
-            Some(id) => *id,
+        let (id, synthesis) = match self.selection.get(&key) {
+            Some(sel) => *sel,
             None => {
                 let families: Vec<&str> = i.font_family.iter().map(|f| match &**f {
                     // Generic names the font database knows by other names
@@ -111,12 +114,22 @@ impl FontContext {
                 let style = if key.2 { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
                 let query = FontQuery::new(&families).weight(fos_text::FontWeight(i.font_weight)).style(style);
                 let id = self.db.query(&query);
-                self.selection.insert(key, id);
-                id
+                // Browsers slant and thicken faces that lack the style
+                let mut synthesis = 0;
+                if let Some(face) = id.and_then(|id| self.db.font(id)) {
+                    if key.2 && face.style == fos_text::FontStyle::Normal {
+                        synthesis |= fos_text::SYNTH_OBLIQUE;
+                    }
+                    if key.1 >= 600 && face.weight.0 < 600 {
+                        synthesis |= fos_text::SYNTH_BOLD;
+                    }
+                }
+                self.selection.insert(key, (id, synthesis));
+                (id, synthesis)
             }
         };
         let metrics = id.map_or(FontMetrics::FALLBACK, |id| self.metrics_of(id));
-        ResolvedFont { id, size: i.font_size, metrics }
+        ResolvedFont { id, size: i.font_size, metrics, synthesis }
     }
 
     fn metrics_of(&mut self, id: FontId) -> FontMetrics {

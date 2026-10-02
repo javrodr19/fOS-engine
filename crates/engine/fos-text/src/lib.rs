@@ -19,7 +19,7 @@ pub mod mmap_resources;
 pub use font::{FaceData, FontDatabase, FontFace, FontId, FontStyle, FontWeight, FontQuery, FontParser};
 pub use shaping::{TextShaper, ShapedGlyph, ShapedRun};
 pub use layout::{TextLayout, LineBreaker, ParagraphLayout};
-pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph};
+pub use render::{GlyphRasterizer, GlyphAtlas, GlyphKey, RasterizedGlyph, SYNTH_BOLD, SYNTH_OBLIQUE};
 pub use glyph_atlas::{GlyphAtlasCache, GlyphInfo};
 pub use ruby::{RubyAnnotation, RubyContainer, RubyStyle};
 pub use mmap_resources::{MappedFont, MappingPool, MappingStats, MappedResource};

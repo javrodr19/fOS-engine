@@ -108,6 +108,48 @@ impl TextRenderer {
         advance
     }
 
+    /// Draw already shaped glyphs: `(glyph id, pen x, baseline y)` in
+    /// canvas pixels, clipped to `clip` (`[x0, y0, x1, y1]`), with
+    /// `synthesis` (oblique, bold) for faces lacking the style
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_glyph_run(
+        &mut self,
+        canvas: &mut Canvas,
+        font_id: FontId,
+        font_size: f32,
+        synthesis: u8,
+        color: Color,
+        glyphs: impl IntoIterator<Item = (u16, f32, f32)>,
+        clip: [i32; 4],
+    ) {
+        if color.a == 0 {
+            return;
+        }
+        let clip = [clip[0].max(0), clip[1].max(0), clip[2].min(canvas.width() as i32), clip[3].min(canvas.height() as i32)];
+        if clip[0] >= clip[2] || clip[1] >= clip[3] {
+            return;
+        }
+        let Some(bytes) = self.fonts.face_data(font_id) else { return };
+        let index = self.fonts.font(font_id).map_or(0, |f| f.index);
+        let mut parser: Option<Option<FontParser>> = None;
+        for (id, x, y) in glyphs {
+            let key = GlyphKey::synthesized(font_id.0, id, font_size, synthesis);
+            let rasterizer = &self.rasterizer;
+            let rasterized = self.atlas.get_or_insert_with(key, || {
+                parser
+                    .get_or_insert_with(|| FontParser::parse_index(&bytes, index).ok())
+                    .as_ref()
+                    .and_then(|p| rasterizer.rasterize_synthesized(p, id, font_size, synthesis))
+                    .unwrap_or_else(|| RasterizedGlyph::empty(id))
+            });
+            if rasterized.width > 0 && rasterized.height > 0 {
+                let gx = (x + rasterized.bearing_x as f32).round() as i32;
+                let gy = (y - rasterized.bearing_y as f32).round() as i32;
+                draw_glyph_clipped(canvas, rasterized, gx, gy, color, clip);
+            }
+        }
+    }
+
     /// Measure text width
     pub fn measure_text(&mut self, text: &str, font_id: FontId, font_size: f32) -> f32 {
         self.shaper.shape(&self.fonts, font_id, text, font_size)
@@ -131,15 +173,20 @@ impl TextRenderer {
 /// Works directly on tiny-skia's premultiplied pixels with integer math and
 /// clips once up front instead of bounds-checking every pixel.
 fn draw_glyph_bitmap(canvas: &mut Canvas, glyph: &RasterizedGlyph, x: i32, y: i32, color: Color) {
+    let clip = [0, 0, canvas.width() as i32, canvas.height() as i32];
+    draw_glyph_clipped(canvas, glyph, x, y, color, clip);
+}
+
+/// Blend a coverage bitmap at (x, y), inside `clip` (within the canvas)
+fn draw_glyph_clipped(canvas: &mut Canvas, glyph: &RasterizedGlyph, x: i32, y: i32, color: Color, clip: [i32; 4]) {
     let canvas_w = canvas.width() as i32;
-    let canvas_h = canvas.height() as i32;
     let glyph_w = glyph.width as i32;
     let glyph_h = glyph.height as i32;
 
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + glyph_w).min(canvas_w);
-    let y1 = (y + glyph_h).min(canvas_h);
+    let x0 = x.max(clip[0]);
+    let y0 = y.max(clip[1]);
+    let x1 = (x + glyph_w).min(clip[2]);
+    let y1 = (y + glyph_h).min(clip[3]);
     if x0 >= x1 || y0 >= y1 {
         return;
     }

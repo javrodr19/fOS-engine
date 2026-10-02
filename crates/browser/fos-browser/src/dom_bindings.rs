@@ -1452,32 +1452,36 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
     h.scroll = scroll;
 }
 
-/// Boxes of all rendered elements: each laid-out text box is unioned into
-/// its element and the element's ancestors
+/// Boxes of all rendered elements: the union of each element's own
+/// fragments (its border boxes and text), and for elements that generate
+/// none (`display: contents`) the union of their descendants'
 fn element_boxes(tree: &DomTree, layout: &crate::renderer::PageLayout) -> HashMap<u32, [f32; 4]> {
-    let mut boxes: HashMap<u32, [f32; 4]> = HashMap::new();
-    for (node, x, y, w, h) in layout.text_boxes() {
-        let (x1, y1) = (x + w, y + h);
-        let mut n = node;
-        while n.is_valid() {
-            match boxes.get_mut(&n.0) {
-                Some(b) => {
-                    if b[0] <= x && b[1] <= y && b[0] + b[2] >= x1 && b[1] + b[3] >= y1 {
-                        // Ancestors' boxes contain this one, so they
-                        // contain the text box too
-                        break;
-                    }
-                    let (nx, ny) = (b[0].min(x), b[1].min(y));
-                    let (nx1, ny1) = ((b[0] + b[2]).max(x1), (b[1] + b[3]).max(y1));
-                    *b = [nx, ny, nx1 - nx, ny1 - ny];
-                }
-                None => {
-                    boxes.insert(n.0, [x, y, w, h]);
-                }
+    fn union(boxes: &mut HashMap<u32, [f32; 4]>, n: u32, r: [f32; 4]) {
+        match boxes.get_mut(&n) {
+            Some(b) => {
+                let (x, y) = (b[0].min(r[0]), b[1].min(r[1]));
+                let (x1, y1) = ((b[0] + b[2]).max(r[0] + r[2]), (b[1] + b[3]).max(r[1] + r[3]));
+                *b = [x, y, x1 - x, y1 - y];
             }
+            None => {
+                boxes.insert(n, r);
+            }
+        }
+    }
+    let rects = layout.boxes();
+    let mut boxes: HashMap<u32, [f32; 4]> = HashMap::with_capacity(rects.len());
+    for (node, r) in &rects {
+        union(&mut boxes, node.0, [r.x, r.y, r.w, r.h]);
+    }
+    let mut derived: HashMap<u32, [f32; 4]> = HashMap::new();
+    for (node, r) in &rects {
+        let mut n = tree.get(*node).map_or(NodeId::NONE, |p| p.parent);
+        while n.is_valid() && !boxes.contains_key(&n.0) {
+            union(&mut derived, n.0, [r.x, r.y, r.w, r.h]);
             n = tree.get(n).map_or(NodeId::NONE, |p| p.parent);
         }
     }
+    boxes.extend(derived);
     boxes
 }
 

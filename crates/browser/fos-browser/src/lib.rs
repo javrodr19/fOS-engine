@@ -37,6 +37,7 @@ pub mod loader;
 pub mod ui;
 /// Page rendering pipeline
 pub mod renderer;
+pub mod paint;
 /// JavaScript runtime integration
 pub mod js_runtime;
 /// Import maps (module specifier resolution)

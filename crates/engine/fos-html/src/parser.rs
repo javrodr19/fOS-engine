@@ -56,6 +56,43 @@ fn is_inter_element_whitespace(text: &str) -> bool {
     text.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r'))
 }
 
+fn tag_of(tree: &DomTree, id: NodeId) -> Option<&str> {
+    tree.get(id).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))
+}
+
+/// Whether a whitespace-only text node can never render or matter: inside
+/// structural elements (tables, lists, the head), or between block-level
+/// elements. Whitespace next to inline content separates words, so it
+/// stays (as does any inside `pre`-like elements).
+fn whitespace_is_insignificant(tree: &DomTree, id: NodeId) -> bool {
+    let Some(node) = tree.get(id) else { return false };
+    match tag_of(tree, node.parent) {
+        None if node.parent == tree.root() => return true,
+        Some("html" | "head" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "colgroup" | "ul" | "ol" | "dl" | "select" | "optgroup" | "datalist" | "frameset" | "menu") => return true,
+        Some("pre" | "textarea" | "listing" | "plaintext" | "xmp" | "script" | "style") => return false,
+        _ => {}
+    }
+    let blockish = |sibling: NodeId| -> bool {
+        if !sibling.is_valid() {
+            return true;
+        }
+        match tree.get(sibling).map(|n| &n.data) {
+            Some(NodeData::Comment(_)) => true,
+            Some(NodeData::Element(_)) => matches!(
+                tag_of(tree, sibling).unwrap_or(""),
+                "address" | "article" | "aside" | "blockquote" | "body" | "center" | "details" | "dialog" | "dd" | "div" | "dl" | "dt"
+                    | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head"
+                    | "header" | "hgroup" | "hr" | "li" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "section" | "summary"
+                    | "table" | "ul" | "script" | "style" | "link" | "meta" | "title" | "template" | "noscript" | "base" | "br"
+                    | "option" | "optgroup" | "caption" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "colgroup" | "col"
+                    | "iframe" | "video" | "audio" | "canvas" | "svg" | "search" | "legend"
+            ),
+            _ => false,
+        }
+    };
+    blockish(node.prev_sibling) && blockish(node.next_sibling)
+}
+
 /// An element name owned by the caller, so no borrow of the sink's state
 /// outlives the call (tag names are almost always static atoms, so cloning
 /// one is a copy)
@@ -158,7 +195,24 @@ impl TreeSink for DomSink {
         // Drop what is not part of the document (nodes the tree builder
         // removed) and inter-element whitespace, and store the rest in
         // document order
-        tree.compact(|node| !matches!(&node.data, NodeData::Text(t) if is_inter_element_whitespace(&t.content)));
+        let mut droppable = Vec::new();
+        let mut stack = vec![tree.root()];
+        while let Some(id) = stack.pop() {
+            let mut child = tree.get(id).map_or(NodeId::NONE, |n| n.first_child);
+            while child.is_valid() {
+                let Some(n) = tree.get(child) else { break };
+                match &n.data {
+                    NodeData::Text(t) if is_inter_element_whitespace(&t.content) && whitespace_is_insignificant(&tree, child) => droppable.push(child),
+                    NodeData::Element(_) | NodeData::Document => stack.push(child),
+                    _ => {}
+                }
+                child = n.next_sibling;
+            }
+        }
+        for id in droppable {
+            tree.remove(id);
+        }
+        tree.compact(|_| true);
 
         let mut contents = Vec::new();
         fos_dom::selector::walk_elements(&tree, tree.root(), &mut |id| {
@@ -427,6 +481,11 @@ mod tests {
         assert_eq!(
             parse_outline("<ul>\n  <li>a</li>\n  <li>&nbsp;</li>\n</ul>"),
             "<html><head></><body><ul><li>'a'</><li>'\u{a0}'</></></></>"
+        );
+        // Whitespace between inline elements separates words
+        assert_eq!(
+            parse_outline("<div>\n<p><a>x</a> <span>y</span></p>\n</div>"),
+            "<html><head></><body><div><p><a>'x'</>' '<span>'y'</></></></></>"
         );
         // Template contents are not part of the document tree
         assert_eq!(

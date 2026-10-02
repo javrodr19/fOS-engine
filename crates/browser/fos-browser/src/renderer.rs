@@ -1,28 +1,26 @@
 //! Rendering Pipeline
 //!
-//! Integrates fos-engine components for rendering web pages.
-//!
 //! Rendering is split in two phases:
-//! 1. **Layout** walks the DOM once per page and viewport width, producing
-//!    positioned lines of text (a display list).
-//! 2. **Paint** draws only the lines that intersect the requested region.
+//! 1. **Layout** styles the DOM and lays it out with the box layout engine
+//!    (`fos_layout::engine`) into a fragment tree: positioned boxes and
+//!    shaped text, plus the page's link regions and anchors.
+//! 2. **Paint** draws the part of the fragment tree inside the requested
+//!    band (`crate::paint`).
 //!
 //! The layout is cached, so scrolling and re-rendering the same page only
-//! repaint the visible lines. The cache keeps just the compact display list,
-//! not the per-node styles it was built from. A layout built from a live
-//! DOM is keyed by the tree's revision, so any DOM mutation (from scripts,
-//! for example) is picked up by the next render.
+//! repaint. Styles are computed during box tree construction and kept only
+//! on the fragments that need them. A layout built from a live DOM is keyed
+//! by the tree's revision, so any DOM mutation (from scripts, for example)
+//! is picked up by the next render.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::hash::{Hash, Hasher};
-use fos_dom::{Document, NodeId, DomTree, DomRevision};
-use fos_css::style::{Display, Style, StyleContext};
-use fos_css::properties::LengthUnit;
-use fos_css::StyleResolver;
-use crate::page_styles::PageStyles;
+use std::sync::Arc;
+
+use crate::page_styles::{AncestorFilter, PageStyles};
+use fos_css::style::{Style, StyleContext};
+use fos_dom::{Document, DomRevision, DomTree, NodeId};
+use fos_layout::engine::{self as layout_engine, BoxFragment, BoxFragmentKind, FontContext, Fragment, FragmentTree, Rect};
 use fos_render::{Canvas, Color, TextRenderer};
-use fos_text::{FontId, LineBreaker};
 
 /// A clickable link region in the rendered page
 #[derive(Debug, Clone)]
@@ -68,69 +66,40 @@ pub struct RenderedPage {
     layout_generation: u64,
 }
 
-/// A run of text with uniform style within a line
-#[derive(Debug, Clone)]
-struct TextSegment {
-    text: String,
-    font_size: f32,
-    color: Color,
-    /// Link href if this is a link
-    href: Option<String>,
-    /// Element the text belongs to (for hit testing clicks)
-    node: NodeId,
-    /// Advance of the text as laid out (including its trailing space)
-    width: f32,
-}
-
-/// A laid-out line of text, in document coordinates
-#[derive(Debug, Clone)]
-struct LaidOutLine {
-    /// Baseline y
-    y: f32,
-    /// Start x
-    x: f32,
-    segments: Vec<TextSegment>,
-}
-
-/// A horizontal rule (`<hr>`), in document coordinates
-#[derive(Debug, Clone, Copy)]
-struct Rule {
-    x: f32,
-    y: f32,
-    width: f32,
-}
-
-/// Display list for a page at one viewport width
-#[derive(Debug, Default)]
+/// A page laid out at one viewport size
+#[derive(Debug)]
 pub struct PageLayout {
-    /// Lines in document order (ascending `y`)
-    lines: Vec<LaidOutLine>,
-    /// Horizontal rules in document order
-    rules: Vec<Rule>,
+    fragments: FragmentTree,
+    /// Link regions in document coordinates, by top edge
+    links: Vec<(Rect, Arc<str>)>,
     /// Element ids and their document y positions
     anchors: Vec<AnchorPosition>,
-    /// Height of the laid-out document
-    content_height: f32,
-    /// Largest font size used (bounds how far glyphs reach above a baseline)
-    max_font_size: f32,
+    /// The canvas color (the root's or body's background)
+    background: fos_css::properties::Color,
+    /// The element whose background is the canvas's
+    background_box: Option<NodeId>,
 }
 
 impl PageLayout {
-    /// The laid-out text, as `(element, x, top, width, height)` boxes in
-    /// document coordinates, in document order
-    pub fn text_boxes(&self) -> impl Iterator<Item = (NodeId, f32, f32, f32, f32)> + '_ {
-        self.lines.iter().flat_map(|line| {
-            line.segments.iter().scan(line.x, move |x, s| {
-                let b = (s.node, *x, line.y - s.font_size, s.width, s.font_size * 1.2);
-                *x += s.width;
-                Some(b)
-            })
-        })
+    /// Every element's border boxes (inline elements have one per line)
+    /// and text rectangles, in document coordinates and tree order
+    pub fn boxes(&self) -> Vec<(NodeId, Rect)> {
+        self.fragments.element_rects()
     }
 
     /// Height of the laid-out document
     pub fn content_height(&self) -> f32 {
-        self.content_height
+        self.fragments.document_height
+    }
+
+    /// The laid-out fragments
+    pub fn fragments(&self) -> &FragmentTree {
+        &self.fragments
+    }
+
+    /// The deepest element at document point (x, y)
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.fragments.hit_test(x, y)
     }
 }
 
@@ -159,10 +128,10 @@ pub struct PageRenderer {
     viewport_width: u32,
     /// Viewport height
     viewport_height: u32,
-    /// Text renderer with font support
+    /// Glyph rasterization and caching
     text_renderer: TextRenderer,
-    /// Default font ID for text rendering
-    default_font: Option<FontId>,
+    /// Font matching, metrics and shaped words for layout
+    fonts: FontContext,
     /// Layout of the most recently rendered page
     cached: Option<CachedLayout>,
     /// Incremented for every new layout, to tell whether a rendered
@@ -175,20 +144,15 @@ pub struct PageRenderer {
 impl PageRenderer {
     pub fn new(viewport_width: u32, viewport_height: u32) -> Self {
         let text_renderer = TextRenderer::new();
-        // Find a default font (prefer sans-serif fonts)
-        let default_font = text_renderer.find_font(&["DejaVu Sans", "Liberation Sans", "Arial", "Helvetica", "sans-serif"]);
-
-        if default_font.is_some() {
-            log::info!("Font loaded for text rendering");
-        } else {
-            log::warn!("No system font found, text rendering may fail");
+        if text_renderer.fonts.is_empty() {
+            log::warn!("No system font found, text will not be drawn");
         }
-
+        let fonts = FontContext::new(text_renderer.fonts.clone());
         Self {
             viewport_width,
             viewport_height,
             text_renderer,
-            default_font,
+            fonts,
             cached: None,
             layout_generation: 0,
             stylesheets: Default::default(),
@@ -197,25 +161,30 @@ impl PageRenderer {
 
     /// Set viewport size
     pub fn set_viewport(&mut self, width: u32, height: u32) {
+        if height != self.viewport_height {
+            // Viewport units and percentages of the root depend on it
+            self.cached = None;
+        }
         self.viewport_width = width;
         self.viewport_height = height;
     }
 
-    /// Drop the cached layout and glyphs (e.g. on memory pressure)
+    /// Drop the cached layout, glyphs and shaped words (e.g. on memory
+    /// pressure)
     pub fn clear_cache(&mut self) {
         self.cached = None;
         self.text_renderer.clear_glyph_cache();
+        self.fonts = FontContext::new(self.text_renderer.fonts.clone());
     }
 
-    /// Measure text width using the text renderer
+    /// Width of `text` in the default sans-serif font
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
-        if let Some(font_id) = self.default_font {
-            self.text_renderer.measure_text(text, font_id, font_size)
-        } else {
-            // Fallback: estimate width based on character count
-            let char_width = font_size * 0.5;
-            text.chars().count() as f32 * char_width
-        }
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_size = font_size;
+        i.font_family = Arc::from([Arc::from("sans-serif")]);
+        let font = self.fonts.resolve(&style);
+        self.fonts.shape(&font, text).width
     }
 
     /// Parse and render HTML to pixels with scroll offset. Prefer
@@ -272,33 +241,13 @@ impl PageRenderer {
         }
     }
 
-    /// Whether the cached layout reflects `document` as it is now
-    /// The element whose text is at `(x, y)` in document coordinates,
-    /// per the current layout
+    /// The element at `(x, y)` in document coordinates, per the current
+    /// layout
     pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
-        let cached = self.cached.take()?;
-        let mut found = None;
-        // Lines are sorted by baseline; text spans the line height above it
-        let first = cached.layout.lines.partition_point(|line| line.y < y);
-        for line in cached.layout.lines[first..].iter().take(4) {
-            let mut sx = line.x;
-            for segment in &line.segments {
-                let top = line.y - segment.font_size * 1.2;
-                let width = self.measure_text(&segment.text, segment.font_size);
-                if y >= top && y <= line.y + segment.font_size * 0.3 && x >= sx && x <= sx + width {
-                    found = Some(segment.node);
-                    break;
-                }
-                sx += width;
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-        self.cached = Some(cached);
-        found.filter(|n| n.is_valid())
+        self.cached.as_ref()?.layout.hit_test(x, y)
     }
 
+    /// Whether the cached layout reflects `document` as it is now
     pub fn is_layout_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
     }
@@ -312,9 +261,8 @@ impl PageRenderer {
         // Free the old layout first, so two are never alive at once
         self.cached = None;
         let width = self.viewport_width;
-        let styler = Styler::new(self, document.tree(), self.page_stylesheet(document));
-        let layout = build_layout(document, &styler, width);
-        // Only the display list is kept
+        let stylesheet = self.page_stylesheet(document);
+        let layout = build_layout(document, stylesheet, &mut self.fonts, (width as f32, self.viewport_height as f32));
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
     }
@@ -322,10 +270,9 @@ impl PageRenderer {
     /// Paint the visible region of the cached layout
     fn paint_cached(&mut self, scroll_offset: f32) -> Option<RenderedPage> {
         let cached = self.cached.take()?;
-
-        let mut links = Vec::new();
-        let painted = self.paint(&cached.layout, scroll_offset, self.viewport_height, &mut links);
-        let content_height = cached.layout.content_height;
+        let painted = self.paint(&cached.layout, scroll_offset, self.viewport_height);
+        let content_height = cached.layout.content_height();
+        let links = links_in(&cached.layout, scroll_offset, self.viewport_height as f32);
         let anchors = anchors_from(&cached.layout, scroll_offset);
         self.cached = Some(cached);
 
@@ -353,40 +300,20 @@ impl PageRenderer {
         let width = page.width as usize;
         let height = page.height as usize;
         let shift = delta.unsigned_abs() as usize;
-        // Rows [kept_top, kept_bottom) of the new buffer come from the old one
-        let (kept_top, band_top) = if delta > 0 {
+        let band_top = if delta > 0 {
             page.pixels.copy_within(shift * width.., 0);
-            (0, height - shift)
+            height - shift
         } else {
             page.pixels.copy_within(..(height - shift) * width, shift * width);
-            (shift, 0)
+            0
         };
-        let kept_bottom = kept_top + (height - shift);
 
-        let mut band_links = Vec::new();
         let band_origin = scroll_offset + band_top as f32;
-        let band = self.paint(&cached.layout, band_origin, shift as u32, &mut band_links);
+        let band = self.paint(&cached.layout, band_origin, shift as u32);
         page.anchors = anchors_from(&cached.layout, scroll_offset);
+        page.links = links_in(&cached.layout, scroll_offset, page.height as f32);
         self.cached = Some(cached);
         page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
-
-        // Links: the old ones still in view, moved, plus the band's. A link
-        // crossing the band edge is in both lists.
-        let (kept_top, kept_bottom) = (kept_top as f32, kept_bottom as f32);
-        page.links.retain_mut(|link| {
-            link.y -= delta as f32;
-            link.y + link.height > kept_top && link.y < kept_bottom
-        });
-        for mut link in band_links {
-            link.y += band_top as f32;
-            let duplicate = page.links.iter().any(|l| {
-                l.href == link.href && l.x == link.x && (l.y - link.y).abs() < 0.5
-            });
-            if !duplicate {
-                page.links.push(link);
-            }
-        }
-
         page.origin = scroll_offset;
         Some(page)
     }
@@ -463,143 +390,14 @@ impl PageRenderer {
         css
     }
 
-    /// Compute styles using the StyleResolver (proper CSS cascade)
-    #[allow(dead_code)]
-    /// Compute an element's style: the UA's defaults, the page's matching
-    /// rules, then its `style` attribute, over what it inherits from
-    /// `parent`
-    #[allow(clippy::too_many_arguments)]
-    fn compute_element_style(
-        &self,
-        tree: &DomTree,
-        node_id: NodeId,
-        element: &fos_dom::ElementData,
-        styles: Option<&PageStyles>,
-        parent: &Style,
-        ctx: &StyleContext,
-        filter: Option<&crate::page_styles::AncestorFilter>,
-        cache: &mut fos_css::ResolveCache,
-    ) -> Style {
-        let mut style = Style::inherit_from(parent);
-        let inline: Vec<fos_css::Declaration> = element
-            .attrs
-            .iter()
-            .filter(|a| tree.resolve(a.name.local) == "style")
-            .flat_map(|a| fos_css::parse_declarations(&a.value))
-            .collect();
-        crate::page_styles::cascade(styles, tree, node_id, element, filter, &inline, &mut style, parent, ctx, cache);
-        style
-    }
-
-    /// Paint the part of `layout` starting at document y `scroll_offset`.
-    ///
-    /// Only lines intersecting the canvas are shaped and drawn.
-    fn paint(&mut self, layout: &PageLayout, scroll_offset: f32, height: u32, links: &mut Vec<LinkRegion>) -> Option<Vec<u32>> {
-        let mut canvas = Canvas::filled(self.viewport_width, height, Color::WHITE)?;
-
-        if layout.lines.is_empty() && layout.rules.is_empty() {
-            // Clipped to the canvas like any text
-            self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0 - scroll_offset, Color::rgb(100, 100, 100), 16.0);
-            return Some(canvas.into_argb32());
-        }
-
-        let canvas_height = canvas.height() as f32;
-        // Glyphs extend at most ~2 font sizes above and below a baseline
-        let reach = layout.max_font_size.max(16.0) * 2.0;
-        let top = scroll_offset - reach;
-        let bottom = scroll_offset + canvas_height + reach;
-
-        let first = layout.lines.partition_point(|line| line.y < top);
-        for line in &layout.lines[first..] {
-            if line.y > bottom {
-                break;
-            }
-            let y = line.y - scroll_offset;
-            let mut x = line.x;
-            for segment in &line.segments {
-                // Painting returns the advance, so the text is shaped only once
-                let width = self.paint_text(&mut canvas, &segment.text, x, y, segment.color, segment.font_size);
-
-                // Text is drawn with its baseline at y, so the region spans
-                // the line above it. Lines just outside the canvas are painted
-                // for their overhang, but their links are not on it.
-                let height = segment.font_size * 1.2;
-                if let Some(href) = segment.href.as_ref().filter(|_| y > 0.0 && y - height < canvas_height) {
-                    links.push(LinkRegion {
-                        x,
-                        y: y - height,
-                        width,
-                        height,
-                        href: href.clone(),
-                    });
-                }
-
-                x += width;
-            }
-        }
-
-        let first_rule = layout.rules.partition_point(|rule| rule.y < top);
-        for rule in layout.rules[first_rule..].iter().take_while(|rule| rule.y <= bottom) {
-            canvas.fill_rect(rule.x, rule.y - scroll_offset, rule.width, 1.0, Color::rgb(128, 128, 128));
-        }
-
+    /// Paint the band of `layout` starting at document y `origin`,
+    /// `height` rows tall
+    fn paint(&mut self, layout: &PageLayout, origin: f32, height: u32) -> Option<Vec<u32>> {
+        let bg = layout.background;
+        let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, layout.background_box);
+        painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
-    }
-
-    /// Text painting using TextRenderer with proper fonts.
-    ///
-    /// Returns the advance width of the painted text.
-    fn paint_text(
-        &mut self,
-        canvas: &mut Canvas,
-        text: &str,
-        x: f32,
-        y: f32,
-        color: Color,
-        font_size: f32,
-    ) -> f32 {
-        // Use TextRenderer if we have a font
-        if let Some(font_id) = self.default_font {
-            // Use the proper font rendering
-            return self.text_renderer.draw_text(canvas, text, x, y, font_id, font_size, color);
-        }
-
-        // No font available - use bitmap fallback
-        let scale = (font_size / 8.0).max(1.0);
-        let char_width = 6.0 * scale;
-        let char_height = 8.0 * scale;
-
-        let mut x_pos = x;
-
-        for c in text.chars() {
-            if c == '\n' {
-                continue;
-            }
-            if c == ' ' {
-                x_pos += char_width * 0.8;
-                continue;
-            }
-            if x_pos > canvas.width() as f32 {
-                break;
-            }
-
-            let pattern = get_char_pattern(c);
-
-            for (row, &bits) in pattern.iter().enumerate() {
-                for col in 0..8 {
-                    if (bits >> (7 - col)) & 1 == 1 {
-                        let px = x_pos + col as f32 * scale;
-                        let py = y - char_height + row as f32 * scale;
-                        let rect_size = scale.max(1.0);
-                        canvas.fill_rect(px, py, rect_size, rect_size, color);
-                    }
-                }
-            }
-
-            x_pos += char_width;
-        }
-
-        x_pos - x
     }
 }
 
@@ -614,527 +412,123 @@ fn page_key(html: &str, base_url: &str) -> u64 {
 
 /// Anchor positions relative to a buffer starting at document y `origin`
 fn anchors_from(layout: &PageLayout, origin: f32) -> Vec<AnchorPosition> {
-    layout.anchors.iter()
-        .map(|a| AnchorPosition { id: a.id.clone(), y: a.y - origin })
+    layout.anchors.iter().map(|a| AnchorPosition { id: a.id.clone(), y: a.y - origin }).collect()
+}
+
+/// Link regions visible in a buffer `height` rows tall at document y
+/// `origin`, in buffer coordinates
+fn links_in(layout: &PageLayout, origin: f32, height: f32) -> Vec<LinkRegion> {
+    layout
+        .links
+        .iter()
+        .filter(|(r, _)| r.bottom() > origin && r.y < origin + height && r.w > 0.0 && r.h > 0.0)
+        .map(|(r, href)| LinkRegion { x: r.x, y: r.y - origin, width: r.w, height: r.h, href: href.to_string() })
         .collect()
 }
 
-/// Computes element styles on demand while laying out.
-///
-/// Layout visits each element once and needs its style only while visiting
-/// it, so styles are never stored for the whole tree: memory stays
-/// proportional to the tree's depth, and elements layout skips (`<head>`,
-/// scripts, hidden subtrees) are never styled at all.
-struct Styler<'a> {
-    renderer: &'a PageRenderer,
-    tree: &'a DomTree,
-    stylesheet: Option<PageStyles>,
-    /// Ancestors of the element being laid out
-    ancestors: std::cell::RefCell<crate::page_styles::AncestorFilter>,
+/// Computes element styles while the box tree is built: the UA's
+/// defaults, the page's matching rules, presentational hints and `style`
+/// attributes. Styles live only as long as layout needs them.
+struct BrowserStyler<'a> {
+    stylesheet: Option<&'a PageStyles>,
+    /// Ancestors of the elements being styled
+    ancestors: AncestorFilter,
     /// `var()` and math resolutions shared across elements
-    resolved: std::cell::RefCell<fos_css::ResolveCache>,
-    /// The viewport and root font size lengths are computed against
-    ctx: std::cell::Cell<StyleContext>,
+    resolved: fos_css::ResolveCache,
+    /// What lengths are computed against (the root's font size once known)
+    ctx: StyleContext,
+    root_styled: bool,
 }
 
-impl<'a> Styler<'a> {
-    /// Style of an element (`None` for other nodes)
-    fn new(renderer: &'a PageRenderer, tree: &'a DomTree, stylesheet: Option<PageStyles>) -> Self {
-        let ctx = StyleContext { root_font_size: 16.0, viewport: (renderer.viewport_width as f32, renderer.viewport_height as f32) };
-        Self { renderer, tree, stylesheet, ancestors: Default::default(), resolved: Default::default(), ctx: std::cell::Cell::new(ctx) }
-    }
-
-    fn style(&self, node_id: NodeId, parent: &Style) -> Option<Style> {
-        let element = self.tree.get(node_id)?.as_element()?;
-        let filter = self.ancestors.borrow();
-        let mut cache = self.resolved.borrow_mut();
-        let ctx = self.ctx.get();
-        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), parent, &ctx, Some(&filter), &mut cache))
-    }
-
-    /// Descend into element `node`'s children
-    fn enter(&self, node: NodeId) {
-        if self.stylesheet.is_some() {
-            self.ancestors.borrow_mut().push(self.tree, node);
-        }
-    }
-
-    /// Come back up from the children of the element entered last
-    fn leave(&self) {
-        if self.stylesheet.is_some() {
-            self.ancestors.borrow_mut().pop();
-        }
-    }
-}
-
-/// Lay out the document body into lines for a viewport of `width` pixels
-fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLayout {
-    let tree = document.tree();
-    let body = document.body();
-
-    log::debug!("DOM tree size: {}, body valid: {}", tree.len(), body.is_valid());
-
-    // Style the body's ancestors first (usually just <html>): their rules
-    // set the inherited font and color, and they are the first entries of
-    // the ancestor filter
-    let mut chain = Vec::new();
-    let mut up = tree.get(body).map_or(NodeId::NONE, |n| n.parent);
-    while up.is_valid() {
-        chain.push(up);
-        up = tree.get(up).map_or(NodeId::NONE, |n| n.parent);
-    }
-    let mut inherited = Style::default();
-    let mut root_styled = false;
-    for &ancestor in chain.iter().rev() {
-        if let Some(style) = styler.style(ancestor, &inherited) {
+impl layout_engine::Styler for BrowserStyler<'_> {
+    fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
+        let Some(element) = tree.get(node).and_then(|n| n.as_element()) else { return Style::inherit_from(parent) };
+        let mut style = Style::inherit_from(parent);
+        let inline: Vec<fos_css::Declaration> = element
+            .attrs
+            .iter()
+            .filter(|a| tree.resolve(a.name.local) == "style")
+            .flat_map(|a| fos_css::parse_declarations(&a.value))
+            .collect();
+        let filter = self.stylesheet.is_some().then_some(&self.ancestors);
+        crate::page_styles::cascade(self.stylesheet, tree, node, element, filter, &inline, &mut style, parent, &self.ctx, &mut self.resolved);
+        if !self.root_styled {
             // The root element's font size is what `rem` means
-            if !root_styled {
-                let mut ctx = styler.ctx.get();
-                ctx.root_font_size = style.font_size();
-                styler.ctx.set(ctx);
-                root_styled = true;
-            }
-            inherited = style;
+            self.root_styled = true;
+            self.ctx.root_font_size = style.font_size();
         }
-        styler.enter(ancestor);
+        style
     }
-    let c = inherited.color();
 
-    let mut builder = LayoutBuilder {
-        tree,
-        styler,
-        // Leave margin for the right edge
-        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, inherited.font_size()),
-        // Document y of the first line
-        y: 20.0,
-        layout: PageLayout::default(),
-        parents: vec![inherited],
+    fn enter(&mut self, tree: &DomTree, node: NodeId) {
+        if self.stylesheet.is_some() {
+            self.ancestors.push(tree, node);
+        }
+    }
+
+    fn leave(&mut self) {
+        if self.stylesheet.is_some() {
+            self.ancestors.pop();
+        }
+    }
+}
+
+/// Lay out `document` in a viewport
+fn build_layout(document: &Document, stylesheet: Option<PageStyles>, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+    let tree = document.tree();
+    let root = document.document_element();
+    let mut styler = BrowserStyler {
+        stylesheet: stylesheet.as_ref(),
+        ancestors: AncestorFilter::default(),
+        resolved: Default::default(),
+        ctx: StyleContext { root_font_size: 16.0, viewport },
+        root_styled: false,
     };
-
-    builder.line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
-    if body.is_valid() {
-        builder.layout_node(body);
-        builder.flush();
+    let fragments = if root.is_valid() {
+        layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)
     } else {
-        log::error!("Body element not valid!");
-    }
+        FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0 }
+    };
+    drop(styler);
 
-    let mut layout = builder.layout;
-    layout.content_height = builder.y.max(0.0);
-    layout
-}
-
-/// Walks the DOM, accumulating inline text into lines
-struct LayoutBuilder<'a> {
-    tree: &'a DomTree,
-    styler: &'a Styler<'a>,
-    line_buffer: LineBuffer,
-    /// Current document y (baseline of the next line)
-    y: f32,
-    layout: PageLayout,
-    /// Styles of the elements being laid out (the last is the parent)
-    parents: Vec<Style>,
-}
-
-impl LayoutBuilder<'_> {
-    /// Move buffered text into laid-out lines
-    fn flush(&mut self) {
-        self.line_buffer.flush(&mut self.y, &mut self.layout);
-    }
-
-    /// Lay out a node and its children with inline/block handling
-    fn layout_node(&mut self, node_id: NodeId) {
-        let tree = self.tree;
-        let node = match tree.get(node_id) {
-            Some(n) => n,
-            None => return,
-        };
-
-        // Get style
-        let parent = self.parents.last().cloned().unwrap_or_default();
-        let style = self.styler.style(node_id, &parent);
-
-        // Check if hidden
-        if style.as_ref().is_some_and(|s| s.display() == Display::None) {
-            return;
-        }
-
-        // If text node, add to line buffer (collapsing whitespace)
-        if let Some(text) = node.as_text() {
-            let mut words = text.split_whitespace();
-            if let Some(first) = words.next() {
-                let mut collapsed = String::with_capacity(text.len());
-                collapsed.push_str(first);
-                for word in words {
-                    collapsed.push(' ');
-                    collapsed.push_str(word);
-                }
-
-                let font_size = self.line_buffer.current_font_size.max(8.0);
-                let text_color = self.line_buffer.current_color;
-                self.line_buffer.add_text(&collapsed, font_size, text_color, node.parent);
-            }
-            return;
-        }
-
-        // If element, handle block vs inline
-        let Some(element) = node.as_element() else { return };
-
-        // HTML tag names are already lowercase after parsing
-        let tag_name = tree.resolve(element.name.local);
-        let lowered;
-        let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
-            lowered = tag_name.to_ascii_lowercase();
-            &lowered
-        } else {
-            tag_name
-        };
-
-        // Skip elements that never render
-        if matches!(tag, "script" | "style" | "noscript" | "template" | "head") {
-            return;
-        }
-
-        let is_block = matches!(tag,
-            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
-            "ul" | "ol" | "li" | "section" | "article" | "header" | "footer" |
-            "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
-            "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
-
-        let font_size = style.as_ref().map(|s| s.font_size()).unwrap_or(self.line_buffer.current_font_size);
-
-        // Block elements flush the line buffer and add vertical space
-        if is_block {
-            self.flush();
-            // Better spacing based on element type
-            let margin_before = match tag {
-                "h1" => 20.0,
-                "h2" => 16.0,
-                "h3" | "h4" => 12.0,
-                "p" => 8.0,
-                "ul" | "ol" => 6.0,
-                "li" => 2.0,
-                "td" | "th" | "tr" => 2.0,
-                _ => font_size * 0.3,
-            };
-            self.y += margin_before;
-        }
-
-        // Handle special elements
-        if tag == "br" {
-            self.flush();
-            return;
-        }
-
-        if tag == "hr" {
-            self.flush();
-            let line_buffer = &self.line_buffer;
-            self.layout.rules.push(Rule {
-                x: line_buffer.start_x,
-                y: self.y,
-                width: line_buffer.max_width - line_buffer.start_x - 20.0,
-            });
-            self.y += 10.0;
-            return;
-        }
-
-        let line_buffer = &mut self.line_buffer;
-
-        // Save current state for restoration
-        let saved_font_size = line_buffer.current_font_size;
-        let saved_color = line_buffer.current_color;
-        let saved_indent = line_buffer.indent_level;
-        let saved_href = line_buffer.current_href.clone();
-        let saved_list_counter = line_buffer.list_counter;
-
-        // Increment indent for lists and blockquotes
-        if tag == "ul" || tag == "ol" || tag == "blockquote" {
-            line_buffer.indent_level += 1;
-            line_buffer.current_x = line_buffer.effective_start_x();
-        }
-
-        // Ordered lists start a counter at 1
-        if tag == "ol" {
-            line_buffer.list_counter = 1;
-        }
-        // Unordered lists reset counter to 0 (signals bullet mode)
-        if tag == "ul" {
-            line_buffer.list_counter = 0;
-        }
-
-        // Table cell handling - simple approach: cells are separated by |
-        if (tag == "td" || tag == "th") && line_buffer.current_x > line_buffer.effective_start_x() + 5.0 {
-            // Add cell separator if not first in row
-            let font_size = line_buffer.current_font_size;
-            line_buffer.add_text(" | ", font_size, Color::rgb(180, 180, 180), node_id);
-        }
-
-        // Table headers get slightly bold look (darker color)
-        if tag == "th" {
-            line_buffer.current_color = Color::rgb(40, 40, 40);
-        }
-
-        // List items get a bullet or number marker
-        if tag == "li" {
-            self.flush();
-            let line_buffer = &mut self.line_buffer;
-            // Add marker based on list type
-            let font_size = line_buffer.current_font_size;
-            let color = line_buffer.current_color;
-            if line_buffer.list_counter > 0 {
-                // Ordered list - show number
-                let marker = format!("{}. ", line_buffer.list_counter);
-                line_buffer.add_text(&marker, font_size, color, node_id);
-                line_buffer.list_counter += 1;
-            } else {
-                // Unordered list - show bullet
-                line_buffer.add_text("• ", font_size, color, node_id);
-            }
-        }
-
-        let line_buffer = &mut self.line_buffer;
-
-        // Inherited properties for the element's contents
-        if let Some(style) = &style {
-            line_buffer.current_font_size = style.font_size();
-            let c = style.color();
-            line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
-        }
-
-        // Single pass over attributes: link target, anchor id
-        for attr in element.attrs.iter() {
-            match tree.resolve(attr.name.local) {
-                "href" if tag == "a" => {
-                    line_buffer.current_href = Some(attr.value.to_string());
-                }
-                "id" if !attr.value.is_empty() => {
-                    // Record element ID for anchor navigation
-                    self.layout.anchors.push(AnchorPosition {
-                        id: attr.value.to_string(),
-                        y: self.y,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Recurse into children
-        self.styler.enter(node_id);
-        self.parents.push(style.unwrap_or(parent));
-        for (child_id, _) in tree.children(node_id) {
-            self.layout_node(child_id);
-        }
-        self.parents.pop();
-        self.styler.leave();
-
-        // Restore state
-        let line_buffer = &mut self.line_buffer;
-        line_buffer.current_font_size = saved_font_size;
-        line_buffer.current_color = saved_color;
-        line_buffer.indent_level = saved_indent;
-        line_buffer.current_href = saved_href;
-        line_buffer.list_counter = saved_list_counter;
-        line_buffer.current_x = line_buffer.effective_start_x();
-
-        // Block elements flush after and add space
-        if is_block {
-            self.flush();
-            // Better spacing based on element type
-            let margin_after = match tag {
-                "h1" => 12.0,
-                "h2" => 10.0,
-                "h3" | "h4" => 8.0,
-                "p" => 12.0,  // Paragraphs need good separation
-                "li" => 2.0,
-                _ => 4.0,
-            };
-            self.y += margin_after;
-        }
-    }
-}
-
-
-/// Line buffer for accumulating inline text
-struct LineBuffer {
-    /// Pending segments; `None` marks a line break
-    segments: Vec<Option<TextSegment>>,
-    start_x: f32,
-    current_x: f32,
-    max_width: f32,
-    current_font_size: f32,
-    current_color: Color,
-    /// Current indentation level (for lists, blockquotes)
-    indent_level: u32,
-    /// Current link href (if inside an <a> tag)
-    current_href: Option<String>,
-    /// Current list counter for <ol> (0 means unordered list or not in list)
-    list_counter: u32,
-}
-
-impl LineBuffer {
-    fn new(start_x: f32, max_width: f32, font_size: f32) -> Self {
-        Self {
-            segments: Vec::new(),
-            start_x,
-            current_x: start_x,
-            max_width,
-            current_font_size: font_size,
-            current_color: Color::BLACK,
-            indent_level: 0,
-            current_href: None,
-            list_counter: 0,
-        }
-    }
-
-    /// Get effective start x (including indentation)
-    fn effective_start_x(&self) -> f32 {
-        self.start_x + (self.indent_level as f32 * 20.0)
-    }
-
-    fn add_text_with_measure<F: Fn(&str, f32) -> f32>(&mut self, text: &str, font_size: f32, color: Color, node: NodeId, measure: F) {
-        let effective_start = self.effective_start_x();
-        let right_margin = 15.0;
-        let wrap_width = self.max_width - right_margin;
-
-        // Use proper text measurement for space width
-        let space_width = measure(" ", font_size);
-
-        // Initialize current_x if needed
-        if self.current_x < effective_start {
-            self.current_x = effective_start;
-        }
-
-        // Use LineBreaker for proper Unicode-aware line breaking
-        let available_width = wrap_width - self.current_x;
-        let lines = LineBreaker::break_lines(text, available_width.max(wrap_width * 0.5), |s| measure(s, font_size));
-
-        for (i, &(start, end)) in lines.iter().enumerate() {
-            let line_text = &text[start..end];
-            let trimmed = line_text.trim_end();
-
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Check if this line needs wrapping from current position
-            let line_width = measure(trimmed, font_size);
-
-            if i > 0 || (self.current_x + line_width > wrap_width && self.current_x > effective_start) {
-                // Need to wrap - start new line
-                if !self.segments.is_empty() {
-                    self.segments.push(None);
-                }
-                self.current_x = effective_start;
-            }
-
-            // Add the text segment
-            let mut segment_text = String::with_capacity(trimmed.len() + 1);
-            segment_text.push_str(trimmed);
-            segment_text.push(' ');
-            self.segments.push(Some(TextSegment {
-                text: segment_text,
-                font_size,
-                color,
-                href: self.current_href.clone(),
-                node,
-                width: line_width + space_width,
-            }));
-
-            self.current_x += line_width + space_width;
-        }
-    }
-
-    // Keep fallback without measure function for backwards compatibility
-    fn add_text(&mut self, text: &str, font_size: f32, color: Color, node: NodeId) {
-        // Fallback using approximate character width
-        let char_width = font_size * 0.5;
-        self.add_text_with_measure(text, font_size, color, node, |s, _| s.chars().count() as f32 * char_width);
-    }
-
-    /// Emit the buffered text as lines starting at `y_cursor`
-    fn flush(&mut self, y_cursor: &mut f32, layout: &mut PageLayout) {
-        if self.segments.is_empty() {
-            return;
-        }
-
-        let effective_start = self.effective_start_x();
-        let line_height = self.current_font_size * 1.3;
-
-        let mut line = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
-        for segment in self.segments.drain(..) {
-            match segment {
-                Some(segment) => {
-                    layout.max_font_size = layout.max_font_size.max(segment.font_size);
-                    line.segments.push(segment);
-                }
-                None => {
-                    *y_cursor += line_height;
-                    let next = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
-                    let done = std::mem::replace(&mut line, next);
-                    if !done.segments.is_empty() {
-                        layout.lines.push(done);
-                    }
+    // Links and anchors
+    let mut links: Vec<(Rect, Arc<str>)> = Vec::new();
+    fn walk(tree: &DomTree, b: &BoxFragment, links: &mut Vec<(Rect, Arc<str>)>) {
+        if b.node.is_valid() {
+            let is_link = tree.get(b.node).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "a");
+            if is_link {
+                if let Some(href) = tree.get_attribute(b.node, "href") {
+                    // A block link's area is its box; an inline link's, each
+                    // line's part
+                    let r = if b.kind == BoxFragmentKind::InlinePart { b.border_box.union(&b.ink) } else { b.border_box };
+                    links.push((r, Arc::from(href)));
                 }
             }
         }
-        if !line.segments.is_empty() {
-            layout.lines.push(line);
+        for c in &b.children {
+            if let Fragment::Box(cb) = c {
+                walk(tree, cb, links);
+            }
         }
-
-        *y_cursor += line_height;
-        self.current_x = effective_start;
     }
-}
-
-/// Apply default user-agent styles based on element type
-/// Get 8x8 bitmap pattern for a character (simple bitmap font)
-fn get_char_pattern(c: char) -> [u8; 8] {
-    match c.to_ascii_lowercase() {
-        'a' => [0b00111100, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'b' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b00000000],
-        'c' => [0b00111100, 0b01000010, 0b01000000, 0b01000000, 0b01000000, 0b01000010, 0b00111100, 0b00000000],
-        'd' => [0b01111000, 0b01000100, 0b01000010, 0b01000010, 0b01000010, 0b01000100, 0b01111000, 0b00000000],
-        'e' => [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01111110, 0b00000000],
-        'f' => [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000],
-        'g' => [0b00111100, 0b01000010, 0b01000000, 0b01001110, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'h' => [0b01000010, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'i' => [0b00111100, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00111100, 0b00000000],
-        'j' => [0b00001110, 0b00000100, 0b00000100, 0b00000100, 0b00000100, 0b01000100, 0b00111000, 0b00000000],
-        'k' => [0b01000100, 0b01001000, 0b01010000, 0b01100000, 0b01010000, 0b01001000, 0b01000100, 0b00000000],
-        'l' => [0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01111110, 0b00000000],
-        'm' => [0b01000010, 0b01100110, 0b01011010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'n' => [0b01000010, 0b01100010, 0b01010010, 0b01001010, 0b01000110, 0b01000010, 0b01000010, 0b00000000],
-        'o' => [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'p' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000],
-        'q' => [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01001010, 0b01000100, 0b00111010, 0b00000000],
-        'r' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01010000, 0b01001000, 0b01000100, 0b00000000],
-        's' => [0b00111100, 0b01000010, 0b01000000, 0b00111100, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        't' => [0b01111110, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000],
-        'u' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'v' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00100100, 0b00100100, 0b00011000, 0b00000000],
-        'w' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01011010, 0b01100110, 0b01000010, 0b00000000],
-        'x' => [0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00100100, 0b01000010, 0b00000000],
-        'y' => [0b01000010, 0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000],
-        'z' => [0b01111110, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01000000, 0b01111110, 0b00000000],
-        // Digits with distinct patterns
-        '0' => [0b00111100, 0b01000110, 0b01001010, 0b01010010, 0b01100010, 0b01000010, 0b00111100, 0b00000000],
-        '1' => [0b00011000, 0b00111000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b01111110, 0b00000000],
-        '2' => [0b00111100, 0b01000010, 0b00000010, 0b00001100, 0b00110000, 0b01000000, 0b01111110, 0b00000000],
-        '3' => [0b00111100, 0b01000010, 0b00000010, 0b00011100, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        '4' => [0b00000100, 0b00001100, 0b00010100, 0b00100100, 0b01111110, 0b00000100, 0b00000100, 0b00000000],
-        '5' => [0b01111110, 0b01000000, 0b01111100, 0b00000010, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        '6' => [0b00011100, 0b00100000, 0b01000000, 0b01111100, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        '7' => [0b01111110, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00010000, 0b00010000, 0b00000000],
-        '8' => [0b00111100, 0b01000010, 0b01000010, 0b00111100, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        '9' => [0b00111100, 0b01000010, 0b01000010, 0b00111110, 0b00000010, 0b00000100, 0b00111000, 0b00000000],
-        '.' => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00011000, 0b00011000, 0b00000000],
-        ',' => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00011000, 0b00011000, 0b00110000, 0b00000000],
-        ':' => [0b00000000, 0b00011000, 0b00011000, 0b00000000, 0b00011000, 0b00011000, 0b00000000, 0b00000000],
-        '-' => [0b00000000, 0b00000000, 0b00000000, 0b01111110, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
-        // Bullet for lists (small filled circle)
-        '•' => [0b00000000, 0b00000000, 0b00011000, 0b00111100, 0b00111100, 0b00011000, 0b00000000, 0b00000000],
-        _ => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
+    if let Some(r) = &fragments.root {
+        walk(tree, r, &mut links);
     }
+    links.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
+
+    let mut anchors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (node, rect) in fragments.element_rects() {
+        if seen.insert(node) {
+            if let Some(id) = tree.get_attribute(node, "id").filter(|id| !id.is_empty()) {
+                anchors.push(AnchorPosition { id: id.to_string(), y: rect.y });
+            }
+        }
+    }
+
+    let body = document.body();
+    let (background, background_box) = crate::paint::canvas_background(&fragments, |b| b.node == body);
+    PageLayout { fragments, links, anchors, background, background_box }
 }
 
 #[cfg(test)]
@@ -1282,17 +676,56 @@ mod tests {
         assert!(past_end.links.is_empty());
     }
 
-    #[test]
-    fn test_layout_lines_are_ordered() {
-        let document = fos_html::parse_with_url(PAGE, "https://example.com/");
-        let renderer = PageRenderer::new(320, 240);
-        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
-        let layout = build_layout(&document, &styler, 320);
+    fn layout_of(document: &Document, width: f32) -> PageLayout {
+        let renderer = PageRenderer::new(width as u32, 240);
+        let sheet = renderer.page_stylesheet(document);
+        build_layout(document, sheet, &mut FontContext::default(), (width, 240.0))
+    }
 
-        assert!(!layout.lines.is_empty());
-        assert!(layout.lines.windows(2).all(|w| w[0].y <= w[1].y));
-        assert_eq!(layout.rules.len(), 1);
-        assert!(layout.content_height >= layout.lines.last().unwrap().y);
+    /// The text fragments of the element whose text is `text`
+    fn texts<'a>(document: &Document, layout: &'a PageLayout, text: &str) -> Vec<&'a layout_engine::TextFragment> {
+        let tree = document.tree();
+        let mut owner = NodeId::NONE;
+        fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
+            let own: String = tree.children(id).filter_map(|(_, n)| n.as_text()).collect();
+            if own.trim() == text {
+                owner = id;
+            }
+            true
+        });
+        let mut out = Vec::new();
+        fn walk<'a>(b: &'a BoxFragment, owner: NodeId, out: &mut Vec<&'a layout_engine::TextFragment>) {
+            for c in &b.children {
+                match c {
+                    Fragment::Text(t) if t.node == owner => out.push(t),
+                    Fragment::Box(cb) => walk(cb, owner, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(layout.fragments.root.as_ref().unwrap(), owner, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_layout_boxes_follow_the_document() {
+        let document = fos_html::parse_with_url(PAGE, "https://example.com/");
+        let layout = layout_of(&document, 320.0);
+        let boxes = layout.boxes();
+        assert!(!boxes.is_empty());
+        // Block boxes come in document order, top to bottom
+        let tree = document.tree();
+        let tops: Vec<f32> = boxes
+            .iter()
+            .filter(|(n, _)| tree.get(*n).and_then(|n| n.as_element()).is_some_and(|e| matches!(tree.resolve(e.name.local), "h1" | "p" | "ul")))
+            .map(|(_, r)| r.y)
+            .collect();
+        assert!(tops.len() >= 4 && tops.windows(2).all(|w| w[0] <= w[1]), "{tops:?}");
+        // The rule is a bordered block across the body
+        let hr = boxes.iter().find(|(n, _)| tree.get(*n).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "hr")).unwrap();
+        assert!(hr.1.w > 250.0 && hr.1.h >= 2.0, "{:?}", hr.1);
+        assert!(layout.content_height() >= tops[tops.len() - 1]);
+        assert!(layout.anchors.iter().any(|a| a.id == "end"));
     }
 
     #[test]
@@ -1321,27 +754,25 @@ mod tests {
             <p style="display: none">hidden</p>
             </body></html>"#;
         let document = fos_html::parse_with_url(html, "https://example.com/");
-        let renderer = PageRenderer::new(640, 480);
-        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
-        let layout = build_layout(&document, &styler, 640);
+        let layout = layout_of(&document, 640.0);
         let seg = |text: &str| {
-            layout.lines.iter().flat_map(|l| &l.segments).find(|s| s.text.trim() == text).unwrap_or_else(|| panic!("no segment {text}")).clone()
+            let t = texts(&document, &layout, text);
+            let t = t.first().unwrap_or_else(|| panic!("no text {text}"));
+            (Color::rgba(t.color.r, t.color.g, t.color.b, t.color.a), t.font.size)
         };
-        assert_eq!(seg("inline").color, Color::rgb(0, 0, 255));
-        assert_eq!(seg("big").color, Color::rgb(255, 0, 0));
-        assert_eq!(seg("big").font_size, 32.0);
+        let rgb = |r, g, b| Color::rgb(r, g, b);
+        assert_eq!(seg("inline").0, rgb(0, 0, 255));
+        assert_eq!(seg("big"), (rgb(255, 0, 0), 32.0));
         // Inherited color, em relative to the parent's size
-        assert_eq!(seg("rel").color, Color::rgb(255, 0, 0));
-        assert_eq!(seg("rel").font_size, 48.0);
-        assert_eq!(seg("nav link").color, Color::rgb(0, 128, 0));
+        assert_eq!(seg("rel"), (rgb(255, 0, 0), 48.0));
+        assert_eq!(seg("nav link").0, rgb(0, 128, 0));
         // The UA stylesheet's link color
-        assert_eq!(seg("plain link").color, Color::rgb(0, 0, 238));
-        assert!(layout.lines.iter().flat_map(|l| &l.segments).all(|s| s.text.trim() != "hidden"));
+        assert_eq!(seg("plain link").0, rgb(0, 0, 238));
+        assert!(texts(&document, &layout, "hidden").is_empty());
         // Custom properties from :root, calc() with rem of the root's 20px
-        assert_eq!(seg("vars").color, Color::rgb(0, 0, 255));
-        assert_eq!(seg("vars").font_size, 22.0);
-        assert_eq!(seg("fallback").color, Color::rgb(255, 0, 255));
+        assert_eq!(seg("vars"), (rgb(0, 0, 255), 22.0));
+        assert_eq!(seg("fallback").0, rgb(255, 0, 255));
         // The root's font size is inherited
-        assert_eq!(seg("inline").font_size, 20.0);
+        assert_eq!(seg("inline").1, 20.0);
     }
 }

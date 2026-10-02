@@ -356,3 +356,27 @@ fn justify_fills_lines_but_not_the_last() {
         assert!((r.right() - 208.0).abs() < 0.5, "{r:?}");
     }
 }
+
+#[test]
+fn spaces_between_inline_elements_are_kept() {
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "");
+    text(&mut tree, p, "by ");
+    let a = el(&mut tree, p, "a", "");
+    text(&mut tree, a, "user");
+    text(&mut tree, p, " ");
+    let span = el(&mut tree, p, "span", "");
+    let b = el(&mut tree, span, "a", "");
+    text(&mut tree, b, "age");
+    let t = layout(&tree, html, 800.0);
+    let mut runs = Vec::new();
+    t.for_each(|f| {
+        if let Fragment::Text(t) = f {
+            runs.push((t.node, t.rect));
+        }
+    });
+    eprintln!("{runs:?}");
+    let ra = runs.iter().find(|r| r.0 == a).unwrap().1;
+    let rb = runs.iter().find(|r| r.0 == b).unwrap().1;
+    assert!(rb.x - ra.right() > 2.0, "{ra:?} {rb:?}");
+}

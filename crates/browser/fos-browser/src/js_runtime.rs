@@ -1955,4 +1955,22 @@ mod tests {
         assert_eq!(rt.eval("out.blob").unwrap(), "image/png,true");
         assert_eq!(rt.eval("out.decoded").unwrap(), "4,4");
     }
+
+    #[test]
+    fn script_load_events_stay_on_the_script() {
+        // A window load handler that inserts a script (as microsoft.com
+        // does) ran forever when each script's load bubbled to window
+        let (mut rt, _doc) = page(r#"<html><head><script src="a.js"></script></head><body></body></html>"#);
+        rt.eval("window.counts = { window: 0, capture: 0, doc: 0, script: 0 };
+            addEventListener('load', () => { counts.window++; const s = document.createElement('script'); s.src = 'b.js'; s.onload = () => counts.script++; document.head.appendChild(s); });
+            addEventListener('load', () => counts.capture++, true);
+            document.addEventListener('load', () => counts.doc++, true);").unwrap();
+        rt.execute_scripts(&mut |url: &str| url.ends_with(".js").then(|| "window.ran = (window.ran || 0) + 1;".to_string())).unwrap();
+        for _ in 0..3 {
+            rt.process_timers(&mut |url: &str| url.ends_with(".js").then(|| "window.ran = (window.ran || 0) + 1;".to_string())).unwrap();
+        }
+        // Capturing document listeners still see element load events
+        assert_eq!(rt.eval("[counts.window, counts.capture, counts.script, ran, counts.doc].join()").unwrap(), "1,1,1,2,2");
+        assert_eq!(rt.eval("const e = new Event('x'); let n = 0; addEventListener('x', () => n++); document.body.dispatchEvent(new Event('x', { bubbles: true })); n").unwrap(), "1");
+    }
 }

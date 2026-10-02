@@ -103,7 +103,9 @@
       event.target = this;
       event.isTrusted = !!event.isTrusted;
       const path = [];
-      for (let n = this; n; n = n === document ? global : n.parentNode) {
+      // A document's parent is the window, except for load events (an
+      // image's or script's load never reaches window listeners)
+      for (let n = this; n; n = n === document ? (event.type === 'load' ? null : global) : n.parentNode) {
         path.push(n);
         if (n === global) break;
       }
@@ -188,12 +190,16 @@
     console.error('Uncaught', e && e.stack ? e.stack : e);
   }
 
-  // Called by the browser to deliver user input and lifecycle events
+  // Called by the browser to deliver user input and lifecycle events.
+  // Resource and focus events neither bubble nor cancel; input does both.
+  const quietEvents = new Set(['load', 'error', 'abort', 'loadstart', 'progress', 'loadend', 'focus', 'blur',
+    'mouseenter', 'mouseleave', 'toggle', 'readystatechange']);
   define(global, {
     __fosDispatch(target, type, init) {
       const Ctor = /^(click|dblclick|mouse|contextmenu)/.test(type) ? MouseEvent
         : /^key/.test(type) ? KeyboardEvent : Event;
-      const ev = new Ctor(type, init || { bubbles: true, cancelable: true });
+      const loud = !quietEvents.has(type);
+      const ev = new Ctor(type, init || { bubbles: loud, cancelable: loud });
       ev.isTrusted = true;
       const notCanceled = target.dispatchEvent(ev);
       if (notCanceled && type === 'click') {

@@ -89,6 +89,9 @@ pub struct DomHost {
     cookies: fos_net::SharedCookieJar,
     /// The URL changed without a navigation (`history.pushState`)
     pub url_changed: bool,
+    /// Prototypes of element interfaces by tag (`HTMLScriptElement` for
+    /// "script"; SVG elements under "svg:<tag>" and "svg:*")
+    tag_protos: HashMap<String, Gc<JsObject>>,
 }
 
 impl DomHost {
@@ -108,6 +111,7 @@ impl DomHost {
             next_fetch_id: 1,
             layout: None,
             viewport: (1024.0, 768.0),
+            tag_protos: HashMap::new(),
             scroll: (0.0, 0.0),
             boxes: None,
             scroll_request: None,
@@ -147,20 +151,68 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
         return vm.host_roots[slot];
     }
     let protos = host(vm).protos.expect("DOM not initialized");
-    let proto = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
-        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => protos.fragment,
-        Some(NodeData::Element(_)) => protos.element,
-        Some(NodeData::Text(_)) => protos.text,
-        Some(NodeData::Comment(_)) => protos.comment,
-        Some(NodeData::Document) => protos.document,
-        _ => protos.node,
+    let by_tag = !host(vm).tag_protos.is_empty();
+    let (proto, tag) = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => (protos.fragment, None),
+        Some(NodeData::Element(e)) => (protos.element, by_tag.then(|| element_tag(t, e))),
+        Some(NodeData::Text(_)) => (protos.text, None),
+        Some(NodeData::Comment(_)) => (protos.comment, None),
+        Some(NodeData::Document) => (protos.document, None),
+        _ => (protos.node, None),
     });
+    let proto = tag.and_then(|tag| tag_proto(&host(vm).tag_protos, &tag)).unwrap_or(proto);
     let o = vm.new_object_with(Some(proto), ObjectKind::Host { class: NODE_CLASS, id: id.0 as u64 });
     let v = Value::object(o);
     let slot = vm.host_roots.len();
     vm.host_roots.push(v);
     host(vm).wrappers.insert(id.0, slot);
     v
+}
+
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+
+/// An element's key in `tag_protos`: its tag, prefixed "svg:" for SVG
+fn element_tag(t: &fos_dom::DomTree, e: &fos_dom::ElementData) -> String {
+    let local = t.resolve(e.name.local);
+    if t.resolve(e.name.ns) == SVG_NS { format!("svg:{local}") } else { local.to_string() }
+}
+
+/// The interface prototype for an element's tag
+fn tag_proto(tag_protos: &HashMap<String, Gc<JsObject>>, tag: &str) -> Option<Gc<JsObject>> {
+    tag_protos.get(tag).or_else(|| if tag.starts_with("svg:") { tag_protos.get("svg:*") } else { None }).copied()
+}
+
+/// `__fosSetElementPrototype(tag, proto)`: elements with this tag get
+/// `proto` (an interface's prototype). Wrappers made earlier are updated.
+fn set_element_prototype(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let tag = arg_string(vm, args, 0)?;
+    let Some(proto) = arg(args, 1).as_object() else { return Ok(Value::UNDEFINED) };
+    vm.host_roots.push(Value::object(proto));
+    host(vm).tag_protos.insert(tag, proto);
+    let Some(protos) = host(vm).protos else { return Ok(Value::UNDEFINED) };
+    let wrappers: Vec<(u32, usize)> = host(vm).wrappers.iter().map(|(&k, &v)| (k, v)).collect();
+    for (node, slot) in wrappers {
+        let o = vm.host_roots[slot].as_object().unwrap();
+        if o.get().proto != Some(protos.element) {
+            continue;
+        }
+        let tag = with_tree(vm, |t| t.get(NodeId(node)).and_then(|n| n.as_element()).map(|e| element_tag(t, e)));
+        if let Some(p) = tag.and_then(|tag| tag_proto(&host(vm).tag_protos, &tag)) {
+            o.get_mut().proto = Some(p);
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn namespace_uri(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let id = this_node(vm, this)?;
+    let ns = with_tree(vm, |t| t.get(id).and_then(|n| n.as_element()).map(|e| t.resolve(e.name.ns).to_string()));
+    Ok(match ns {
+        // Elements made without a namespace by the HTML parser are HTML
+        Some(ns) if ns.is_empty() => string(vm, "http://www.w3.org/1999/xhtml"),
+        Some(ns) => string(vm, &ns),
+        None => Value::NULL,
+    })
 }
 
 fn wrap_all(vm: &mut Vm, ids: Vec<NodeId>) -> Value {
@@ -1524,6 +1576,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
     accessors(vm, element, &[
         ("tagName", tag_name, None),
         ("localName", local_name, None),
+        ("namespaceURI", namespace_uri, None),
         ("id", get_id, Some(set_id)),
         ("className", get_class_name, Some(set_class_name)),
         ("innerHTML", inner_html, Some(set_inner_html)),
@@ -1576,6 +1629,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetURL", 1, set_url),
         ("__fosRandomBytes", 1, random_bytes),
         ("__fosTemplateContent", 1, template_content),
+        ("__fosSetElementPrototype", 2, set_element_prototype),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

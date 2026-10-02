@@ -299,9 +299,9 @@ pub struct Template {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
-    Method,
-    Getter,
-    Setter,
+    Method = 0,
+    Getter = 1,
+    Setter = 2,
 }
 
 #[derive(Debug)]

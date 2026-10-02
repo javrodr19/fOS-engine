@@ -35,6 +35,39 @@ impl Vm {
     // ---- own properties ----
 
     /// Create a function's lazy built-in properties
+    /// SetFunctionName for a function stored under a computed key, unless
+    /// it already has a name of its own (a class with a static `name`)
+    pub(crate) fn set_function_name(&mut self, f: Gc<JsObject>, key: PropertyKey, prefix: u8) {
+        if f.get().lazy & crate::object::LAZY_NAME == 0 {
+            // Classes materialize their properties while being built; their
+            // name is still the anonymous "" (a `static name` is not)
+            let anonymous = matches!(&f.get().kind, ObjectKind::Function(c) if c.proto.name == atoms::empty);
+            let unnamed = match f.get().find_own(&self.shapes, PropertyKey::Atom(atoms::name)) {
+                Some((slot, flags)) if !flags.is_accessor() => f.get().read(slot).as_string().is_some_and(|s| s.get().len() == 0),
+                _ => false,
+            };
+            if !(anonymous && unnamed) {
+                return;
+            }
+        }
+        self.materialize(f);
+        let name = match key {
+            PropertyKey::Atom(a) => self.atoms.string(a).get().to_rust_string(),
+            PropertyKey::Index(i) => i.to_string(),
+            PropertyKey::Symbol(s) => match s.get().description {
+                Some(d) => format!("[{}]", d.get().to_rust_string()),
+                None => String::new(),
+            },
+        };
+        let name = match prefix {
+            1 => format!("get {name}"),
+            2 => format!("set {name}"),
+            _ => name,
+        };
+        let v = self.str_value(&name);
+        self.define_value(f, PropertyKey::Atom(atoms::name), v, PropFlags::READONLY_HIDDEN);
+    }
+
     pub(crate) fn materialize(&mut self, o: Gc<JsObject>) {
         let lazy = o.get().lazy;
         if lazy == 0 {

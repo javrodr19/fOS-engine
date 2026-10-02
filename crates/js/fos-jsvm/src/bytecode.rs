@@ -159,6 +159,9 @@ pub enum Insn {
     DynamicImport { dst: Reg, spec: Reg, referrer: Reg },
     /// Set a function's home object (methods that use `super`)
     SetHomeObject { func: Reg, obj: Reg },
+    /// Name an anonymous function after a computed key (SetFunctionName);
+    /// `prefix`: 0 none, 1 "get ", 2 "set "
+    SetFunctionName { func: Reg, key: Reg, prefix: u8 },
     /// Create a class: dst = constructor from closure `ctor` (already
     /// created), with prototype object `proto` and parent `parent`
     MakeClass { ctor: Reg, proto: Reg, parent: Reg },

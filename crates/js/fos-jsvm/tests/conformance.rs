@@ -1314,7 +1314,7 @@ fn normalize_and_locale_compare() {
 #[test]
 fn weak_references() {
     let mut vm = Vm::new();
-    let mut eval = |vm: &mut Vm, src: &str| -> String {
+    let eval = |vm: &mut Vm, src: &str| -> String {
         match vm.eval(src) {
             Ok(v) => vm.display(v),
             Err(e) => format!("throws {}", vm.display(e)),
@@ -1406,4 +1406,28 @@ fn stack_trace_locations() {
     "#;
     let got = vm.eval_named(src, "c.js").map(|v| vm.display(v)).unwrap();
     assert_eq!(got, "[ false, true, 'Error: second', 'mine', '    at make (c.js:3:34)|    at c.js:9:89', 10, 'function', undefined ]");
+    // A getter's caller is located at the property access
+    let src = "var o = { get g() { return new Error('g').stack; } };\nfunction f() { return [1, o.g][1]; }\nf().split('\\n').slice(1, 3).join('|')";
+    let got = vm.eval_named(src, "g.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "    at get g (g.js:1:28)|    at f (g.js:2:29)");
+}
+
+/// Functions take their names from computed keys and accessor kinds
+#[test]
+fn computed_function_names() {
+    check(&[
+        ("const n = 'dyn'; ({ [n]: function () {} })[n].name", "'dyn'"),
+        ("({ [Symbol.iterator]: () => 0 })[Symbol.iterator].name", "'[Symbol.iterator]'"),
+        ("({ [Symbol()]: () => 0 })[Object.getOwnPropertySymbols({ [Symbol()]: 1 }).length - 1] === undefined", "true"),
+        ("const s = Symbol(); Object.getOwnPropertyDescriptor({ [s]() {} }, s).value.name", "''"),
+        ("({ [1 + 1]() {} })[2].name", "'2'"),
+        ("({ ['m' + 1]() {} }).m1.name", "'m1'"),
+        ("Object.getOwnPropertyDescriptor({ get ['a' + 'b']() { return 1; } }, 'ab').get.name", "'get ab'"),
+        ("Object.getOwnPropertyDescriptor({ get x() { return 1; }, set x(v) {} }, 'x').set.name", "'set x'"),
+        ("Object.getOwnPropertyDescriptor(class { static get y() { return 1; } }, 'y').get.name", "'get y'"),
+        ("class A { [Symbol.toPrimitive]() {} } A.prototype[Symbol.toPrimitive].name", "'[Symbol.toPrimitive]'"),
+        ("const k = 'c'; ({ [k]: class {} }).c.name", "'c'"),
+        ("const k2 = 'c'; ({ [k2]: class { static name() {} } }).c.name.call === Function.prototype.call", "true"),
+        ("const k3 = 'f'; ({ [k3]: function named() {} }).f.name", "'named'"),
+    ]);
 }

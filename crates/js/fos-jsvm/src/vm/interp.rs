@@ -638,7 +638,7 @@ impl Vm {
                                 _ => {}
                             }
                         }
-                        let r = tri!(self.get_prop_ic(v, cell));
+                        let r = tri!(self.get_prop_slow(v, cell, pc));
                         w!(dst, r);
                     }
                     Insn::SetProp { obj, src, ic } => {
@@ -664,7 +664,7 @@ impl Vm {
                             }
                         }
                         let strict = unsafe { (*proto).strict };
-                        tri!(self.set_prop_ic(v, val, cell, strict));
+                        tri!(self.set_prop_slow(v, val, cell, strict, pc));
                     }
                     Insn::DefineProp { obj, src, ic } => {
                         let o = r!(obj).as_object().unwrap();
@@ -695,7 +695,7 @@ impl Vm {
                                 continue;
                             }
                         }
-                        let r = tri!(self.get_elem(v, k));
+                        let r = tri!(self.get_elem_slow(v, k, pc));
                         w!(dst, r);
                     }
                     Insn::SetElem { obj, key, src } => {
@@ -726,7 +726,7 @@ impl Vm {
                             }
                         }
                         let strict = unsafe { (*proto).strict };
-                        tri!(self.set_elem(v, k, val, strict));
+                        tri!(self.set_elem_slow(v, k, val, strict, pc));
                     }
                     Insn::DefineElem { obj, key, src } => {
                         let o = r!(obj).as_object().unwrap();
@@ -839,6 +839,11 @@ impl Vm {
                             }
                         }
                         w!(dst, Value::object(f));
+                    }
+                    Insn::SetFunctionName { func, key, prefix } => {
+                        let f = r!(func).as_object().unwrap();
+                        let k = tri!(self.to_property_key(r!(key)));
+                        self.set_function_name(f, k, prefix);
                     }
                     Insn::SetHomeObject { func, obj } => {
                         let f = r!(func).as_object().unwrap();
@@ -1159,6 +1164,38 @@ impl Vm {
         self.sp = f.base + unsafe { (&*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         None
+    }
+
+    // Property slow paths, out of line to keep the dispatch loop compact.
+    // They save the pc first, so getters and setters they run see this
+    // frame's location in stack traces.
+
+    #[cold]
+    #[inline(never)]
+    fn get_prop_slow(&mut self, v: Value, cell: &std::cell::Cell<Ic>, pc: usize) -> JsResult<Value> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.get_prop_ic(v, cell)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_prop_slow(&mut self, v: Value, val: Value, cell: &std::cell::Cell<Ic>, strict: bool, pc: usize) -> JsResult<()> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.set_prop_ic(v, val, cell, strict)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_elem_slow(&mut self, v: Value, k: Value, pc: usize) -> JsResult<Value> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.get_elem(v, k)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_elem_slow(&mut self, v: Value, k: Value, val: Value, strict: bool, pc: usize) -> JsResult<()> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.set_elem(v, k, val, strict)
     }
 
     /// A unary numeric operator on a number or a BigInt

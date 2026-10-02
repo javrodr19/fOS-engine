@@ -206,60 +206,23 @@
 
   // ---- element conveniences ----
 
-  // Reflected attributes: string-valued ...
-  for (const [prop, attr] of [['title', 'title'], ['lang', 'lang'], ['dir', 'dir'], ['name', 'name'],
-    ['type', 'type'], ['alt', 'alt'], ['rel', 'rel'], ['target', 'target'], ['placeholder', 'placeholder'],
-    ['htmlFor', 'for'], ['accessKey', 'accesskey'], ['role', 'role'], ['slot', 'slot'],
-    ['width', 'width'], ['height', 'height'], ['min', 'min'], ['max', 'max'], ['step', 'step'],
-    ['pattern', 'pattern'], ['autocomplete', 'autocomplete'], ['method', 'method'], ['enctype', 'enctype'],
-    ['content', 'content'], ['charset', 'charset'], ['media', 'media'], ['label', 'label']]) {
+  // Reflected attributes common to all HTML elements (those of particular
+  // elements are defined on their interfaces, below)
+  for (const [prop, attr] of [['title', 'title'], ['lang', 'lang'], ['dir', 'dir'], ['accessKey', 'accesskey'],
+    ['role', 'role'], ['slot', 'slot'], ['nonce', 'nonce']]) {
     Object.defineProperty(E, prop, {
       get() { return this.getAttribute(attr) ?? ''; },
       set(v) { this.setAttribute(attr, String(v)); },
       configurable: true,
     });
   }
-  // ... URLs, resolved against the document ...
-  for (const prop of ['href', 'src', 'action', 'poster', 'cite', 'data']) {
+  for (const prop of ['hidden', 'autofocus', 'inert']) {
     Object.defineProperty(E, prop, {
-      get() {
-        const v = this.getAttribute(prop);
-        return v === null ? '' : __fosResolveURL(v, document.baseURI);
-      },
-      set(v) { this.setAttribute(prop, String(v)); },
+      get() { return this.hasAttribute(prop); },
+      set(v) { if (v) this.setAttribute(prop, ''); else this.removeAttribute(prop); },
       configurable: true,
     });
   }
-  // ... and boolean
-  for (const prop of ['hidden', 'disabled', 'checked', 'selected', 'readOnly', 'required', 'multiple',
-    'autofocus', 'async', 'defer', 'noValidate', 'open', 'controls', 'autoplay', 'loop', 'muted']) {
-    const attr = prop.toLowerCase();
-    Object.defineProperty(E, prop, {
-      get() { return this.hasAttribute(attr); },
-      set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
-      configurable: true,
-    });
-  }
-  // Form control values live in the `value` attribute (no separate dirty value)
-  Object.defineProperty(E, 'value', {
-    get() {
-      const tag = this.localName;
-      if (tag === 'textarea') return this.textContent;
-      if (tag === 'select') {
-        const opt = this.querySelector('option[selected]') || this.querySelector('option');
-        return opt ? opt.value : '';
-      }
-      if (tag === 'option') return this.getAttribute('value') ?? this.textContent.trim();
-      return this.getAttribute('value') ?? (this.type === 'checkbox' || this.type === 'radio' ? 'on' : '');
-    },
-    set(v) {
-      if (this.localName === 'textarea') this.textContent = String(v);
-      else if (this.localName === 'select') {
-        for (const o of this.querySelectorAll('option')) o.selected = o.value === String(v);
-      } else this.setAttribute('value', v == null ? '' : String(v));
-    },
-    configurable: true,
-  });
   Object.defineProperty(E, 'tabIndex', {
     get() { const v = parseInt(this.getAttribute('tabindex'), 10); return isNaN(v) ? -1 : v; },
     set(v) { this.setAttribute('tabindex', String(v)); },
@@ -731,15 +694,196 @@
   });
   Object.assign(global, { NodeFilter, TreeWalker, NodeIterator });
 
-  // Tag-specific interfaces, for `instanceof` checks; all share HTMLElement.prototype
-  for (const name of ['HTMLDivElement', 'HTMLSpanElement', 'HTMLAnchorElement', 'HTMLImageElement',
-    'HTMLInputElement', 'HTMLButtonElement', 'HTMLFormElement', 'HTMLSelectElement', 'HTMLOptionElement',
-    'HTMLTextAreaElement', 'HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLCanvasElement',
-    'HTMLVideoElement', 'HTMLAudioElement', 'HTMLMediaElement', 'HTMLIFrameElement', 'HTMLTemplateElement',
-    'HTMLParagraphElement', 'HTMLHeadingElement', 'HTMLLIElement', 'HTMLUListElement', 'HTMLTableElement',
-    'HTMLBodyElement', 'HTMLHeadElement', 'HTMLHtmlElement', 'HTMLLabelElement', 'HTMLUnknownElement',
-    'SVGElement', 'SVGSVGElement']) {
-    global[name] = HTMLElement;
+  // ---- element interfaces ----
+  //
+  // One prototype per interface, as in browsers: `instanceof` tells
+  // elements apart, and reflected attributes (`async`, `value`, `src`...)
+  // exist only on the elements that have them, so a custom element class
+  // can define its own `value` or `async`. Wrappers get their interface's
+  // prototype by tag (__fosSetElementPrototype).
+  const elementInterfaces = [];
+  function makeInterface(name, parent, tags) {
+    // Constructible only as the base of a custom element (`super()`)
+    const ctor = ({ [name]: function () { return ceConstruct(new.target); } })[name];
+    ctor.prototype = Object.create(parent.prototype);
+    Object.defineProperty(ctor.prototype, 'constructor', { value: ctor, writable: true, configurable: true });
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    Object.setPrototypeOf(ctor, parent);
+    Object.defineProperty(global, name, { value: ctor, writable: true, configurable: true });
+    elementInterfaces.push(ctor);
+    for (const tag of tags ? tags.split(' ') : []) __fosSetElementPrototype(tag, ctor.prototype);
+    return ctor;
+  }
+  for (const [name, tags] of Object.entries({
+    HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLBaseElement: 'base', HTMLBodyElement: 'body',
+    HTMLBRElement: 'br', HTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDataElement: 'data',
+    HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details', HTMLDialogElement: 'dialog',
+    HTMLDivElement: 'div', HTMLDListElement: 'dl', HTMLEmbedElement: 'embed', HTMLFieldSetElement: 'fieldset',
+    HTMLFormElement: 'form', HTMLHeadElement: 'head', HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6',
+    HTMLHRElement: 'hr', HTMLHtmlElement: 'html', HTMLIFrameElement: 'iframe', HTMLImageElement: 'img',
+    HTMLInputElement: 'input', HTMLLabelElement: 'label', HTMLLegendElement: 'legend', HTMLLIElement: 'li',
+    HTMLLinkElement: 'link', HTMLMapElement: 'map', HTMLMenuElement: 'menu', HTMLMetaElement: 'meta',
+    HTMLMeterElement: 'meter', HTMLModElement: 'ins del', HTMLObjectElement: 'object', HTMLOListElement: 'ol',
+    HTMLOptGroupElement: 'optgroup', HTMLOptionElement: 'option', HTMLOutputElement: 'output',
+    HTMLParagraphElement: 'p', HTMLParamElement: 'param', HTMLPictureElement: 'picture',
+    HTMLPreElement: 'pre listing xmp', HTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote',
+    HTMLScriptElement: 'script', HTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source',
+    HTMLSpanElement: 'span', HTMLStyleElement: 'style', HTMLTableCaptionElement: 'caption',
+    HTMLTableCellElement: 'td th', HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table',
+    HTMLTableRowElement: 'tr', HTMLTableSectionElement: 'thead tbody tfoot', HTMLTemplateElement: 'template',
+    HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time', HTMLTitleElement: 'title', HTMLTrackElement: 'track',
+    HTMLUListElement: 'ul', HTMLUnknownElement: '',
+  })) makeInterface(name, HTMLElement, tags);
+  makeInterface('HTMLMediaElement', HTMLElement, '');
+  makeInterface('HTMLAudioElement', HTMLMediaElement, 'audio');
+  makeInterface('HTMLVideoElement', HTMLMediaElement, 'video');
+  // SVG elements keep HTMLElement's conveniences (style, dataset, events)
+  makeInterface('SVGElement', HTMLElement, 'svg:*');
+  makeInterface('SVGGraphicsElement', SVGElement, '');
+  makeInterface('SVGSVGElement', SVGGraphicsElement, 'svg:svg');
+
+  // Reflected attributes of particular elements
+  const reflectOn = (names, props, descriptor) => {
+    for (const name of names.split(' ')) {
+      for (const [prop, attr] of props) Object.defineProperty(global[name].prototype, prop, { ...descriptor(attr), configurable: true });
+    }
+  };
+  const stringAttr = (attr) => ({
+    get() { return this.getAttribute(attr) ?? ''; },
+    set(v) { this.setAttribute(attr, String(v)); },
+  });
+  const urlAttr = (attr) => ({
+    get() { const v = this.getAttribute(attr); return v === null ? '' : __fosResolveURL(v, document.baseURI); },
+    set(v) { this.setAttribute(attr, String(v)); },
+  });
+  const boolAttr = (attr) => ({
+    get() { return this.hasAttribute(attr); },
+    set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
+  });
+  const intAttr = (fallback) => (attr) => ({
+    get() { const v = parseInt(this.getAttribute(attr), 10); return v >= 0 ? v : fallback; },
+    set(v) { this.setAttribute(attr, String(Math.max(0, Math.trunc(Number(v)) || 0))); },
+  });
+  const props = (list) => list.split(' ').map(p => [p, p.toLowerCase()]);
+  reflectOn('HTMLButtonElement HTMLFieldSetElement HTMLFormElement HTMLIFrameElement HTMLInputElement HTMLMapElement HTMLMetaElement HTMLObjectElement HTMLOutputElement HTMLSelectElement HTMLSlotElement HTMLTextAreaElement HTMLAnchorElement HTMLImageElement HTMLParamElement', props('name'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLButtonElement HTMLEmbedElement HTMLLinkElement HTMLObjectElement HTMLOListElement HTMLScriptElement HTMLSourceElement HTMLStyleElement HTMLUListElement HTMLLIElement', props('type'), stringAttr);
+  reflectOn('HTMLAreaElement HTMLImageElement HTMLInputElement', props('alt'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLLinkElement HTMLFormElement', props('rel'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLFormElement', props('target'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement', props('download hreflang ping referrerPolicy'), stringAttr);
+  reflectOn('HTMLInputElement HTMLTextAreaElement', props('placeholder dirName'), stringAttr);
+  reflectOn('HTMLLabelElement HTMLOutputElement', [['htmlFor', 'for']], stringAttr);
+  reflectOn('HTMLInputElement', props('min max step pattern accept'), stringAttr);
+  reflectOn('HTMLInputElement HTMLFormElement HTMLSelectElement HTMLTextAreaElement', props('autocomplete'), stringAttr);
+  reflectOn('HTMLFormElement', [['method', 'method'], ['enctype', 'enctype'], ['acceptCharset', 'accept-charset']], stringAttr);
+  reflectOn('HTMLMetaElement', [['content', 'content'], ['httpEquiv', 'http-equiv']], stringAttr);
+  reflectOn('HTMLMetaElement HTMLScriptElement', props('charset'), stringAttr);
+  reflectOn('HTMLLinkElement HTMLMetaElement HTMLSourceElement HTMLStyleElement', props('media'), stringAttr);
+  reflectOn('HTMLLinkElement HTMLScriptElement HTMLImageElement HTMLMediaElement', [['crossOrigin', 'crossorigin']], stringAttr);
+  reflectOn('HTMLLinkElement HTMLScriptElement', props('integrity'), stringAttr);
+  reflectOn('HTMLLinkElement', props('as sizes hreflang'), stringAttr);
+  reflectOn('HTMLImageElement HTMLSourceElement', props('srcset sizes'), stringAttr);
+  reflectOn('HTMLImageElement HTMLIFrameElement', props('loading'), stringAttr);
+  reflectOn('HTMLImageElement', props('decoding'), stringAttr);
+  reflectOn('HTMLOptionElement HTMLOptGroupElement HTMLTrackElement', props('label'), stringAttr);
+  reflectOn('HTMLTrackElement', props('kind srclang'), stringAttr);
+  reflectOn('HTMLIFrameElement HTMLEmbedElement HTMLObjectElement', props('width height'), stringAttr);
+  reflectOn('HTMLTableCellElement', props('headers abbr scope'), stringAttr);
+  reflectOn('HTMLTimeElement HTMLModElement', [['dateTime', 'datetime']], stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLLinkElement', props('href'), urlAttr);
+  reflectOn('HTMLMediaElement HTMLEmbedElement HTMLIFrameElement HTMLImageElement HTMLInputElement HTMLScriptElement HTMLSourceElement HTMLTrackElement', props('src'), urlAttr);
+  reflectOn('HTMLFormElement', props('action'), urlAttr);
+  reflectOn('HTMLButtonElement HTMLInputElement', [['formAction', 'formaction']], urlAttr);
+  reflectOn('HTMLVideoElement', props('poster'), urlAttr);
+  reflectOn('HTMLQuoteElement HTMLModElement', props('cite'), urlAttr);
+  reflectOn('HTMLObjectElement', props('data'), urlAttr);
+  reflectOn('HTMLButtonElement HTMLFieldSetElement HTMLInputElement HTMLLinkElement HTMLOptGroupElement HTMLOptionElement HTMLSelectElement HTMLTextAreaElement', props('disabled'), boolAttr);
+  reflectOn('HTMLInputElement', [['checked', 'checked'], ['defaultChecked', 'checked'], ['indeterminate', 'indeterminate']], boolAttr);
+  reflectOn('HTMLOptionElement', [['selected', 'selected'], ['defaultSelected', 'selected']], boolAttr);
+  reflectOn('HTMLInputElement HTMLTextAreaElement', props('readOnly'), boolAttr);
+  reflectOn('HTMLInputElement HTMLSelectElement HTMLTextAreaElement', props('required'), boolAttr);
+  reflectOn('HTMLInputElement HTMLSelectElement', props('multiple'), boolAttr);
+  reflectOn('HTMLScriptElement', props('async defer noModule'), boolAttr);
+  reflectOn('HTMLFormElement', props('noValidate'), boolAttr);
+  reflectOn('HTMLButtonElement HTMLInputElement', props('formNoValidate'), boolAttr);
+  reflectOn('HTMLDetailsElement HTMLDialogElement', props('open'), boolAttr);
+  reflectOn('HTMLMediaElement', [['controls', 'controls'], ['autoplay', 'autoplay'], ['loop', 'loop'], ['muted', 'muted'], ['defaultMuted', 'muted']], boolAttr);
+  reflectOn('HTMLVideoElement', props('playsInline'), boolAttr);
+  reflectOn('HTMLImageElement', props('isMap'), boolAttr);
+  reflectOn('HTMLOListElement', props('reversed'), boolAttr);
+  reflectOn('HTMLImageElement HTMLVideoElement HTMLInputElement', props('width height'), intAttr(0));
+  reflectOn('HTMLCanvasElement', props('width'), intAttr(300));
+  reflectOn('HTMLCanvasElement', props('height'), intAttr(150));
+  reflectOn('HTMLTextAreaElement', props('rows'), intAttr(2));
+  reflectOn('HTMLTextAreaElement', props('cols'), intAttr(20));
+  reflectOn('HTMLInputElement', props('size'), intAttr(20));
+  reflectOn('HTMLTableCellElement', props('colSpan rowSpan'), intAttr(1));
+  reflectOn('HTMLInputElement HTMLTextAreaElement', [['maxLength', 'maxlength'], ['minLength', 'minlength']], intAttr(-1));
+  // Form control values live in the `value` attribute (no separate dirty value)
+  const valueAttr = (fallback) => ({
+    get() { return this.getAttribute('value') ?? fallback(this); },
+    set(v) { this.setAttribute('value', v == null ? '' : String(v)); },
+    configurable: true,
+  });
+  for (const name of ['HTMLButtonElement', 'HTMLDataElement', 'HTMLParamElement']) {
+    Object.defineProperty(global[name].prototype, 'value', valueAttr(() => ''));
+  }
+  Object.defineProperty(HTMLInputElement.prototype, 'value', valueAttr((el) => el.type === 'checkbox' || el.type === 'radio' ? 'on' : ''));
+  Object.defineProperty(HTMLInputElement.prototype, 'defaultValue', valueAttr(() => ''));
+  Object.defineProperty(HTMLOptionElement.prototype, 'value', valueAttr((el) => el.textContent.trim()));
+  Object.defineProperty(HTMLOptionElement.prototype, 'text', { get() { return this.textContent.trim(); }, set(v) { this.textContent = v; }, configurable: true });
+  for (const name of ['HTMLTextAreaElement', 'HTMLOutputElement']) {
+    for (const prop of ['value', 'defaultValue']) {
+      Object.defineProperty(global[name].prototype, prop, { get() { return this.textContent; }, set(v) { this.textContent = String(v); }, configurable: true });
+    }
+  }
+  Object.defineProperty(HTMLSelectElement.prototype, 'value', {
+    get() {
+      const opt = this.querySelector('option[selected]') || this.querySelector('option');
+      return opt ? opt.value : '';
+    },
+    set(v) { for (const o of this.querySelectorAll('option')) o.selected = o.value === String(v); },
+    configurable: true,
+  });
+  define(HTMLSelectElement.prototype, {
+    get options() { return this.querySelectorAll('option'); },
+    get selectedIndex() { return Array.prototype.findIndex.call(this.querySelectorAll('option'), o => o.selected); },
+    set selectedIndex(i) { Array.prototype.forEach.call(this.querySelectorAll('option'), (o, j) => { o.selected = j === i; }); },
+    get length() { return this.querySelectorAll('option').length; },
+  });
+  for (const name of ['HTMLLIElement', 'HTMLMeterElement', 'HTMLProgressElement']) {
+    Object.defineProperty(global[name].prototype, 'value', {
+      get() { const v = parseFloat(this.getAttribute('value')); return isNaN(v) ? 0 : v; },
+      set(v) { this.setAttribute('value', String(v)); },
+      configurable: true,
+    });
+  }
+  define(HTMLScriptElement.prototype, {
+    get text() { return this.textContent; },
+    set text(v) { this.textContent = v; },
+  });
+  // Interfaces scripts test for or patch (polyfills walk them), and
+  // character data the page parser does not produce. Shadow roots are
+  // still a stand-in (attachShadow returns the host), so none is made.
+  for (const [name, parent] of [['CDATASection', Text], ['ProcessingInstruction', CharacterData], ['ShadowRoot', DocumentFragment],
+    ['Attr', Node], ['DocumentType', Node]]) {
+    const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
+    ctor.prototype = Object.create(parent.prototype, { constructor: { value: ctor, writable: true, configurable: true } });
+    Object.setPrototypeOf(ctor, parent);
+    global[name] = ctor;
+  }
+  // `window instanceof Window`, with Window.prototype on the global's chain
+  {
+    const WindowCtor = function Window() { throw new TypeError('Illegal constructor'); };
+    let proto = Object.getPrototypeOf(global);
+    if (proto === Object.prototype || proto === null) {
+      proto = Object.create(EventTarget.prototype);
+      Object.setPrototypeOf(global, proto);
+    }
+    WindowCtor.prototype = proto;
+    Object.defineProperty(proto, 'constructor', { value: WindowCtor, writable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
+    global.Window = WindowCtor;
   }
   // Legacy factory constructors
   function Image(width, height) {
@@ -786,8 +930,10 @@
 
   // `super()` in a custom element class: the element being upgraded, or a
   // new one for `new MyElement()`
-  const HTMLElementCtor = function HTMLElement() {
-    const def = new.target && ceByCtor.get(new.target);
+  const HTMLElementCtor = function HTMLElement() { return ceConstruct(new.target); };
+  // `super()` reaching an element interface's constructor
+  function ceConstruct(newTarget) {
+    const def = newTarget && ceByCtor.get(newTarget);
     if (!def) throw new TypeError('Illegal constructor');
     let el = def.stack.pop();
     if (!el) {
@@ -795,14 +941,14 @@
       if (def.extends) el.setAttribute('is', def.name);
       ceState.set(el, 'custom');
     }
-    Object.setPrototypeOf(el, new.target.prototype);
+    Object.setPrototypeOf(el, newTarget.prototype);
     return el;
-  };
+  }
   HTMLElementCtor.prototype = NativeHTMLElement.prototype;
   Object.defineProperty(NativeHTMLElement.prototype, 'constructor', { value: HTMLElementCtor, writable: true, configurable: true });
   global.HTMLElement = HTMLElementCtor;
-  for (const k of Object.getOwnPropertyNames(global)) {
-    if (global[k] === NativeHTMLElement && /^(HTML|SVG)\w*Element$/.test(k)) global[k] = HTMLElementCtor;
+  for (const c of elementInterfaces) {
+    if (Object.getPrototypeOf(c) === NativeHTMLElement) Object.setPrototypeOf(c, HTMLElementCtor);
   }
 
   function ceDefinitionOf(el) {

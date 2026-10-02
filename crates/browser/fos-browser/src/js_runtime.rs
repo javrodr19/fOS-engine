@@ -987,6 +987,46 @@ mod tests {
     }
 
     #[test]
+    fn element_interfaces() {
+        let (mut rt, _doc) = page(r#"<html><body><script async src="data:,"></script><input id="i" value="5" maxlength="3"><canvas id="c" width="64"></canvas><select id="s"><option>a</option><option value="b" selected>B</option></select><svg id="v"><circle></circle></svg></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // Each element has its interface's prototype
+        assert_eq!(
+            rt.eval("const s = document.querySelector('script'), i = document.getElementById('i'), c = document.getElementById('c');
+                [s instanceof HTMLScriptElement, s instanceof HTMLElement, i instanceof HTMLScriptElement, document.createElement('video') instanceof HTMLMediaElement,
+                 Object.prototype.toString.call(i), document.createElement('h3').constructor.name, document.createElement('section').constructor === HTMLElement,
+                 document.getElementById('v') instanceof SVGSVGElement, document.querySelector('circle') instanceof SVGElement,
+                 document.getElementById('v').namespaceURI, i.namespaceURI].join()").unwrap(),
+            "true,true,false,true,[object HTMLInputElement],HTMLHeadingElement,true,true,true,http://www.w3.org/2000/svg,http://www.w3.org/1999/xhtml"
+        );
+        // Reflected attributes exist where the spec puts them, with their types
+        assert_eq!(
+            rt.eval("[s.async, 'async' in i, i.value, i.maxLength, c.width, c.height, typeof c.width, document.getElementById('s').value, document.getElementById('s').selectedIndex,
+                 'value' in document.createElement('div'), document.createElement('div').hidden].join()").unwrap(),
+            "true,false,5,3,64,150,number,b,1,false,false"
+        );
+        // A custom element defines its own `value`, `async` and `src` (YouTube's
+        // Polymer elements do), and can extend a particular interface
+        assert_eq!(
+            rt.eval("class MyEl extends HTMLElement { constructor() { super(); this.value = 42; } }
+                MyEl.prototype.async = function () { return 'mine'; };
+                customElements.define('my-el', MyEl);
+                const m = document.createElement('my-el');
+                class FancyButton extends HTMLButtonElement {}
+                customElements.define('fancy-button', FancyButton, { extends: 'button' });
+                const b = document.createElement('button', { is: 'fancy-button' });
+                [m.value, typeof m.value, m.async(), m.hasAttribute('value'), b instanceof FancyButton, b instanceof HTMLButtonElement, Object.getPrototypeOf(HTMLButtonElement) === HTMLElement,
+                 typeof CDATASection, typeof ProcessingInstruction, (() => { try { new HTMLDivElement(); } catch (e) { return e.message; } })()].join()").unwrap(),
+            "42,number,mine,false,true,true,true,function,function,Illegal constructor"
+        );
+        assert_eq!(
+            rt.eval("[window instanceof Window, window instanceof EventTarget, Object.prototype.toString.call(window), typeof ShadowRoot, Object.getPrototypeOf(ShadowRoot) === DocumentFragment,
+                 typeof addEventListener, setTimeout === window.setTimeout].join()").unwrap(),
+            "true,true,[object Window],function,true,function,true"
+        );
+    }
+
+    #[test]
     fn streams_and_message_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();
@@ -1107,7 +1147,7 @@ mod tests {
             ("document.querySelector('i').closest('div').id", "d"),
             ("document.getElementById('d').innerHTML", "<span>a</span>text<i>b</i>"),
             ("document.body instanceof HTMLElement && document.body instanceof Node", "true"),
-            ("Object.prototype.toString.call(document.body)", "[object HTMLElement]"),
+            ("Object.prototype.toString.call(document.body)", "[object HTMLBodyElement]"),
             ("document.createElement('div').parentNode", "null"),
             ("try { document.querySelector('!!') } catch (e) { e.name }", "SyntaxError"),
             ("let f = document.createDocumentFragment(); f.append('x', document.createElement('hr')); document.body.appendChild(f); document.body.lastChild.tagName", "HR"),

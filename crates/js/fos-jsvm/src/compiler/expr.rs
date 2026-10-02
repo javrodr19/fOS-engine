@@ -968,6 +968,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
         }
     }
 
+    /// A method's function name: accessors are "get x" and "set x"
+    fn method_name(&mut self, name: Option<Atom>, kind: MethodKind) -> Option<Atom> {
+        let name = name?;
+        Some(match kind {
+            MethodKind::Method => name,
+            MethodKind::Getter | MethodKind::Setter => {
+                let prefix = if kind == MethodKind::Getter { "get " } else { "set " };
+                let s = self.atoms.string(name).get().to_rust_string();
+                self.intern(&format!("{prefix}{s}"))
+            }
+        })
+    }
+
     fn key_name(&mut self, key: &'a PropKey) -> Option<Atom> {
         match self.static_key(key)? {
             StaticKey::Atom(a) => Some(a),
@@ -1019,6 +1032,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
                             let v = self.alloc()?;
                             let name = self.key_name(key).map(|a| self.atoms.string(a).get().to_rust_string());
                             self.expr_named(value, v, name.as_deref())?;
+                            if name.is_none() && is_anonymous_function(value) {
+                                self.emit(Insn::SetFunctionName { func: v, key: k, prefix: 0 });
+                            }
                             self.emit(Insn::DefineElem { obj: dst, key: k, src: v });
                         }
                     }
@@ -1036,8 +1052,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
                     self.load_key(key, k)?;
                     let t = self.alloc()?;
                     let name = self.key_name(key);
+                    let name = self.method_name(name, *kind);
                     if self.closure(func, name, t, false)? {
                         self.emit(Insn::SetHomeObject { func: t, obj: dst });
+                    }
+                    if name.is_none() {
+                        self.emit(Insn::SetFunctionName { func: t, key: k, prefix: *kind as u8 });
                     }
                     let insn = match kind {
                         MethodKind::Method => Insn::DefineElem { obj: dst, key: k, src: t },
@@ -1252,8 +1272,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
                         PropKey::Private(n) => Some(self.intern(&format!("#{n}"))),
                         key => self.key_name(key),
                     };
+                    let name = self.method_name(name, *kind);
                     if self.closure(func, name, t, false)? {
                         self.emit(Insn::SetHomeObject { func: t, obj: target });
+                    }
+                    if name.is_none() {
+                        self.emit(Insn::SetFunctionName { func: t, key: k, prefix: *kind as u8 });
                     }
                     let insn = match kind {
                         MethodKind::Method => Insn::DefineMethod { obj: target, key: k, func: t },

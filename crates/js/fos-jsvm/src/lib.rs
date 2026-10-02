@@ -5,6 +5,8 @@
 
 pub mod ast;
 pub mod bigint;
+pub mod collate;
+mod latin_tables;
 pub mod builtins;
 pub mod bytecode;
 pub mod compiler;

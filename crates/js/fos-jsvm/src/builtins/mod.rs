@@ -2,6 +2,7 @@
 
 pub(crate) mod array;
 mod bigint;
+mod intl;
 mod collections;
 mod date;
 mod error;
@@ -46,6 +47,7 @@ pub(crate) fn init(vm: &mut Vm) {
     typedarray::init(vm);
     generator::init(vm);
     uri::init(vm);
+    intl::init(vm);
 
     let g = vm.global;
     vm.def_value(g, "globalThis", Value::object(g), PropFlags::HIDDEN);

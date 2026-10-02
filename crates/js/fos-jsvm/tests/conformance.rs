@@ -1244,3 +1244,68 @@ fn bigint() {
         ("let big = 1n; for (let i = 0; i < 100; i++) big *= 3n; big % 1000000007n", "886041711n"),
     ]);
 }
+
+#[test]
+fn intl() {
+    check(&[
+        // Built on first use, then an ordinary property
+        ("[typeof Intl, Object.getOwnPropertyDescriptor(globalThis, 'Intl').get === undefined, String(Intl)]", "[ 'object', true, '[object Intl]' ]"),
+        ("Intl = 5; Intl", "5"),
+        // NumberFormat
+        ("new Intl.NumberFormat().format(1234567.891)", "'1,234,567.891'"),
+        ("new Intl.NumberFormat('de-DE').format(-0.5)", "'-0.5'"),
+        ("new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(1234.5)", "'$1,234.50'"),
+        ("new Intl.NumberFormat('en', { style: 'currency', currency: 'JPY' }).format(1234.5)", "'¥1,235'"),
+        ("new Intl.NumberFormat('en', { style: 'currency', currency: 'EUR', currencyDisplay: 'code' }).format(3)", "'EUR 3.00'"),
+        ("new Intl.NumberFormat('en', { style: 'percent' }).format(0.256)", "'26%'"),
+        ("new Intl.NumberFormat('en', { maximumFractionDigits: 1 }).format(2.25)", "'2.3'"),
+        ("new Intl.NumberFormat('en', { minimumFractionDigits: 2 }).format(5)", "'5.00'"),
+        ("new Intl.NumberFormat('en', { maximumSignificantDigits: 3 }).format(123456)", "'123,000'"),
+        ("[1234, 15300, 2500000, 999].map(n => new Intl.NumberFormat('en', { notation: 'compact' }).format(n)).join(' ')", "'1.2K 15K 2.5M 999'"),
+        ("new Intl.NumberFormat('en', { notation: 'compact', compactDisplay: 'long' }).format(2500000)", "'2.5 million'"),
+        ("new Intl.NumberFormat('en', { signDisplay: 'always' }).format(3)", "'+3'"),
+        ("new Intl.NumberFormat('en', { style: 'unit', unit: 'kilometer' }).format(12)", "'12 km'"),
+        ("new Intl.NumberFormat().format(12345678901234567890n)", "'12,345,678,901,234,567,890'"),
+        ("new Intl.NumberFormat('en', { useGrouping: false }).format(12345)", "'12345'"),
+        ("new Intl.NumberFormat().formatToParts(-1234.5).map(p => p.type).join()", "'minusSign,integer,group,integer,decimal,fraction'"),
+        ("const f = new Intl.NumberFormat().format; [1, 2000].map(f).join('|')", "'1|2,000'"),
+        ("new Intl.NumberFormat('en', { style: 'currency' })", "throws TypeError*"),
+        // DateTimeFormat (UTC)
+        ("new Intl.DateTimeFormat('en-US').format(Date.UTC(2024, 0, 5))", "'1/5/2024'"),
+        ("new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(Date.UTC(2024, 6, 4, 15, 30))", "'Jul 4, 2024'"),
+        ("new Intl.DateTimeFormat('en', { dateStyle: 'full' }).format(Date.UTC(2024, 6, 4))", "'Thursday, July 4, 2024'"),
+        ("new Intl.DateTimeFormat('en', { hour: 'numeric', minute: '2-digit' }).format(Date.UTC(2024, 6, 4, 15, 5))", "'3:05 PM'"),
+        ("new Intl.DateTimeFormat('en', { timeStyle: 'short' }).format(Date.UTC(2024, 6, 4, 0, 7))", "'12:07 AM'"),
+        ("new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(Date.UTC(2024, 11, 25))", "'Dec 25'"),
+        ("new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit', hour12: false }).format(Date.UTC(2024, 0, 1, 9, 3))", "'09:03'"),
+        ("new Intl.DateTimeFormat().resolvedOptions().timeZone", "'UTC'"),
+        // PluralRules, RelativeTimeFormat, ListFormat
+        ("[0, 1, 2].map(n => new Intl.PluralRules('en').select(n)).join()", "'other,one,other'"),
+        ("[1, 2, 3, 4, 11, 22].map(n => new Intl.PluralRules('en', { type: 'ordinal' }).select(n)).join()", "'one,two,few,other,other,two'"),
+        ("const r = new Intl.RelativeTimeFormat('en'); [r.format(-3, 'day'), r.format(1, 'hours'), r.format(1, 'year')].join('|')", "'3 days ago|in 1 hour|in 1 year'"),
+        ("new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(-1, 'day')", "'yesterday'"),
+        ("new Intl.ListFormat('en').format(['a', 'b', 'c'])", "'a, b, and c'"),
+        ("new Intl.ListFormat('en', { type: 'disjunction' }).format(['a', 'b'])", "'a or b'"),
+        // Collator, Segmenter, the rest
+        ("['b', 'a', 'C'].sort(new Intl.Collator().compare).join('')", "'abC'"),
+        ("['item10', 'item2', 'item1'].sort(new Intl.Collator('en', { numeric: true }).compare).join()", "'item1,item2,item10'"),
+        ("new Intl.Collator('en', { sensitivity: 'base' }).compare('a', 'Á')", "0"),
+        ("[...new Intl.Segmenter().segment('e\\u0301👍🏽🇪🇸x')].map(s => s.segment).length", "4"),
+        ("[...new Intl.Segmenter('en', { granularity: 'word' }).segment('Hi, you!')].filter(s => s.isWordLike).map(s => s.segment).join('|')", "'Hi|you'"),
+        ("Intl.getCanonicalLocales(['EN-us', 'es-mx', 'en-US'])", "[ 'en-US', 'es-MX' ]"),
+        ("new Intl.DisplayNames(['en'], { type: 'region' }).of('ES')", "'Spain'"),
+        ("new Intl.Locale('es-Latn-MX').region", "'MX'"),
+        ("Intl.getCanonicalLocales('not a locale!')", "throws RangeError*"),
+    ]);
+}
+
+#[test]
+fn normalize_and_locale_compare() {
+    check(&[
+        ("['Á'.normalize('NFD').length, 'A\\u0301'.normalize() === 'Á', 'ệ'.normalize('NFD').length, 'x'.normalize('NFD')]", "[ 2, true, 3, 'x' ]"),
+        ("'a'.normalize('bad')", "throws RangeError*"),
+        ("['b', 'a', 'B', 'á', 'A'].sort((x, y) => x.localeCompare(y)).join('')", "'aAábB'"),
+        ("['a'.localeCompare('Á', undefined, { sensitivity: 'base' }), 'a'.localeCompare('A', undefined, { sensitivity: 'accent' }), 'a'.localeCompare('A')]", "[ 0, 0, -1 ]"),
+        ("'v10'.localeCompare('v9', undefined, { numeric: true })", "1"),
+    ]);
+}

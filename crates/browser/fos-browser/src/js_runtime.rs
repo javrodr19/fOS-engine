@@ -926,6 +926,65 @@ mod tests {
     }
 
     #[test]
+    fn streams_and_message_channel() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        rt.eval(
+            r#"window.out = {};
+            // A source with start/pull/cancel, read by async iteration
+            let n = 0;
+            const counter = new ReadableStream({
+              start(c) { c.enqueue('start'); },
+              pull(c) { n++; if (n <= 3) c.enqueue(n); else c.close(); },
+            });
+            (async () => { const got = []; for await (const v of counter) got.push(v); out.iter = got.join(); })();
+            // Piping through a transform into a writable
+            const written = [];
+            const upper = new TransformStream({ transform(chunk, c) { c.enqueue(chunk.toUpperCase()); }, flush(c) { c.enqueue('!'); } });
+            ReadableStream.from(['a', 'b'])
+              .pipeThrough(upper)
+              .pipeTo(new WritableStream({ write(chunk) { written.push(chunk); }, close() { out.piped = written.join(''); } }));
+            // Text encoding streams, with a character split across chunks
+            const bytes = new TextEncoder().encode('héllo €');
+            const parts = [bytes.slice(0, 2), bytes.slice(2, 7), bytes.slice(7)];
+            (async () => {
+              const decoded = ReadableStream.from(parts).pipeThrough(new TextDecoderStream());
+              let text = '';
+              for await (const s of decoded) text += s;
+              out.decoded = text;
+            })();
+            // tee, errors, locking
+            const [t1, t2] = ReadableStream.from([1, 2]).tee();
+            Promise.all([t1, t2].map(async t => { let sum = 0; for await (const v of t) sum += v; return sum; })).then(r => out.tee = r.join());
+            const failing = new ReadableStream({ pull(c) { c.error(new Error('boom')); } });
+            failing.getReader().read().catch(e => out.err = e.message);
+            const locked = new ReadableStream();
+            locked.getReader();
+            try { locked.getReader(); } catch (e) { out.locked = e.name; }
+            // Response bodies are real streams
+            new Response('body text').body.getReader().read().then(r => out.body = new TextDecoder().decode(r.value));
+            // MessageChannel
+            const ch = new MessageChannel();
+            ch.port2.onmessage = e => out.msg = e.data.x;
+            ch.port1.postMessage({ x: 42 });
+            'ok'"#,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            rt.process_timers(&mut |_: &str| None).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(rt.eval("out.iter").unwrap(), "start,1,2,3");
+        assert_eq!(rt.eval("out.piped").unwrap(), "AB!");
+        assert_eq!(rt.eval("out.decoded").unwrap(), "héllo €");
+        assert_eq!(rt.eval("out.tee").unwrap(), "3,3");
+        assert_eq!(rt.eval("out.err").unwrap(), "boom");
+        assert_eq!(rt.eval("out.locked").unwrap(), "TypeError");
+        assert_eq!(rt.eval("out.body").unwrap(), "body text");
+        assert_eq!(rt.eval("out.msg").unwrap(), "42");
+    }
+
+    #[test]
     fn dynamic_import_in_classic_scripts() {
         let (mut rt, _doc) = page(
             r#"<html><body><script>

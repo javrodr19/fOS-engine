@@ -128,7 +128,9 @@ pub enum ObjectKind {
     Bound(Box<BoundFunction>),
     /// A getter/setter pair (internal: the value of an accessor property)
     Accessor { getter: Value, setter: Value },
-    Error,
+    /// An error, with the frames captured when it was made (until its
+    /// `stack` is first read and formatted from them)
+    Error(Option<Box<CapturedStack>>),
     Boolean(bool),
     Number(f64),
     String(Gc<JsString>),
@@ -305,6 +307,11 @@ pub struct ForInIterator {
 
 /// Insertion-ordered hash map for Map and Set (deleted entries are holes
 /// so iterators stay valid)
+/// Frames (function, saved pc) captured for an error, innermost first
+pub struct CapturedStack {
+    pub frames: Box<[(Rc<FunctionProto>, u32)]>,
+}
+
 /// A FinalizationRegistry: its cleanup callback and registered cells
 pub struct FinalizationData {
     pub cleanup: Value,
@@ -491,9 +498,14 @@ impl Trace for JsObject {
                     r.trace(tracer);
                 }
             }
+            ObjectKind::Error(stack) => {
+                // The functions' constants stay alive for the stack's sake
+                for (p, _) in stack.iter().flat_map(|s| s.frames.iter()) {
+                    p.trace(tracer);
+                }
+            }
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }
-            | ObjectKind::Error
             | ObjectKind::Boolean(_)
             | ObjectKind::Host { .. }
             | ObjectKind::Number(_)

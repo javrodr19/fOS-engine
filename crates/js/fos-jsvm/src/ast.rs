@@ -107,7 +107,8 @@ pub enum Stmt {
     DoWhile { body: Box<Stmt>, test: Expr },
     Break(Option<Name>),
     Continue(Option<Name>),
-    Throw(Expr),
+    /// The thrown value and the `throw` keyword's source offset
+    Throw(Expr, u32),
     Try { block: Vec<Stmt>, param: Option<Pattern>, handler: Option<Vec<Stmt>>, finalizer: Option<Vec<Stmt>> },
     Switch { discriminant: Expr, cases: Vec<SwitchCase> },
     Labeled { label: Name, body: Box<Stmt> },
@@ -253,11 +254,13 @@ pub enum Expr {
     Logical { op: LogicalOp, left: Box<Expr>, right: Box<Expr> },
     Assign { op: AssignOp, target: Box<Pattern>, value: Box<Expr> },
     Cond { test: Box<Expr>, cons: Box<Expr>, alt: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<ArrayElem>, optional: bool },
+    /// `pos`: source offset for stack traces (the callee's property, or the `(`)
+    Call { callee: Box<Expr>, args: Vec<ArrayElem>, optional: bool, pos: u32 },
     /// `super(...)`
     SuperCall(Vec<ArrayElem>),
-    New { callee: Box<Expr>, args: Vec<ArrayElem> },
-    Member { object: Box<Expr>, prop: MemberProp, optional: bool },
+    New { callee: Box<Expr>, args: Vec<ArrayElem>, pos: u32 },
+    /// `pos`: source offset of the property (for stack traces)
+    Member { object: Box<Expr>, prop: MemberProp, optional: bool, pos: u32 },
     /// `super.x` / `super[x]`
     SuperMember(MemberProp),
     /// An optional chain (`a?.b.c`): short-circuits as a whole
@@ -549,7 +552,7 @@ fn expr_refs(e: &Expr, out: &mut Refs) {
             expr_refs(cons, out);
             expr_refs(alt, out);
         }
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             expr_refs(callee, out);
             elems_refs(args, out);
         }
@@ -594,7 +597,7 @@ fn stmts_refs(v: &[Stmt], out: &mut Refs) {
 
 fn stmt_refs(s: &Stmt, out: &mut Refs) {
     match s {
-        Stmt::Expr(e) | Stmt::Throw(e) => expr_refs(e, out),
+        Stmt::Expr(e) | Stmt::Throw(e, _) => expr_refs(e, out),
         Stmt::Var { decls, .. } => {
             for d in decls {
                 pattern_refs(&d.target, out);

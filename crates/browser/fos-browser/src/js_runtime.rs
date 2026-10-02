@@ -256,6 +256,8 @@ impl PageJsRuntime {
     }
 
     fn run_script(&mut self, script: &Script) {
+        // Stack traces name inline scripts after the page, as browsers do
+        let url = script.source_url.clone().unwrap_or_else(|| self.page_url.clone());
         let Some(vm) = self.vm.as_mut() else { return };
         let name = script.source_url.as_deref().unwrap_or("inline script");
         log::debug!("Executing {} ({} bytes)", name, script.source.len());
@@ -265,7 +267,7 @@ impl PageJsRuntime {
             let _ = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[el]);
         }
         let start = std::time::Instant::now();
-        if let Err(e) = vm.eval(&script.source) {
+        if let Err(e) = vm.eval_named(&script.source, &url) {
             dom_bindings::report_exception(vm, e);
         }
         if let Ok(f) = set_current {

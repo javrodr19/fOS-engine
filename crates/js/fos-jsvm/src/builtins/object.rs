@@ -529,7 +529,7 @@ pub(crate) fn to_string(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObjec
         ObjectKind::Proxy(_) if super::array::is_array_value(Value::object(o)) => "Array",
         ObjectKind::Proxy(p) if p.callable => "Function",
         ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) => "Function",
-        ObjectKind::Error => "Error",
+        ObjectKind::Error(_) => "Error",
         ObjectKind::Boolean(_) => "Boolean",
         ObjectKind::Number(_) => "Number",
         ObjectKind::String(_) => "String",

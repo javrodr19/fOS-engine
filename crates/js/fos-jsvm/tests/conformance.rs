@@ -1371,3 +1371,39 @@ fn weak_references() {
         assert_eq!(eval(&mut vm, src), want, "{src}");
     }
 }
+
+/// Stack traces name each frame's function and source location
+#[test]
+fn stack_trace_locations() {
+    let mut vm = Vm::new();
+    let src = "function outer() {\n  return inner();\n}\nfunction inner() {\n  const o = {};\n  return o.missing.deep;\n}\ntry { outer(); } catch (e) { e.stack }";
+    let stack = vm.eval_named(src, "https://example.com/app.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(
+        stack,
+        "TypeError: Cannot read properties of undefined (reading 'deep')\n    at inner (https://example.com/app.js:6:20)\n    at outer (https://example.com/app.js:2:10)\n    at https://example.com/app.js:8:7"
+    );
+    // Errors made by `new Error` and `throw`, calls of non-functions, and
+    // lazily compiled functions on one long line
+    let src = "var f = () => { throw new Error('x'); }; var g = function named() { undefinedFn(); }; var h = () => { ({}).nope(); };\nvar r = [];\nfor (const fn of [f, g, h]) { try { fn(); } catch (e) { r.push(e.stack.split('\\n')[1]); } }\nr.join('|')";
+    let got = vm.eval_named(src, "t.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "    at f (t.js:1:23)|    at named (t.js:1:69)|    at h (t.js:1:108)");
+    // Syntax errors point at the offending token
+    let err = vm.eval_named("let a = 1;\nlet b = ;", "bad.js").unwrap_err();
+    let stack = vm.eval_named("x => x.stack", "").and_then(|f| vm.call(f, fos_jsvm::Value::UNDEFINED, &[err])).map(|v| vm.display(v)).unwrap();
+    assert_eq!(stack, "SyntaxError: unexpected ';': expected expression\n    at bad.js:2:9");
+    // The stack is formatted when first read, from the message then; it
+    // can be replaced; captureStackTrace leaves out the constructor's frames
+    let src = r#"
+        function MyError(msg) { this.message = msg; Error.captureStackTrace(this, MyError); }
+        function make() { return new MyError('custom'); }
+        var e = new Error('first');
+        var before = Object.getOwnPropertyNames(e).includes('stack');
+        e.message = 'second';
+        var head = e.stack.split('\n')[0];
+        var replaced = new TypeError('t'); replaced.stack = 'mine';
+        [before, Object.getOwnPropertyNames(e).includes('stack'), head, replaced.stack, make().stack.split('\n').slice(1).join('|'),
+         Error.stackTraceLimit, typeof Object.getOwnPropertyDescriptor(Error.prototype, 'stack').get, Object.create(Error.prototype).stack]
+    "#;
+    let got = vm.eval_named(src, "c.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "[ false, true, 'Error: second', 'mine', '    at make (c.js:3:34)|    at c.js:9:89', 10, 'function', undefined ]");
+}

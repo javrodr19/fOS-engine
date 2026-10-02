@@ -204,17 +204,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.expr_to(alt, dst)?;
                 self.patch_here(vec![j])?;
             }
-            Expr::Call { callee, args, optional } => self.call(callee, args, *optional, dst)?,
+            Expr::Call { callee, args, optional, pos } => self.call(callee, args, *optional, dst, *pos)?,
             Expr::SuperCall(args) => self.super_call(args, dst)?,
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, pos } => {
                 let f = self.alloc_n(2)?;
                 self.expr_to(callee, f)?;
-                match self.args(args, f + 2)? {
+                let argc = self.args(args, f + 2)?;
+                self.set_pos(*pos);
+                match argc {
                     Some(argc) => self.emit(Insn::New { dst, func: f, argc }),
                     None => self.emit(Insn::NewSpread { dst, func: f }),
                 };
             }
-            Expr::Member { object, prop, optional } => {
+            Expr::Member { object, prop, optional, pos } => {
                 let obj = if member_key_simple(prop) {
                     self.expr_any(object)?
                 } else {
@@ -225,6 +227,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 if *optional {
                     self.chain_jump(obj);
                 }
+                self.set_pos(*pos);
                 self.get_member(obj, prop, dst)?;
             }
             Expr::SuperMember(prop) => {
@@ -384,7 +387,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
             target = inner;
         }
         match target {
-            Expr::Member { object, prop, .. } => {
+            Expr::Member { object, prop, pos, .. } => {
+                self.set_pos(*pos);
                 let obj = if value_simple && member_key_simple(prop) {
                     self.expr_any(object)?
                 } else {
@@ -806,11 +810,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
             callee = inner;
         }
         match callee {
-            Expr::Member { object, prop, optional } => {
+            Expr::Member { object, prop, optional, pos } => {
                 self.expr_to(object, f + 1)?;
                 if *optional {
                     self.chain_jump(f + 1);
                 }
+                self.set_pos(*pos);
                 let mark = self.mark();
                 self.get_member(f + 1, prop, f)?;
                 self.release(mark);
@@ -847,13 +852,17 @@ impl<'a, 'h> Compiler<'a, 'h> {
         Ok(())
     }
 
-    fn call(&mut self, callee: &'a Expr, args: &'a [ArrayElem], optional: bool, dst: Reg) -> CResult<()> {
+    fn call(&mut self, callee: &'a Expr, args: &'a [ArrayElem], optional: bool, dst: Reg, pos: u32) -> CResult<()> {
         let f = self.alloc_n(2)?;
+        // Also covers loading the callee (`undefinedFn()`)
+        self.set_pos(pos);
         self.callee(callee, f)?;
         if optional {
             self.chain_jump(f);
         }
-        match self.args(args, f + 2)? {
+        let argc = self.args(args, f + 2)?;
+        self.set_pos(pos);
+        match argc {
             Some(argc) => self.emit(Insn::Call { dst, func: f, argc }),
             None => self.emit(Insn::CallSpread { dst, func: f }),
         };

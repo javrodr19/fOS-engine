@@ -1598,6 +1598,6 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
     methods(vm, performance, &[("now", 0, performance_now)]);
     vm.def_value(g, "performance", Value::object(performance), PropFlags::HIDDEN);
 
-    vm.eval(include_str!("dom_bootstrap.js"))?;
+    vm.eval_named(include_str!("dom_bootstrap.js"), "fos://dom_bootstrap.js")?;
     Ok(())
 }

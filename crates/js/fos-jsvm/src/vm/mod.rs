@@ -49,6 +49,9 @@ const STACK_SIZE: usize = 1 << 20;
 /// Nested interpreter activations (natives calling back into scripts)
 const MAX_NATIVE_DEPTH: u32 = 400;
 
+/// Frames kept in an error's stack (V8's default `Error.stackTraceLimit`)
+pub(crate) const STACK_FRAMES: usize = 10;
+
 pub(crate) const F_ENTRY: u8 = 1;
 pub(crate) const F_CONSTRUCT: u8 = 2;
 /// A resumed generator or async function (always also F_ENTRY)
@@ -191,6 +194,9 @@ pub struct Vm {
     /// WeakRef targets read during the current job, kept alive until the
     /// job queue drains (the spec's [[KeptAlive]] list)
     pub(crate) kept_alive: Vec<Value>,
+    /// The last error the VM made while code ran, with the frame depth,
+    /// whose stack `fix_error_stack` may correct
+    stack_fixup: Option<(Gc<JsObject>, usize)>,
     /// `arguments` / rest array being built during frame setup
     pending_rest: Option<Gc<JsObject>>,
     pending_arguments: Option<Gc<JsObject>>,
@@ -339,6 +345,7 @@ impl Vm {
             finalization_registries: Default::default(),
             finalizations: Default::default(),
             kept_alive: Vec::new(),
+            stack_fixup: None,
             pending_rest: None,
             pending_arguments: None,
             char_strings,
@@ -358,13 +365,18 @@ impl Vm {
 
     /// Parse, compile and run a script; returns its completion value
     pub fn eval(&mut self, src: &str) -> JsResult<Value> {
+        self.eval_named(src, "")
+    }
+
+    /// `eval`, naming the script (its URL) in stack traces
+    pub fn eval_named(&mut self, src: &str, name: &str) -> JsResult<Value> {
         let program = match crate::parser::parse_script_lazy(src) {
             Ok(p) => p,
-            Err(e) => return Err(self.make_error(ErrorKind::Syntax, &e.message)),
+            Err(e) => return Err(self.syntax_error_at(&e, src, name)),
         };
-        let proto = match crate::compiler::compile_script(&self.heap, &mut self.atoms, src, &program) {
+        let proto = match crate::compiler::compile_script(&self.heap, &mut self.atoms, src, name, &program) {
             Ok(p) => p,
-            Err(e) => return Err(self.make_error(ErrorKind::Syntax, &e.message)),
+            Err(e) => return Err(self.syntax_error_at(&e, src, name)),
         };
         drop(program);
         self.run_script(proto)
@@ -600,7 +612,8 @@ impl Vm {
             ErrorKind::Eval => self.realm.eval_error_proto,
             ErrorKind::Uri => self.realm.uri_error_proto,
         };
-        let o = self.new_object_with(Some(proto), ObjectKind::Error);
+        let captured = self.capture_stack();
+        let o = self.new_object_with(Some(proto), ObjectKind::Error(captured));
         let msg = self.str_value(message);
         self.define_value(o, crate::object::PropertyKey::Atom(atoms::message), msg, PropFlags::HIDDEN);
         let name = match kind {
@@ -612,10 +625,10 @@ impl Vm {
             ErrorKind::Eval => "EvalError",
             ErrorKind::Uri => "URIError",
         };
-        let stack = if message.is_empty() { name.to_string() } else { format!("{name}: {message}") };
-        let stack = format!("{stack}\n{}", self.stack_trace());
-        let stack = self.str_value(&stack);
-        self.define_value(o, crate::object::PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
+        let _ = name;
+        if !self.frames.is_empty() {
+            self.stack_fixup = Some((o, self.frames.len()));
+        }
         Value::object(o)
     }
 
@@ -631,17 +644,83 @@ impl Vm {
         self.make_error(ErrorKind::Reference, message)
     }
 
-    /// Function names of the active frames, innermost first
-    pub fn stack_trace(&self) -> String {
+    /// A SyntaxError for `e`, whose stack points at the error's location
+    pub(crate) fn syntax_error_at(&mut self, e: &crate::lexer::SyntaxError, src: &str, name: &str) -> Value {
+        let err = self.make_error(ErrorKind::Syntax, &e.message);
+        if let Some(o) = err.as_object() {
+            let script = crate::bytecode::Script::new(name, std::rc::Rc::from(src));
+            let (line, col) = script.line_col(e.pos);
+            let name = if name.is_empty() { "<anonymous>" } else { name };
+            let stack = self.str_value(&format!("SyntaxError: {}\n    at {name}:{line}:{col}", e.message));
+            self.define_value(o, crate::object::PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
+        }
+        err
+    }
+
+    /// The active frames, innermost first (at most `STACK_FRAMES`), for an
+    /// error's stack
+    pub(crate) fn capture_stack(&self) -> Option<Box<crate::object::CapturedStack>> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let frames = self
+            .frames
+            .iter()
+            .rev()
+            .filter_map(|f| match &f.func.get().kind {
+                ObjectKind::Function(c) => Some((c.proto.clone(), f.pc)),
+                _ => None,
+            })
+            .take(STACK_FRAMES)
+            .collect();
+        Some(Box::new(crate::object::CapturedStack { frames }))
+    }
+
+    /// Frames as `    at name (url:line:col)` lines
+    pub(crate) fn format_frames(&self, frames: &[(Rc<FunctionProto>, u32)]) -> String {
         let mut out = String::new();
-        for f in self.frames.iter().rev().take(20) {
-            let proto = unsafe { &*f.proto };
+        for (proto, pc) in frames {
             let name = self.atoms.string(proto.name).get().to_rust_string();
-            out.push_str("    at ");
-            out.push_str(if name.is_empty() { "<anonymous>" } else { &name });
-            out.push('\n');
+            out.push_str("\n    at ");
+            let location = proto.script.as_ref().and_then(|script| {
+                let code = proto.compiled.get()?;
+                // Before the first recorded position: the function's start
+                let pos = code.position_at(pc.saturating_sub(1)).unwrap_or(proto.source.0);
+                let (line, col) = script.line_col(pos);
+                let url = if script.name.is_empty() { "<anonymous>" } else { &script.name };
+                Some(format!("{url}:{line}:{col}"))
+            });
+            match (name.is_empty(), location) {
+                (false, Some(l)) => out.push_str(&format!("{name} ({l})")),
+                (true, Some(l)) => out.push_str(&l),
+                (false, None) => out.push_str(&name),
+                (true, None) => out.push_str("<anonymous>"),
+            }
         }
         out
+    }
+
+    /// The active frames, innermost first, as `    at name (url:line:col)`
+    /// lines (each preceded by a newline)
+    pub fn stack_trace(&self) -> String {
+        match self.capture_stack() {
+            Some(s) => self.format_frames(&s.frames),
+            None => String::new(),
+        }
+    }
+
+    /// Correct the stack of an error the interpreter raised itself: its
+    /// frames were captured before the innermost frame's pc was saved
+    pub(crate) fn fix_error_stack(&mut self, exc: Value, pc: usize) {
+        let Some((o, depth)) = self.stack_fixup.take() else { return };
+        if depth != self.frames.len() || exc != Value::object(o) {
+            return;
+        }
+        if let ObjectKind::Error(Some(s)) = &mut o.get_mut().kind {
+            if let Some(top) = s.frames.first_mut() {
+                top.1 = pc as u32;
+            }
+        }
     }
 
     // ---- calls ----
@@ -1014,6 +1093,9 @@ impl Vm {
         t.mark_values(&self.temp_roots);
         t.mark_values(&self.host_roots);
         t.mark_values(&self.kept_alive);
+        if let Some((o, _)) = &self.stack_fixup {
+            t.mark(*o);
+        }
         self.modules.trace(t);
         for job in &self.jobs {
             match job {

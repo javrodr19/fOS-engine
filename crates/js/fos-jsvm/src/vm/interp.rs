@@ -1086,6 +1086,7 @@ impl Vm {
             };
 
             // ---- exception handling ----
+            self.fix_error_stack(exc, pc);
             let mut fault = pc - 1;
             loop {
                 let f = self.frames.last().unwrap();

@@ -39,8 +39,9 @@ use crate::value::Value;
 /// go in the global lexical scope shared by all scripts. The compiled
 /// function returns the value of the script's last top-level expression
 /// statement.
-pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: false };
+pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, name: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
+    let script = Script::new(name, Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: false };
     let mut no_fused = false;
     loop {
         match c.script(program, no_fused) {
@@ -82,7 +83,7 @@ pub struct CompiledModule {
 }
 
 /// Compile a module
-pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, module: &Module) -> Result<CompiledModule, SyntaxError> {
+pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, name: &str, module: &Module) -> Result<CompiledModule, SyntaxError> {
     let mut scope: Vec<(Name, ModuleBindingKind, BindKind)> = Vec::new();
     let mut add = |name: &Name, kind: ModuleBindingKind, bind: BindKind| -> Result<(), SyntaxError> {
         if let Some(existing) = scope.iter().find(|b| b.0 == *name) {
@@ -146,7 +147,8 @@ pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, module: &Module
             kind: b.2,
         })
         .collect();
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: true };
+    let script = Script::new(name, Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: true };
     let init = c.with_retry(|c, no_fused| c.module_init(module, &upvals, &names, no_fused))?;
     let body = c.with_retry(|c, no_fused| c.module_body(module, &upvals, &names, no_fused))?;
     Ok(CompiledModule { init, body, bindings: scope.into_iter().map(|b| (b.0, b.1)).collect() })
@@ -155,7 +157,8 @@ pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, module: &Module
 /// Compile a function created by the `Function` constructor (its scope is
 /// the global scope)
 pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: &Function) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None, in_module: false };
+    let script = Script::new("", Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: false };
     // An empty script level to resolve names against (all globals)
     c.fs.push(FuncState::new(true, false, func.strict, FunctionKind::Normal, false));
     let name = c.atoms.intern_str(heap, "anonymous");
@@ -287,6 +290,8 @@ struct UpvalInfo {
 
 pub(crate) struct FuncState<'a> {
     code: Vec<Insn>,
+    /// (pc, source offset) of instructions that can throw
+    positions: Vec<(u32, u32)>,
     consts: Vec<Value>,
     num_consts: FxHashMap<u64, u32>,
     str_consts: FxHashMap<Atom, u32>,
@@ -335,6 +340,7 @@ impl<'a> FuncState<'a> {
     fn new(is_script: bool, is_arrow: bool, strict: bool, kind: FunctionKind, no_fused: bool) -> Self {
         FuncState {
             code: Vec::new(),
+            positions: Vec::new(),
             consts: Vec::new(),
             num_consts: FxHashMap::default(),
             str_consts: FxHashMap::default(),
@@ -388,8 +394,8 @@ pub(crate) struct Compiler<'a, 'h> {
     atoms: &'h mut Atoms,
     src: &'a str,
     fs: Vec<FuncState<'a>>,
-    /// Shared copy of `src` kept by lazy functions
-    src_rc: Option<Rc<str>>,
+    /// The script being compiled (its source is shared with lazy functions)
+    script: Rc<Script>,
     /// Compiling a lazy function: its upvalues (by name) and the
     /// strictness of its definition
     lazy_root: Option<(Vec<UpvalInfo>, Vec<Name>, bool)>,
@@ -409,7 +415,8 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         outer_strict: info.outer_strict,
         in_module: info.in_module,
     };
-    let src: &str = &info.source;
+    let script = proto.script.as_ref().expect("lazy functions know their script");
+    let src: &str = &script.source;
     let mut func = crate::parser::reparse_function(src, &reparse)?;
     func.name = info.fn_name.clone();
     let upvals: Vec<UpvalInfo> = proto
@@ -424,7 +431,7 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         atoms,
         src,
         fs: Vec::new(),
-        src_rc: Some(info.source.clone()),
+        script: script.clone(),
         lazy_root: Some((upvals, names, info.outer_strict)),
         in_module: info.in_module,
     };
@@ -457,6 +464,18 @@ impl<'a, 'h> Compiler<'a, 'h> {
     #[inline]
     fn fr(&self) -> &FuncState<'a> {
         self.fs.last().unwrap()
+    }
+
+    /// Record that the next instruction comes from source offset `pos`
+    /// (for stack traces); call right before emitting one that can throw
+    fn set_pos(&mut self, pos: u32) {
+        let pc = self.pc();
+        let positions = &mut self.f().positions;
+        match positions.last_mut() {
+            Some(last) if last.0 == pc => last.1 = pos,
+            Some(last) if last.1 == pos => {}
+            _ => positions.push((pc, pos)),
+        }
     }
 
     fn emit(&mut self, insn: Insn) -> u32 {
@@ -1440,7 +1459,6 @@ impl<'a, 'h> Compiler<'a, 'h> {
             let n = names.iter().find(|(_, j)| *j as usize == i).map(|(n, _)| n.clone()).unwrap_or_else(|| Rc::from(""));
             upval_names.push((n, u.checked, u.kind.to_u8()));
         }
-        let source = self.src_rc.get_or_insert_with(|| Rc::from(self.src)).clone();
         let name = name.or_else(|| func.name.as_ref().map(|n| self.intern(n))).unwrap_or(atoms::empty);
         let is_constructor = matches!(func.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
             && !func.is_generator
@@ -1460,7 +1478,6 @@ impl<'a, 'h> Compiler<'a, 'h> {
             source: (func.span.start, func.span.end),
             traced: Cell::new(0),
             lazy: Some(Box::new(LazyInfo {
-                source,
                 params_start: func.params_start,
                 kind: func.kind,
                 fn_name: func.name.clone(),
@@ -1470,6 +1487,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 in_module: self.in_module,
             })),
             compiled: std::cell::OnceCell::new(),
+            script: Some(self.script.clone()),
         };
         Ok((Rc::new(proto), uses_super))
     }
@@ -1511,7 +1529,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
     }
 
     fn finish(&mut self, mut f: FuncState<'a>, name: Atom, length: u16, source: (u32, u32)) -> Rc<FunctionProto> {
-        strip_nops(&mut f.code, &mut f.handlers);
+        strip_nops(&mut f.code, &mut f.handlers, &mut f.positions);
         let arguments_reg = f.arguments_binding.map(|b| f.bindings.get(b).map(|b| b.reg).unwrap_or(0));
         let arguments_reg = if f.arguments_binding.is_some() { arguments_reg } else { None };
         let is_constructor = matches!(f.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
@@ -1531,6 +1549,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
             coerce_this: !f.strict && f.uses_this,
             arguments_reg,
             rest_reg: f.rest_reg,
+            positions: encode_positions(&f.positions),
         };
         Rc::new(FunctionProto {
             name,
@@ -1548,6 +1567,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
             traced: Cell::new(0),
             lazy: None,
             compiled: std::cell::OnceCell::from(code),
+            script: Some(self.script.clone()),
         })
     }
 
@@ -1727,7 +1747,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
 /// Remove `Nop`s (unused placeholders) and fix up jump offsets and handler
 /// ranges
-fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler]) {
+fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler], positions: &mut Vec<(u32, u32)>) {
     if !code.iter().any(|i| matches!(i, Insn::Nop)) {
         return;
     }
@@ -1775,6 +1795,18 @@ fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler]) {
         }
         out.push(insn);
     }
+    // Several positions may now share a pc; the last one wins
+    for p in positions.iter_mut() {
+        p.0 = new_index[p.0 as usize];
+    }
+    positions.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = later.1;
+            true
+        } else {
+            false
+        }
+    });
     for h in handlers.iter_mut() {
         h.start = new_index[h.start as usize];
         h.end = new_index[h.end as usize];

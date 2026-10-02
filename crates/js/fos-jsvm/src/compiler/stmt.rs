@@ -91,8 +91,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
             }
             Stmt::Break(label) => self.break_stmt(label.as_ref()),
             Stmt::Continue(label) => self.continue_stmt(label.as_ref()),
-            Stmt::Throw(e) => {
+            Stmt::Throw(e, pos) => {
                 let r = self.expr_any(e)?;
+                self.set_pos(*pos);
                 self.emit(Insn::Throw { src: r });
                 Ok(())
             }

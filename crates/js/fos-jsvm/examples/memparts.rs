@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static POS: AtomicUsize = AtomicUsize::new(0);
+static POSN: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
@@ -48,7 +50,7 @@ fn main() {
     let program = fos_jsvm::parser::parse_script_lazy(&src).unwrap();
     let r1 = rss_kib();
     println!("parse: peak +{} KiB, AST {} KiB", kib(PEAK.load(Relaxed) - live0), kib(LIVE.load(Relaxed) - live0));
-    let proto = fos_jsvm::compiler::compile_script(&vm.heap, &mut vm.atoms, &src, &program).unwrap();
+    let proto = fos_jsvm::compiler::compile_script(&vm.heap, &mut vm.atoms, &src, "", &program).unwrap();
     let r2 = rss_kib();
     drop(program);
     let r3 = rss_kib();
@@ -60,6 +62,8 @@ fn main() {
             *i += c.code.len();
             *c2 += c.ics.len();
             *k += c.consts.len();
+            POS.fetch_add(c.positions.len(), Relaxed);
+            if !c.positions.is_empty() { POSN.fetch_add(1, Relaxed); }
             for q in c.funcs.iter() {
                 walk(q, f, i, c2, k);
             }
@@ -69,7 +73,7 @@ fn main() {
     walk(&proto, &mut funcs, &mut insns, &mut ics, &mut consts);
     let r4 = rss_kib();
     println!("after run: live +{} KiB, peak +{} KiB", kib(LIVE.load(Relaxed) - live0), kib(PEAK.load(Relaxed) - live0));
-    println!("source {} KiB", src.len() / 1024);
+    println!("source {} KiB; position tables {} bytes in {} functions", src.len() / 1024, POS.load(Relaxed), POSN.load(Relaxed));
     let (t, e) = vm.shapes.table_stats();
     println!("{} shapes, {t} with tables holding {e} entries; {} atoms", vm.shapes.count(), vm.atoms.len());
     println!("parse: +{} KiB, compile: +{} KiB, drop AST: {} KiB, run: +{} KiB ({})", r1 - r0, r2 as i64 - r1 as i64, r3 as i64 - r2 as i64, r4 as i64 - r3 as i64, r.is_ok());

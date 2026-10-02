@@ -190,7 +190,7 @@ impl Vm {
             }
             return;
         }
-        if matches!(o.get().kind, ObjectKind::Error) {
+        if matches!(o.get().kind, ObjectKind::Error(_)) {
             let s = error::error_to_string(self, v).unwrap_or_default();
             out.push_str(&s);
             return;

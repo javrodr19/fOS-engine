@@ -161,7 +161,7 @@ impl Vm {
             Ok(m) => m,
             Err(e) => return Err(self.make_error(ErrorKind::Syntax, &format!("{} ({url})", e.message))),
         };
-        let compiled = match crate::compiler::compile_module(&self.heap, &mut self.atoms, source, &module) {
+        let compiled = match crate::compiler::compile_module(&self.heap, &mut self.atoms, source, url, &module) {
             Ok(c) => c,
             Err(e) => return Err(self.make_error(ErrorKind::Syntax, &format!("{} ({url})", e.message))),
         };

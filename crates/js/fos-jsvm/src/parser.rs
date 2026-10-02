@@ -798,13 +798,14 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Return(arg))
             }
             Tok::Keyword(Kw::Throw) => {
+                let pos = self.tok.span.start;
                 self.advance()?;
                 if self.tok.newline_before {
                     return self.error("line break after throw");
                 }
                 let arg = self.parse_expression()?;
                 self.consume_semicolon()?;
-                Ok(Stmt::Throw(arg))
+                Ok(Stmt::Throw(arg, pos))
             }
             Tok::Keyword(Kw::Try) => self.parse_try(),
             Tok::Keyword(Kw::Switch) => self.parse_switch(),
@@ -1465,7 +1466,7 @@ impl<'a> Parser<'a> {
 
         // `async (a, b) => ...` parsed as a call to `async`
         if self.at(P::Arrow) && !self.tok.newline_before {
-            if let Expr::Call { callee, args, optional: false } = left {
+            if let Expr::Call { callee, args, optional: false, .. } = left {
                 if matches!(&*callee, Expr::Ident(n) if &**n == "async") {
                     self.cover_inits = before;
                     let (params, rest) = self.args_to_params(args)?;
@@ -1774,6 +1775,7 @@ impl<'a> Parser<'a> {
     /// Left-hand-side expression: member accesses, calls, `new`, optional
     /// chains and tagged templates
     fn parse_lhs(&mut self) -> PResult<Expr> {
+        let start = self.tok.span.start;
         let mut expr = if self.at_kw(Kw::New) {
             self.parse_new()?
         } else if self.at_kw(Kw::Super) {
@@ -1806,33 +1808,38 @@ impl<'a> Parser<'a> {
             match &self.tok.tok {
                 Tok::Punct(P::Dot) => {
                     self.advance()?;
+                    let pos = self.tok.span.start;
                     let prop = self.parse_member_name()?;
-                    expr = Expr::Member { object: Box::new(expr), prop, optional: false };
+                    expr = Expr::Member { object: Box::new(expr), prop, optional: false, pos };
                 }
                 Tok::Punct(P::QuestionDot) => {
                     self.advance()?;
                     in_chain = true;
+                    let pos = self.tok.span.start;
                     if self.at(P::LParen) {
+                        let pos = call_pos(&expr, start);
                         let args = self.parse_arguments()?;
-                        expr = Expr::Call { callee: Box::new(expr), args, optional: true };
+                        expr = Expr::Call { callee: Box::new(expr), args, optional: true, pos };
                     } else if self.eat(P::LBracket)? {
                         let prop = self.parse_bracket_prop()?;
-                        expr = Expr::Member { object: Box::new(expr), prop, optional: true };
+                        expr = Expr::Member { object: Box::new(expr), prop, optional: true, pos };
                     } else if matches!(self.tok.tok, Tok::Template { .. }) {
                         return self.error("tagged template in optional chain");
                     } else {
                         let prop = self.parse_member_name()?;
-                        expr = Expr::Member { object: Box::new(expr), prop, optional: true };
+                        expr = Expr::Member { object: Box::new(expr), prop, optional: true, pos };
                     }
                 }
                 Tok::Punct(P::LBracket) => {
+                    let pos = self.tok.span.start;
                     self.advance()?;
                     let prop = self.parse_bracket_prop()?;
-                    expr = Expr::Member { object: Box::new(expr), prop, optional: false };
+                    expr = Expr::Member { object: Box::new(expr), prop, optional: false, pos };
                 }
                 Tok::Punct(P::LParen) => {
+                    let pos = call_pos(&expr, start);
                     let args = self.parse_arguments()?;
-                    expr = Expr::Call { callee: Box::new(expr), args, optional: false };
+                    expr = Expr::Call { callee: Box::new(expr), args, optional: false, pos };
                 }
                 Tok::Template { .. } => {
                     if in_chain {
@@ -1868,6 +1875,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_new(&mut self) -> PResult<Expr> {
+        let new_pos = self.tok.span.start;
         self.expect_kw(Kw::New)?;
         if self.eat(P::Dot)? {
             if !self.at_ident("target") {
@@ -1888,13 +1896,15 @@ impl<'a> Parser<'a> {
             match &self.tok.tok {
                 Tok::Punct(P::Dot) => {
                     self.advance()?;
+                    let pos = self.tok.span.start;
                     let prop = self.parse_member_name()?;
-                    callee = Expr::Member { object: Box::new(callee), prop, optional: false };
+                    callee = Expr::Member { object: Box::new(callee), prop, optional: false, pos };
                 }
                 Tok::Punct(P::LBracket) => {
+                    let pos = self.tok.span.start;
                     self.advance()?;
                     let prop = self.parse_bracket_prop()?;
-                    callee = Expr::Member { object: Box::new(callee), prop, optional: false };
+                    callee = Expr::Member { object: Box::new(callee), prop, optional: false, pos };
                 }
                 Tok::Template { .. } => {
                     let template = self.parse_template(true)?;
@@ -1905,7 +1915,7 @@ impl<'a> Parser<'a> {
             }
         }
         let args = if self.at(P::LParen) { self.parse_arguments()? } else { Vec::new() };
-        Ok(Expr::New { callee: Box::new(callee), args })
+        Ok(Expr::New { callee: Box::new(callee), args, pos: new_pos })
     }
 
     fn parse_super(&mut self) -> PResult<Expr> {
@@ -2205,11 +2215,11 @@ mod tests {
             Expr::Logical { op, left, right } => format!("({:?} {} {})", op, sexpr(left), sexpr(right)),
             Expr::Cond { test, cons, alt } => format!("(? {} {} {})", sexpr(test), sexpr(cons), sexpr(alt)),
             Expr::Assign { op, target, value } => format!("({:?} {} {})", op, pat(target), sexpr(value)),
-            Expr::Call { callee, args, optional } => {
+            Expr::Call { callee, args, optional, .. } => {
                 format!("(call{} {}{})", if *optional { "?" } else { "" }, sexpr(callee), args.iter().map(|a| format!(" {}", elem(a))).collect::<String>())
             }
-            Expr::New { callee, args } => format!("(new {}{})", sexpr(callee), args.iter().map(|a| format!(" {}", elem(a))).collect::<String>()),
-            Expr::Member { object, prop, optional } => {
+            Expr::New { callee, args, .. } => format!("(new {}{})", sexpr(callee), args.iter().map(|a| format!(" {}", elem(a))).collect::<String>()),
+            Expr::Member { object, prop, optional, .. } => {
                 let p = match prop {
                     MemberProp::Name(n) => n.to_string(),
                     MemberProp::Computed(e) => format!("[{}]", sexpr(e)),
@@ -2412,5 +2422,14 @@ mod tests {
         "#;
         let program = parse_script(src).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(program.body.len(), 8);
+    }
+}
+
+/// Where a call is reported: at the callee's property for member calls
+/// (as `a.b.c()` errors point at `c`), else at the callee's start
+fn call_pos(callee: &Expr, start: u32) -> u32 {
+    match callee {
+        Expr::Member { pos, .. } => *pos,
+        _ => start,
     }
 }

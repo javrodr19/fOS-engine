@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 use fos_dom::{Document, NodeId, DomTree, DomRevision};
-use fos_css::computed::{ComputedStyle, Display, SizeValue, EdgeSizes};
+use fos_css::style::{Display, Style, StyleContext};
 use fos_css::properties::LengthUnit;
 use fos_css::StyleResolver;
 use crate::page_styles::PageStyles;
@@ -465,57 +465,29 @@ impl PageRenderer {
 
     /// Compute styles using the StyleResolver (proper CSS cascade)
     #[allow(dead_code)]
-    fn compute_styles_with_resolver(
-        &self,
-        tree: &DomTree,
-        node_id: NodeId,
-        styles: &mut HashMap<NodeId, ComputedStyle>,
-        resolver: &StyleResolver,
-    ) {
-        if !node_id.is_valid() {
-            return;
-        }
-
-        // Compute style for this node using the resolver
-        let style = resolver.compute_style(tree, node_id);
-        styles.insert(node_id, style);
-
-        // Recurse to children
-        for (child_id, _) in tree.children(node_id) {
-            self.compute_styles_with_resolver(tree, child_id, styles, resolver);
-        }
-    }
-
-    /// Compute an element's style: inherited values, browser defaults,
-    /// the page's matching rules, then its `style` attribute
+    /// Compute an element's style: the UA's defaults, the page's matching
+    /// rules, then its `style` attribute, over what it inherits from
+    /// `parent`
+    #[allow(clippy::too_many_arguments)]
     fn compute_element_style(
         &self,
         tree: &DomTree,
         node_id: NodeId,
         element: &fos_dom::ElementData,
         styles: Option<&PageStyles>,
-        inherited: &Inherited,
+        parent: &Style,
+        ctx: &StyleContext,
         filter: Option<&crate::page_styles::AncestorFilter>,
         cache: &mut fos_css::ResolveCache,
-    ) -> ComputedStyle {
-        let mut style = ComputedStyle::default();
-        style.font_size = inherited.font_size;
-        style.parent_font_size = inherited.font_size;
-        style.root_font_size = inherited.root_font_size;
-        style.font_weight = inherited.font_weight;
-        style.custom_properties = inherited.custom.clone();
-        style.color = fos_css::properties::Color::rgba(inherited.color.r, inherited.color.g, inherited.color.b, inherited.color.a);
-        let tag_name = tree.resolve(element.name.local);
-
-        apply_default_styles(&mut style, tag_name, element, tree);
+    ) -> Style {
+        let mut style = Style::inherit_from(parent);
         let inline: Vec<fos_css::Declaration> = element
             .attrs
             .iter()
             .filter(|a| tree.resolve(a.name.local) == "style")
             .flat_map(|a| fos_css::parse_declarations(&a.value))
             .collect();
-        let viewport = (self.viewport_width as f32, self.viewport_height as f32);
-        crate::page_styles::cascade(styles, tree, node_id, element, filter, &inline, &mut style, viewport, cache);
+        crate::page_styles::cascade(styles, tree, node_id, element, filter, &inline, &mut style, parent, ctx, cache);
         style
     }
 
@@ -661,19 +633,23 @@ struct Styler<'a> {
     ancestors: std::cell::RefCell<crate::page_styles::AncestorFilter>,
     /// `var()` and math resolutions shared across elements
     resolved: std::cell::RefCell<fos_css::ResolveCache>,
+    /// The viewport and root font size lengths are computed against
+    ctx: std::cell::Cell<StyleContext>,
 }
 
 impl<'a> Styler<'a> {
     /// Style of an element (`None` for other nodes)
     fn new(renderer: &'a PageRenderer, tree: &'a DomTree, stylesheet: Option<PageStyles>) -> Self {
-        Self { renderer, tree, stylesheet, ancestors: Default::default(), resolved: Default::default() }
+        let ctx = StyleContext { root_font_size: 16.0, viewport: (renderer.viewport_width as f32, renderer.viewport_height as f32) };
+        Self { renderer, tree, stylesheet, ancestors: Default::default(), resolved: Default::default(), ctx: std::cell::Cell::new(ctx) }
     }
 
-    fn style(&self, node_id: NodeId, inherited: &Inherited) -> Option<ComputedStyle> {
+    fn style(&self, node_id: NodeId, parent: &Style) -> Option<Style> {
         let element = self.tree.get(node_id)?.as_element()?;
         let filter = self.ancestors.borrow();
         let mut cache = self.resolved.borrow_mut();
-        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), inherited, Some(&filter), &mut cache))
+        let ctx = self.ctx.get();
+        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), parent, &ctx, Some(&filter), &mut cache))
     }
 
     /// Descend into element `node`'s children
@@ -689,17 +665,6 @@ impl<'a> Styler<'a> {
             self.ancestors.borrow_mut().pop();
         }
     }
-}
-
-/// The inherited properties layout tracks while descending the tree
-struct Inherited {
-    font_size: f32,
-    font_weight: u16,
-    color: Color,
-    /// Custom properties (`--name`)
-    custom: Option<std::sync::Arc<HashMap<String, String>>>,
-    /// The root element's font size (`rem`)
-    root_font_size: f32,
 }
 
 /// Lay out the document body into lines for a viewport of `width` pixels
@@ -718,40 +683,35 @@ fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLay
         chain.push(up);
         up = tree.get(up).map_or(NodeId::NONE, |n| n.parent);
     }
-    let mut inherited = Inherited { font_size: 16.0, font_weight: 400, color: Color::BLACK, custom: None, root_font_size: 16.0 };
+    let mut inherited = Style::default();
     let mut root_styled = false;
     for &ancestor in chain.iter().rev() {
         if let Some(style) = styler.style(ancestor, &inherited) {
-            let c = style.color;
             // The root element's font size is what `rem` means
-            let root_font_size = if root_styled { inherited.root_font_size } else { style.font_size };
-            root_styled = true;
-            inherited = Inherited {
-                font_size: style.font_size,
-                font_weight: style.font_weight,
-                color: Color::rgba(c.r, c.g, c.b, c.a),
-                custom: style.custom_properties.clone(),
-                root_font_size,
-            };
+            if !root_styled {
+                let mut ctx = styler.ctx.get();
+                ctx.root_font_size = style.font_size();
+                styler.ctx.set(ctx);
+                root_styled = true;
+            }
+            inherited = style;
         }
         styler.enter(ancestor);
     }
+    let c = inherited.color();
 
     let mut builder = LayoutBuilder {
         tree,
         styler,
         // Leave margin for the right edge
-        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, inherited.font_size),
+        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, inherited.font_size()),
         // Document y of the first line
         y: 20.0,
         layout: PageLayout::default(),
-        custom: None,
-        root_font_size: 16.0,
+        parents: vec![inherited],
     };
 
-    builder.line_buffer.current_color = inherited.color;
-    builder.custom = inherited.custom.clone();
-    builder.root_font_size = inherited.root_font_size;
+    builder.line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
     if body.is_valid() {
         builder.layout_node(body);
         builder.flush();
@@ -772,10 +732,8 @@ struct LayoutBuilder<'a> {
     /// Current document y (baseline of the next line)
     y: f32,
     layout: PageLayout,
-    /// Custom properties of the element being laid out
-    custom: Option<std::sync::Arc<HashMap<String, String>>>,
-    /// The root element's font size (`rem`)
-    root_font_size: f32,
+    /// Styles of the elements being laid out (the last is the parent)
+    parents: Vec<Style>,
 }
 
 impl LayoutBuilder<'_> {
@@ -793,17 +751,11 @@ impl LayoutBuilder<'_> {
         };
 
         // Get style
-        let inherited = Inherited {
-            font_size: self.line_buffer.current_font_size,
-            font_weight: 400,
-            color: self.line_buffer.current_color,
-            custom: self.custom.clone(),
-            root_font_size: self.root_font_size,
-        };
-        let style = self.styler.style(node_id, &inherited);
+        let parent = self.parents.last().cloned().unwrap_or_default();
+        let style = self.styler.style(node_id, &parent);
 
         // Check if hidden
-        if style.as_ref().is_some_and(|s| matches!(s.display, Display::None)) {
+        if style.as_ref().is_some_and(|s| s.display() == Display::None) {
             return;
         }
 
@@ -849,7 +801,7 @@ impl LayoutBuilder<'_> {
             "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
             "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
 
-        let font_size = style.as_ref().map(|s| s.font_size).unwrap_or(self.line_buffer.current_font_size);
+        let font_size = style.as_ref().map(|s| s.font_size()).unwrap_or(self.line_buffer.current_font_size);
 
         // Block elements flush the line buffer and add vertical space
         if is_block {
@@ -943,12 +895,10 @@ impl LayoutBuilder<'_> {
         let line_buffer = &mut self.line_buffer;
 
         // Inherited properties for the element's contents
-        let saved_custom = self.custom.clone();
         if let Some(style) = &style {
-            line_buffer.current_font_size = style.font_size;
-            let c = style.color;
+            line_buffer.current_font_size = style.font_size();
+            let c = style.color();
             line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
-            self.custom = style.custom_properties.clone();
         }
 
         // Single pass over attributes: link target, anchor id
@@ -970,11 +920,12 @@ impl LayoutBuilder<'_> {
 
         // Recurse into children
         self.styler.enter(node_id);
+        self.parents.push(style.unwrap_or(parent));
         for (child_id, _) in tree.children(node_id) {
             self.layout_node(child_id);
         }
+        self.parents.pop();
         self.styler.leave();
-        self.custom = saved_custom;
 
         // Restore state
         let line_buffer = &mut self.line_buffer;
@@ -1136,151 +1087,6 @@ impl LineBuffer {
 }
 
 /// Apply default user-agent styles based on element type
-fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str, element: &fos_dom::ElementData, tree: &DomTree) {
-    let parent = style.font_size;
-    let lowered;
-    let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
-        lowered = tag_name.to_ascii_lowercase();
-        &lowered
-    } else {
-        tag_name
-    };
-
-    match tag {
-        // Block elements
-        "div" | "p" | "article" | "section" | "main" | "header" | "footer" | "nav" |
-        "aside" | "figure" | "figcaption" | "address" | "blockquote" | "pre" => {
-            style.display = Display::Block;
-        }
-
-        // Headings
-        "h1" => {
-            style.display = Display::Block;
-            style.font_size = parent * 2.0;
-            style.font_weight = 700;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(21.44, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(21.44, LengthUnit::Px),
-                left: SizeValue::Length(0.0, LengthUnit::Px),
-            };
-        }
-        "h2" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.5;
-            style.font_weight = 700;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(19.92, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(19.92, LengthUnit::Px),
-                left: SizeValue::Length(0.0, LengthUnit::Px),
-            };
-        }
-        "h3" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.17;
-            style.font_weight = 700;
-        }
-        "h4" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.0;
-            style.font_weight = 700;
-        }
-        "h5" => {
-            style.display = Display::Block;
-            style.font_size = parent * 0.83;
-            style.font_weight = 700;
-        }
-        "h6" => {
-            style.display = Display::Block;
-            style.font_size = parent * 0.67;
-            style.font_weight = 700;
-        }
-
-        // Links (`:link`: with an href)
-        "a" => {
-            style.display = Display::Inline;
-            if element.attrs.iter().any(|a| tree.resolve(a.name.local) == "href") {
-                style.color = fos_css::properties::Color::rgb(51, 102, 204);
-            }
-        }
-
-        // Inline elements
-        "span" | "em" | "i" | "u" | "code" | "kbd" | "samp" => {
-            style.display = Display::Inline;
-        }
-        "small" | "sub" | "sup" => {
-            style.display = Display::Inline;
-            style.font_size = parent * 0.83;
-        }
-        "big" => {
-            style.display = Display::Inline;
-            style.font_size = parent * 1.2;
-        }
-
-        // Bold
-        "strong" | "b" => {
-            style.display = Display::Inline;
-            style.font_weight = 700;
-        }
-
-        // Lists
-        "ul" | "ol" => {
-            style.display = Display::Block;
-            style.padding = EdgeSizes {
-                top: SizeValue::Length(0.0, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(0.0, LengthUnit::Px),
-                left: SizeValue::Length(40.0, LengthUnit::Px),
-            };
-        }
-        "li" => {
-            style.display = Display::Block;
-        }
-
-        // Table
-        "table" => {
-            style.display = Display::Block;
-        }
-        "tr" => {
-            style.display = Display::Block;
-        }
-        "td" | "th" => {
-            style.display = Display::Inline;
-        }
-
-        // Images
-        "img" => {
-            style.display = Display::Inline;
-        }
-
-        // Body
-        "body" => {
-            style.display = Display::Block;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(8.0, LengthUnit::Px),
-                right: SizeValue::Length(8.0, LengthUnit::Px),
-                bottom: SizeValue::Length(8.0, LengthUnit::Px),
-                left: SizeValue::Length(8.0, LengthUnit::Px),
-            };
-        }
-
-        // HTML
-        "html" => {
-            style.display = Display::Block;
-        }
-
-        // Head - hidden
-        "head" | "title" | "script" | "style" | "meta" | "link" => {
-            style.display = Display::None;
-        }
-
-        _ => {
-            style.display = Display::Inline;
-        }
-    }
-}
-
 /// Get 8x8 bitmap pattern for a character (simple bitmap font)
 fn get_char_pattern(c: char) -> [u8; 8] {
     match c.to_ascii_lowercase() {
@@ -1528,7 +1334,8 @@ mod tests {
         assert_eq!(seg("rel").color, Color::rgb(255, 0, 0));
         assert_eq!(seg("rel").font_size, 48.0);
         assert_eq!(seg("nav link").color, Color::rgb(0, 128, 0));
-        assert_eq!(seg("plain link").color, Color::rgb(51, 102, 204));
+        // The UA stylesheet's link color
+        assert_eq!(seg("plain link").color, Color::rgb(0, 0, 238));
         assert!(layout.lines.iter().flat_map(|l| &l.segments).all(|s| s.text.trim() != "hidden"));
         // Custom properties from :root, calc() with rem of the root's 20px
         assert_eq!(seg("vars").color, Color::rgb(0, 0, 255));

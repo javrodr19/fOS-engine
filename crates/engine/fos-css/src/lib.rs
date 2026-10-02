@@ -51,6 +51,8 @@ pub mod view_transitions;
 pub mod predictive;
 
 pub mod values;
+pub mod style;
+mod longhand;
 pub use values::{ResolveCache, ResolveContext, resolve_declaration, substitute_vars, compute_custom_properties};
 pub use parser::{CssParser, MediaContext, parse_declarations, parse_color, parse_length, media_matches};
 pub use cascade::StyleResolver;

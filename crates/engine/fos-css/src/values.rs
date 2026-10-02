@@ -403,8 +403,8 @@ impl MathParser<'_, '_> {
 }
 
 /// Evaluate a math function (`calc(...)`, `min(...)`, ...) to CSS text:
-/// `"12px"`, `"50%"` or `"1.5"`; `None` if it mixes a percentage of an
-/// unknown basis with lengths, or is invalid
+/// `"12px"`, `"50%"`, `"1.5"`, or `"-fos-mix(12px 50%)"` for a length
+/// plus a percentage of a basis known only at layout; `None` if invalid
 fn evaluate_math(expr: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -> Option<String> {
     let mut p = MathParser { s: expr.as_bytes(), i: 0, ctx, percent_basis };
     let q = p.value()?;
@@ -420,7 +420,8 @@ fn evaluate_math(expr: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -
     } else if q.px == 0.0 {
         Some(format!("{}%", q.percent))
     } else {
-        None
+        // Both parts, for layout to resolve once the basis is known
+        Some(format!("-fos-mix({}px {}%)", q.px, q.percent))
     }
 }
 
@@ -563,7 +564,8 @@ mod tests {
         assert_eq!(eval("max(1rem, 12px)").as_deref(), Some("16px"));
         assert_eq!(eval("clamp(12px, 5vw, 40px)").as_deref(), Some("40px"));
         assert_eq!(eval("calc(50%)").as_deref(), Some("50%"));
-        assert_eq!(eval("calc(100% - 20px)"), None);
+        // Mixed with a percentage: both parts kept for layout
+        assert_eq!(eval("calc(100% - 20px)").as_deref(), Some("-fos-mix(-20px 100%)"));
         assert_eq!(eval("calc(10px * 2px)"), None);
         assert_eq!(eval("calc(1.5 * 2)").as_deref(), Some("3"));
     }
@@ -579,6 +581,6 @@ mod tests {
         assert_eq!(px(&resolve_declaration("margin-top", "calc(var(--size) * 2)", false, &c)), Some(60.0));
         assert!(resolve_declaration("color", "var(--nope)", false, &c).is_empty());
         let d = resolve_declaration("margin", "var(--gap) calc(var(--gap) * 2)", true, &c);
-        assert!(d.len() == 1 && d[0].important);
+        assert!(d.len() == 4 && d.iter().all(|d| d.important));
     }
 }

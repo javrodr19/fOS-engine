@@ -111,7 +111,7 @@ fn find_top(b: &[u8], mut i: usize, stops: &[u8]) -> usize {
 }
 
 /// Split at top-level `sep` bytes
-fn split_top(s: &str, sep: u8) -> Vec<&str> {
+pub(crate) fn split_top(s: &str, sep: u8) -> Vec<&str> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
@@ -506,7 +506,7 @@ fn decl(property: PropertyId, value: PropertyValue, important: bool) -> Declarat
 }
 
 /// Whitespace-separated components (keeping functions like rgb(...) whole)
-fn components(v: &str) -> Vec<&str> {
+pub(crate) fn components(v: &str) -> Vec<&str> {
     let b = v.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -535,130 +535,21 @@ fn global_keyword(v: &str) -> Option<Keyword> {
 }
 
 fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>) {
-    let Some(id) = PropertyId::from_name(name).or(match name {
-        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" | "font" => Some(PropertyId::FontSize),
-        _ => None,
-    }) else {
+    if !crate::longhand::is_known(name) {
         return;
-    };
+    }
     // Values depending on custom properties or math functions are computed
     // per element, during the cascade
     let lower = value.to_ascii_lowercase();
     if lower.contains("var(") || ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&lower, f)) {
+        let id = if name == "font-size" || name == "font" { PropertyId::FontSize } else { PropertyId::Custom };
         out.push(decl(id, PropertyValue::Unresolved(Box::new((name.to_string(), value.to_string()))), important));
         return;
     }
     if lower.contains("env(") || lower.contains("attr(") {
         return;
     }
-    if let Some(kw) = global_keyword(value) {
-        out.push(decl(id, PropertyValue::Keyword(kw), important));
-        return;
-    }
-    match name {
-        "display" => {
-            let kw = match lower.split_whitespace().collect::<Vec<_>>().as_slice() {
-                ["none"] => Keyword::None,
-                ["inline"] => Keyword::Inline,
-                ["inline-block"] | ["inline", "flow-root"] => Keyword::InlineBlock,
-                ["flex"] | ["inline-flex"] | ["block", "flex"] | ["inline", "flex"] => Keyword::Flex,
-                ["grid"] | ["inline-grid"] | ["block", "grid"] | ["inline", "grid"] => Keyword::Grid,
-                ["contents"] => Keyword::Contents,
-                // Blocks for our layout: block, list-item, table parts, flow-root
-                _ => Keyword::Block,
-            };
-            out.push(decl(PropertyId::Display, PropertyValue::Keyword(kw), important));
-        }
-        "color" | "background-color" | "border-color" => {
-            if let Some(c) = parse_color(value) {
-                let id = id;
-                out.push(decl(id, PropertyValue::Color(c), important));
-            }
-        }
-        "background" => {
-            if let Some(c) = components(value).into_iter().rev().find_map(parse_color) {
-                out.push(decl(PropertyId::BackgroundColor, PropertyValue::Color(c), important));
-            } else if lower.trim() == "none" || lower.trim() == "transparent" {
-                out.push(decl(PropertyId::BackgroundColor, PropertyValue::Color(Color::TRANSPARENT), important));
-            }
-        }
-        "font-size" => {
-            if let Some(v) = font_size(&lower) {
-                out.push(decl(PropertyId::FontSize, v, important));
-            }
-        }
-        "font-weight" => {
-            if let Some(w) = font_weight(&lower) {
-                out.push(decl(PropertyId::FontWeight, PropertyValue::Integer(w), important));
-            }
-        }
-        "font" => font_shorthand(&lower, important, out),
-        "margin" | "padding" => {
-            let parts: Vec<PropertyValue> = components(&lower).into_iter().filter_map(|c| length_or_auto(c, name == "margin")).collect();
-            if !parts.is_empty() && parts.len() <= 4 {
-                let id = id;
-                out.push(decl(id, PropertyValue::List(parts), important));
-            }
-        }
-        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding-top" | "padding-right" | "padding-bottom"
-        | "padding-left" | "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" | "top" | "right"
-        | "bottom" | "left" | "flex-basis" | "line-height" | "letter-spacing" | "border-radius" | "border-width" => {
-            if let Some(v) = length_or_auto(lower.trim(), true) {
-                out.push(decl(id, v, important));
-            } else {
-                out.push(decl(id, PropertyValue::Raw(value.to_string()), important));
-            }
-        }
-        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" => {
-            let parts: Vec<PropertyValue> = components(&lower).into_iter().filter_map(|c| length_or_auto(c, true)).collect();
-            if let (Some(first), true) = (parts.first().cloned(), parts.len() <= 2) {
-                let second = parts.get(1).cloned().unwrap_or_else(|| first.clone());
-                let (a, b) = match name {
-                    "margin-block" => (PropertyId::MarginTop, PropertyId::MarginBottom),
-                    "margin-inline" => (PropertyId::MarginLeft, PropertyId::MarginRight),
-                    "padding-block" => (PropertyId::PaddingTop, PropertyId::PaddingBottom),
-                    _ => (PropertyId::PaddingLeft, PropertyId::PaddingRight),
-                };
-                out.push(decl(a, first, important));
-                out.push(decl(b, second, important));
-            }
-        }
-        "opacity" => {
-            let v = lower.trim();
-            let n = match v.strip_suffix('%') {
-                Some(p) => p.parse::<f32>().ok().map(|p| p / 100.0),
-                None => v.parse::<f32>().ok(),
-            };
-            if let Some(n) = n {
-                out.push(decl(PropertyId::Opacity, PropertyValue::Number(n), important));
-            }
-        }
-        "z-index" | "flex-grow" | "flex-shrink" => {
-            if let Ok(n) = lower.trim().parse::<f32>() {
-                out.push(decl(id, PropertyValue::Number(n), important));
-            }
-        }
-        "visibility" | "position" | "float" | "clear" | "flex-direction" | "flex-wrap" | "justify-content" | "align-items"
-        | "align-content" | "text-align" | "font-style" | "text-decoration" | "white-space" | "overflow" | "overflow-x"
-        | "overflow-y" | "border-style" => {
-            let id = id;
-            let first = lower.split_whitespace().next().unwrap_or("");
-            let kw = match first {
-                "start" => Some(Keyword::Left),
-                "end" => Some(Keyword::Right),
-                "nowrap" => Some(Keyword::Nowrap),
-                _ => Keyword::from_str(first),
-            };
-            match kw {
-                Some(kw) => out.push(decl(id, PropertyValue::Keyword(kw), important)),
-                None => out.push(decl(id, PropertyValue::Raw(value.to_string()), important)),
-            }
-        }
-        "font-family" => {
-            out.push(decl(PropertyId::FontFamily, PropertyValue::String(value.to_string()), important));
-        }
-        _ => out.push(decl(id, PropertyValue::Raw(value.to_string()), important)),
-    }
+    crate::longhand::expand(name, value, important, out);
 }
 
 /// A length, `0`, or (if allowed) `auto`
@@ -703,7 +594,7 @@ pub fn parse_length(v: &str) -> Option<Length> {
     Some(Length { value, unit })
 }
 
-fn font_size(v: &str) -> Option<PropertyValue> {
+pub(crate) fn font_size(v: &str) -> Option<PropertyValue> {
     let px = |n: f32| Some(PropertyValue::Length(Length::px(n)));
     match v.trim() {
         "xx-small" => px(9.0),
@@ -720,7 +611,7 @@ fn font_size(v: &str) -> Option<PropertyValue> {
     }
 }
 
-fn font_weight(v: &str) -> Option<i32> {
+pub(crate) fn font_weight(v: &str) -> Option<i32> {
     match v.trim() {
         "normal" => Some(400),
         "bold" | "bolder" => Some(700),
@@ -942,8 +833,10 @@ mod tests {
         let size = d.iter().find(|d| d.property == PropertyId::FontSize).unwrap();
         assert!(matches!(size.value, PropertyValue::Length(Length { value, unit: LengthUnit::Px }) if (value - 16.0).abs() < 0.01));
         assert!(d.iter().any(|d| d.property == PropertyId::FontWeight && matches!(d.value, PropertyValue::Integer(700))));
-        assert!(d.iter().any(|d| d.property == PropertyId::Margin && matches!(&d.value, PropertyValue::List(l) if l.len() == 2)));
-        assert!(d.iter().any(|d| d.property == PropertyId::Padding && d.important));
+        // Shorthands expand into longhands
+        assert!(d.iter().any(|d| d.property == PropertyId::MarginTop && matches!(d.value, PropertyValue::Length(Length { value, unit: LengthUnit::Em }) if value == 1.0)));
+        assert!(d.iter().any(|d| d.property == PropertyId::MarginRight && matches!(d.value, PropertyValue::Keyword(Keyword::Auto))));
+        assert_eq!(d.iter().filter(|d| d.property == PropertyId::PaddingLeft && d.important).count(), 1);
         assert!(d.iter().any(|d| d.property == PropertyId::BackgroundColor && matches!(d.value, PropertyValue::Color(c) if c.r == 255)));
     }
 

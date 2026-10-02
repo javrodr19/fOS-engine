@@ -88,6 +88,85 @@ pub enum PropertyId {
 
     /// A custom property (`--name`); the name is in the value
     Custom,
+
+    // Longhands (shorthands above are expanded into these when parsed)
+    BorderTopWidth,
+    BorderRightWidth,
+    BorderBottomWidth,
+    BorderLeftWidth,
+    BorderTopStyle,
+    BorderRightStyle,
+    BorderBottomStyle,
+    BorderLeftStyle,
+    BorderTopColor,
+    BorderRightColor,
+    BorderBottomColor,
+    BorderLeftColor,
+    BorderTopLeftRadius,
+    BorderTopRightRadius,
+    BorderBottomRightRadius,
+    BorderBottomLeftRadius,
+    OutlineWidth,
+    OutlineStyle,
+    OutlineColor,
+    OutlineOffset,
+    BoxSizing,
+    VerticalAlign,
+    ListStyleType,
+    ListStylePosition,
+    TextTransform,
+    TextIndent,
+    WordSpacing,
+    AlignSelf,
+    Order,
+    RowGap,
+    ColumnGap,
+    BackgroundImage,
+    BackgroundRepeat,
+    BackgroundPosition,
+    BackgroundSize,
+    TextDecorationLine,
+    TextDecorationColor,
+    TextDecorationStyle,
+    TextOverflow,
+    OverflowWrap,
+    WordBreak,
+    Direction,
+    ObjectFit,
+    BorderCollapse,
+    BorderSpacing,
+    TableLayout,
+    PointerEvents,
+}
+
+impl PropertyId {
+    /// Whether the property is inherited (CSS's "Inherited: yes")
+    pub fn is_inherited(self) -> bool {
+        matches!(
+            self,
+            Self::Color
+                | Self::FontFamily
+                | Self::FontSize
+                | Self::FontWeight
+                | Self::FontStyle
+                | Self::LineHeight
+                | Self::TextAlign
+                | Self::TextIndent
+                | Self::TextTransform
+                | Self::WhiteSpace
+                | Self::LetterSpacing
+                | Self::WordSpacing
+                | Self::Visibility
+                | Self::ListStyleType
+                | Self::ListStylePosition
+                | Self::Direction
+                | Self::WordBreak
+                | Self::OverflowWrap
+                | Self::BorderCollapse
+                | Self::BorderSpacing
+                | Self::PointerEvents
+        )
+    }
 }
 
 impl PropertyId {
@@ -193,6 +272,15 @@ pub enum PropertyValue {
     Unresolved(Box<(String, String)>),
     /// A custom property declaration (name with `--`, value text)
     Custom(Box<(String, String)>),
+    /// A keyword of an enumerated property: the discriminant of its
+    /// `crate::style` enum
+    Enum(u8),
+    /// `calc()` mixing pixels and a percentage
+    Mix { px: f32, pct: f32 },
+    /// `currentcolor`
+    CurrentColor,
+    /// Background image layers
+    Images(std::sync::Arc<[crate::style::Image]>),
 }
 
 /// CSS keyword values
@@ -326,7 +414,7 @@ impl Keyword {
 }
 
 /// CSS length value
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Length {
     pub value: f32,
     pub unit: LengthUnit,
@@ -366,7 +454,7 @@ pub enum LengthUnit {
 }
 
 /// CSS color
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Color {
     pub r: u8,
     pub g: u8,

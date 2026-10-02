@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use fos_css::computed::ComputedStyle;
+use std::sync::LazyLock;
+
+use fos_css::style::{Style, StyleContext};
 use fos_css::{Specificity, Stylesheet};
 use fos_dom::{DomTree, ElementData, NodeId, SelectorList, SubjectKey};
 
@@ -158,10 +160,12 @@ impl PageStyles {
         self.stylesheet.rules.len()
     }
 
-    /// Apply the declarations of the rules matching element `node`;
-    /// `filter`, if given, holds the element's ancestors
-    pub fn apply(&self, tree: &DomTree, node: NodeId, element: &ElementData, style: &mut ComputedStyle, filter: Option<&AncestorFilter>) {
-        cascade(Some(self), tree, node, element, filter, &[], style, (1024.0, 768.0), &mut Default::default());
+    /// Style element `node` with these rules alone (plus the UA's), as a
+    /// child of `parent`; `filter`, if given, holds the element's ancestors
+    pub fn style(&self, tree: &DomTree, node: NodeId, element: &ElementData, parent: &Style, filter: Option<&AncestorFilter>) -> Style {
+        let mut style = Style::inherit_from(parent);
+        cascade(Some(self), tree, node, element, filter, &[], &mut style, parent, &StyleContext::default(), &mut Default::default());
+        style
     }
 
     /// The rules matching element `node`, lowest priority first (each once)
@@ -215,12 +219,128 @@ impl PageStyles {
     }
 }
 
-/// Style element `node`: its matching rules (if there is a stylesheet)
-/// and its `style` attribute declarations (`inline`), in cascade order:
-/// normal declarations by specificity and source order, inline ones above
-/// them, then the `!important` ones in the same order. Custom properties,
-/// `var()` and math functions are computed against the element and
-/// `viewport`.
+/// The browser's default styles (`ua.css`), compiled once
+static UA: LazyLock<PageStyles> = LazyLock::new(|| PageStyles::new(fos_css::parse_stylesheet(include_str!("ua.css")).unwrap_or(Stylesheet { rules: Vec::new() })));
+
+/// Presentational attributes (`bgcolor`, `align`, `width`, ...) as
+/// declarations, which rank just above the UA's styles
+fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::Declaration> {
+    let tag = tree.resolve(element.name.local);
+    let relevant = matches!(
+        tag,
+        "body" | "table" | "tr" | "td" | "th" | "font" | "img" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "caption" | "canvas" | "video"
+            | "iframe" | "embed" | "object" | "col" | "hr" | "thead" | "tbody" | "tfoot" | "input" | "textarea" | "select" | "legend"
+    );
+    if !relevant || element.attrs.is_empty() {
+        return Vec::new();
+    }
+    // A dimension attribute: a number of pixels or a percentage
+    let dimension = |v: &str| -> Option<String> {
+        let v = v.trim();
+        let end = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+        let n: f32 = v[..end].parse().ok()?;
+        Some(if v[end..].starts_with('%') { format!("{n}%") } else { format!("{n}px") })
+    };
+    let mut css = String::new();
+    for a in element.attrs.iter() {
+        let value = a.value.trim();
+        match (tree.resolve(a.name.local), tag) {
+            ("bgcolor", "body" | "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot") => css += &format!("background-color: {value};"),
+            ("text", "body") | ("color", "font" | "hr") => css += &format!("color: {value};"),
+            ("face", "font") => css += &format!("font-family: {value};"),
+            ("size", "font") => {
+                let sizes = ["x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"];
+                let n = match value.strip_prefix('+') {
+                    Some(r) => r.parse::<i32>().ok().map(|n| 3 + n),
+                    None => match value.strip_prefix('-') {
+                        Some(r) => r.parse::<i32>().ok().map(|n| 3 - n),
+                        None => value.parse::<i32>().ok(),
+                    },
+                };
+                if let Some(n) = n {
+                    css += &format!("font-size: {};", sizes[(n.clamp(1, 7) - 1) as usize]);
+                }
+            }
+            ("width", "img" | "canvas" | "video" | "iframe" | "embed" | "object" | "table" | "td" | "th" | "col" | "hr" | "input") => {
+                if let Some(d) = dimension(value) {
+                    css += &format!("width: {d};");
+                }
+            }
+            ("height", "img" | "canvas" | "video" | "iframe" | "embed" | "object" | "table" | "td" | "th" | "tr") => {
+                if let Some(d) = dimension(value) {
+                    css += &format!("height: {d};");
+                }
+            }
+            ("align", "table") => match value.to_ascii_lowercase().as_str() {
+                "left" => css += "float: left;",
+                "right" => css += "float: right;",
+                "center" => css += "margin-left: auto; margin-right: auto;",
+                _ => {}
+            },
+            ("align", "img" | "iframe" | "embed" | "object" | "input") => match value.to_ascii_lowercase().as_str() {
+                "left" => css += "float: left;",
+                "right" => css += "float: right;",
+                "middle" | "absmiddle" | "center" => css += "vertical-align: middle;",
+                "top" => css += "vertical-align: top;",
+                "bottom" | "baseline" => css += "vertical-align: baseline;",
+                _ => {}
+            },
+            ("align", _) => {
+                let v = value.to_ascii_lowercase();
+                if matches!(v.as_str(), "left" | "right" | "center" | "justify") {
+                    css += &format!("text-align: {v};");
+                }
+            }
+            ("valign", "td" | "th" | "tr" | "thead" | "tbody" | "tfoot") => {
+                let v = value.to_ascii_lowercase();
+                if matches!(v.as_str(), "top" | "middle" | "bottom" | "baseline") {
+                    css += &format!("vertical-align: {v};");
+                }
+            }
+            ("border", "table" | "img" | "object") => {
+                let n = value.parse::<f32>().unwrap_or(if value.is_empty() { 1.0 } else { 0.0 });
+                css += &format!("border: {n}px {} gray;", if tag == "table" { "outset" } else { "solid" });
+            }
+            ("cellspacing", "table") => {
+                if let Some(d) = dimension(value) {
+                    css += &format!("border-spacing: {d};");
+                }
+            }
+            ("nowrap", "td" | "th") => css += "white-space: nowrap;",
+            ("hspace", "img") => {
+                if let Some(d) = dimension(value) {
+                    css += &format!("margin-left: {d}; margin-right: {d};");
+                }
+            }
+            ("vspace", "img") => {
+                if let Some(d) = dimension(value) {
+                    css += &format!("margin-top: {d}; margin-bottom: {d};");
+                }
+            }
+            ("noshade", "hr") => css += "border-style: solid; background-color: gray;",
+            ("size", "hr") => {
+                if let Ok(n) = value.parse::<f32>() {
+                    css += &format!("height: {}px;", (n - 2.0).max(0.0));
+                }
+            }
+            _ => {}
+        }
+    }
+    if css.is_empty() {
+        Vec::new()
+    } else {
+        fos_css::parse_declarations(&css)
+    }
+}
+
+/// Style element `node`, starting from `style` (its inherited values):
+/// the UA's rules, presentational hints, the page's matching rules (if
+/// there is a stylesheet) and the `style` attribute's declarations
+/// (`inline`), in cascade order: normal declarations by origin,
+/// specificity and source order (inline above rules), then `!important`
+/// ones with the origins reversed. `parent` is what `inherit` refers to;
+/// custom properties, `var()` and math functions are computed against the
+/// element and `ctx`.
 #[allow(clippy::too_many_arguments)]
 pub fn cascade(
     styles: Option<&PageStyles>,
@@ -229,53 +349,76 @@ pub fn cascade(
     element: &ElementData,
     filter: Option<&AncestorFilter>,
     inline: &[fos_css::Declaration],
-    style: &mut ComputedStyle,
-    viewport: (f32, f32),
+    style: &mut Style,
+    parent: &Style,
+    ctx: &StyleContext,
     cache: &mut fos_css::ResolveCache,
 ) {
+    let ua = &*UA;
+    let ua_rules = ua.matching_rules(tree, node, element, filter);
+    let hints = presentational_hints(tree, element);
     let rules = styles.map_or(Vec::new(), |s| s.matching_rules(tree, node, element, filter));
-    if rules.is_empty() && inline.is_empty() {
+    if ua_rules.is_empty() && hints.is_empty() && rules.is_empty() && inline.is_empty() {
+        style.finish();
         return;
     }
     let mut ordered: Vec<&fos_css::Declaration> = Vec::new();
-    for important in [false, true] {
-        if let Some(s) = styles {
-            for &rule in &rules {
-                ordered.extend(s.stylesheet.rules[rule as usize].declarations.iter().filter(|d| d.important == important));
-            }
-        }
-        ordered.extend(inline.iter().filter(|d| d.important == important));
+    fn of(s: &PageStyles, rule: u32, important: bool) -> impl Iterator<Item = &fos_css::Declaration> {
+        s.stylesheet.rules[rule as usize].declarations.iter().filter(move |d| d.important == important)
     }
-    style.apply_cascade_cached(&ordered, viewport, cache);
+    for &rule in &ua_rules {
+        ordered.extend(of(ua, rule, false));
+    }
+    ordered.extend(hints.iter());
+    if let Some(s) = styles {
+        for &rule in &rules {
+            ordered.extend(of(s, rule, false));
+        }
+    }
+    ordered.extend(inline.iter().filter(|d| !d.important));
+    if let Some(s) = styles {
+        for &rule in &rules {
+            ordered.extend(of(s, rule, true));
+        }
+    }
+    ordered.extend(inline.iter().filter(|d| d.important));
+    for &rule in &ua_rules {
+        ordered.extend(of(ua, rule, true));
+    }
+    style.cascade(&ordered, parent, ctx, cache);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fos_css::parse_stylesheet;
+    use fos_css::style::{Display, Lp, LpAuto};
 
-    fn style_of(css: &str, html: &str, id: &str) -> ComputedStyle {
+    /// Style an element as layout does: its ancestors first, down the tree
+    fn style_with(css: &str, html: &str, id: &str, filtered: bool) -> Style {
         let doc = fos_html::parse(html);
         let styles = PageStyles::new(parse_stylesheet(css).unwrap());
-        let node = doc.get_element_by_id(id).unwrap();
-        let element = doc.tree().get(node).unwrap().as_element().unwrap();
-        let mut style = ComputedStyle::default();
-        styles.apply(doc.tree(), node, element, &mut style, None);
-        // Same result through an ancestor filter
-        let mut filter = AncestorFilter::default();
-        let mut chain = vec![];
-        let mut p = doc.tree().get(node).unwrap().parent;
-        while p.is_valid() {
+        let tree = doc.tree();
+        let target = doc.get_element_by_id(id).unwrap();
+        let mut chain = vec![target];
+        while let Some(p) = tree.get(*chain.last().unwrap()).map(|n| n.parent).filter(|p| tree.get(*p).is_some_and(|n| n.is_element())) {
             chain.push(p);
-            p = doc.tree().get(p).unwrap().parent;
         }
-        for &a in chain.iter().rev() {
-            filter.push(doc.tree(), a);
+        let mut filter = AncestorFilter::default();
+        let mut parent = Style::default();
+        for &n in chain.iter().rev() {
+            let e = tree.get(n).unwrap().as_element().unwrap();
+            parent = styles.style(tree, n, e, &parent, filtered.then_some(&filter));
+            filter.push(tree, n);
         }
-        let mut filtered = ComputedStyle::default();
-        styles.apply(doc.tree(), node, element, &mut filtered, Some(&filter));
-        assert_eq!(filtered.font_size, style.font_size);
-        style
+        parent
+    }
+
+    fn style_of(css: &str, html: &str, id: &str) -> Style {
+        let s = style_with(css, html, id, false);
+        // Same result through an ancestor filter
+        assert!(style_with(css, html, id, true) == s);
+        s
     }
 
     const HTML: &str = r#"<html><body><nav><a id="in" class="l">x</a></nav><a id="out" class="l">y</a><p id="p" class="a b">z</p></body></html>"#;
@@ -283,55 +426,54 @@ mod tests {
     #[test]
     fn combinators_and_pseudo_classes() {
         let css = "nav a { font-size: 30px } a:hover { font-size: 50px } p::before { font-size: 60px }";
-        assert_eq!(style_of(css, HTML, "in").font_size, 30.0);
-        assert_ne!(style_of(css, HTML, "out").font_size, 30.0);
-        assert_ne!(style_of(css, HTML, "out").font_size, 50.0);
-        assert_ne!(style_of(css, HTML, "p").font_size, 60.0);
+        assert_eq!(style_of(css, HTML, "in").font_size(), 30.0);
+        assert_ne!(style_of(css, HTML, "out").font_size(), 30.0);
+        assert_ne!(style_of(css, HTML, "out").font_size(), 50.0);
+        assert_ne!(style_of(css, HTML, "p").font_size(), 60.0);
     }
 
     #[test]
     fn custom_properties_and_calc() {
-        let css = ":root { --big: 30px; --unit: 4px } #p { --big: 40px; font-size: var(--big) } .a { margin-top: calc(var(--unit) * 3) } #in { font-size: calc(1em + var(--unit)) }";
-        let html = r#"<html><body><nav><a id="in" class="l">x</a></nav><p id="p" class="a b">z</p></body></html>"#;
-        let doc = fos_html::parse(html);
-        let styles = PageStyles::new(parse_stylesheet(css).unwrap());
-        let tree = doc.tree();
-        // Style down the tree as layout does: parent first, values inherited
-        let style_for = |id: &str| {
-            let target = doc.get_element_by_id(id).unwrap();
-            let mut chain = vec![target];
-            while let Some(p) = tree.get(*chain.last().unwrap()).map(|n| n.parent).filter(|p| tree.get(*p).is_some_and(|n| n.is_element())) {
-                chain.push(p);
-            }
-            let mut parent: Option<ComputedStyle> = None;
-            for &n in chain.iter().rev() {
-                let e = tree.get(n).unwrap().as_element().unwrap();
-                let mut s = ComputedStyle::default();
-                let (fs, custom) = parent.as_ref().map_or((16.0, None), |p| (p.font_size, p.custom_properties.clone()));
-                s.font_size = fs;
-                s.parent_font_size = fs;
-                s.custom_properties = custom;
-                cascade(Some(&styles), tree, n, e, None, &[], &mut s, (1024.0, 768.0), &mut Default::default());
-                parent = Some(s);
-            }
-            parent.unwrap()
-        };
-        assert_eq!(style_for("p").font_size, 40.0);
-        assert_eq!(style_for("in").font_size, 20.0);
-        let p = style_for("p");
-        assert!(matches!(p.margin.top, fos_css::computed::SizeValue::Length(v, _) if v == 12.0));
+        let css = ":root { --big: 30px; --unit: 4px } #p { --big: 40px; font-size: var(--big) } .a { margin-top: calc(var(--unit) * 3) } #in { font-size: calc(1em + var(--unit)) } #out { width: calc(100% - 2em) }";
+        let html = r#"<html><body><nav><a id="in" class="l">x</a></nav><a id="out">y</a><p id="p" class="a b">z</p></body></html>"#;
+        assert_eq!(style_of(css, html, "p").font_size(), 40.0);
+        assert_eq!(style_of(css, html, "in").font_size(), 20.0);
+        assert_eq!(style_of(css, html, "p").box_.margin[0], LpAuto::Lp(Lp::px(12.0)));
+        assert_eq!(style_of(css, html, "out").box_.width, LpAuto::Lp(Lp { px: -32.0, pct: 100.0 }));
     }
 
     #[test]
     fn cascade_order() {
         // Specificity beats source order
         let css = "#p { font-size: 20px } .a { font-size: 10px } p { font-size: 5px }";
-        assert_eq!(style_of(css, HTML, "p").font_size, 20.0);
+        assert_eq!(style_of(css, HTML, "p").font_size(), 20.0);
         // Equal specificity: the later rule wins
         let css = ".a { font-size: 10px } .b { font-size: 12px }";
-        assert_eq!(style_of(css, HTML, "p").font_size, 12.0);
+        assert_eq!(style_of(css, HTML, "p").font_size(), 12.0);
         // !important beats specificity
         let css = "p { font-size: 7px !important } #p { font-size: 20px }";
-        assert_eq!(style_of(css, HTML, "p").font_size, 7.0);
+        assert_eq!(style_of(css, HTML, "p").font_size(), 7.0);
+    }
+
+    #[test]
+    fn user_agent_styles_and_hints() {
+        let html = r#"<html><body><p id="p">x</p><h1 id="h">y</h1><ul><li id="li">z</li></ul><span id="s">s</span><div id="d" hidden>q</div>
+            <table id="t" width="50%" bgcolor="red" align="center"><tr><td id="td" nowrap>1</td></tr></table><font id="f" color="blue" size="5">f</font></body></html>"#;
+        // Page rules override the UA's
+        let p = style_of("p { margin-top: 3px }", html, "p");
+        assert_eq!((p.display(), p.box_.margin[0], p.box_.margin[2]), (Display::Block, LpAuto::Lp(Lp::px(3.0)), LpAuto::Lp(Lp::px(16.0))));
+        let h = style_of("", html, "h");
+        assert_eq!((h.font_size(), h.inherited.font_weight), (32.0, 700));
+        assert_eq!(style_of("", html, "li").display(), Display::ListItem);
+        assert_eq!(style_of("", html, "s").display(), Display::Inline);
+        assert_eq!(style_of("", html, "d").display(), Display::None);
+        let t = style_of("", html, "t");
+        assert_eq!((t.display(), t.box_.width, t.box_.margin[1]), (Display::Table, LpAuto::Lp(Lp::pct(50.0)), LpAuto::Auto));
+        assert_eq!(t.background.color, fos_css::properties::Color::rgb(255, 0, 0));
+        assert_eq!(style_of("", html, "td").inherited.white_space, fos_css::style::WhiteSpace::Nowrap);
+        let f = style_of("", html, "f");
+        assert_eq!((f.color(), f.font_size()), (fos_css::properties::Color::rgb(0, 0, 255), 24.0));
+        // Hints rank below the page's rules
+        assert_eq!(style_of("table { width: 10px }", html, "t").box_.width, LpAuto::Lp(Lp::px(10.0)));
     }
 }

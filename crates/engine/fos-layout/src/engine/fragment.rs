@@ -282,11 +282,20 @@ impl FragmentTree {
     /// paint over earlier ones); boxes with `pointer-events: none` are
     /// transparent to hits
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.hit_test_scrolled(x, y, 0.0)
+    }
+
+    /// [`Self::hit_test`] with the page scrolled by `scroll` (fixed boxes
+    /// stay in the viewport)
+    pub fn hit_test_scrolled(&self, x: f32, y: f32, scroll: f32) -> Option<NodeId> {
         fn hits(b: &BoxFragment) -> bool {
             b.node.is_valid() && b.style.inherited.pointer_events != fos_css::style::PointerEvents::None && b.kind != BoxFragmentKind::Placeholder
         }
-        fn walk(b: &BoxFragment, x: f32, y: f32) -> Option<NodeId> {
-            if !b.ink.contains(x, y) {
+        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32) -> Option<NodeId> {
+            if b.style.box_.position == fos_css::style::Position::Fixed && scroll != 0.0 {
+                return walk(b, x, y - scroll, 0.0);
+            }
+            if !b.ink.contains(x, y) && !(scroll != 0.0 && b.children.iter().any(|c| matches!(c, Fragment::Box(_)))) {
                 return None;
             }
             let mut layers: Vec<&BoxFragment> = b
@@ -301,7 +310,7 @@ impl FragmentTree {
             layers.reverse();
             layers.sort_by_key(|l| std::cmp::Reverse(l.style.box_.z_index.unwrap_or(0)));
             for l in layers {
-                if let Some(n) = walk(l, x, y) {
+                if let Some(n) = walk(l, x, y, scroll) {
                     return Some(n);
                 }
             }
@@ -309,7 +318,7 @@ impl FragmentTree {
                 match c {
                     Fragment::Box(cb) if cb.style.is_positioned() => {}
                     Fragment::Box(cb) => {
-                        if let Some(n) = walk(cb, x, y) {
+                        if let Some(n) = walk(cb, x, y, scroll) {
                             return Some(n);
                         }
                     }
@@ -322,7 +331,7 @@ impl FragmentTree {
             }
             (hits(b) && b.border_box.contains(x, y)).then_some(b.node)
         }
-        walk(self.root.as_ref()?, x, y)
+        walk(self.root.as_ref()?, x, y, scroll)
     }
 }
 

@@ -28,6 +28,11 @@ pub struct Painter<'a> {
     /// The element whose background became the canvas's (not painted
     /// again)
     canvas_background_box: Option<NodeId>,
+    /// How far the page is scrolled (fixed boxes ignore it)
+    scroll: f32,
+    /// Fixed boxes may sit inside boxes scrolled out of view: layers are
+    /// then looked for everywhere
+    find_fixed: bool,
 }
 
 /// A device-space clip rectangle: x0, y0, x1, y1
@@ -159,8 +164,16 @@ pub fn canvas_background(tree: &FragmentTree, is_body: impl Fn(&BoxFragment) -> 
 }
 
 impl<'a> Painter<'a> {
-    pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box }
+    /// `origin` is the document y of the canvas's first row; `scroll` the
+    /// page's scroll position (the canvas may be a band below its top)
+    pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false }
+    }
+
+    /// The page has fixed boxes
+    pub fn with_fixed(mut self, has_fixed: bool) -> Self {
+        self.find_fixed = has_fixed;
+        self
     }
 
     pub fn paint(&mut self, tree: &FragmentTree) {
@@ -253,6 +266,18 @@ impl<'a> Painter<'a> {
     /// z-index, the in-flow content, then positioned descendants by
     /// z-index (tree order among equals)
     fn paint_layer(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        if b.style.box_.position == fos_css::style::Position::Fixed && self.scroll != 0.0 {
+            // Laid out against the viewport at the top of the page: drawn
+            // where the viewport is now
+            let saved = self.origin;
+            self.origin -= self.scroll;
+            let full = Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]);
+            self.scroll = 0.0;
+            self.paint_layer(b, full, alpha);
+            self.scroll = saved - self.origin;
+            self.origin = saved;
+            return;
+        }
         if self.culled(b, clip) {
             return;
         }
@@ -283,7 +308,7 @@ impl<'a> Painter<'a> {
             let Fragment::Box(cb) = c else { continue };
             if Self::is_layer(cb) {
                 out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha));
-            } else if !self.culled(cb, clip) {
+            } else if self.find_fixed || !self.culled(cb, clip) {
                 self.collect_layers(cb, self.inner_clip(cb, clip), alpha * cb.style.box_.opacity, out);
             }
         }

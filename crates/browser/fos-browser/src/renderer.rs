@@ -78,6 +78,8 @@ pub struct PageLayout {
     background: fos_css::properties::Color,
     /// The element whose background is the canvas's
     background_box: Option<NodeId>,
+    /// Some box is `position: fixed` (scrolling must repaint it)
+    has_fixed: bool,
 }
 
 impl PageLayout {
@@ -142,6 +144,8 @@ pub struct PageRenderer {
     /// The page's compiled CSS, by hash of its text and the viewport
     /// (relayouts after DOM changes rarely change the CSS)
     compiled_css: Option<(u64, Option<Arc<PageStyles>>)>,
+    /// The scroll position last painted (where fixed boxes are)
+    scroll: f32,
 }
 
 impl PageRenderer {
@@ -160,6 +164,7 @@ impl PageRenderer {
             layout_generation: 0,
             stylesheets: Default::default(),
             compiled_css: None,
+            scroll: 0.0,
         }
     }
 
@@ -242,7 +247,8 @@ impl PageRenderer {
             && previous.height == self.viewport_height
             && previous.pixels.len() == self.viewport_width as usize * self.viewport_height as usize
             && delta.fract() == 0.0
-            && delta.abs() < self.viewport_height as f32;
+            && delta.abs() < self.viewport_height as f32
+            && self.cached.as_ref().is_some_and(|c| !c.layout.has_fixed);
         if reusable {
             self.repaint_scrolled(previous, scroll_offset)
         } else {
@@ -254,7 +260,7 @@ impl PageRenderer {
     /// The element at `(x, y)` in document coordinates, per the current
     /// layout
     pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
-        self.cached.as_ref()?.layout.hit_test(x, y)
+        self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll)
     }
 
     /// Whether the cached layout reflects `document` as it is now
@@ -283,7 +289,8 @@ impl PageRenderer {
     /// Paint the visible region of the cached layout
     fn paint_cached(&mut self, scroll_offset: f32) -> Option<RenderedPage> {
         let cached = self.cached.take()?;
-        let painted = self.paint(&cached.layout, scroll_offset, self.viewport_height);
+        self.scroll = scroll_offset;
+        let painted = self.paint(&cached.layout, scroll_offset, scroll_offset, self.viewport_height);
         let content_height = cached.layout.content_height();
         let links = links_in(&cached.layout, scroll_offset, self.viewport_height as f32);
         let anchors = anchors_from(&cached.layout, scroll_offset);
@@ -322,7 +329,8 @@ impl PageRenderer {
         };
 
         let band_origin = scroll_offset + band_top as f32;
-        let band = self.paint(&cached.layout, band_origin, shift as u32);
+        self.scroll = scroll_offset;
+        let band = self.paint(&cached.layout, band_origin, scroll_offset, shift as u32);
         page.anchors = anchors_from(&cached.layout, scroll_offset);
         page.links = links_in(&cached.layout, scroll_offset, page.height as f32);
         self.cached = Some(cached);
@@ -427,10 +435,10 @@ impl PageRenderer {
 
     /// Paint the band of `layout` starting at document y `origin`,
     /// `height` rows tall
-    fn paint(&mut self, layout: &PageLayout, origin: f32, height: u32) -> Option<Vec<u32>> {
+    fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
         let bg = layout.background;
         let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
-        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, layout.background_box);
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed);
         painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
     }
@@ -563,7 +571,13 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, fonts:
 
     let body = document.body();
     let (background, background_box) = crate::paint::canvas_background(&fragments, |b| b.node == body);
-    PageLayout { fragments, links, anchors, background, background_box }
+    let mut has_fixed = false;
+    fragments.for_each(|f| {
+        if let Fragment::Box(b) = f {
+            has_fixed |= b.style.box_.position == fos_css::style::Position::Fixed;
+        }
+    });
+    PageLayout { fragments, links, anchors, background, background_box, has_fixed }
 }
 
 #[cfg(test)]
@@ -761,6 +775,25 @@ mod tests {
         assert!(hr.1.w > 250.0 && hr.1.h >= 2.0, "{:?}", hr.1);
         assert!(layout.content_height() >= tops[tops.len() - 1]);
         assert!(layout.anchors.iter().any(|a| a.id == "end"));
+    }
+
+    #[test]
+    fn test_fixed_boxes_stay_in_the_viewport() {
+        let mut html = String::from("<html><body><div style='position: fixed; top: 0; left: 0; width: 50px; height: 20px; background: #f00'></div>");
+        for i in 0..100 {
+            html.push_str(&format!("<p>line {i}</p>"));
+        }
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let top = renderer.render_document(&document, 0.0).unwrap();
+        let scrolled = renderer.render_document_scrolled(&document, 40.0, top).unwrap();
+        // Red (0xffff0000) at the viewport's top-left at both positions
+        assert_eq!(scrolled.pixels[5 * 200 + 5], 0xffff0000);
+        let far = renderer.render_document(&document, 1000.0).unwrap();
+        assert_eq!(far.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(far.pixels[50 * 200 + 5], 0xffff0000);
+        let fixed = renderer.node_at(10.0, 1010.0).unwrap();
+        assert_eq!(document.tree().get(fixed).and_then(|n| n.as_element()).map(|e| document.tree().resolve(e.name.local).to_string()).as_deref(), Some("div"));
     }
 
     #[test]

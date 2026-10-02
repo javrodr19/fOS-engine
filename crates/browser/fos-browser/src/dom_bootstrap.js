@@ -353,64 +353,15 @@
 
   // style: a CSSStyleDeclaration over the `style` attribute
   const camelToKebab = s => s.startsWith('--') ? s : s.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, '-$1-');
-  function parseStyle(text) {
-    const map = new Map();
-    for (const decl of (text || '').split(';')) {
-      const i = decl.indexOf(':');
-      if (i < 0) continue;
-      const k = decl.slice(0, i).trim().toLowerCase();
-      if (k) map.set(k, decl.slice(i + 1).trim());
-    }
-    return map;
-  }
-  const writeStyle = (el, map) => {
-    const text = [...map].map(([k, v]) => k + ': ' + v).join('; ');
-    if (text) el.setAttribute('style', text + ';'); else el.removeAttribute('style');
-  };
-  const styleMethods = {
-    getPropertyValue(el, name) { return parseStyle(el.getAttribute('style')).get(String(name).toLowerCase()) ?? ''; },
-    setProperty(el, name, value) {
-      const map = parseStyle(el.getAttribute('style'));
-      name = String(name).toLowerCase();
-      if (value === null || value === undefined || value === '') map.delete(name);
-      else map.set(name, String(value).replace(/\s*!important\s*$/, ''));
-      writeStyle(el, map);
-    },
-    removeProperty(el, name) {
-      const map = parseStyle(el.getAttribute('style'));
-      const old = map.get(String(name).toLowerCase()) ?? '';
-      map.delete(String(name).toLowerCase());
-      writeStyle(el, map);
-      return old;
-    },
-  };
   const styles = new WeakMap();
   Object.defineProperty(E, 'style', {
     get() {
       let s = styles.get(this);
-      if (s) return s;
-      const el = this;
-      s = new Proxy({}, {
-        get(_, key) {
-          if (typeof key === 'symbol') return undefined;
-          if (key in styleMethods) return (...a) => styleMethods[key](el, ...a);
-          if (key === 'cssText') return el.getAttribute('style') || '';
-          if (key === 'length') return parseStyle(el.getAttribute('style')).size;
-          if (/^\d+$/.test(key)) return [...parseStyle(el.getAttribute('style')).keys()][+key];
-          if (key === 'item') return i => [...parseStyle(el.getAttribute('style')).keys()][i] ?? '';
-          if (key === 'cssFloat') key = 'float';
-          return parseStyle(el.getAttribute('style')).get(camelToKebab(key)) ?? '';
-        },
-        set(_, key, value) {
-          if (typeof key === 'symbol') return true;
-          if (key === 'cssText') { el.setAttribute('style', String(value)); return true; }
-          if (key === 'cssFloat') key = 'float';
-          styleMethods.setProperty(el, camelToKebab(key), value);
-          return true;
-        },
-        has(_, key) { return typeof key === 'string'; },
-      });
-      styles.set(this, s);
+      if (!s) {
+        const el = this;
+        s = makeDeclaration(() => el.getAttribute('style'), (t) => { if (t) el.setAttribute('style', t); else el.removeAttribute('style'); });
+        styles.set(this, s);
+      }
       return s;
     },
     set(v) { this.setAttribute('style', String(v)); },
@@ -885,6 +836,437 @@
     Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
     global.Window = WindowCtor;
   }
+  // ---- CSSOM: style sheets and rules ----
+  //
+  // A <style> element's sheet is parsed from its text when first used.
+  // Rules scripts insert or delete (CSS-in-JS libraries add every rule
+  // with insertRule) go to the renderer, which uses them while the
+  // element's text stays the same; new text makes a new sheet, as in
+  // browsers. Constructed sheets apply through adoptedStyleSheets.
+
+  // Top-level rules of CSS text (statements like @import included)
+  function splitRules(text) {
+    const out = [];
+    const n = text.length;
+    let depth = 0, start = 0, i = 0;
+    const take = (end) => {
+      const r = text.slice(start, end).replace(/^(\s*\/\*[\s\S]*?\*\/)+/, '').trim();
+      start = end;
+      return r;
+    };
+    while (i < n) {
+      const c = text[i];
+      if (c === '/' && text[i + 1] === '*') {
+        const e = text.indexOf('*/', i + 2);
+        i = e < 0 ? n : e + 2;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        i++;
+        while (i < n && text[i] !== c) i += text[i] === '\\' ? 2 : 1;
+        i++;
+        continue;
+      }
+      if (c === '{') depth++;
+      else if (c === '}' && depth > 0) {
+        if (--depth === 0) {
+          const r = take(i + 1);
+          if (r) out.push(r);
+        }
+      } else if (c === ';' && depth === 0) {
+        const r = take(i + 1);
+        if (r.startsWith('@')) out.push(r);
+      }
+      i++;
+    }
+    return out;
+  }
+  // Declarations of a block, split at semicolons outside strings and parentheses
+  function splitDeclarations(text) {
+    const out = [];
+    let depth = 0, quote = '', start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (c === quote) quote = '';
+      } else if (c === '"' || c === "'") quote = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth = Math.max(0, depth - 1);
+      else if (c === ';' && depth === 0) {
+        out.push(text.slice(start, i));
+        start = i + 1;
+      }
+    }
+    out.push(text.slice(start));
+    return out;
+  }
+  function parseDeclarations(text) {
+    const map = new Map();
+    for (const decl of splitDeclarations(text || '')) {
+      const i = decl.indexOf(':');
+      if (i < 0) continue;
+      const k = decl.slice(0, i).trim();
+      if (k) map.set(k.startsWith('--') ? k : k.toLowerCase(), decl.slice(i + 1).trim());
+    }
+    return map;
+  }
+  const serializeDeclarations = (map) => [...map].map(([k, v]) => k + ': ' + v + ';').join(' ');
+
+  // A CSSStyleDeclaration over declaration text that `read` returns and
+  // `write` stores (an element's style attribute, or a rule's body)
+  function CSSStyleDeclaration() { throw new TypeError('Illegal constructor'); }
+  const declarationMethods = {
+    getPropertyValue(d, name) { return d.map().get(normalizeProperty(name))?.replace(/\s*!important$/i, '') ?? ''; },
+    getPropertyPriority(d, name) { return /!important$/i.test(d.map().get(normalizeProperty(name)) ?? '') ? 'important' : ''; },
+    setProperty(d, name, value, priority = '') {
+      const map = d.map();
+      name = normalizeProperty(name);
+      if (value === null || value === undefined || value === '') map.delete(name);
+      else {
+        value = String(value).replace(/\s*!important\s*$/i, '');
+        map.set(name, String(priority).toLowerCase() === 'important' ? value + ' !important' : value);
+      }
+      d.write(serializeDeclarations(map));
+    },
+    removeProperty(d, name) {
+      const map = d.map();
+      name = normalizeProperty(name);
+      const old = map.get(name) ?? '';
+      map.delete(name);
+      d.write(serializeDeclarations(map));
+      return old;
+    },
+    item(d, i) { return [...d.map().keys()][i] ?? ''; },
+  };
+  const normalizeProperty = (name) => { name = String(name); return name.startsWith('--') ? name : name.toLowerCase(); };
+  function makeDeclaration(read, write, parentRule = null) {
+    const d = { map: () => parseDeclarations(read()), write };
+    return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
+      get(target, key) {
+        if (typeof key === 'symbol') return target[key];
+        if (key in declarationMethods) return (...a) => declarationMethods[key](d, ...a);
+        if (key === 'cssText') return serializeDeclarations(d.map());
+        if (key === 'length') return d.map().size;
+        if (key === 'parentRule') return parentRule;
+        if (key === 'constructor') return CSSStyleDeclaration;
+        if (/^\d+$/.test(key)) return [...d.map().keys()][+key];
+        if (key === 'cssFloat') key = 'float';
+        return declarationMethods.getPropertyValue(d, camelToKebab(key));
+      },
+      set(_, key, value) {
+        if (typeof key === 'symbol') return true;
+        if (key === 'cssText') { write(serializeDeclarations(parseDeclarations(String(value)))); return true; }
+        if (key === 'cssFloat') key = 'float';
+        declarationMethods.setProperty(d, camelToKebab(key), value);
+        return true;
+      },
+      has(_, key) { return typeof key === 'string'; },
+    });
+  }
+
+  const ruleTypes = {
+    STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, PAGE_RULE: 6,
+    KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9, NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11,
+    SUPPORTS_RULE: 12, FONT_FEATURE_VALUES_RULE: 14,
+  };
+  class CSSRule {
+    constructor(text, sheet, parent) {
+      Object.defineProperties(this, {
+        _text: { value: text, writable: true },
+        _sheet: { value: sheet, writable: true },
+        _parent: { value: parent ?? null, writable: true },
+      });
+    }
+    get cssText() { return this._text; }
+    set cssText(_) {}
+    get type() { return 0; }
+    get parentStyleSheet() { return this._sheet; }
+    get parentRule() { return this._parent; }
+    _changed() { if (this._parent) this._parent._childChanged(); else if (this._sheet) this._sheet._changed(); }
+  }
+  for (const [k, v] of Object.entries(ruleTypes)) {
+    Object.defineProperty(CSSRule, k, { value: v, enumerable: true });
+    Object.defineProperty(CSSRule.prototype, k, { value: v, enumerable: true });
+  }
+  // The prelude (before `{`) and block (inside the braces) of a rule
+  const prelude = (text) => { const i = text.indexOf('{'); return (i < 0 ? text : text.slice(0, i)).trim(); };
+  const block = (text) => { const i = text.indexOf('{'); const j = text.lastIndexOf('}'); return i < 0 ? '' : text.slice(i + 1, j < i ? text.length : j); };
+  // Rules with declarations: keep their text until a script changes them
+  class DeclarationsRule extends CSSRule {
+    get style() {
+      if (!this._style) {
+        Object.defineProperty(this, '_style', { value: makeDeclaration(() => this._body ?? block(this._text), (t) => {
+          this._body = t;
+          this._text = `${this._prelude()} { ${t} }`;
+          this._changed();
+        }, this), writable: true });
+      }
+      return this._style;
+    }
+    set style(v) { this.style.cssText = v; }
+    _prelude() { return prelude(this._text); }
+  }
+  class CSSStyleRule extends DeclarationsRule {
+    get type() { return 1; }
+    get selectorText() { return this._prelude(); }
+    set selectorText(v) { this._text = `${String(v).trim()} { ${block(this._text).trim()} }`; this._changed(); }
+  }
+  class CSSPageRule extends CSSStyleRule { get type() { return 6; } }
+  class CSSFontFaceRule extends DeclarationsRule { get type() { return 5; } }
+  class CSSKeyframeRule extends DeclarationsRule {
+    get type() { return 8; }
+    get keyText() { return this._prelude(); }
+  }
+  // Rules holding rules (@media, @supports, @keyframes...): children are
+  // parsed on first use; the text is rebuilt once they change
+  class CSSGroupingRule extends CSSRule {
+    _children() {
+      if (!this._rules) Object.defineProperty(this, '_rules', { value: splitRules(block(this._text)).map(r => this._makeChild(r)), writable: true });
+      return this._rules;
+    }
+    _makeChild(text) { return makeRule(text, this._sheet, this); }
+    get cssRules() { return ruleList(this._children()); }
+    insertRule(rule, index = 0) {
+      const rules = this._children();
+      index = Number(index) >>> 0;
+      if (index > rules.length) throw new DOMException(`Failed to execute 'insertRule': the index provided (${index}) is larger than the maximum index (${rules.length}).`, 'IndexSizeError');
+      const parts = splitRules(String(rule));
+      if (parts.length !== 1) throw new DOMException(`Failed to execute 'insertRule': Failed to parse the rule '${rule}'.`, 'SyntaxError');
+      rules.splice(index, 0, this._makeChild(parts[0]));
+      this._childChanged();
+      return index;
+    }
+    deleteRule(index) {
+      const rules = this._children();
+      index = Number(index) >>> 0;
+      if (index >= rules.length) throw new DOMException(`Failed to execute 'deleteRule': the index provided (${index}) is outside the range [0, ${rules.length}).`, 'IndexSizeError');
+      rules.splice(index, 1);
+      this._childChanged();
+    }
+    _childChanged() {
+      this._text = `${prelude(this._text)} {\n${this._children().map(r => '  ' + r.cssText).join('\n')}\n}`;
+      this._changed();
+    }
+    get conditionText() { return prelude(this._text).replace(/^@[-\w]+\s*/, ''); }
+  }
+  class CSSMediaRule extends CSSGroupingRule {
+    get type() { return 4; }
+    get media() { return new MediaList(this.conditionText); }
+  }
+  class CSSSupportsRule extends CSSGroupingRule { get type() { return 12; } }
+  class CSSContainerRule extends CSSGroupingRule {}
+  class CSSLayerBlockRule extends CSSGroupingRule { get name() { return this.conditionText; } }
+  class CSSKeyframesRule extends CSSGroupingRule {
+    get type() { return 7; }
+    get name() { return this.conditionText; }
+    _makeChild(text) { return new CSSKeyframeRule(text, this._sheet, this); }
+    appendRule(text) { this.insertRule(text, this._children().length); }
+    findRule(key) { return this._children().find(r => r.keyText === String(key)) ?? null; }
+    deleteRule(key) {
+      const i = this._children().findIndex(r => r.keyText === String(key));
+      if (i >= 0) super.deleteRule(i);
+    }
+  }
+  class CSSImportRule extends CSSRule {
+    get type() { return 3; }
+    get href() { return /^@import\s+(?:url\()?\s*['"]?([^'")\s]+)/i.exec(this._text)?.[1] ?? ''; }
+    get media() { return new MediaList(''); }
+    get styleSheet() { return null; }
+  }
+  class CSSNamespaceRule extends CSSRule { get type() { return 10; } }
+  function makeRule(text, sheet, parent) {
+    if (text[0] !== '@') return new CSSStyleRule(text, sheet, parent);
+    const name = (/^@([-\w]+)/.exec(text)?.[1] ?? '').toLowerCase().replace(/^-(webkit|moz|o|ms)-/, '');
+    const hasBlock = text.includes('{');
+    switch (name) {
+      case 'media': return new CSSMediaRule(text, sheet, parent);
+      case 'supports': return new CSSSupportsRule(text, sheet, parent);
+      case 'container': return new CSSContainerRule(text, sheet, parent);
+      case 'layer': return hasBlock ? new CSSLayerBlockRule(text, sheet, parent) : new CSSRule(text, sheet, parent);
+      case 'keyframes': return new CSSKeyframesRule(text, sheet, parent);
+      case 'font-face': return new CSSFontFaceRule(text, sheet, parent);
+      case 'page': return new CSSPageRule(text, sheet, parent);
+      case 'import': return new CSSImportRule(text, sheet, parent);
+      case 'namespace': return new CSSNamespaceRule(text, sheet, parent);
+      default: return hasBlock ? new CSSGroupingRule(text, sheet, parent) : new CSSRule(text, sheet, parent);
+    }
+  }
+  class CSSRuleList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  const ruleList = (rules) => { const l = new CSSRuleList(); l.push(...rules); return l; };
+  class MediaList {
+    constructor(text) { Object.defineProperty(this, '_items', { value: String(text).split(',').map(s => s.trim()).filter(Boolean), writable: true }); }
+    get mediaText() { return this._items.join(', '); }
+    set mediaText(v) { this._items = String(v).split(',').map(s => s.trim()).filter(Boolean); }
+    get length() { return this._items.length; }
+    item(i) { return this._items[i] ?? null; }
+    appendMedium(m) { if (!this._items.includes(m)) this._items.push(String(m)); }
+    deleteMedium(m) { this._items = this._items.filter(x => x !== m); }
+    toString() { return this.mediaText; }
+  }
+
+  class StyleSheet {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const sheetState = new WeakMap(); // sheet -> internal state
+  class CSSStyleSheet extends StyleSheet {
+    constructor(options = {}) {
+      const sheet = Object.create(new.target.prototype);
+      sheetState.set(sheet, { text: '', rules: [], parsed: true, owner: null, constructed: true, media: new MediaList(options.media ?? ''), href: null, title: null });
+      sheet.disabled = !!options.disabled;
+      return sheet;
+    }
+    get type() { return 'text/css'; }
+    get href() { return state(this).href; }
+    get title() { return state(this).title; }
+    get ownerNode() { return state(this).owner; }
+    get ownerRule() { return null; }
+    get parentStyleSheet() { return null; }
+    get media() { return state(this).media; }
+    get cssRules() { return ruleList(rulesOf(this)); }
+    get rules() { return this.cssRules; }
+    insertRule(rule, index = 0) {
+      const s = state(this), rules = rulesOf(this);
+      index = Number(index) >>> 0;
+      if (index > rules.length) throw new DOMException(`Failed to execute 'insertRule' on 'CSSStyleSheet': The index provided (${index}) is larger than the maximum index (${rules.length}).`, 'IndexSizeError');
+      const parts = splitRules(String(rule));
+      if (parts.length !== 1 || (s.constructed && /^@import/i.test(parts[0]))) {
+        throw new DOMException(`Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '${rule}'.`, 'SyntaxError');
+      }
+      rules.splice(index, 0, makeRule(parts[0], this, null));
+      this._changed();
+      return index;
+    }
+    deleteRule(index) {
+      const rules = rulesOf(this);
+      index = Number(index) >>> 0;
+      if (index >= rules.length) throw new DOMException(`Failed to execute 'deleteRule' on 'CSSStyleSheet': The index provided (${index}) is outside the range [0, ${rules.length}).`, 'IndexSizeError');
+      rules.splice(index, 1);
+      this._changed();
+    }
+    addRule(selector = 'undefined', style = 'undefined', index) {
+      this.insertRule(`${selector} { ${style} }`, index === undefined ? rulesOf(this).length : index);
+      return -1;
+    }
+    removeRule(index = 0) { this.deleteRule(index); }
+    replaceSync(text) {
+      const s = state(this);
+      if (!s.constructed) throw new DOMException("Failed to execute 'replaceSync' on 'CSSStyleSheet': Can't call replaceSync on non-constructed CSSStyleSheets.", 'NotAllowedError');
+      s.rules = splitRules(String(text)).filter(r => !/^@import/i.test(r)).map(r => makeRule(r, this, null));
+      this._changed();
+    }
+    replace(text) {
+      try { this.replaceSync(text); } catch (e) { return Promise.reject(e); }
+      return Promise.resolve(this);
+    }
+    _css() { return rulesOf(this).map(r => r.cssText).join('\n'); }
+    _changed() {
+      const s = state(this);
+      if (s.owner && s.owner.localName === 'style') __fosSetSheetCSS(s.owner, this._css());
+      else if (s.constructed) flushAdopted();
+    }
+  }
+  const state = (sheet) => {
+    const s = sheetState.get(sheet);
+    if (!s) throw new TypeError('Illegal invocation');
+    return s;
+  };
+  // A sheet's rules, parsed on first use. Cross-origin <link> sheets
+  // can't be read; the browser fetched same-origin ones for rendering
+  // only, so they read as empty.
+  function rulesOf(sheet) {
+    const s = state(sheet);
+    if (s.href && !s.owner?.isConnected) return s.rules;
+    if (s.href && new URL(s.href, document.baseURI).origin !== location.origin) {
+      throw new DOMException("Failed to read the 'cssRules' property from 'CSSStyleSheet': Cannot access rules", 'SecurityError');
+    }
+    if (!s.parsed) {
+      s.parsed = true;
+      s.rules = splitRules(s.text).map(r => makeRule(r, sheet, null));
+    }
+    return s.rules;
+  }
+  // The sheet of a <style> or stylesheet <link>, while connected
+  const elementSheets = new WeakMap(); // element -> { sheet, text }
+  function sheetOf(el) {
+    if (!el.isConnected) return null;
+    const isLink = el.localName === 'link';
+    if (isLink && !/(^|\s)stylesheet(\s|$)/i.test(el.getAttribute('rel') || '')) return null;
+    const text = isLink ? el.href : el.textContent;
+    const cached = elementSheets.get(el);
+    if (cached && cached.text === text) return cached.sheet;
+    if (cached && !isLink) __fosSetSheetCSS(el, null);
+    const sheet = Object.create(CSSStyleSheet.prototype);
+    sheetState.set(sheet, {
+      text: isLink ? '' : text, rules: [], parsed: isLink, owner: el, constructed: false,
+      media: new MediaList(el.getAttribute('media') ?? ''), href: isLink ? el.href : null, title: el.getAttribute('title'),
+    });
+    sheet.disabled = false;
+    elementSheets.set(el, { sheet, text });
+    return sheet;
+  }
+  for (const proto of [HTMLStyleElement.prototype, HTMLLinkElement.prototype]) {
+    Object.defineProperty(proto, 'sheet', { get() { return sheetOf(this); }, configurable: true });
+  }
+  class StyleSheetList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.defineProperty(Document.prototype, 'styleSheets', {
+    get() {
+      const list = new StyleSheetList();
+      for (const el of this.querySelectorAll('style, link')) {
+        const s = sheetOf(el);
+        if (s) list.push(s);
+      }
+      return list;
+    },
+    configurable: true,
+  });
+  // adoptedStyleSheets, on the document and on (stand-in) shadow roots,
+  // which are their hosts: all apply to the whole page
+  const adopters = new Set();
+  const adopted = new WeakMap(); // document or host -> array proxy
+  function flushAdopted() {
+    let css = '';
+    for (const owner of adopters) {
+      for (const s of adopted.get(owner) || []) if (s && !s.disabled) css += s._css() + '\n';
+    }
+    __fosSetAdoptedCSS(css);
+  }
+  const adoptedSheets = {
+    get() {
+      let list = adopted.get(this);
+      if (!list) adopted.set(this, list = observedArray([]));
+      return list;
+    },
+    set(v) {
+      const sheets = Array.from(v);
+      for (const s of sheets) {
+        if (!(s instanceof CSSStyleSheet) || !state(s).constructed) throw new DOMException("Failed to set the 'adoptedStyleSheets' property: Can't adopt non-constructed stylesheets.", 'NotAllowedError');
+      }
+      adopted.set(this, observedArray(sheets));
+      adopters.add(this);
+      flushAdopted();
+    },
+    configurable: true,
+  };
+  // An array whose changes (push, splice, index stores) re-apply the sheets
+  const observedArray = (arr) => new Proxy(arr, {
+    set(target, key, value) { target[key] = value; flushAdopted(); return true; },
+    deleteProperty(target, key) { delete target[key]; flushAdopted(); return true; },
+  });
+  Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedSheets);
+  Object.defineProperty(E, 'adoptedStyleSheets', adoptedSheets);
+  Object.assign(global, {
+    CSSStyleDeclaration, CSSRule, CSSStyleRule, CSSPageRule, CSSFontFaceRule, CSSKeyframeRule, CSSKeyframesRule,
+    CSSGroupingRule, CSSConditionRule: CSSGroupingRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule,
+    CSSImportRule, CSSNamespaceRule, CSSRuleList, MediaList, StyleSheet, CSSStyleSheet, StyleSheetList,
+  });
+
   // Legacy factory constructors
   function Image(width, height) {
     const img = document.createElement('img');
@@ -2036,6 +2418,40 @@
     start() {}
     close() { this._closed = true; }
   }
+  // Channels by name. There is one browsing context per page, so a
+  // message reaches the other channels of the same name in this page.
+  const broadcastChannels = new Map(); // name -> Set of channels
+  class BroadcastChannel extends EventTargetCtor {
+    constructor(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+      super();
+      Object.defineProperties(this, { _name: { value: String(name) }, _closed: { value: false, writable: true }, _onmessage: { value: null, writable: true } });
+      let set = broadcastChannels.get(this._name);
+      if (!set) broadcastChannels.set(this._name, set = new Set());
+      set.add(this);
+    }
+    get name() { return this._name; }
+    get onmessage() { return this._onmessage; }
+    set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; }
+    postMessage(data) {
+      if (this._closed) throw new DOMException("Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed", 'InvalidStateError');
+      const value = structuredClone(data);
+      const targets = [...(broadcastChannels.get(this._name) || [])].filter(c => c !== this);
+      setTimeout(() => {
+        for (const target of targets) {
+          if (target._closed) continue;
+          const ev = Object.assign(new Event('message'), { data: value, ports: [], origin: location.origin, lastEventId: '' });
+          target.dispatchEvent(ev);
+          if (target._onmessage) { try { target._onmessage.call(target, ev); } catch (e) { reportError(e); } }
+        }
+      }, 0);
+    }
+    close() {
+      this._closed = true;
+      broadcastChannels.get(this._name)?.delete(this);
+    }
+  }
+  global.BroadcastChannel = BroadcastChannel;
   class MessageChannel {
     constructor() {
       const port1 = new MessagePort(), port2 = new MessagePort();

@@ -16,6 +16,12 @@ pub struct Document {
     body_element: NodeId,
     /// The contents fragment of each `<template>` element (outside the tree)
     template_contents: std::collections::HashMap<NodeId, NodeId>,
+    /// CSS of `<style>` elements whose sheets scripts changed through the
+    /// CSSOM (`insertRule`): (the element's text when it happened, the
+    /// sheet's CSS). The CSS applies while the element's text is unchanged.
+    sheet_overrides: std::collections::HashMap<NodeId, (String, String)>,
+    /// CSS of the document's adopted (constructed) style sheets
+    adopted_css: String,
 }
 
 impl Document {
@@ -39,6 +45,8 @@ impl Document {
             head_element: head,
             body_element: body,
             template_contents: Default::default(),
+            sheet_overrides: Default::default(),
+            adopted_css: String::new(),
         }
     }
     
@@ -51,6 +59,8 @@ impl Document {
             head_element: NodeId::NONE,
             body_element: NodeId::NONE,
             template_contents: Default::default(),
+            sheet_overrides: Default::default(),
+            adopted_css: String::new(),
         }
     }
     
@@ -62,6 +72,38 @@ impl Document {
     /// Set the contents fragment of `<template>` element `template`
     pub fn set_template_content(&mut self, template: NodeId, fragment: NodeId) {
         self.template_contents.insert(template, fragment);
+    }
+
+    /// The CSS a script gave `<style>` element `style` through the CSSOM,
+    /// if its text is still `text`
+    pub fn sheet_override(&self, style: NodeId, text: &str) -> Option<&str> {
+        self.sheet_overrides.get(&style).filter(|(source, _)| source == text).map(|(_, css)| css.as_str())
+    }
+
+    /// Record the CSS of `style`'s sheet (`None` drops it); styles and
+    /// layout are redone
+    pub fn set_sheet_override(&mut self, style: NodeId, text: String, css: Option<String>) {
+        match css {
+            Some(css) => {
+                self.sheet_overrides.insert(style, (text, css));
+            }
+            None => {
+                self.sheet_overrides.remove(&style);
+            }
+        }
+        self.tree.mark_mutated();
+    }
+
+    /// CSS of the adopted style sheets, applied after the page's own
+    pub fn adopted_css(&self) -> &str {
+        &self.adopted_css
+    }
+
+    pub fn set_adopted_css(&mut self, css: String) {
+        if css != self.adopted_css {
+            self.adopted_css = css;
+            self.tree.mark_mutated();
+        }
     }
 
     /// Finalize the document after parsing - finds html, head, body elements

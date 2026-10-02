@@ -1050,7 +1050,20 @@ pub fn report_exception(vm: &mut Vm, e: Value) {
 // ---- console, misc ----
 
 fn console_message(vm: &mut Vm, args: &[Value], level: ConsoleLevel) -> JsResult<Value> {
-    let parts: Vec<String> = args.iter().map(|&a| vm.display(a)).collect();
+    // Errors print with their stack, as in browsers
+    let parts: Vec<String> = args
+        .iter()
+        .map(|&a| {
+            if let Some(o) = a.as_object().filter(|o| matches!(o.get().kind, ObjectKind::Error(_))) {
+                if let Ok(stack) = vm.get_str(Value::object(o), "stack") {
+                    if stack.is_string() {
+                        return vm.display(stack);
+                    }
+                }
+            }
+            vm.display(a)
+        })
+        .collect();
     let line = parts.join(" ");
     match level {
         ConsoleLevel::Error => log::error!("[console] {line}"),
@@ -1114,6 +1127,26 @@ fn template_content(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> J
         }
     });
     Ok(wrap(vm, fragment))
+}
+
+/// `__fosSetSheetCSS(style, css)`: the CSS of a `<style>` element's sheet
+/// after CSSOM changes (null: back to its text), for rendering
+fn set_sheet_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let css = if arg(args, 1).is_nullish() { None } else { Some(arg_string(vm, args, 1)?) };
+    with_doc(vm, |d| {
+        let tree = d.tree();
+        let text: String = tree.children(id).filter_map(|(_, c)| c.as_text()).collect();
+        d.set_sheet_override(id, text, css);
+    });
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosSetAdoptedCSS(css)`: the CSS of `document.adoptedStyleSheets`
+fn set_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let css = arg_string(vm, args, 0)?;
+    with_doc(vm, |d| d.set_adopted_css(css));
+    Ok(Value::UNDEFINED)
 }
 
 /// `__fosRandomBytes(n)`: an ArrayBuffer of `n` bytes from the OS's
@@ -1630,6 +1663,8 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosRandomBytes", 1, random_bytes),
         ("__fosTemplateContent", 1, template_content),
         ("__fosSetElementPrototype", 2, set_element_prototype),
+        ("__fosSetSheetCSS", 2, set_sheet_css),
+        ("__fosSetAdoptedCSS", 1, set_adopted_css),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

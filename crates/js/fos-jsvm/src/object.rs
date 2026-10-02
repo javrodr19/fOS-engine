@@ -386,6 +386,8 @@ pub struct JsObject {
     pub class_constructor: bool,
     /// Keep shape mode however many properties it gets (the global object)
     pub keep_shape: bool,
+    /// An array whose `length` is not writable (frozen, or so defined)
+    pub length_readonly: bool,
     /// Built-in properties not created yet (functions' `length`, `name`
     /// and `prototype`): see `LAZY_*`
     pub lazy: u8,
@@ -534,6 +536,7 @@ impl JsObject {
             is_prototype: false,
             class_constructor: false,
             keep_shape: false,
+            length_readonly: false,
             lazy: 0,
             proto,
             slots: Vec::new(),

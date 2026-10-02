@@ -440,12 +440,15 @@ impl PageRenderer {
                 }
             }
             if is_style {
+                let mut text = String::new();
                 for (_, child) in tree.children(id) {
-                    if let Some(text) = child.as_text() {
-                        css.push_str(text);
-                        css.push('\n');
+                    if let Some(t) = child.as_text() {
+                        text.push_str(t);
                     }
                 }
+                // A sheet scripts changed through the CSSOM (`insertRule`)
+                css.push_str(document.sheet_override(id, &text).unwrap_or(&text));
+                css.push('\n');
             } else if let Some(href) = tree.get_attribute(id, "href") {
                 let base = base.get_or_insert_with(|| crate::css_loader::base_url(document));
                 let url = fos_net::url_util::resolve(base, href.trim());
@@ -456,6 +459,7 @@ impl PageRenderer {
             }
             true
         });
+        css.push_str(document.adopted_css());
         css
     }
 

@@ -188,17 +188,23 @@ pub(crate) fn define_from_descriptor(vm: &mut Vm, o: Gc<JsObject>, key: Property
                 if let Some(v) = desc.value {
                     vm.set_array_length(o, v)?;
                 }
+                if desc.writable == Some(false) {
+                    o.get_mut().length_readonly = true;
+                }
                 return Ok(true);
             }
             return Ok(false);
         }
-    } else if !o.get().extensible {
+    } else if !o.get().extensible || crate::vm::property::grows_readonly_length(o, key) {
         return Ok(false);
     }
     let base = old_flags.unwrap_or(PropFlags::NONE);
     let enumerable = desc.enumerable.unwrap_or(base.enumerable());
     let configurable = desc.configurable.unwrap_or(base.configurable());
-    if desc.get.is_some() || desc.set.is_some() {
+    // A generic descriptor ({ enumerable } alone) keeps an accessor an
+    // accessor, with its getter and setter
+    let generic = desc.get.is_none() && desc.set.is_none() && desc.value.is_none() && desc.writable.is_none();
+    if desc.get.is_some() || desc.set.is_some() || (generic && old_flags.is_some_and(|f| f.is_accessor())) {
         let mut flags = PropFlags::NONE.with(PropFlags::ENUMERABLE, enumerable).with(PropFlags::CONFIGURABLE, configurable);
         if old_flags.is_some_and(|f| !f.is_accessor()) {
             // Data -> accessor: replace
@@ -412,6 +418,9 @@ pub(crate) fn set_integrity(vm: &mut Vm, o: Gc<JsObject>, frozen: bool) {
     }
     let ob = o.get_mut();
     ob.extensible = false;
+    if frozen && ob.is_array() {
+        ob.length_readonly = true;
+    }
     // Inline caches never match dictionary objects, so cached stores
     // can't bypass the new attributes
     ob.to_dictionary(&vm.shapes);
@@ -497,12 +506,12 @@ fn has_own_property(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -
 fn is_prototype_of(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(v) = arg(args, 0).as_object() else { return Ok(Value::FALSE) };
     let o = vm.to_object(this)?;
-    let mut cur = v.get().proto;
+    let mut cur = vm.prototype_of(v)?;
     while let Some(c) = cur {
         if c == o {
             return Ok(Value::TRUE);
         }
-        cur = c.get().proto;
+        cur = vm.prototype_of(c)?;
     }
     Ok(Value::FALSE)
 }

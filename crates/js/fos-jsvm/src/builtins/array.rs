@@ -174,7 +174,9 @@ fn delete_idx(vm: &mut Vm, o: Gc<JsObject>, i: u64) -> JsResult<()> {
 fn dense(o: Gc<JsObject>) -> bool {
     let ob = o.get();
     match ob.kind {
-        ObjectKind::Array { length } => ob.elements.len() == length as usize && ob.dict.is_none() && !ob.elements.iter().any(|e| e.is_hole()),
+        ObjectKind::Array { length } => {
+            ob.elements.len() == length as usize && ob.dict.is_none() && !ob.length_readonly && !ob.elements.iter().any(|e| e.is_hole())
+        }
         _ => false,
     }
 }
@@ -290,7 +292,7 @@ fn push(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<V
     {
         let ob = o.get_mut();
         if let ObjectKind::Array { length } = &mut ob.kind {
-            if *length as usize == ob.elements.len() && ob.extensible && (*length as u64 + args.len() as u64) < u32::MAX as u64 {
+            if *length as usize == ob.elements.len() && ob.extensible && !ob.length_readonly && (*length as u64 + args.len() as u64) < u32::MAX as u64 {
                 *length += args.len() as u32;
                 let len = *length;
                 ob.elements.extend_from_slice(args);
@@ -311,8 +313,9 @@ fn pop(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObject>) -> JsResult<V
     let o = vm.to_object(this)?;
     {
         let ob = o.get_mut();
+        let readonly = ob.length_readonly;
         if let ObjectKind::Array { length } = &mut ob.kind {
-            if *length as usize == ob.elements.len() && *length > 0 {
+            if *length as usize == ob.elements.len() && *length > 0 && !readonly {
                 let v = ob.elements.pop().unwrap();
                 if !v.is_hole() {
                     *length -= 1;

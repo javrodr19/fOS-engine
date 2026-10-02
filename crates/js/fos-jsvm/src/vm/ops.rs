@@ -546,14 +546,22 @@ impl Vm {
         let Some(p) = p.as_object() else {
             return Err(self.type_error("Function has non-object prototype in instanceof check"));
         };
-        let mut cur = o.get().proto;
+        let mut cur = self.prototype_of(o)?;
         while let Some(c) = cur {
             if c == p {
                 return Ok(true);
             }
-            cur = c.get().proto;
+            cur = self.prototype_of(c)?;
         }
         Ok(false)
+    }
+
+    /// [[GetPrototypeOf]]: a proxy's comes from its handler (or target)
+    pub(crate) fn prototype_of(&mut self, o: Gc<JsObject>) -> JsResult<Option<Gc<JsObject>>> {
+        if crate::builtins::proxy::is_proxy(o) {
+            return Ok(self.proxy_get_prototype(o)?.as_object());
+        }
+        Ok(o.get().proto)
     }
 
     pub fn is_callable(&self, v: Value) -> bool {

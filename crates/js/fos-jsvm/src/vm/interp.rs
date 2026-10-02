@@ -715,7 +715,7 @@ impl Vm {
                                     crate::builtins::typedarray::ta_set(ob, i as u32, n);
                                     continue;
                                 }
-                            } else if i == ob.elements.len() && ob.extensible && !ob.is_prototype {
+                            } else if i == ob.elements.len() && ob.extensible && !ob.is_prototype && !ob.length_readonly {
                                 if let ObjectKind::Array { length } = &mut ob.kind {
                                     if *length as usize == i {
                                         *length += 1;

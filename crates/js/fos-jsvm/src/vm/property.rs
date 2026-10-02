@@ -112,7 +112,8 @@ impl Vm {
         let ob = o.get();
         match &ob.kind {
             ObjectKind::Array { length } if key == PropertyKey::Atom(atoms::length) => {
-                return Some(Own::Virtual(Value::number(*length as f64), PropFlags(PropFlags::WRITABLE)));
+                let flags = if ob.length_readonly { PropFlags::NONE } else { PropFlags(PropFlags::WRITABLE) };
+                return Some(Own::Virtual(Value::number(*length as f64), flags));
             }
             ObjectKind::TypedArray(t) => {
                 if let PropertyKey::Index(i) = key {
@@ -134,7 +135,7 @@ impl Vm {
         ob.find_own(&self.shapes, key).map(|(s, f)| Own::Slot(s, f))
     }
 
-    /// Add a property known to be absent
+    /// Add a property known to be absent (see `grows_readonly_length`)
     pub(crate) fn add_prop(&mut self, o: Gc<JsObject>, key: PropertyKey, v: Value, flags: PropFlags) -> Slot {
         let ob = o.get_mut();
         if let (PropertyKey::Index(i), ObjectKind::Array { length }) = (key, &mut ob.kind) {
@@ -384,7 +385,7 @@ impl Vm {
                     break;
                 }
                 Some(Own::Virtual(_, flags)) => {
-                    if Value::object(cur) == receiver && cur.get().is_array() && key == PropertyKey::Atom(atoms::length) {
+                    if Value::object(cur) == receiver && cur.get().is_array() && key == PropertyKey::Atom(atoms::length) && flags.writable() {
                         self.set_array_length(cur, val)?;
                         return Ok(true);
                     }
@@ -430,7 +431,7 @@ impl Vm {
                 return Ok(true);
             }
         }
-        if !r.get().extensible {
+        if !r.get().extensible || grows_readonly_length(r, key) {
             return Ok(false);
         }
         self.add_prop(r, key, val, PropFlags::DEFAULT);
@@ -738,7 +739,8 @@ impl Vm {
             }
             ObjectKind::Array { .. } => {
                 let split = keys.iter().position(|(k, _)| !matches!(k, PropertyKey::Index(_))).unwrap_or(keys.len());
-                keys.insert(split, (PropertyKey::Atom(atoms::length), PropFlags(PropFlags::WRITABLE)));
+                let flags = if o.get().length_readonly { PropFlags::NONE } else { PropFlags(PropFlags::WRITABLE) };
+                keys.insert(split, (PropertyKey::Atom(atoms::length), flags));
             }
             _ => {}
         }
@@ -1220,4 +1222,11 @@ fn push_values(arr: Gc<JsObject>, values: &[Value]) {
     if let ObjectKind::Array { length } = &mut ob.kind {
         *length += values.len() as u32;
     }
+}
+
+/// Whether adding `key` would grow an array whose `length` is read-only,
+/// which arrays reject
+pub(crate) fn grows_readonly_length(o: Gc<JsObject>, key: PropertyKey) -> bool {
+    let ob = o.get();
+    matches!((key, &ob.kind), (PropertyKey::Index(i), ObjectKind::Array { length }) if ob.length_readonly && i >= *length)
 }

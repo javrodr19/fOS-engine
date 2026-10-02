@@ -1027,6 +1027,26 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_channel() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut run_timers = |rt: &mut PageJsRuntime| {
+            for _ in 0..3 {
+                rt.process_timers(&mut |_: &str| None).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        rt.eval("window.got = []; window.a = new BroadcastChannel('c'); window.b = new BroadcastChannel('c'); const other = new BroadcastChannel('x');
+            b.onmessage = e => got.push('b:' + e.data.n); a.addEventListener('message', () => got.push('a'));
+            other.onmessage = () => got.push('other');
+            a.postMessage({ n: 1 });").unwrap();
+        run_timers(&mut rt);
+        rt.eval("b.close(); a.postMessage({ n: 2 }); try { b.postMessage(1); } catch (e) { got.push(e.name); }").unwrap();
+        run_timers(&mut rt);
+        assert_eq!(rt.eval("[got.join(), new BroadcastChannel('n').name].join('|')").unwrap(), "b:1,InvalidStateError|n");
+    }
+
+    #[test]
     fn streams_and_message_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();
@@ -1532,6 +1552,51 @@ mod tests {
         for (code, want) in cases {
             assert_eq!(rt.eval(code).unwrap(), want, "{code}");
         }
+    }
+
+    #[test]
+    fn cssom_rules_reach_rendering() {
+        let (mut rt, doc) = page(
+            r#"<html><head><style id=st>/* base */ #a { color: red } @media (min-width: 1px) { #b { color: blue } }</style></head>
+            <body><p id=a>first</p><p id=b>second</p><p id=c>third</p></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // Reading the sheet the page parsed
+        assert_eq!(
+            rt.eval("const sheet = document.getElementById('st').sheet;
+                [document.styleSheets.length, sheet.cssRules.length, sheet.cssRules[0].selectorText, sheet.cssRules[0].style.color, sheet.cssRules[0].type,
+                 sheet.cssRules[1] instanceof CSSMediaRule, sheet.cssRules[1].conditionText, sheet.cssRules[1].cssRules[0].selectorText, sheet.ownerNode.id].join()").unwrap(),
+            "1,2,#a,red,1,true,(min-width: 1px),#b,st"
+        );
+        // A CSS-in-JS library's way of styling: rules only through insertRule
+        let visible = |rt: &mut PageJsRuntime| -> String {
+            let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+            renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+            rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+            rt.eval("['a', 'b', 'c'].map(id => document.getElementById(id).getClientRects().length).join('')").unwrap()
+        };
+        assert_eq!(visible(&mut rt), "111");
+        rt.eval("const style = document.createElement('style'); document.head.appendChild(style);
+            const s = style.sheet;
+            s.insertRule('#c { display: none }', 0);
+            s.insertRule('.unused { color: green }', 1);").unwrap();
+        assert_eq!(visible(&mut rt), "110");
+        // Editing a rule's declarations, deleting it, constructed sheets
+        rt.eval("document.getElementById('st').sheet.cssRules[0].style.setProperty('display', 'none');").unwrap();
+        assert_eq!(visible(&mut rt), "010");
+        rt.eval("s.deleteRule(0); const c = new CSSStyleSheet(); c.replaceSync('#b { display: none }'); document.adoptedStyleSheets = [c];").unwrap();
+        assert_eq!(visible(&mut rt), "001");
+        rt.eval("document.adoptedStyleSheets = []; document.getElementById('st').textContent = '#c { color: red }';").unwrap();
+        assert_eq!(visible(&mut rt), "111");
+        // Errors and serialization
+        assert_eq!(
+            rt.eval("const errs = [];
+                for (const f of [() => s.insertRule('a {} b {}'), () => s.insertRule('a {}', 99), () => s.deleteRule(5), () => s.replaceSync('x {}'), () => { document.adoptedStyleSheets = [s]; }])
+                  try { f(); errs.push('ok'); } catch (e) { errs.push(e.name); }
+                const el = document.getElementById('a'); el.style.setProperty('margin-top', '2px', 'important'); el.style.backgroundImage = 'url(\"data:image/png;base64,AA==\")';
+                [errs.join(), s.cssRules[0].cssText, el.style.getPropertyPriority('margin-top'), el.style.backgroundImage, el.style.length, el.style instanceof CSSStyleDeclaration].join('|')").unwrap(),
+            "SyntaxError,IndexSizeError,IndexSizeError,NotAllowedError,NotAllowedError|.unused { color: green }|important|url(\"data:image/png;base64,AA==\")|2|true"
+        );
     }
 
     #[test]

@@ -1431,3 +1431,42 @@ fn computed_function_names() {
         ("const k3 = 'f'; ({ [k3]: function named() {} }).f.name", "'named'"),
     ]);
 }
+
+/// Redefining a property with a partial descriptor keeps what it omits
+#[test]
+fn partial_property_redefinition() {
+    check(&[
+        // React's input value tracker
+        ("var o = {}, cur; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; }, set(x) { cur = x; } }); Object.defineProperty(o, 'v', { enumerable: false }); (function () { 'use strict'; o.v = 5; })(); var d = Object.getOwnPropertyDescriptor(o, 'v'); [cur, typeof d.get, typeof d.set, 'value' in d, d.configurable]", "[ 5, 'function', 'function', false, true ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; }, set(x) {} }); Object.defineProperty(o, 'v', { get() { return 2; } }); [o.v, typeof Object.getOwnPropertyDescriptor(o, 'v').set]", "[ 2, 'function' ]"),
+        ("var o = { v: 1 }; Object.defineProperty(o, 'v', { enumerable: false }); var d = Object.getOwnPropertyDescriptor(o, 'v'); [d.value, d.writable, d.enumerable]", "[ 1, true, false ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; } }); Object.defineProperty(o, 'v', { value: 3 }); var d = Object.getOwnPropertyDescriptor(o, 'v'); [d.value, d.writable, 'get' in d]", "[ 3, false, false ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { get() { return 1; } }); try { Object.defineProperty(o, 'v', { enumerable: true }); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+    ]);
+}
+
+/// Frozen arrays, and arrays whose length is read-only
+#[test]
+fn frozen_arrays() {
+    check(&[
+        // DOMPurify's addToSet only writes to arrays that are not frozen
+        ("[Object.isFrozen(Object.freeze(['A'])), Object.isFrozen(Object.freeze([])), Object.isFrozen(Object.seal([1])), Object.isSealed(Object.freeze([1]))]", "[ true, true, false, true ]"),
+        ("Object.getOwnPropertyDescriptor(Object.freeze([1]), 'length').writable", "false"),
+        ("var a = Object.freeze([1, 2]); a.length = 0; a[5] = 1; a[0] = 9; [a.length, a[0], a[5]]", "[ 2, 1, undefined ]"),
+        ("var a = Object.freeze([1]); [() => a.push(2), () => a.pop(), () => a.shift(), () => a.unshift(0), () => a.splice(0, 1)].map(f => { try { f(); return 'ok'; } catch (e) { return e.constructor.name; } })", "[ 'TypeError', 'TypeError', 'TypeError', 'TypeError', 'TypeError' ]"),
+        ("var b = [1, 2, 3]; Object.defineProperty(b, 'length', { writable: false }); var r = []; try { b.push(4); } catch (e) { r.push(e.constructor.name); } b[0] = 7; b[3] = 1; [r[0], b.length, b[0], b[3], Object.isFrozen(b)]", "[ 'TypeError', 3, 7, undefined, false ]"),
+        ("(function () { 'use strict'; var a = Object.freeze([1]); try { a.length = 0; return 'no'; } catch (e) { return e.constructor.name; } })()", "'TypeError'"),
+        ("var b = [1]; Object.defineProperty(b, 'length', { writable: false }); try { Object.defineProperty(b, 'length', { writable: true }); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+    ]);
+}
+
+/// instanceof and isPrototypeOf see a proxy's [[GetPrototypeOf]]
+#[test]
+fn proxy_prototype_chain() {
+    check(&[
+        ("class A {} [new Proxy(new A(), {}) instanceof A, A.prototype.isPrototypeOf(new Proxy(new A(), {}))]", "[ true, true ]"),
+        ("class B {} new Proxy({}, { getPrototypeOf() { return B.prototype; } }) instanceof B", "true"),
+        ("class C {} const p = new Proxy(Object.create(C.prototype), {}); Object.create(p) instanceof C", "true"),
+        ("var log = []; class D {} new Proxy({}, { getPrototypeOf(t) { log.push('trap'); return null; } }) instanceof D; log.join()", "'trap'"),
+    ]);
+}

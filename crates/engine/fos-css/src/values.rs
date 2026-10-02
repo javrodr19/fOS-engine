@@ -14,11 +14,70 @@ use crate::Declaration;
 /// Most nested `var()` substitutions followed (guards against blow-up)
 const MAX_VAR_DEPTH: u32 = 32;
 
+/// Where `var()` looks names up
+pub trait VarSource: std::fmt::Debug {
+    fn var(&self, name: &str) -> Option<&str>;
+}
+
+impl VarSource for HashMap<String, String> {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.get(name).map(String::as_str)
+    }
+}
+
+/// An element's computed custom properties: the ones it declares, over its
+/// parent's (shared, never copied: pages define thousands of variables
+/// at the root and override a few per component)
+#[derive(Debug, Default, PartialEq)]
+pub struct CustomProperties {
+    /// Declared here; `None` marks a property made invalid (a cycle),
+    /// which hides the inherited one
+    own: HashMap<String, Option<String>>,
+    parent: Option<std::sync::Arc<CustomProperties>>,
+    depth: u16,
+}
+
+/// Chains longer than this are flattened (lookups stay short)
+const MAX_CUSTOM_CHAIN: u16 = 12;
+
+impl CustomProperties {
+    /// The computed value of property `name`
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let mut at = Some(self);
+        while let Some(c) = at {
+            if let Some(v) = c.own.get(name) {
+                return v.as_deref();
+            }
+            at = c.parent.as_deref();
+        }
+        None
+    }
+
+    /// Every defined property (nearest definition wins)
+    pub fn to_map(&self) -> HashMap<String, String> {
+        let mut out: HashMap<String, Option<String>> = HashMap::new();
+        let mut at = Some(self);
+        while let Some(c) = at {
+            for (k, v) in &c.own {
+                out.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            at = c.parent.as_deref();
+        }
+        out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
+    }
+}
+
+impl VarSource for CustomProperties {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.get(name)
+    }
+}
+
 /// What values are computed against
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveContext<'a> {
     /// The element's custom properties (already computed)
-    pub custom: Option<&'a HashMap<String, String>>,
+    pub custom: Option<&'a dyn VarSource>,
     /// The element's font size (what `em` means, except in `font-size`)
     pub font_size: f32,
     /// The parent's font size (what `em` and `%` mean in `font-size`)
@@ -80,11 +139,11 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
 /// Replace every `var(--name[, fallback])` in `value`; `None` if a
 /// reference has neither a value nor a fallback (the declaration is then
 /// "invalid at computed-value time")
-pub fn substitute_vars(value: &str, custom: Option<&HashMap<String, String>>) -> Option<String> {
+pub fn substitute_vars(value: &str, custom: Option<&dyn VarSource>) -> Option<String> {
     substitute(value, custom, 0)
 }
 
-fn substitute(value: &str, custom: Option<&HashMap<String, String>>, depth: u32) -> Option<String> {
+fn substitute(value: &str, custom: Option<&dyn VarSource>, depth: u32) -> Option<String> {
     if depth > MAX_VAR_DEPTH {
         return None;
     }
@@ -99,7 +158,7 @@ fn substitute(value: &str, custom: Option<&HashMap<String, String>>, depth: u32)
             Some(c) => (inner[..c].trim(), Some(&inner[c + 1..])),
             None => (inner.trim(), None),
         };
-        let replacement = match custom.and_then(|m| m.get(name)) {
+        let replacement = match custom.and_then(|m| m.var(name)) {
             Some(v) => substitute(v, custom, depth + 1)?,
             None => substitute(fallback?.trim(), custom, depth + 1)?,
         };
@@ -112,36 +171,43 @@ fn substitute(value: &str, custom: Option<&HashMap<String, String>>, depth: u32)
 
 /// Compute the custom properties an element declares (`own`, in cascade
 /// order) on top of the inherited ones: references between them are
-/// resolved, and cycles make the properties involved invalid (unset)
-pub fn compute_custom_properties(inherited: Option<&HashMap<String, String>>, own: &[(&str, &str)]) -> HashMap<String, String> {
+/// resolved, and cycles make the properties involved invalid
+pub fn compute_custom_properties(inherited: Option<&std::sync::Arc<CustomProperties>>, own: &[(&str, &str)]) -> CustomProperties {
     let mut raw: HashMap<&str, &str> = HashMap::new();
     for &(name, value) in own {
         raw.insert(name, value);
     }
-    let mut out: HashMap<String, String> = inherited.cloned().unwrap_or_default();
-    for &name in raw.keys() {
-        out.remove(name);
-    }
+    let parent = inherited.map(|p| &**p);
+    let mut done: HashMap<String, String> = HashMap::new();
     let names: Vec<&str> = raw.keys().copied().collect();
     let mut resolving = Vec::new();
-    for name in names {
-        resolve_custom(name, &raw, &mut out, inherited, &mut resolving);
+    for &name in &names {
+        resolve_custom(name, &raw, &mut done, parent, &mut resolving);
     }
-    out
+    let mut own: HashMap<String, Option<String>> = names.iter().map(|&n| (n.to_string(), done.remove(n))).collect();
+    let depth = inherited.map_or(0, |p| p.depth + 1);
+    if depth > MAX_CUSTOM_CHAIN {
+        // Flatten: copy the inherited properties under this level's
+        for (k, v) in inherited.map(|p| p.to_map()).unwrap_or_default() {
+            own.entry(k).or_insert(Some(v));
+        }
+        return CustomProperties { own, parent: None, depth: 0 };
+    }
+    CustomProperties { own, parent: inherited.cloned(), depth }
 }
 
 fn resolve_custom<'a>(
     name: &'a str,
     raw: &HashMap<&'a str, &'a str>,
     done: &mut HashMap<String, String>,
-    inherited: Option<&HashMap<String, String>>,
+    inherited: Option<&CustomProperties>,
     resolving: &mut Vec<&'a str>,
 ) -> Option<String> {
     if let Some(v) = done.get(name) {
         return Some(v.clone());
     }
     let Some(&value) = raw.get(name) else {
-        return inherited.and_then(|m| m.get(name)).cloned();
+        return inherited.and_then(|m| m.get(name)).map(str::to_string);
     };
     if resolving.contains(&name) {
         // A cycle: every property in it is invalid
@@ -164,7 +230,7 @@ fn resolve_custom<'a>(
             if let Some(v) = resolve_custom(key, raw, done, inherited, resolving) {
                 local.insert(referenced.to_string(), v);
             }
-        } else if let Some(v) = done.get(referenced).cloned().or_else(|| inherited.and_then(|m| m.get(referenced)).cloned()) {
+        } else if let Some(v) = done.get(referenced).cloned().or_else(|| inherited.and_then(|m| m.get(referenced)).map(str::to_string)) {
             local.insert(referenced.to_string(), v);
         }
         at = close + 1;
@@ -454,7 +520,7 @@ pub struct ResolveCache {
     entries: HashMap<CacheKey, Vec<Declaration>>,
     /// The custom property maps keyed by address, kept alive so an address
     /// is never reused by another map while the cache exists
-    pinned: HashMap<usize, std::sync::Arc<HashMap<String, String>>>,
+    pinned: HashMap<usize, std::sync::Arc<CustomProperties>>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -475,7 +541,7 @@ impl ResolveCache {
         name: &str,
         value: &str,
         important: bool,
-        custom: Option<&std::sync::Arc<HashMap<String, String>>>,
+        custom: Option<&std::sync::Arc<CustomProperties>>,
         ctx: &ResolveContext,
     ) -> &[Declaration] {
         let addr = custom.map_or(0, |m| std::sync::Arc::as_ptr(m) as usize);
@@ -519,7 +585,7 @@ mod tests {
     use super::*;
     use crate::properties::{Length, LengthUnit, PropertyValue};
 
-    fn ctx(custom: Option<&HashMap<String, String>>) -> ResolveContext<'_> {
+    fn ctx(custom: Option<&dyn VarSource>) -> ResolveContext<'_> {
         ResolveContext { custom, font_size: 20.0, parent_font_size: 10.0, root_font_size: 16.0, viewport: (1000.0, 800.0) }
     }
 
@@ -533,22 +599,34 @@ mod tests {
     #[test]
     fn var_substitution() {
         let m: HashMap<String, String> = [("--a".to_string(), "10px".to_string()), ("--c".to_string(), "red".to_string())].into();
-        assert_eq!(substitute_vars("var(--a) var(--b, 2px) VAR(--c)", Some(&m)).as_deref(), Some("10px 2px red"));
-        assert_eq!(substitute_vars("var(--missing, var(--a))", Some(&m)).as_deref(), Some("10px"));
-        assert_eq!(substitute_vars("var(--missing)", Some(&m)), None);
+        let m: &dyn VarSource = &m;
+        assert_eq!(substitute_vars("var(--a) var(--b, 2px) VAR(--c)", Some(m)).as_deref(), Some("10px 2px red"));
+        assert_eq!(substitute_vars("var(--missing, var(--a))", Some(m)).as_deref(), Some("10px"));
+        assert_eq!(substitute_vars("var(--missing)", Some(m)), None);
         // Not a var() call
-        assert_eq!(substitute_vars("navvar(x)", Some(&m)).as_deref(), Some("navvar(x)"));
+        assert_eq!(substitute_vars("navvar(x)", Some(m)).as_deref(), Some("navvar(x)"));
     }
 
     #[test]
     fn custom_property_inheritance_and_cycles() {
-        let parent: HashMap<String, String> = [("--base".to_string(), "4px".to_string())].into();
+        let root = std::sync::Arc::new(compute_custom_properties(None, &[("--base", "4px"), ("--x", "1")]));
         let own = [("--a", "var(--b)"), ("--b", "calc(var(--base) * 2)"), ("--x", "var(--y)"), ("--y", "var(--x)")];
-        let m = compute_custom_properties(Some(&parent), &own);
-        assert_eq!(m.get("--base").map(String::as_str), Some("4px"));
-        assert_eq!(m.get("--b").map(String::as_str), Some("calc(4px * 2)"));
-        assert_eq!(m.get("--a").map(String::as_str), Some("calc(4px * 2)"));
-        assert!(!m.contains_key("--x") && !m.contains_key("--y"));
+        let m = compute_custom_properties(Some(&root), &own);
+        assert_eq!(m.get("--base"), Some("4px"));
+        assert_eq!(m.get("--b"), Some("calc(4px * 2)"));
+        assert_eq!(m.get("--a"), Some("calc(4px * 2)"));
+        // A cycle invalidates, hiding the inherited value too
+        assert!(m.get("--x").is_none() && m.get("--y").is_none());
+        assert_eq!(m.to_map().len(), 3);
+        // Long chains flatten without losing anything
+        let mut chain = std::sync::Arc::new(m);
+        for i in 0..40 {
+            let name = format!("--v{i}");
+            chain = std::sync::Arc::new(compute_custom_properties(Some(&chain), &[(name.as_str(), "x")]));
+        }
+        assert_eq!(chain.get("--base"), Some("4px"));
+        assert_eq!(chain.get("--v0"), Some("x"));
+        assert!(chain.get("--x").is_none());
     }
 
     #[test]
@@ -573,7 +651,7 @@ mod tests {
     #[test]
     fn resolving_declarations() {
         let m: HashMap<String, String> = [("--size".to_string(), "1.5em".to_string()), ("--gap".to_string(), "4px".to_string())].into();
-        let c = ctx(Some(&m));
+        let c = ctx(Some(&m as &dyn VarSource));
         // font-size em is the parent's (10px)
         assert_eq!(px(&resolve_declaration("font-size", "calc(var(--size) + 1px)", false, &c)), Some(16.0));
         assert_eq!(px(&resolve_declaration("font-size", "calc(50% + 2px)", false, &c)), Some(7.0));

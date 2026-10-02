@@ -16,6 +16,97 @@ use super::inline;
 pub struct LayoutCtx<'a> {
     pub fonts: &'a mut FontContext,
     pub viewport: (f32, f32),
+    /// Floats of the block formatting context being laid out, in its
+    /// coordinates
+    pub floats: FloatList,
+    /// Where the box about to be laid out starts in the formatting
+    /// context: its containing block's content left, its border-box top
+    pub origin: (f32, f32),
+    /// Min- and max-content widths by box (addresses in the box tree,
+    /// which lives unchanged through one layout)
+    intrinsic: std::collections::HashMap<usize, (f32, f32)>,
+}
+
+impl<'a> LayoutCtx<'a> {
+    pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default() }
+    }
+}
+
+/// The floats placed so far in a block formatting context (margin boxes)
+#[derive(Debug, Default)]
+pub struct FloatList {
+    items: Vec<(Rect, bool)>,
+    /// A float's top may not be above an earlier one's
+    last_top: f32,
+}
+
+impl FloatList {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The free span of `[left, right)` beside floats between `top` and
+    /// `bottom`
+    pub fn available(&self, top: f32, bottom: f32, left: f32, right: f32) -> (f32, f32) {
+        let (mut l, mut r) = (left, right);
+        for (f, is_left) in &self.items {
+            if f.bottom() > top && f.y < bottom && f.h > 0.0 {
+                if *is_left {
+                    l = l.max(f.right());
+                } else {
+                    r = r.min(f.x);
+                }
+            }
+        }
+        (l, r.max(l))
+    }
+
+    /// The lowest bottom of floats overlapping `[top, bottom)` (to move
+    /// below them), if any
+    pub fn next_bottom(&self, top: f32, bottom: f32) -> Option<f32> {
+        self.items.iter().filter(|(f, _)| f.bottom() > top && f.y < bottom && f.h > 0.0).map(|(f, _)| f.bottom()).min_by(f32::total_cmp)
+    }
+
+    /// Place a `w` × `h` margin box as far up (from `y_min`) and to its
+    /// side as it fits within `[left, right)`
+    pub fn place(&mut self, w: f32, h: f32, is_left: bool, y_min: f32, left: f32, right: f32) -> (f32, f32) {
+        let mut y = y_min.max(self.last_top);
+        let hh = h.max(0.01);
+        let x = loop {
+            let (l, r) = self.available(y, y + hh, left, right);
+            if r - l >= w - 0.01 || (l <= left && r >= right) {
+                break if is_left { l } else { r - w };
+            }
+            match self.next_bottom(y, y + hh) {
+                Some(next) if next > y => y = next,
+                _ => break if is_left { l } else { r - w },
+            }
+        };
+        self.items.push((Rect::new(x, y, w, h), is_left));
+        self.last_top = y;
+        (x, y)
+    }
+
+    /// Where content clearing `clear` floats may start
+    pub fn clear_y(&self, clear: fos_css::style::Clear) -> Option<f32> {
+        use fos_css::style::Clear;
+        self.items
+            .iter()
+            .filter(|(_, l)| match clear {
+                Clear::None => false,
+                Clear::Left => *l,
+                Clear::Right => !*l,
+                Clear::Both => true,
+            })
+            .map(|(f, _)| f.bottom())
+            .max_by(f32::total_cmp)
+    }
+
+    /// The bottom of the lowest float
+    pub fn bottom(&self) -> f32 {
+        self.items.iter().map(|(f, _)| f.bottom()).fold(0.0, f32::max)
+    }
 }
 
 /// Adjoining margins: the largest positive and the most negative
@@ -239,12 +330,15 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         replaced: None,
     };
     let (content_x, content_y) = (ml + e.border[3] + e.padding[3], e.border[0] + e.padding[0]);
+    // A new formatting context has its own floats and coordinates
+    let base = if bfc { (0.0, 0.0) } else { (ctx.origin.0 + content_x, ctx.origin.1 + content_y) };
+    let outer_floats = bfc.then(|| std::mem::take(&mut ctx.floats));
     let mut escaped_top = Margin::default();
     let mut escaped_bottom = Margin::default();
     let mut through = false;
     let content_h = match &b.kind {
         BoxKind::Block(children) => {
-            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom);
+            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base);
             escaped_top = flow.top;
             escaped_bottom = flow.bottom;
             through = flow.through;
@@ -252,7 +346,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             flow.height
         }
         BoxKind::Inline(content) => {
-            let lines = inline::layout_inline(ctx, content, width, inner_cb_h);
+            let lines = inline::layout_inline(ctx, content, width, inner_cb_h, base);
             frag.children = lines.frags;
             lines.height
         }
@@ -263,6 +357,16 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         }
         BoxKind::Replaced(_) => unreachable!(),
     };
+    // Formatting context roots grow to contain their floats
+    let content_h = match outer_floats {
+        Some(outer) => {
+            let floats_bottom = ctx.floats.bottom();
+            ctx.floats = outer;
+            content_h.max(floats_bottom)
+        }
+        None => content_h,
+    };
+    let through = through && content_h <= 0.0;
     let height = match forced.height {
         Some(_) => specified_h.unwrap_or(content_h),
         None => clamp_height(style, specified_h.unwrap_or(content_h), cb_h, vbp),
@@ -321,7 +425,8 @@ struct Flow {
     through: bool,
 }
 
-fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool) -> Flow {
+#[allow(clippy::too_many_arguments)]
+fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32)) -> Flow {
     let mut frags = Vec::with_capacity(children.len());
     let mut y = 0.0f32;
     let mut pending = Margin::default();
@@ -333,9 +438,50 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             frags.push(Fragment::Box(placeholder(child, Rect::new(0.0, y + pending.size(), 0.0, 0.0))));
             continue;
         }
-        let sizing = if child.style.box_.float != Float::None { Sizing::Shrink } else { Sizing::Stretch };
-        let mut laid = layout_block_level(ctx, child, width, cb_h, sizing, false);
         let rel = relative_offset(&child.style, width, cb_h);
+        let float = child.style.box_.float;
+        let clear_at = ctx.floats.clear_y(child.style.box_.clear).map(|c| c - base.1);
+        if float != Float::None {
+            // Beside earlier floats, as high as the current position
+            let mut laid = layout_block_level(ctx, child, width, cb_h, Sizing::Shrink, false);
+            let (w, h) = (laid.margin_box_width(), laid.mt.size() + laid.frag.border_box.h + laid.mb.size());
+            let mut y_min = base.1 + y + if placed { pending.size() } else { 0.0 };
+            if let Some(c) = clear_at {
+                y_min = y_min.max(c + base.1);
+            }
+            let (fx, fy) = ctx.floats.place(w, h, float == Float::Left, y_min, base.0, base.0 + width);
+            laid.frag.translate(fx - base.0 + rel.0, fy - base.1 + laid.mt.size() + rel.1);
+            frags.push(Fragment::Box(laid.frag));
+            continue;
+        }
+        // Where the child's border box will (most likely) start
+        let own_mt = Margin::new(child.style.box_.margin[0].resolve(width).unwrap_or(0.0));
+        let mut est_y = if !placed && collapse_top { y } else { y + pending.adjoin(own_mt).size() };
+        let cleared = clear_at.filter(|&c| c > est_y);
+        if let Some(c) = cleared {
+            est_y = c;
+        }
+        ctx.origin = (base.0, base.1 + est_y);
+        // Formatting context roots (overflow: hidden...) sit beside floats
+        let (mut cw, mut shift) = (width, 0.0);
+        if !ctx.floats.is_empty() && child.is_bfc_root() {
+            let (l, r) = ctx.floats.available(base.1 + est_y, base.1 + est_y + 1.0, base.0, base.0 + width);
+            cw = r - l;
+            shift = l - base.0;
+        }
+        let mut laid = layout_block_level(ctx, child, cw, cb_h, Sizing::Stretch, false);
+        laid.frag.translate(shift, 0.0);
+        if let Some(c) = cleared {
+            // Clearance: the child starts below the floats; margins above
+            // it no longer collapse through
+            let h = laid.frag.border_box.h;
+            laid.frag.translate(rel.0, c + rel.1);
+            frags.push(Fragment::Box(laid.frag));
+            y = c + h;
+            pending = laid.mb;
+            placed = true;
+            continue;
+        }
         if laid.through {
             let at = y + pending.adjoin(laid.mt).size();
             pending = pending.adjoin(laid.mt);
@@ -522,6 +668,16 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
 
 /// The min-content and max-content widths of a box's content box
 pub fn intrinsic_content(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
+    let key = b as *const LayoutBox as usize;
+    if let Some(&sizes) = ctx.intrinsic.get(&key) {
+        return sizes;
+    }
+    let sizes = intrinsic_content_uncached(ctx, b);
+    ctx.intrinsic.insert(key, sizes);
+    sizes
+}
+
+fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
     match &b.kind {
         BoxKind::Inline(content) => inline::intrinsic_inline(ctx, content),
         BoxKind::Block(children) => {

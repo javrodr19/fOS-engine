@@ -94,6 +94,8 @@ pub struct PageStyles {
     by_id: HashMap<String, Vec<u32>>,
     by_class: HashMap<String, Vec<u32>>,
     by_tag: HashMap<String, Vec<u32>>,
+    /// Selectors whose subject needs an attribute (`[data-x]`, ...)
+    by_attr: HashMap<String, Vec<u32>>,
     /// Selectors that can match any element (`*`, `:hover`, `[attr]`, ...)
     universal: Vec<u32>,
 }
@@ -105,6 +107,7 @@ impl PageStyles {
             by_id: HashMap::new(),
             by_class: HashMap::new(),
             by_tag: HashMap::new(),
+            by_attr: HashMap::new(),
             universal: Vec::new(),
             stylesheet: Stylesheet { rules: Vec::new() },
         };
@@ -131,7 +134,11 @@ impl PageStyles {
                         Some(SubjectKey::Id(id)) => styles.by_id.entry(id).or_default().push(idx),
                         Some(SubjectKey::Class(c)) => styles.by_class.entry(c).or_default().push(idx),
                         Some(SubjectKey::Tag(t)) => styles.by_tag.entry(t).or_default().push(idx),
-                        None => styles.universal.push(idx),
+                        Some(SubjectKey::Attr(a)) => styles.by_attr.entry(a).or_default().push(idx),
+                        None => {
+                            log::trace!("universal selector: {}", selector.text);
+                            styles.universal.push(idx)
+                        }
                     }
                 }
                 styles.selectors.push(CompiledSelector {
@@ -152,7 +159,7 @@ impl PageStyles {
     /// Selectors per bucket kind (id, class, tag, universal), for tuning
     pub fn bucket_sizes(&self) -> (usize, usize, usize, usize) {
         let sum = |m: &HashMap<String, Vec<u32>>| m.values().map(Vec::len).sum();
-        (sum(&self.by_id), sum(&self.by_class), sum(&self.by_tag), self.universal.len())
+        (sum(&self.by_id), sum(&self.by_class), sum(&self.by_tag) + sum(&self.by_attr), self.universal.len())
     }
 
     /// Number of rules
@@ -190,16 +197,26 @@ impl PageStyles {
         if let Some(list) = tag_list {
             candidates.extend_from_slice(list);
         }
-        candidates.extend_from_slice(&self.universal);
-        if candidates.is_empty() {
+        if !self.by_attr.is_empty() {
+            for a in &element.attrs {
+                if let Some(list) = self.by_attr.get(tree.resolve(a.name.local)) {
+                    candidates.extend_from_slice(list);
+                }
+            }
+        }
+        if candidates.is_empty() && self.universal.is_empty() {
             return Vec::new();
         }
-        // A selector is filed once, but an element may repeat a class
+        // A selector list may be filed under several keys, and an element
+        // may repeat a class: each selector is tried once. The universal
+        // list is long and already sorted, so it is merged in unsorted.
         candidates.sort_unstable();
         candidates.dedup();
-
+        let universal = self.universal.iter().copied().filter(|i| candidates.binary_search(i).is_err());
         let mut matched: Vec<(Specificity, u32)> = candidates
-            .into_iter()
+            .iter()
+            .copied()
+            .chain(universal)
             .map(|i| &self.selectors[i as usize])
             .filter(|c| filter.is_none_or(|f| c.ancestors.iter().all(|&h| f.may_contain(h))))
             .filter(|c| c.selector.matches(tree, node))

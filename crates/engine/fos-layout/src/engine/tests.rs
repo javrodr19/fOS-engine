@@ -515,3 +515,48 @@ fn absolute_boxes_without_insets_stay_at_their_static_position() {
     let f = rect_of(&t, fixed);
     assert_eq!((f.x, f.y, f.w), (0.0, 560.0, 800.0));
 }
+
+#[test]
+fn floats_sit_side_by_side_and_text_wraps_around_them() {
+    let (mut tree, html, body) = doc();
+    let c = el(&mut tree, body, "div", "width: 400px");
+    let l = el(&mut tree, c, "div", "float: left; width: 100px; height: 50px");
+    let r = el(&mut tree, c, "div", "float: right; width: 80px; height: 30px");
+    let l2 = el(&mut tree, c, "div", "float: left; width: 100px; height: 20px");
+    let p = el(&mut tree, c, "p", "margin: 0");
+    text(&mut tree, p, "text beside the floats");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, l).x, rect_of(&t, l).y), (8.0, 8.0));
+    assert_eq!((rect_of(&t, r).x, rect_of(&t, r).y), (328.0, 8.0));
+    assert_eq!((rect_of(&t, l2).x, rect_of(&t, l2).y), (108.0, 8.0));
+    // The paragraph's first line starts right of both left floats
+    let first = rects_of(&t, p).into_iter().nth(1).expect("text");
+    assert!((first.x - 208.0).abs() < 0.5, "{first:?}");
+    assert!(first.right() <= 328.5);
+    // The container does not grow to contain floats (not a formatting
+    // context root)
+    assert!(rect_of(&t, c).h < 50.0);
+}
+
+#[test]
+fn clear_and_formatting_contexts_contain_floats() {
+    let (mut tree, html, body) = doc();
+    let c = el(&mut tree, body, "div", "overflow: hidden");
+    el(&mut tree, c, "div", "float: left; width: 100px; height: 60px");
+    let after = el(&mut tree, body, "div", "height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, c).h, 60.0);
+    assert_eq!(rect_of(&t, after).y, 68.0);
+
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "float: left; width: 100px; height: 60px");
+    let cleared = el(&mut tree, body, "div", "clear: both; height: 10px");
+    let beside = el(&mut tree, body, "div", "float: right; width: 50px; height: 5px");
+    let bfc = el(&mut tree, body, "div", "overflow: hidden; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, cleared).y, 68.0);
+    assert_eq!(rect_of(&t, beside).y, 78.0);
+    // A formatting context root narrows beside the float
+    let b = rect_of(&t, bfc);
+    assert_eq!((b.y, b.w), (78.0, 734.0));
+}

@@ -646,7 +646,7 @@ pub struct Style {
     pub border: Arc<BorderStyles>,
     pub background: Arc<BackgroundStyle>,
     /// Custom properties (`--name`), inherited
-    pub custom: Option<Arc<HashMap<String, String>>>,
+    pub custom: Option<Arc<crate::values::CustomProperties>>,
 }
 
 impl Default for Style {
@@ -762,7 +762,7 @@ impl Style {
             })
             .collect();
         if !own.is_empty() {
-            let computed = crate::values::compute_custom_properties(self.custom.as_deref(), &own);
+            let computed = crate::values::compute_custom_properties(self.custom.as_ref(), &own);
             self.custom = Some(Arc::new(computed));
         }
         let parent_font_size = parent.inherited.font_size;
@@ -780,7 +780,7 @@ impl Style {
                     PropertyValue::Unresolved(b) => {
                         let custom = self.custom.clone();
                         let rctx = crate::values::ResolveContext {
-                            custom: custom.as_deref(),
+                            custom: custom.as_deref().map(|c| c as &dyn crate::values::VarSource),
                             font_size: self.inherited.font_size,
                             parent_font_size,
                             root_font_size: ctx.root_font_size,

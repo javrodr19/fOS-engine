@@ -153,6 +153,38 @@ pub enum SubjectKey {
     Class(String),
     /// Lowercase tag name
     Tag(String),
+    /// An attribute the subject must carry (lowercase name)
+    Attr(String),
+}
+
+/// Keys one of which any element matching `c` carries: its id, a class,
+/// its tag or an attribute, or for `:is()`/`:where()` subjects the keys of
+/// every alternative inside
+fn compound_keys(c: &Compound) -> Option<Vec<SubjectKey>> {
+    if let Some(id) = &c.id {
+        return Some(vec![SubjectKey::Id(id.clone())]);
+    }
+    if let Some(class) = c.classes.first() {
+        return Some(vec![SubjectKey::Class(class.clone())]);
+    }
+    if let Some(tag) = &c.tag {
+        return Some(vec![SubjectKey::Tag(tag.clone())]);
+    }
+    if let Some(a) = c.attrs.first() {
+        return Some(vec![SubjectKey::Attr(a.name.to_ascii_lowercase())]);
+    }
+    c.pseudos.iter().find_map(|p| match p {
+        // The root of an HTML document is its html element
+        Pseudo::Root => Some(vec![SubjectKey::Tag("html".into())]),
+        Pseudo::Is(list) | Pseudo::Where(list) => {
+            let mut keys = Vec::new();
+            for alt in &list.0 {
+                keys.extend(compound_keys(&alt.parts.first()?.0)?);
+            }
+            Some(keys)
+        }
+        _ => None,
+    })
 }
 
 impl SelectorList {
@@ -194,22 +226,18 @@ impl SelectorList {
         self.0.iter().map(Complex::specificity).max().unwrap_or((0, 0, 0))
     }
 
-    /// The key of each complex selector of the list (`None`: it can match
-    /// any element)
+    /// Keys under which to file the list for matching: for each complex
+    /// selector, keys one of which its subject must carry (several for an
+    /// `:is()` subject), or `None` when it can match any element
     pub fn subject_keys(&self) -> Vec<Option<SubjectKey>> {
-        self.0
-            .iter()
-            .map(|c| {
-                let (subject, _) = c.parts.first()?;
-                if let Some(id) = &subject.id {
-                    Some(SubjectKey::Id(id.clone()))
-                } else if let Some(class) = subject.classes.first() {
-                    Some(SubjectKey::Class(class.clone()))
-                } else {
-                    subject.tag.clone().map(SubjectKey::Tag)
-                }
-            })
-            .collect()
+        let mut out = Vec::new();
+        for c in &self.0 {
+            match c.parts.first().and_then(|(subject, _)| compound_keys(subject)) {
+                Some(keys) => out.extend(keys.into_iter().map(Some)),
+                None => out.push(None),
+            }
+        }
+        out
     }
 
     /// Parse a selector list; `None` if it is not valid (`querySelector`
@@ -771,6 +799,14 @@ mod tests {
         assert_eq!(
             SelectorList::parse("#a .x, ul > li.y.z, p, *:hover").unwrap().subject_keys(),
             vec![Some(SubjectKey::Class("x".into())), Some(SubjectKey::Class("y".into())), Some(SubjectKey::Tag("p".into())), None]
+        );
+        assert_eq!(
+            SelectorList::parse(":where(.a, b) > i, :is(.c, :hover)").unwrap().subject_keys(),
+            vec![Some(SubjectKey::Tag("i".into())), None]
+        );
+        assert_eq!(
+            SelectorList::parse(":where(.a, b):hover, [data-x]").unwrap().subject_keys(),
+            vec![Some(SubjectKey::Class("a".into())), Some(SubjectKey::Tag("b".into())), Some(SubjectKey::Attr("data-x".into()))]
         );
         let anc = |s: &str| SelectorList::parse(s).unwrap().ancestor_hashes()[0].clone();
         let mut want = vec![key_hash(KEY_CLASS, "a"), key_hash(KEY_ID, "m"), key_hash(KEY_TAG, "ul")];

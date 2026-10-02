@@ -139,6 +139,9 @@ pub struct PageRenderer {
     layout_generation: u64,
     /// The current page's external stylesheets
     stylesheets: crate::css_loader::Stylesheets,
+    /// The page's compiled CSS, by hash of its text and the viewport
+    /// (relayouts after DOM changes rarely change the CSS)
+    compiled_css: Option<(u64, Option<Arc<PageStyles>>)>,
 }
 
 impl PageRenderer {
@@ -156,6 +159,7 @@ impl PageRenderer {
             cached: None,
             layout_generation: 0,
             stylesheets: Default::default(),
+            compiled_css: None,
         }
     }
 
@@ -169,10 +173,16 @@ impl PageRenderer {
         self.viewport_height = height;
     }
 
+    /// Lay out again on the next render (keeping caches)
+    pub fn invalidate_layout(&mut self) {
+        self.cached = None;
+    }
+
     /// Drop the cached layout, glyphs and shaped words (e.g. on memory
     /// pressure)
     pub fn clear_cache(&mut self) {
         self.cached = None;
+        self.compiled_css = None;
         self.text_renderer.clear_glyph_cache();
         self.fonts = FontContext::new(self.text_renderer.fonts.clone());
     }
@@ -261,8 +271,11 @@ impl PageRenderer {
         // Free the old layout first, so two are never alive at once
         self.cached = None;
         let width = self.viewport_width;
-        let stylesheet = self.page_stylesheet(document);
+        let started = std::time::Instant::now();
+        let stylesheet = self.compiled_stylesheet(document);
+        let parsed = started.elapsed();
         let layout = build_layout(document, stylesheet, &mut self.fonts, (width as f32, self.viewport_height as f32));
+        log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
     }
@@ -318,16 +331,38 @@ impl PageRenderer {
         Some(page)
     }
 
+    /// The page's CSS compiled for matching, reused while its text and
+    /// the viewport stay the same
+    fn compiled_stylesheet(&mut self, document: &Document) -> Option<Arc<PageStyles>> {
+        let css_text = self.extract_css_from_document(document);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        css_text.hash(&mut hasher);
+        (self.viewport_width, self.viewport_height).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((k, sheet)) = &self.compiled_css {
+            if *k == key {
+                return sheet.clone();
+            }
+        }
+        let sheet = self.compile(&css_text).map(Arc::new);
+        self.compiled_css = Some((key, sheet.clone()));
+        sheet
+    }
+
     /// Parse the page's own CSS (`<style>` elements) and compile it for
     /// matching
-    fn page_stylesheet(&self, document: &Document) -> Option<PageStyles> {
-        let css_text = self.extract_css_from_document(document);
+    #[cfg(test)]
+    fn page_stylesheet(&self, document: &Document) -> Option<Arc<PageStyles>> {
+        self.compile(&self.extract_css_from_document(document)).map(Arc::new)
+    }
+
+    fn compile(&self, css_text: &str) -> Option<PageStyles> {
         if css_text.is_empty() {
             return None;
         }
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
-        let styles = PageStyles::new(fos_css::parse_stylesheet_for(&css_text, media));
-        log::debug!("Parsed {} CSS rules from page", styles.rule_count());
+        let styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        log::debug!("Parsed {} CSS rules from page, buckets (id, class, tag+attr, universal) {:?}", styles.rule_count(), styles.bucket_sizes());
         Some(styles)
     }
 
@@ -474,11 +509,11 @@ impl layout_engine::Styler for BrowserStyler<'_> {
 }
 
 /// Lay out `document` in a viewport
-fn build_layout(document: &Document, stylesheet: Option<PageStyles>, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
     let tree = document.tree();
     let root = document.document_element();
     let mut styler = BrowserStyler {
-        stylesheet: stylesheet.as_ref(),
+        stylesheet: stylesheet.as_deref(),
         ancestors: AncestorFilter::default(),
         resolved: Default::default(),
         ctx: StyleContext { root_font_size: 16.0, viewport },

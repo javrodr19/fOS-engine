@@ -141,29 +141,20 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
     out
 }
 
-/// Choose line boundaries greedily: [start, end) ranges of pieces
-fn break_lines(pieces: &[Piece], avail: f32, indent: f32) -> Vec<(usize, usize)> {
-    let mut lines = Vec::new();
-    let mut start = 0;
+/// The end of the line starting at piece `start` (greedy: as many
+/// pieces as fit in `avail`, breaking at the last opportunity)
+fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
     let mut x = indent;
     let mut last_opportunity: Option<usize> = None;
     let mut content = false;
-    let mut i = 0;
+    let mut i = start;
     while i < pieces.len() {
         let p = &pieces[i];
         if p.break_before && i > start && content {
             last_opportunity = Some(i);
         }
         match p.kind {
-            PieceKind::Break => {
-                lines.push((start, i + 1));
-                start = i + 1;
-                x = 0.0;
-                last_opportunity = None;
-                content = false;
-                i += 1;
-                continue;
-            }
+            PieceKind::Break => return i + 1,
             // Spaces hang at line ends: they never overflow
             PieceKind::Space { collapsible } => {
                 if content || !collapsible {
@@ -174,13 +165,7 @@ fn break_lines(pieces: &[Piece], avail: f32, indent: f32) -> Vec<(usize, usize)>
                 x += p.width;
                 if x > avail + 0.01 {
                     if let Some(o) = last_opportunity {
-                        lines.push((start, o));
-                        start = o;
-                        x = 0.0;
-                        last_opportunity = None;
-                        content = false;
-                        i = o;
-                        continue;
+                        return o;
                     }
                 }
                 content = true;
@@ -189,10 +174,32 @@ fn break_lines(pieces: &[Piece], avail: f32, indent: f32) -> Vec<(usize, usize)>
         }
         i += 1;
     }
-    if start < pieces.len() || lines.is_empty() {
-        lines.push((start, pieces.len()));
+    pieces.len()
+}
+
+/// The width of the unbreakable run starting a line at `start`
+fn first_run_width(pieces: &[Piece], start: usize) -> f32 {
+    let mut w = 0.0;
+    let mut content = false;
+    for p in &pieces[start..] {
+        if content && p.break_before {
+            break;
+        }
+        match p.kind {
+            PieceKind::Break => break,
+            PieceKind::Space { .. } => {
+                if content {
+                    break;
+                }
+            }
+            PieceKind::Word { .. } | PieceKind::Atomic(_) => {
+                w += p.width;
+                content = true;
+            }
+            _ => w += p.width,
+        }
     }
-    lines
+    w
 }
 
 /// An inline box open on the line being built
@@ -247,7 +254,9 @@ fn atomic_baseline(laid: &Laid) -> f32 {
     }
 }
 
-pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: Option<f32>) -> InlineLayout {
+/// Lay out inline content in a box `avail` wide whose content box starts
+/// at `base` in its formatting context (floats shorten lines)
+pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: Option<f32>, base: (f32, f32)) -> InlineLayout {
     let fonts: Vec<ResolvedFont> = ic.styles.iter().map(|s| ctx.fonts.resolve(s)).collect();
     // Atomic inlines are laid out first: their widths drive line breaking
     let mut atomics: Vec<Option<Laid>> = Vec::new();
@@ -262,7 +271,6 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
 
     let container = &ic.styles[0];
     let indent = container.inherited.text_indent.resolve(avail);
-    let lines = break_lines(&pieces, avail, indent);
     let root_font = fonts[0];
     let root_lh = container.inherited.line_height.resolve(root_font.size);
     let rtl = container.inherited.direction == Direction::Rtl;
@@ -272,11 +280,40 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     let mut y = 0.0f32;
     // Inline boxes open across line ends: (style, node)
     let mut carried: Vec<(u32, NodeId)> = Vec::new();
-    for (li, &(a, b)) in lines.iter().enumerate() {
+    let full_avail = avail;
+    let mut start = 0;
+    let mut li = 0;
+    loop {
+        if li > 0 && start >= pieces.len() {
+            break;
+        }
+        let first_indent = if li == 0 { indent } else { 0.0 };
+        // Floats beside this line narrow it; when even the first word
+        // does not fit, the line moves below them
+        let (mut line_x, mut avail) = (0.0, full_avail);
+        if !ctx.floats.is_empty() {
+            let top = base.1 + y;
+            let bottom = top + root_lh.max(1.0);
+            let (l, r) = ctx.floats.available(top, bottom, base.0, base.0 + full_avail);
+            if r - l < full_avail {
+                if first_run_width(&pieces, start) + first_indent > r - l {
+                    if let Some(next) = ctx.floats.next_bottom(top, bottom).filter(|&n| n > top) {
+                        y = next - base.1;
+                        continue;
+                    }
+                }
+                line_x = l - base.0;
+                avail = r - l;
+            }
+        }
+        let a = start;
+        let b = next_line(&pieces, start, avail, first_indent).max((start + 1).min(pieces.len()));
+        start = b;
+        li += 1;
         let line = &pieces[a..b];
-        let start_x = if li == 0 { indent } else { 0.0 };
+        let start_x = line_x + first_indent;
         let ends_forced = matches!(line.last().map(|p| &p.kind), Some(PieceKind::Break));
-        let last_line = li + 1 == lines.len();
+        let last_line = b >= pieces.len();
 
         // Pass 1: the line's width and justification opportunities
         let (mut x, mut content, mut pending, mut pending_n, mut opportunities) = (start_x, false, 0.0f32, 0usize, 0usize);
@@ -322,7 +359,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // Inline boxes with vertical borders or padding show even when empty
         let has_content = has_content
             || line.iter().any(|p| matches!(p.kind, PieceKind::Open { style, .. } if { let s = &ic.styles[style as usize]; s.border.has_border() || s.box_.padding.iter().any(|p| !p.is_zero()) }));
-        let free = avail - end;
+        let free = line_x + avail - end;
         let justify = align == TextAlign::Justify && !last_line && !ends_forced && opportunities > 0 && free > 0.0;
         let offset = if free <= 0.0 {
             0.0

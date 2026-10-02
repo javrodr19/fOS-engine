@@ -1149,6 +1149,20 @@ fn set_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> Js
     Ok(Value::UNDEFINED)
 }
 
+/// `__fosParseDocument(html)`: parse a whole HTML document (DOMParser) and
+/// return its `<html>` element, detached in the page's tree. Its scripts
+/// never run.
+fn parse_document(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let html = arg_string(vm, args, 0)?;
+    let parsed = fos_html::parse(&html);
+    let root = parsed.document_element();
+    if !root.is_valid() {
+        return Ok(Value::NULL);
+    }
+    let id = with_tree(vm, |t| t.import_node(parsed.tree(), root, true));
+    Ok(wrap(vm, id))
+}
+
 /// `__fosRandomBytes(n)`: an ArrayBuffer of `n` bytes from the OS's
 /// secure random source (`crypto.getRandomValues`, at most 64 KiB)
 fn random_bytes(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -1665,6 +1679,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetElementPrototype", 2, set_element_prototype),
         ("__fosSetSheetCSS", 2, set_sheet_css),
         ("__fosSetAdoptedCSS", 1, set_adopted_css),
+        ("__fosParseDocument", 1, parse_document),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

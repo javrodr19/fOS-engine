@@ -717,7 +717,22 @@
   });
   const props = (list) => list.split(' ').map(p => [p, p.toLowerCase()]);
   reflectOn('HTMLButtonElement HTMLFieldSetElement HTMLFormElement HTMLIFrameElement HTMLInputElement HTMLMapElement HTMLMetaElement HTMLObjectElement HTMLOutputElement HTMLSelectElement HTMLSlotElement HTMLTextAreaElement HTMLAnchorElement HTMLImageElement HTMLParamElement', props('name'), stringAttr);
-  reflectOn('HTMLAnchorElement HTMLButtonElement HTMLEmbedElement HTMLLinkElement HTMLObjectElement HTMLOListElement HTMLScriptElement HTMLSourceElement HTMLStyleElement HTMLUListElement HTMLLIElement', props('type'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLEmbedElement HTMLLinkElement HTMLObjectElement HTMLOListElement HTMLScriptElement HTMLSourceElement HTMLStyleElement HTMLUListElement HTMLLIElement', props('type'), stringAttr);
+  // An input's type is an enumerated attribute: unknown values are "text"
+  const inputTypes = new Set(['hidden', 'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month', 'week', 'time',
+    'datetime-local', 'number', 'range', 'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button']);
+  Object.defineProperty(HTMLInputElement.prototype, 'type', {
+    get() { const t = (this.getAttribute('type') || '').toLowerCase(); return inputTypes.has(t) ? t : 'text'; },
+    set(v) { this.setAttribute('type', String(v)); },
+    configurable: true,
+  });
+  Object.defineProperty(HTMLSelectElement.prototype, 'type', { get() { return this.multiple ? 'select-multiple' : 'select-one'; }, configurable: true });
+  Object.defineProperty(HTMLTextAreaElement.prototype, 'type', { get() { return 'textarea'; }, configurable: true });
+  Object.defineProperty(HTMLButtonElement.prototype, 'type', {
+    get() { const t = (this.getAttribute('type') || '').toLowerCase(); return t === 'reset' || t === 'button' ? t : 'submit'; },
+    set(v) { this.setAttribute('type', String(v)); },
+    configurable: true,
+  });
   reflectOn('HTMLAreaElement HTMLImageElement HTMLInputElement', props('alt'), stringAttr);
   reflectOn('HTMLAnchorElement HTMLAreaElement HTMLLinkElement HTMLFormElement', props('rel'), stringAttr);
   reflectOn('HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLFormElement', props('target'), stringAttr);
@@ -3076,4 +3091,872 @@
   });
   global.location = new Location();
   global.origin = global.location.origin;
+
+  // ---- interface objects for the window's singletons ----
+  //
+  // Scripts look methods up on prototypes (Navigator.prototype.sendBeacon,
+  // History.prototype.replaceState) and test `instanceof`, so each
+  // singleton's members move to its interface's prototype.
+  function exposeInterface(name, instance, parentProto = Object.prototype) {
+    const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
+    const proto = Object.create(parentProto);
+    for (const k of Reflect.ownKeys(instance)) {
+      Object.defineProperty(proto, k, Object.getOwnPropertyDescriptor(instance, k));
+      delete instance[k];
+    }
+    Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true });
+    ctor.prototype = proto;
+    Object.setPrototypeOf(instance, proto);
+    Object.defineProperty(global, name, { value: ctor, writable: true, configurable: true });
+    return instance;
+  }
+  exposeInterface('Navigator', global.navigator);
+  exposeInterface('Screen', global.screen, EventTarget.prototype);
+  exposeInterface('Performance', global.performance, EventTarget.prototype);
+  for (const [name, ctor] of [['History', History], ['Location', Location]]) {
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    global[name] = ctor;
+  }
+
+  // ---- more event interfaces ----
+  const eventFields = (target, init, fields) => { for (const [k, d] of Object.entries(fields)) target[k] = init[k] ?? d; };
+  class MessageEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, { data: null, origin: '', lastEventId: '', source: null, ports: [] }); }
+  }
+  class PointerEvent extends MouseEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false });
+    }
+    getCoalescedEvents() { return []; }
+    getPredictedEvents() { return []; }
+  }
+  class WheelEvent extends MouseEvent {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }); }
+  }
+  Object.assign(WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  class DragEvent extends MouseEvent {
+    constructor(type, init = {}) { super(type, init); this.dataTransfer = init.dataTransfer ?? null; }
+  }
+  class TouchEvent extends UIEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, { touches: [], targetTouches: [], changedTouches: [], altKey: false, metaKey: false, ctrlKey: false, shiftKey: false });
+    }
+  }
+  class CompositionEvent extends UIEvent {
+    constructor(type, init = {}) { super(type, init); this.data = String(init.data ?? ''); }
+  }
+  class AnimationEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, { animationName: '', elapsedTime: 0, pseudoElement: '' }); }
+  }
+  class TransitionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, { propertyName: '', elapsedTime: 0, pseudoElement: '' }); }
+  }
+  class SubmitEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.submitter = init.submitter ?? null; }
+  }
+  class ClipboardEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.clipboardData = init.clipboardData ?? null; }
+  }
+  class PageTransitionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.persisted = !!init.persisted; }
+  }
+  class StorageEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, { key: null, oldValue: null, newValue: null, url: '', storageArea: null }); }
+  }
+  class PromiseRejectionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.promise = init.promise; this.reason = init.reason; }
+  }
+  class SecurityPolicyViolationEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, { documentURI: '', referrer: '', blockedURI: '', violatedDirective: '', effectiveDirective: '', originalPolicy: '', sourceFile: '', sample: '', disposition: 'enforce', statusCode: 0, lineNumber: 0, columnNumber: 0 });
+    }
+  }
+  class BeforeUnloadEvent extends Event {}
+  Object.assign(global, {
+    MessageEvent, PointerEvent, WheelEvent, DragEvent, TouchEvent, CompositionEvent, AnimationEvent, TransitionEvent,
+    SubmitEvent, ClipboardEvent, PageTransitionEvent, StorageEvent, PromiseRejectionEvent, SecurityPolicyViolationEvent,
+    BeforeUnloadEvent,
+  });
+
+  // ---- performance entry interfaces ----
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  for (const k of ['initiatorType', 'nextHopProtocol', 'renderBlockingStatus']) Object.defineProperty(PerformanceResourceTiming.prototype, k, { get() { return ''; }, configurable: true });
+  for (const k of ['workerStart', 'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'transferSize', 'encodedBodySize', 'decodedBodySize']) {
+    Object.defineProperty(PerformanceResourceTiming.prototype, k, { get() { return 0; }, configurable: true });
+  }
+  PerformanceResourceTiming.prototype.toJSON = function () { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; };
+  Object.assign(global, { PerformanceResourceTiming, PerformanceObserverEntryList });
+
+  // ---- attributes: NamedNodeMap of Attr ----
+  const attrState = new WeakMap(); // attr -> { el, name }
+  function makeAttr(el, name) {
+    const a = Object.create(Attr.prototype);
+    attrState.set(a, { el, name });
+    return a;
+  }
+  const attr = (a) => attrState.get(a) || (() => { throw new TypeError('Illegal invocation'); })();
+  define(Attr.prototype, {
+    get name() { return attr(this).name; },
+    get localName() { const n = attr(this).name; return n.includes(':') ? n.slice(n.indexOf(':') + 1) : n; },
+    get nodeName() { return attr(this).name; },
+    get value() { const s = attr(this); return s.el ? s.el.getAttribute(s.name) ?? '' : s.value ?? ''; },
+    set value(v) { const s = attr(this); if (s.el) s.el.setAttribute(s.name, String(v)); else s.value = String(v); },
+    get nodeValue() { return this.value; },
+    set nodeValue(v) { this.value = v; },
+    get textContent() { return this.value; },
+    set textContent(v) { this.value = v; },
+    get ownerElement() { return attr(this).el; },
+    get namespaceURI() { return null; },
+    get prefix() { const n = attr(this).name; return n.includes(':') ? n.slice(0, n.indexOf(':')) : null; },
+    get specified() { return true; },
+    get nodeType() { return 2; },
+  });
+  class NamedNodeMap extends Array {
+    getNamedItem(name) { return this._el && this._el.hasAttribute(name) ? makeAttr(this._el, String(name).toLowerCase()) : null; }
+    getNamedItemNS(ns, name) { return this.getNamedItem(name); }
+    item(i) { return this[i] ?? null; }
+    setNamedItem(a) {
+      const s = attr(a);
+      const old = this.getNamedItem(s.name);
+      this._el.setAttribute(s.name, a.value);
+      s.el = this._el;
+      return old;
+    }
+    setNamedItemNS(a) { return this.setNamedItem(a); }
+    removeNamedItem(name) {
+      const old = this.getNamedItem(name);
+      if (!old) throw new DOMException(`Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '${name}' was found.`, 'NotFoundError');
+      const value = old.value;
+      this._el.removeAttribute(name);
+      attrState.set(old, { el: null, name: attr(old).name, value });
+      return old;
+    }
+    removeNamedItemNS(ns, name) { return this.removeNamedItem(name); }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.defineProperty(E, 'attributes', {
+    get() {
+      const map = new NamedNodeMap();
+      Object.defineProperty(map, '_el', { value: this });
+      for (const name of this.getAttributeNames()) {
+        const a = makeAttr(this, name);
+        map.push(a);
+        // Named access (attributes.href), as in browsers
+        if (!(name in map)) Object.defineProperty(map, name, { value: a, configurable: true });
+      }
+      return map;
+    },
+    configurable: true,
+  });
+  define(E, {
+    getAttributeNode(name) { return this.hasAttribute(name) ? makeAttr(this, String(name).toLowerCase()) : null; },
+    getAttributeNodeNS(ns, name) { return this.getAttributeNode(name); },
+    setAttributeNode(a) { const old = this.getAttributeNode(attr(a).name); this.setAttribute(attr(a).name, a.value); attr(a).el = this; return old; },
+    removeAttributeNode(a) { this.removeAttribute(attr(a).name); return a; },
+  });
+  Document.prototype.createAttribute = function (name) {
+    const a = Object.create(Attr.prototype);
+    attrState.set(a, { el: null, name: String(name).toLowerCase(), value: '' });
+    return a;
+  };
+  global.NamedNodeMap = NamedNodeMap;
+
+  // ---- SVG odds and ends ----
+  class SVGAnimatedString {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const animatedString = (el, attrs) => {
+    const s = Object.create(SVGAnimatedString.prototype);
+    Object.defineProperties(s, {
+      baseVal: { get() { for (const a of attrs) { const v = el.getAttribute(a); if (v !== null) return v; } return ''; }, set(v) { el.setAttribute(attrs[0], String(v)); } },
+      animVal: { get() { return s.baseVal; } },
+    });
+    return s;
+  };
+  makeInterface('SVGAElement', SVGGraphicsElement, 'svg:a');
+  Object.defineProperty(SVGAElement.prototype, 'href', { get() { return animatedString(this, ['href', 'xlink:href']); }, configurable: true });
+  Object.defineProperty(SVGAElement.prototype, 'target', { get() { return animatedString(this, ['target']); }, configurable: true });
+  for (const [name, tags] of [['SVGGElement', 'g'], ['SVGPathElement', 'path'], ['SVGCircleElement', 'circle'], ['SVGRectElement', 'rect'],
+    ['SVGLineElement', 'line'], ['SVGPolylineElement', 'polyline'], ['SVGPolygonElement', 'polygon'], ['SVGEllipseElement', 'ellipse'],
+    ['SVGTextElement', 'text'], ['SVGUseElement', 'use'], ['SVGImageElement', 'image'], ['SVGDefsElement', 'defs'], ['SVGSymbolElement', 'symbol']]) {
+    makeInterface(name, SVGGraphicsElement, 'svg:' + tags);
+  }
+  global.SVGAnimatedString = SVGAnimatedString;
+
+  // ---- constraint validation ----
+  class ValidityState {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const customValidity = new WeakMap();
+  const emailRe = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+  function validityOf(el) {
+    const v = Object.create(ValidityState.prototype);
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const value = el.value ?? '';
+    const barred = el.disabled || el.readOnly || ['hidden', 'reset', 'button', 'submit', 'image'].includes(type) && el.localName === 'input';
+    const flags = {
+      valueMissing: !barred && el.required && (type === 'checkbox' || type === 'radio' ? !el.checked : value === ''),
+      typeMismatch: value !== '' && ((type === 'email' && !value.split(el.multiple ? ',' : '\0').every(s => emailRe.test(s.trim())))
+        || (type === 'url' && (() => { try { new URL(value); return false; } catch { return true; } })())),
+      patternMismatch: value !== '' && el.hasAttribute('pattern') && (() => { try { return !new RegExp(`^(?:${el.getAttribute('pattern')})$`, 'u').test(value); } catch { return false; } })(),
+      // Only edits by the user can make a value too long or short
+      tooLong: false,
+      tooShort: false,
+      rangeUnderflow: value !== '' && el.hasAttribute('min') && ['number', 'range'].includes(type) && +value < +el.getAttribute('min'),
+      rangeOverflow: value !== '' && el.hasAttribute('max') && ['number', 'range'].includes(type) && +value > +el.getAttribute('max'),
+      stepMismatch: false,
+      badInput: type === 'number' && value !== '' && isNaN(+value),
+      customError: !!customValidity.get(el),
+    };
+    flags.valid = !barred ? !Object.values(flags).some(Boolean) : true;
+    for (const [k, b] of Object.entries(flags)) Object.defineProperty(v, k, { value: b, enumerable: true });
+    return v;
+  }
+  const validationMessage = (el) => {
+    const v = validityOf(el);
+    if (v.customError) return customValidity.get(el);
+    if (v.valueMissing) return 'Please fill out this field.';
+    if (v.typeMismatch) return el.type === 'email' ? 'Please enter an email address.' : 'Please enter a URL.';
+    if (v.patternMismatch) return 'Please match the requested format.';
+    if (v.rangeUnderflow) return `Value must be greater than or equal to ${el.getAttribute('min')}.`;
+    if (v.rangeOverflow) return `Value must be less than or equal to ${el.getAttribute('max')}.`;
+    if (v.badInput) return 'Please enter a number.';
+    return '';
+  };
+  const constraintMethods = {
+    get validity() { return validityOf(this); },
+    get validationMessage() { return validationMessage(this); },
+    get willValidate() { return !this.disabled && !(this.localName === 'input' && ['hidden', 'reset', 'button'].includes(this.type)); },
+    checkValidity() {
+      if (validityOf(this).valid) return true;
+      this.dispatchEvent(new Event('invalid', { cancelable: true }));
+      return false;
+    },
+    reportValidity() { return this.checkValidity(); },
+    setCustomValidity(message) { customValidity.set(this, String(message)); },
+    get form() { return this.closest('form'); },
+    get labels() { return this.id ? [...document.querySelectorAll(`label[for="${CSS.escape(this.id)}"]`), ...(this.closest('label') ? [this.closest('label')] : [])] : (this.closest('label') ? [this.closest('label')] : []); },
+  };
+  for (const name of ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLButtonElement', 'HTMLOutputElement', 'HTMLFieldSetElement', 'HTMLObjectElement']) {
+    for (const k of Object.keys(constraintMethods)) {
+      Object.defineProperty(global[name].prototype, k, { ...Object.getOwnPropertyDescriptor(constraintMethods, k), configurable: true });
+    }
+  }
+  define(HTMLFormElement.prototype, {
+    get elements() { return this.querySelectorAll('input, select, textarea, button, output, fieldset, object'); },
+    get length() { return this.elements.length; },
+    checkValidity() { let ok = true; for (const el of this.elements) if (el.checkValidity && !el.checkValidity()) ok = false; return ok; },
+    reportValidity() { return this.checkValidity(); },
+    requestSubmit(submitter) {
+      if (!this.checkValidity()) return;
+      const ev = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter ?? null });
+      this.dispatchEvent(ev);
+    },
+    reset() { this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true })); },
+  });
+  global.ValidityState = ValidityState;
+
+  // ---- structuredClone (the HTML structured clone algorithm) ----
+  function structuredCloneImpl(value, options) {
+    const memory = new Map();
+    const transfer = options && options.transfer ? Array.from(options.transfer) : [];
+    const fail = (what) => { throw new DOMException(`Failed to execute 'structuredClone' on 'Window': ${what} could not be cloned.`, 'DataCloneError'); };
+    const clone = (v) => {
+      if (v === null || (typeof v !== 'object' && typeof v !== 'function')) {
+        if (typeof v === 'symbol') fail(String(v));
+        return v;
+      }
+      if (typeof v === 'function') fail(String(v).slice(0, 40));
+      if (memory.has(v)) return memory.get(v);
+      let out;
+      const tag = Object.prototype.toString.call(v).slice(8, -1);
+      if (v instanceof Date) out = new Date(v.getTime());
+      else if (v instanceof RegExp) out = new RegExp(v.source, v.flags);
+      else if (v instanceof ArrayBuffer) out = transfer.includes(v) ? v : v.slice(0);
+      else if (ArrayBuffer.isView(v)) {
+        const buffer = clone(v.buffer);
+        out = v instanceof DataView ? new DataView(buffer, v.byteOffset, v.byteLength) : new v.constructor(buffer, v.byteOffset, v.length);
+      } else if (v instanceof Map) {
+        out = new Map();
+        memory.set(v, out);
+        for (const [k, val] of v) out.set(clone(k), clone(val));
+        return out;
+      } else if (v instanceof Set) {
+        out = new Set();
+        memory.set(v, out);
+        for (const k of v) out.add(clone(k));
+        return out;
+      } else if (v instanceof Error) {
+        const Ctor = { EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError }[v.name] || Error;
+        out = Object.create(Ctor.prototype);
+        memory.set(v, out);
+        if ('message' in v) Object.defineProperty(out, 'message', { value: String(v.message), writable: true, configurable: true });
+        if (typeof v.stack === 'string') Object.defineProperty(out, 'stack', { value: v.stack, writable: true, configurable: true });
+        if ('cause' in v) Object.defineProperty(out, 'cause', { value: clone(v.cause), writable: true, configurable: true });
+        return out;
+      } else if (tag === 'Boolean' || tag === 'Number' || tag === 'String' || tag === 'BigInt') {
+        out = Object(v.valueOf());
+      } else if (v instanceof Blob) out = v;
+      else if (Array.isArray(v)) {
+        out = new Array(v.length);
+        memory.set(v, out);
+        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+        return out;
+      } else if (v instanceof Node || v instanceof Promise || v instanceof WeakMap || v instanceof WeakSet || tag === 'Symbol') {
+        fail(`#<${tag}>`);
+      } else {
+        out = {};
+        memory.set(v, out);
+        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+        return out;
+      }
+      memory.set(v, out);
+      return out;
+    };
+    return clone(value);
+  }
+  global.structuredClone = function structuredClone(value, options) {
+    if (arguments.length === 0) throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+    return structuredCloneImpl(value, options);
+  };
+
+  // ---- geometry: DOMPoint, DOMMatrix ----
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { Object.defineProperties(this, { _x: { value: +x, writable: true }, _y: { value: +y, writable: true }, _z: { value: +z, writable: true }, _w: { value: +w, writable: true } }); }
+    static fromPoint(p = {}) { return new this(p.x ?? 0, p.y ?? 0, p.z ?? 0, p.w ?? 1); }
+    get x() { return this._x; } get y() { return this._y; } get z() { return this._z; } get w() { return this._w; }
+    matrixTransform(m) { return (m instanceof DOMMatrixReadOnly ? m : DOMMatrix.fromMatrix(m)).transformPoint(this); }
+    toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
+  }
+  class DOMPoint extends DOMPointReadOnly {
+    set x(v) { this._x = +v; } set y(v) { this._y = +v; } set z(v) { this._z = +v; } set w(v) { this._w = +v; }
+    get x() { return this._x; } get y() { return this._y; } get z() { return this._z; } get w() { return this._w; }
+  }
+  const M = ['m11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44'];
+  const identity = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  // Column-major 4x4 product a·b (CSS/DOMMatrix convention: m[col*4+row])
+  const mul = (a, b) => {
+    const out = new Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      out[c * 4 + r] = s;
+    }
+    return out;
+  };
+  const deg = (v) => v * Math.PI / 180;
+  // A CSS <transform-list> as a matrix (and whether it is 2D)
+  function parseTransformList(text) {
+    let m = identity(), is2D = true;
+    text = String(text).trim();
+    if (text === '' || text === 'none') return { m, is2D };
+    const re = /([a-zA-Z0-9]+)\(([^)]*)\)/g;
+    let match, consumed = '';
+    while ((match = re.exec(text))) {
+      consumed += match[0];
+      const fn = match[1].toLowerCase();
+      const args = match[2].split(/\s*,\s*|\s+/).filter(Boolean);
+      const num = (s, unit) => {
+        const v = parseFloat(s);
+        if (isNaN(v)) throw new SyntaxError(`Failed to parse '${text}'`);
+        if (unit === 'angle') return /turn$/.test(s) ? v * 360 : /grad$/.test(s) ? v * 0.9 : /rad$/.test(s) && !/grad$/.test(s) ? v * 180 / Math.PI : v;
+        return v;
+      };
+      let t = identity();
+      const a = (i, unit) => num(args[i], unit);
+      switch (fn) {
+        case 'matrix': t = [a(0), a(1), 0, 0, a(2), a(3), 0, 0, 0, 0, 1, 0, a(4), a(5), 0, 1]; break;
+        case 'matrix3d': t = args.map(s => num(s)); is2D = false; break;
+        case 'translate': t[12] = a(0); t[13] = args[1] ? a(1) : 0; break;
+        case 'translatex': t[12] = a(0); break;
+        case 'translatey': t[13] = a(0); break;
+        case 'translatez': t[14] = a(0); is2D = false; break;
+        case 'translate3d': t[12] = a(0); t[13] = a(1); t[14] = a(2); is2D = false; break;
+        case 'scale': t[0] = a(0); t[5] = args[1] ? a(1) : a(0); break;
+        case 'scalex': t[0] = a(0); break;
+        case 'scaley': t[5] = a(0); break;
+        case 'scalez': t[10] = a(0); is2D = false; break;
+        case 'scale3d': t[0] = a(0); t[5] = a(1); t[10] = a(2); is2D = false; break;
+        case 'rotate': case 'rotatez': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[0] = c; t[1] = s; t[4] = -s; t[5] = c; break; }
+        case 'rotatex': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[5] = c; t[6] = s; t[9] = -s; t[10] = c; is2D = false; break; }
+        case 'rotatey': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[0] = c; t[2] = -s; t[8] = s; t[10] = c; is2D = false; break; }
+        case 'skew': t[4] = Math.tan(deg(a(0, 'angle'))); if (args[1]) t[1] = Math.tan(deg(a(1, 'angle'))); break;
+        case 'skewx': t[4] = Math.tan(deg(a(0, 'angle'))); break;
+        case 'skewy': t[1] = Math.tan(deg(a(0, 'angle'))); break;
+        case 'perspective': if (a(0) !== 0) t[11] = -1 / a(0); is2D = false; break;
+        default: throw new DOMException(`Failed to construct 'DOMMatrix': Failed to parse '${text}'.`, 'SyntaxError');
+      }
+      m = mul(m, t);
+    }
+    if (consumed.replace(/\s/g, '') !== text.replace(/\s/g, '')) throw new DOMException(`Failed to construct 'DOMMatrix': Failed to parse '${text}'.`, 'SyntaxError');
+    return { m, is2D };
+  }
+  class DOMMatrixReadOnly {
+    constructor(init) {
+      let m = identity(), is2D = true;
+      if (typeof init === 'string') ({ m, is2D } = parseTransformList(init));
+      else if (init !== undefined && init !== null) {
+        const v = Array.from(init, Number);
+        if (v.length === 6) m = [v[0], v[1], 0, 0, v[2], v[3], 0, 0, 0, 0, 1, 0, v[4], v[5], 0, 1];
+        else if (v.length === 16) { m = v; is2D = false; }
+        else throw new TypeError(`Failed to construct 'DOMMatrix': The sequence must contain 6 elements for a 2D matrix or 16 elements for a 3D matrix.`);
+      }
+      Object.defineProperties(this, { _m: { value: m, writable: true }, _2d: { value: is2D, writable: true } });
+    }
+    static fromMatrix(o = {}) {
+      if (o instanceof DOMMatrixReadOnly) return new this(o._2d ? [o.a, o.b, o.c, o.d, o.e, o.f] : o._m);
+      const m = new this();
+      const a = o.a ?? o.m11 ?? 1, b = o.b ?? o.m12 ?? 0, c = o.c ?? o.m21 ?? 0, d = o.d ?? o.m22 ?? 1, e = o.e ?? o.m41 ?? 0, f = o.f ?? o.m42 ?? 0;
+      m._m = [a, b, o.m13 ?? 0, o.m14 ?? 0, c, d, o.m23 ?? 0, o.m24 ?? 0, o.m31 ?? 0, o.m32 ?? 0, o.m33 ?? 1, o.m34 ?? 0, e, f, o.m43 ?? 0, o.m44 ?? 1];
+      m._2d = o.is2D ?? M.every((k, i) => [2, 3, 6, 7, 8, 9, 11, 14].includes(i) ? !o[k] : [10, 15].includes(i) ? (o[k] ?? 1) === 1 : true);
+      return m;
+    }
+    static fromFloat32Array(a) { return new this(Array.from(a)); }
+    static fromFloat64Array(a) { return new this(Array.from(a)); }
+    get a() { return this._m[0]; } get b() { return this._m[1]; } get c() { return this._m[4]; }
+    get d() { return this._m[5]; } get e() { return this._m[12]; } get f() { return this._m[13]; }
+    get is2D() { return this._2d; }
+    get isIdentity() { return this._m.every((v, i) => v === (i % 5 === 0 ? 1 : 0)); }
+    _derive(m, is2D = this._2d) { const r = new DOMMatrix(); r._m = m; r._2d = is2D; return r; }
+    multiply(o) { const b = o instanceof DOMMatrixReadOnly ? o : DOMMatrix.fromMatrix(o); return this._derive(mul(this._m, b._m), this._2d && b._2d); }
+    translate(tx = 0, ty = 0, tz = 0) { const t = identity(); t[12] = tx; t[13] = ty; t[14] = tz; return this._derive(mul(this._m, t), this._2d && !tz); }
+    scale(sx = 1, sy = sx, sz = 1, ox = 0, oy = 0, oz = 0) {
+      const t = identity(); t[0] = sx; t[5] = sy; t[10] = sz;
+      return this.translate(ox, oy, oz).multiply(this._derive(t, sz === 1)).translate(-ox, -oy, -oz);
+    }
+    scaleNonUniform(sx = 1, sy = 1) { return this.scale(sx, sy); }
+    rotate(rx = 0, ry, rz) {
+      if (ry === undefined && rz === undefined) { rz = rx; rx = 0; ry = 0; }
+      let m = this._m;
+      const is2D = this._2d && !rx && !ry;
+      for (const [angle, fn] of [[rx, 'rotateX'], [ry, 'rotateY'], [rz, 'rotate']]) {
+        if (angle) m = mul(m, parseTransformList(`${fn}(${angle}deg)`).m);
+      }
+      return this._derive(m, is2D);
+    }
+    rotateFromVector(x = 0, y = 0) { return this.rotate(x === 0 && y === 0 ? 0 : Math.atan2(y, x) * 180 / Math.PI); }
+    skewX(sx = 0) { return this._derive(mul(this._m, parseTransformList(`skewX(${sx}deg)`).m)); }
+    skewY(sy = 0) { return this._derive(mul(this._m, parseTransformList(`skewY(${sy}deg)`).m)); }
+    flipX() { return this.scale(-1, 1); }
+    flipY() { return this.scale(1, -1); }
+    inverse() {
+      const m = this._m, inv = new Array(16);
+      inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+      inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+      inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+      inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+      inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+      inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+      inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+      inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+      inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+      inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+      inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+      inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+      inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+      inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+      inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+      inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+      const det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+      if (!det) return this._derive(new Array(16).fill(NaN), false);
+      return this._derive(inv.map(v => v / det));
+    }
+    transformPoint(p = {}) {
+      const m = this._m, x = p.x ?? 0, y = p.y ?? 0, z = p.z ?? 0, w = p.w ?? 1;
+      return new DOMPoint(
+        m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w,
+        m[2] * x + m[6] * y + m[10] * z + m[14] * w, m[3] * x + m[7] * y + m[11] * z + m[15] * w);
+    }
+    toFloat32Array() { return new Float32Array(this._m); }
+    toFloat64Array() { return new Float64Array(this._m); }
+    toString() {
+      const f = (v) => { if (!isFinite(v)) throw new DOMException('Cannot stringify a matrix with non-finite values', 'InvalidStateError'); return String(Object.is(v, -0) ? 0 : v); };
+      return this._2d ? `matrix(${[this.a, this.b, this.c, this.d, this.e, this.f].map(f).join(', ')})` : `matrix3d(${this._m.map(f).join(', ')})`;
+    }
+    toJSON() { const o = { a: this.a, b: this.b, c: this.c, d: this.d, e: this.e, f: this.f, is2D: this.is2D, isIdentity: this.isIdentity }; M.forEach((k, i) => { o[k] = this._m[i]; }); return o; }
+  }
+  M.forEach((k, i) => Object.defineProperty(DOMMatrixReadOnly.prototype, k, { get() { return this._m[i]; }, configurable: true }));
+  class DOMMatrix extends DOMMatrixReadOnly {
+    _self(m, is2D = this._2d) { this._m = m; this._2d = is2D; return this; }
+    multiplySelf(o) { const r = this.multiply(o); return this._self(r._m, r._2d); }
+    preMultiplySelf(o) { const b = o instanceof DOMMatrixReadOnly ? o : DOMMatrix.fromMatrix(o); return this._self(mul(b._m, this._m), this._2d && b._2d); }
+    translateSelf(...a) { const r = this.translate(...a); return this._self(r._m, r._2d); }
+    scaleSelf(...a) { const r = this.scale(...a); return this._self(r._m, r._2d); }
+    rotateSelf(...a) { const r = this.rotate(...a); return this._self(r._m, r._2d); }
+    skewXSelf(s) { return this._self(this.skewX(s)._m); }
+    skewYSelf(s) { return this._self(this.skewY(s)._m); }
+    invertSelf() { const r = this.inverse(); return this._self(r._m, r._2d); }
+    setMatrixValue(text) { const { m, is2D } = parseTransformList(text); return this._self(m, is2D); }
+  }
+  M.forEach((k, i) => Object.defineProperty(DOMMatrix.prototype, k, {
+    get() { return this._m[i]; },
+    set(v) { this._m[i] = +v; if (![0, 1, 4, 5, 10, 12, 13, 15].includes(i) && +v !== 0) this._2d = false; },
+    configurable: true,
+  }));
+  for (const [k, i] of [['a', 0], ['b', 1], ['c', 4], ['d', 5], ['e', 12], ['f', 13]]) {
+    Object.defineProperty(DOMMatrix.prototype, k, { get() { return this._m[i]; }, set(v) { this._m[i] = +v; }, configurable: true });
+  }
+  class DOMQuad {
+    constructor(p1 = {}, p2 = {}, p3 = {}, p4 = {}) { [this.p1, this.p2, this.p3, this.p4] = [p1, p2, p3, p4].map(p => DOMPoint.fromPoint(p)); }
+    static fromRect(r = {}) { const x = r.x ?? 0, y = r.y ?? 0, w = r.width ?? 0, h = r.height ?? 0; return new DOMQuad({ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }); }
+    getBounds() {
+      const xs = [this.p1, this.p2, this.p3, this.p4].map(p => p.x), ys = [this.p1, this.p2, this.p3, this.p4].map(p => p.y);
+      const x = Math.min(...xs), y = Math.min(...ys);
+      return new DOMRect(x, y, Math.max(...xs) - x, Math.max(...ys) - y);
+    }
+  }
+  Object.assign(global, { DOMPointReadOnly, DOMPoint, DOMMatrixReadOnly, DOMMatrix, WebKitCSSMatrix: DOMMatrix, DOMQuad, DOMRectReadOnly: DOMRect });
+
+  // ---- Range and Selection (DOM §5, Selection API) ----
+  //
+  // Ranges are static: unlike browsers' live ranges they do not move when
+  // the DOM changes under them.
+  const nodeLength = (n) => [3, 4, 7, 8].includes(n.nodeType) ? n.data.length : n.nodeType === 10 ? 0 : n.childNodes.length;
+  const indexOfNode = (n) => { let i = 0; for (let s = n.previousSibling; s; s = s.previousSibling) i++; return i; };
+  const rootOfNode = (n) => { while (n.parentNode) n = n.parentNode; return n; };
+  // Position of boundary point (nA, oA) relative to (nB, oB): -1 before, 0 equal, 1 after
+  function comparePoints(nA, oA, nB, oB) {
+    if (nA === nB) return oA === oB ? 0 : oA < oB ? -1 : 1;
+    const pos = nB.compareDocumentPosition(nA);
+    if (pos & 4) return -comparePoints(nB, oB, nA, oA);
+    if (pos & 8) {
+      let child = nB;
+      while (child.parentNode !== nA) child = child.parentNode;
+      return indexOfNode(child) < oA ? 1 : -1;
+    }
+    return -1;
+  }
+  const isCharacterData = (n) => n.nodeType === 3 || n.nodeType === 4 || n.nodeType === 7 || n.nodeType === 8;
+  class AbstractRange {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get startContainer() { return this._sc; }
+    get startOffset() { return this._so; }
+    get endContainer() { return this._ec; }
+    get endOffset() { return this._eo; }
+    get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+  }
+  class StaticRange extends AbstractRange {
+    constructor(init) {
+      const r = Object.create(new.target.prototype);
+      Object.assign(r, { _sc: init.startContainer, _so: init.startOffset >>> 0, _ec: init.endContainer, _eo: init.endOffset >>> 0 });
+      return r;
+    }
+  }
+  class Range extends AbstractRange {
+    constructor() {
+      const r = Object.create(new.target.prototype);
+      Object.defineProperties(r, { _sc: { value: document, writable: true }, _so: { value: 0, writable: true }, _ec: { value: document, writable: true }, _eo: { value: 0, writable: true } });
+      return r;
+    }
+    get commonAncestorContainer() {
+      let c = this._sc;
+      while (!c.contains(this._ec)) c = c.parentNode;
+      return c;
+    }
+    _boundary(node, offset, which) {
+      if (!(node instanceof Node)) throw new TypeError(`Failed to execute 'set${which}' on 'Range': parameter 1 is not of type 'Node'.`);
+      if (node.nodeType === 10) throw new DOMException(`Failed to execute 'set${which}' on 'Range': The node provided is a DocumentType.`, 'InvalidNodeTypeError');
+      offset = Number(offset) >>> 0;
+      if (offset > nodeLength(node)) throw new DOMException(`Failed to execute 'set${which}' on 'Range': The offset ${offset} is larger than the node's length (${nodeLength(node)}).`, 'IndexSizeError');
+      return offset;
+    }
+    setStart(node, offset) {
+      offset = this._boundary(node, offset, 'Start');
+      this._sc = node; this._so = offset;
+      if (rootOfNode(node) !== rootOfNode(this._ec) || comparePoints(node, offset, this._ec, this._eo) > 0) { this._ec = node; this._eo = offset; }
+    }
+    setEnd(node, offset) {
+      offset = this._boundary(node, offset, 'End');
+      this._ec = node; this._eo = offset;
+      if (rootOfNode(node) !== rootOfNode(this._sc) || comparePoints(node, offset, this._sc, this._so) < 0) { this._sc = node; this._so = offset; }
+    }
+    _parentOf(node, name) {
+      const p = node.parentNode;
+      if (!p) throw new DOMException(`Failed to execute '${name}' on 'Range': the given Node has no parent.`, 'InvalidNodeTypeError');
+      return p;
+    }
+    setStartBefore(n) { this.setStart(this._parentOf(n, 'setStartBefore'), indexOfNode(n)); }
+    setStartAfter(n) { this.setStart(this._parentOf(n, 'setStartAfter'), indexOfNode(n) + 1); }
+    setEndBefore(n) { this.setEnd(this._parentOf(n, 'setEndBefore'), indexOfNode(n)); }
+    setEndAfter(n) { this.setEnd(this._parentOf(n, 'setEndAfter'), indexOfNode(n) + 1); }
+    collapse(toStart = false) { if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; } }
+    selectNode(n) { const p = this._parentOf(n, 'selectNode'), i = indexOfNode(n); this._sc = this._ec = p; this._so = i; this._eo = i + 1; }
+    selectNodeContents(n) {
+      if (n.nodeType === 10) throw new DOMException("Failed to execute 'selectNodeContents' on 'Range': The node provided is a DocumentType.", 'InvalidNodeTypeError');
+      this._sc = this._ec = n; this._so = 0; this._eo = nodeLength(n);
+    }
+    compareBoundaryPoints(how, source) {
+      const [a, b] = [[['_sc', '_so'], ['_sc', '_so']], [['_ec', '_eo'], ['_sc', '_so']], [['_ec', '_eo'], ['_ec', '_eo']], [['_sc', '_so'], ['_ec', '_eo']]][how] ?? [];
+      if (!a) throw new DOMException("Failed to execute 'compareBoundaryPoints' on 'Range': The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.", 'NotSupportedError');
+      if (rootOfNode(this._sc) !== rootOfNode(source._sc)) throw new DOMException("Failed to execute 'compareBoundaryPoints' on 'Range': The source range is in a different document than this range.", 'WrongDocumentError');
+      return comparePoints(this[a[0]], this[a[1]], source[b[0]], source[b[1]]);
+    }
+    comparePoint(node, offset) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) throw new DOMException("Failed to execute 'comparePoint' on 'Range': The node provided and the Range are not in the same tree.", 'WrongDocumentError');
+      offset = this._boundary(node, offset, 'Point');
+      if (comparePoints(node, offset, this._sc, this._so) < 0) return -1;
+      if (comparePoints(node, offset, this._ec, this._eo) > 0) return 1;
+      return 0;
+    }
+    isPointInRange(node, offset) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) return false;
+      return this.comparePoint(node, offset) === 0;
+    }
+    intersectsNode(node) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) return false;
+      const parent = node.parentNode;
+      if (!parent) return true;
+      const i = indexOfNode(node);
+      return comparePoints(parent, i, this._ec, this._eo) < 0 && comparePoints(parent, i + 1, this._sc, this._so) > 0;
+    }
+    cloneRange() { const r = new Range(); Object.assign(r, { _sc: this._sc, _so: this._so, _ec: this._ec, _eo: this._eo }); return r; }
+    _contains(node) {
+      return rootOfNode(node) === rootOfNode(this._sc) && comparePoints(node, 0, this._sc, this._so) > 0 && comparePoints(node, nodeLength(node), this._ec, this._eo) < 0;
+    }
+    _partiallyContains(node) {
+      const a = node.contains(this._sc), b = node.contains(this._ec);
+      return a !== b;
+    }
+    // The "extract" and "clone the contents" algorithms
+    _contents(extract) {
+      const fragment = document.createDocumentFragment();
+      if (this.collapsed) return fragment;
+      const { _sc: sc, _so: so, _ec: ec, _eo: eo } = this;
+      if (sc === ec && isCharacterData(sc)) {
+        const clone = sc.cloneNode(false);
+        clone.data = sc.data.slice(so, eo);
+        fragment.appendChild(clone);
+        if (extract) sc.data = sc.data.slice(0, so) + sc.data.slice(eo);
+        return fragment;
+      }
+      let common = sc;
+      while (!common.contains(ec)) common = common.parentNode;
+      let firstPartial = null, lastPartial = null;
+      if (!sc.contains(ec)) { for (let n = sc; n !== common; n = n.parentNode) if (n.parentNode === common) firstPartial = n; }
+      if (!ec.contains(sc)) { for (let n = ec; n !== common; n = n.parentNode) if (n.parentNode === common) lastPartial = n; }
+      const contained = Array.from(common.childNodes).filter(c => this._contains(c));
+      let newNode, newOffset;
+      if (extract) {
+        if (sc.contains(ec)) { newNode = sc; newOffset = so; }
+        else {
+          let ref = sc;
+          while (ref.parentNode && !ref.parentNode.contains(ec)) ref = ref.parentNode;
+          newNode = ref.parentNode; newOffset = indexOfNode(ref) + 1;
+        }
+      }
+      if (firstPartial) {
+        if (isCharacterData(firstPartial)) {
+          const clone = firstPartial.cloneNode(false);
+          clone.data = sc.data.slice(so);
+          fragment.appendChild(clone);
+          if (extract) sc.data = sc.data.slice(0, so);
+        } else {
+          const clone = firstPartial.cloneNode(false);
+          fragment.appendChild(clone);
+          const sub = new Range();
+          sub.setStart(sc, so); sub.setEnd(firstPartial, nodeLength(firstPartial));
+          clone.appendChild(sub._contents(extract));
+        }
+      }
+      for (const c of contained) fragment.appendChild(extract ? c : c.cloneNode(true));
+      if (lastPartial) {
+        if (isCharacterData(lastPartial)) {
+          const clone = lastPartial.cloneNode(false);
+          clone.data = ec.data.slice(0, eo);
+          fragment.appendChild(clone);
+          if (extract) ec.data = ec.data.slice(eo);
+        } else {
+          const clone = lastPartial.cloneNode(false);
+          fragment.appendChild(clone);
+          const sub = new Range();
+          sub.setStart(lastPartial, 0); sub.setEnd(ec, eo);
+          clone.appendChild(sub._contents(extract));
+        }
+      }
+      if (extract) { this._sc = this._ec = newNode; this._so = this._eo = newOffset; }
+      return fragment;
+    }
+    cloneContents() { return this._contents(false); }
+    extractContents() { return this._contents(true); }
+    deleteContents() { this._contents(true); }
+    insertNode(node) {
+      const { _sc: sc, _so: so } = this;
+      if (sc === node || ([4, 7, 8].includes(sc.nodeType)) || (sc.nodeType === 3 && !sc.parentNode)) {
+        throw new DOMException("Failed to execute 'insertNode' on 'Range': The node provided cannot be inserted here.", 'HierarchyRequestError');
+      }
+      let reference = null, parent;
+      if (sc.nodeType === 3) {
+        // Split the text node at the offset
+        parent = sc.parentNode;
+        const tail = document.createTextNode(sc.data.slice(so));
+        sc.data = sc.data.slice(0, so);
+        parent.insertBefore(tail, sc.nextSibling);
+        reference = tail;
+      } else {
+        parent = sc;
+        reference = sc.childNodes[so] ?? null;
+      }
+      if (reference === node) reference = node.nextSibling;
+      parent.insertBefore(node, reference);
+      if (this.collapsed) { this._ec = parent; this._eo = (reference ? indexOfNode(reference) : parent.childNodes.length); }
+    }
+    surroundContents(newParent) {
+      const cut = (n) => this._partiallyContains(n) && !isCharacterData(n);
+      for (let n = this._sc; n; n = n.parentNode) if (cut(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", 'InvalidStateError');
+      for (let n = this._ec; n; n = n.parentNode) if (cut(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", 'InvalidStateError');
+      const fragment = this.extractContents();
+      while (newParent.firstChild) newParent.removeChild(newParent.firstChild);
+      this.insertNode(newParent);
+      newParent.appendChild(fragment);
+      this.selectNode(newParent);
+    }
+    toString() {
+      const { _sc: sc, _so: so, _ec: ec, _eo: eo } = this;
+      if (sc === ec && sc.nodeType === 3) return sc.data.slice(so, eo);
+      let s = sc.nodeType === 3 ? sc.data.slice(so) : '';
+      const walker = document.createTreeWalker(this.commonAncestorContainer, NodeFilter.SHOW_TEXT);
+      for (let t; (t = walker.nextNode());) if (t !== sc && t !== ec && this._contains(t)) s += t.data;
+      if (ec.nodeType === 3 && ec !== sc) s += ec.data.slice(0, eo);
+      return s;
+    }
+    _elements() {
+      const out = [];
+      const add = (n) => { const el = n.nodeType === 1 ? n : n.parentElement; if (el && !out.includes(el)) out.push(el); };
+      if (this.collapsed) { add(this._sc); return out; }
+      add(this._sc);
+      const walker = document.createTreeWalker(this.commonAncestorContainer, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      for (let n; (n = walker.nextNode());) if (this._contains(n)) add(n);
+      add(this._ec);
+      return out;
+    }
+    getClientRects() { return this._elements().flatMap(el => Array.from(el.getClientRects())); }
+    getBoundingClientRect() {
+      const rects = this.getClientRects().filter(r => r.width || r.height);
+      if (!rects.length) return new DOMRect(0, 0, 0, 0);
+      const l = Math.min(...rects.map(r => r.left)), t = Math.min(...rects.map(r => r.top));
+      return new DOMRect(l, t, Math.max(...rects.map(r => r.right)) - l, Math.max(...rects.map(r => r.bottom)) - t);
+    }
+    createContextualFragment(html) {
+      const context = this._sc.nodeType === 1 ? this._sc : this._sc.parentElement || document.body;
+      const t = document.createElement(context && context.localName !== 'html' ? context.localName : 'body');
+      t.innerHTML = html;
+      const f = document.createDocumentFragment();
+      f.append(...t.childNodes);
+      return f;
+    }
+    detach() {}
+  }
+  Object.assign(Range, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+  Object.assign(Range.prototype, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+  Document.prototype.createRange = function () { return new Range(); };
+
+  class Selection {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get rangeCount() { return this._range ? 1 : 0; }
+    get anchorNode() { return this._range ? (this._backward ? this._range._ec : this._range._sc) : null; }
+    get anchorOffset() { return this._range ? (this._backward ? this._range._eo : this._range._so) : 0; }
+    get focusNode() { return this._range ? (this._backward ? this._range._sc : this._range._ec) : null; }
+    get focusOffset() { return this._range ? (this._backward ? this._range._so : this._range._eo) : 0; }
+    get isCollapsed() { return !this._range || this._range.collapsed; }
+    get type() { return !this._range ? 'None' : this._range.collapsed ? 'Caret' : 'Range'; }
+    get direction() { return !this._range || this._range.collapsed ? 'none' : this._backward ? 'backward' : 'forward'; }
+    getRangeAt(i) {
+      if (!this._range || i !== 0) throw new DOMException(`Failed to execute 'getRangeAt' on 'Selection': ${i} is not a valid index.`, 'IndexSizeError');
+      return this._range;
+    }
+    addRange(r) { if (!this._range) { this._range = r; this._backward = false; } }
+    removeRange(r) {
+      if (r !== this._range) throw new DOMException("Failed to execute 'removeRange' on 'Selection': The given range isn't in document.", 'NotFoundError');
+      this._range = null;
+    }
+    removeAllRanges() { this._range = null; }
+    empty() { this._range = null; }
+    collapse(node, offset = 0) {
+      if (node === null) { this._range = null; return; }
+      const r = new Range();
+      r.setStart(node, offset);
+      this._range = r; this._backward = false;
+    }
+    setPosition(node, offset) { this.collapse(node, offset); }
+    collapseToStart() { if (!this._range) throw new DOMException('Selection has no ranges', 'InvalidStateError'); this.collapse(this._range._sc, this._range._so); }
+    collapseToEnd() { if (!this._range) throw new DOMException('Selection has no ranges', 'InvalidStateError'); this.collapse(this._range._ec, this._range._eo); }
+    extend(node, offset = 0) {
+      if (!this._range) throw new DOMException("Failed to execute 'extend' on 'Selection': This Selection object doesn't have any Ranges.", 'InvalidStateError');
+      const anchor = [this.anchorNode, this.anchorOffset];
+      const r = new Range();
+      if (comparePoints(node, offset, anchor[0], anchor[1]) < 0) { r.setStart(node, offset); r.setEnd(anchor[0], anchor[1]); this._backward = true; }
+      else { r.setStart(anchor[0], anchor[1]); r.setEnd(node, offset); this._backward = false; }
+      this._range = r;
+    }
+    setBaseAndExtent(an, ao, fn, fo) { this.collapse(an, ao); this.extend(fn, fo); }
+    selectAllChildren(node) { const r = new Range(); r.selectNodeContents(node); this._range = r; this._backward = false; }
+    containsNode(node, partial = false) {
+      if (!this._range) return false;
+      return partial ? this._range.intersectsNode(node) : this._range._contains(node);
+    }
+    deleteFromDocument() { if (this._range) this._range.deleteContents(); }
+    toString() { return this._range ? this._range.toString() : ''; }
+  }
+  const selection = Object.create(Selection.prototype);
+  Object.defineProperties(selection, { _range: { value: null, writable: true }, _backward: { value: false, writable: true } });
+  global.getSelection = function getSelection() { return selection; };
+  Document.prototype.getSelection = function () { return selection; };
+  Object.assign(global, { AbstractRange, StaticRange, Range, Selection });
+
+  // ---- DOMParser and XMLSerializer ----
+  //
+  // Every type parses as HTML (there is no XML parser); scripts in the
+  // parsed document do not run.
+  class DOMParser {
+    parseFromString(text, type) {
+      type = String(type);
+      if (!['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'].includes(type)) {
+        throw new TypeError(`Failed to execute 'parseFromString' on 'DOMParser': The provided value '${type}' is not a valid enum value of type DOMParserSupportedType.`);
+      }
+      const html = __fosParseDocument(String(text).replace(/^\s*<\?xml[^>]*\?>/i, ''));
+      const child = (tag) => Array.from(html.children).find(c => c.localName === tag) || null;
+      const doc = Object.create(document);
+      define(doc, {
+        documentElement: html,
+        get head() { return child('head'); },
+        get body() { return child('body'); },
+        get title() { const t = html.querySelector('title'); return t ? t.textContent.trim() : ''; },
+        get contentType() { return type; },
+        get URL() { return 'about:blank'; },
+        getElementById(id) { return html.querySelector('#' + CSS.escape(String(id))); },
+        querySelector(s) { return html.matches(s) ? html : html.querySelector(s); },
+        querySelectorAll(s) { return html.querySelectorAll(s); },
+        getElementsByTagName(t) { return html.getElementsByTagName(t); },
+        getElementsByClassName(c) { return html.getElementsByClassName(c); },
+        get readyState() { return 'complete'; },
+        get defaultView() { return null; },
+      });
+      if (type !== 'text/html') {
+        // An XML document's element is the root, not a body child
+        const root = child('body')?.firstElementChild || Array.from(html.children).find(c => c.localName !== 'head');
+        if (root) define(doc, { documentElement: root });
+      }
+      return doc;
+    }
+  }
+  const escapeText = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  class XMLSerializer {
+    serializeToString(node) {
+      if (!(node instanceof Node) && !(node && node.documentElement)) throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+      if (node.documentElement && node.nodeType !== 1) return '<!DOCTYPE html>' + node.documentElement.outerHTML;
+      switch (node.nodeType) {
+        case 1: return node.outerHTML;
+        case 3: return escapeText(node.data);
+        case 8: return `<!--${node.data}-->`;
+        case 11: return Array.from(node.childNodes, n => this.serializeToString(n)).join('');
+        default: return '';
+      }
+    }
+  }
+  Object.assign(global, { DOMParser, XMLSerializer });
 })(globalThis);

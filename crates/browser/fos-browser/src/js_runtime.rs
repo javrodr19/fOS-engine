@@ -1027,6 +1027,76 @@ mod tests {
     }
 
     #[test]
+    fn ranges_parsers_and_platform_objects() {
+        let (mut rt, _doc) = page(r#"<html><body><div id="r"><p id="a">Hello <b>big</b> world</p><p id="b">second</p></div><form id="f"><input id="e" type="email" required value="x"><input id="n" type="number" min="3" value="5"></form><svg><a href="/x"></a></svg></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let run = |rt: &mut PageJsRuntime, src: &str| rt.eval(src).unwrap();
+        // Range: text, cloning, extraction across elements, insertion
+        assert_eq!(
+            run(&mut rt, "const a = document.getElementById('a'), t = a.firstChild, w = a.lastChild;
+                const r = document.createRange(); r.setStart(t, 2); r.setEnd(w, 3);
+                const out = [r.toString(), r.commonAncestorContainer.id, r.cloneContents().childNodes.length, r.collapsed];
+                r.extractContents(); out.push(a.textContent, r.collapsed, r.startContainer === a);
+                const r2 = new Range(); r2.selectNodeContents(document.getElementById('b')); r2.insertNode(document.createTextNode('1st '));
+                out.push(document.getElementById('b').textContent, r2.comparePoint(document.getElementById('b').firstChild, 0), r2.intersectsNode(a));
+                out.join('|')"),
+            "llo big wo|a|3|false|Herld|true|true|1st second|0|false"
+        );
+        // Selection
+        assert_eq!(
+            run(&mut rt, "const sel = getSelection(); const b = document.getElementById('b');
+                const t0 = sel.type; sel.selectAllChildren(b); const t1 = [sel.type, sel.toString(), sel.rangeCount, sel.anchorNode === b];
+                sel.collapse(b.lastChild, 2); sel.extend(b.firstChild, 1);
+                [t0, ...t1, sel.direction, sel.toString(), sel === document.getSelection(), sel instanceof Selection].join('|')"),
+            "None|Range|1st second|1|true|backward|st se|true|true"
+        );
+        // DOMParser and XMLSerializer
+        assert_eq!(
+            run(&mut rt, "const d = new DOMParser().parseFromString('<!doctype html><html lang=fr><head><title>T</title></head><body><p class=x>hi</p><script>window.ran = 1</script></body></html>', 'text/html');
+                const x = new DOMParser().parseFromString('<root><item id=\"1\"/></root>', 'application/xml');
+                [d.title, d.body.querySelector('.x').textContent, d.documentElement.getAttribute('lang'), typeof window.ran, x.documentElement.localName,
+                 new XMLSerializer().serializeToString(document.getElementById('b')), new XMLSerializer().serializeToString(document.createTextNode('a<b'))].join('|')"),
+            "T|hi|fr|undefined|root|<p id=\"b\">1st second</p>|a&lt;b"
+        );
+        // DOMMatrix
+        assert_eq!(
+            run(&mut rt, "const m = new DOMMatrix('translate(10px, 20px) scale(2)'); const p = m.transformPoint({ x: 1, y: 1 });
+                const i = m.inverse().multiply(m);
+                [m.toString(), p.x, p.y, i.isIdentity, new DOMMatrix([1, 2, 3, 4, 5, 6]).f, new DOMMatrix().rotate(90).transformPoint({ x: 1, y: 0 }).y.toFixed(3),
+                 new DOMMatrix('none').isIdentity, new DOMMatrix().translate(0, 0, 5).is2D, String(new DOMMatrix('matrix(1, 0, 0, 1, 7, 8)'))].join('|')"),
+            "matrix(2, 0, 0, 2, 10, 20)|12|22|true|6|1.000|true|false|matrix(1, 0, 0, 1, 7, 8)"
+        );
+        // structuredClone keeps types and cycles, and refuses functions
+        assert_eq!(
+            run(&mut rt, "const src = { d: new Date(5), m: new Map([[1, { s: new Set([2]) }]]), u: new Uint8Array([1, 2]), big: 10n, re: /x/g, err: new RangeError('r'), undef: undefined };
+                src.self = src;
+                const c = structuredClone(src);
+                let fn; try { structuredClone(() => 1); } catch (e) { fn = e.name; }
+                [c.d.getTime(), c.m.get(1).s.has(2), c.u[1], c.big, c.re.flags, c.err instanceof RangeError, c.err.message, 'undef' in c, c.self === c, c !== src, fn].join('|')"),
+            "5|true|2|10|g|true|r|true|true|true|DataCloneError"
+        );
+        // Interface objects, attributes, validity, SVG
+        assert_eq!(
+            run(&mut rt, "const e = document.getElementById('e'), n = document.getElementById('n');
+                const attrs = e.attributes;
+                const v1 = [e.validity.valid, e.validity.typeMismatch, e.validationMessage];
+                e.value = 'me@example.com'; n.value = '1';
+                [navigator instanceof Navigator, typeof Navigator.prototype.sendBeacon, history instanceof History, typeof History.prototype.replaceState,
+                 performance instanceof Performance, typeof performance.now(), Object.prototype.toString.call(screen),
+                 attrs.length, attrs.type.value, attrs.getNamedItem('id').ownerElement === e, attrs[0] instanceof Attr,
+                 ...v1, e.checkValidity(), n.validity.rangeUnderflow, document.getElementById('f').checkValidity(),
+                 document.querySelector('svg a') instanceof SVGAElement, document.querySelector('svg a').href instanceof SVGAnimatedString, document.querySelector('svg a').href.baseVal,
+                 new PointerEvent('pointerdown', { pointerType: 'pen' }).pointerType, new WheelEvent('wheel', { deltaY: 3 }).deltaY, new MessageEvent('message', { data: 1 }).data].join('|')"),
+            "true|function|true|function|true|number|[object Screen]|4|email|true|true|false|true|Please enter an email address.|true|true|false|true|true|/x|pen|3|1"
+        );
+        assert_eq!(
+            run(&mut rt, "const mk = (html) => { const d = document.createElement('div'); d.innerHTML = html; return d.firstChild; };
+                [mk('<input>').type, mk('<input type=CheckBox>').type, mk('<input type=bogus>').type, mk('<button>').type, mk('<select multiple>').type, mk('<textarea>').type].join()"),
+            "text,checkbox,text,submit,select-multiple,textarea"
+        );
+    }
+
+    #[test]
     fn broadcast_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();

@@ -11,10 +11,12 @@
 //! | 0xFFFB      | string cell address                   |
 //! | 0xFFFC      | object cell address                   |
 //! | 0xFFFD      | symbol cell address                   |
+//! | 0xFFFE      | BigInt cell address                   |
 //!
 //! Integers in int32 range are stored as int32 (except -0), which gives
 //! arithmetic and array indexing an integer fast path.
 
+use crate::bigint::BigInt;
 use crate::gc::Gc;
 use crate::object::{JsObject, Symbol};
 use crate::string::JsString;
@@ -29,6 +31,7 @@ const TAG_MISC: u64 = 0xFFFA;
 const TAG_STRING: u64 = 0xFFFB;
 const TAG_OBJECT: u64 = 0xFFFC;
 const TAG_SYMBOL: u64 = 0xFFFD;
+const TAG_BIGINT: u64 = 0xFFFE;
 const PAYLOAD: u64 = 0x0000_FFFF_FFFF_FFFF;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
@@ -96,6 +99,11 @@ impl Value {
         Value((TAG_SYMBOL << TAG_SHIFT) | s.addr() as u64)
     }
 
+    #[inline(always)]
+    pub fn bigint(b: Gc<BigInt>) -> Value {
+        Value((TAG_BIGINT << TAG_SHIFT) | b.addr() as u64)
+    }
+
     // ---- type tests ----
 
     #[inline(always)]
@@ -153,6 +161,17 @@ impl Value {
         self.tag() == TAG_SYMBOL
     }
 
+    #[inline(always)]
+    pub fn is_bigint(self) -> bool {
+        self.tag() == TAG_BIGINT
+    }
+
+    /// A primitive whose ToNumeric is a number (not an object or BigInt)
+    #[inline(always)]
+    pub fn is_primitive_number_like(self) -> bool {
+        !self.is_object() && !self.is_bigint()
+    }
+
     // ---- extraction ----
 
     #[inline(always)]
@@ -193,6 +212,11 @@ impl Value {
     #[inline(always)]
     pub fn as_object(self) -> Option<Gc<JsObject>> {
         if self.is_object() { Some(unsafe { Gc::from_addr((self.0 & PAYLOAD) as usize) }) } else { None }
+    }
+
+    #[inline(always)]
+    pub fn as_bigint(self) -> Option<Gc<BigInt>> {
+        if self.is_bigint() { Some(unsafe { Gc::from_addr((self.0 & PAYLOAD) as usize) }) } else { None }
     }
 
     #[inline(always)]
@@ -245,6 +269,8 @@ impl std::fmt::Debug for Value {
             _ => {
                 if let Some(s) = self.as_string() {
                     write!(f, "{:?}", s.get().to_rust_string())
+                } else if let Some(b) = self.as_bigint() {
+                    write!(f, "{}n", b.get().to_string_radix(10))
                 } else if self.is_object() {
                     write!(f, "[object]")
                 } else {

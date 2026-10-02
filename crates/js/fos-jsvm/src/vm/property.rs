@@ -169,6 +169,8 @@ impl Vm {
             Ok(self.realm.boolean_proto)
         } else if v.is_symbol() {
             Ok(self.realm.symbol_proto)
+        } else if v.is_bigint() {
+            Ok(self.realm.bigint_proto)
         } else {
             let k = self.key_display(key);
             Err(self.type_error(&format!("Cannot read properties of {v:?} (reading '{k}')")))
@@ -645,6 +647,11 @@ impl Vm {
         }
         if let Some(s) = v.as_symbol() {
             return Ok(PropertyKey::Symbol(s));
+        }
+        if let Some(b) = v.as_bigint() {
+            let text = b.get().to_string_radix(10);
+            let s = self.new_string(&text);
+            return self.to_property_key(Value::string(s));
         }
         let atom = match v {
             Value::UNDEFINED => atoms::undefined,

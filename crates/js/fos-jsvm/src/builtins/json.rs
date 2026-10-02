@@ -335,7 +335,7 @@ impl Stringifier {
     /// serializable (undefined, functions, symbols)
     fn property(&mut self, vm: &mut Vm, holder: Value, key: PropertyKey, value: Value) -> JsResult<bool> {
         let mut value = value;
-        if value.is_object() || value.is_string() && false {
+        if value.is_object() || value.is_bigint() {
             let to_json = vm.get(value, PropertyKey::Atom(atoms::toJSON))?;
             if vm.is_callable(to_json) {
                 let kv = vm.key_value(key);
@@ -351,8 +351,12 @@ impl Stringifier {
                 ObjectKind::Number(_) => Value::number(vm.to_number(value)?),
                 ObjectKind::String(_) => Value::string(vm.to_string(value)?),
                 ObjectKind::Boolean(b) => Value::bool(b),
+                ObjectKind::BigInt(b) => Value::bigint(b),
                 _ => value,
             };
+        }
+        if value.is_bigint() {
+            return Err(vm.type_error("Do not know how to serialize a BigInt"));
         }
         match value {
             Value::NULL => self.push_str("null"),

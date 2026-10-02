@@ -133,6 +133,7 @@ pub enum ObjectKind {
     Number(f64),
     String(Gc<JsString>),
     Symbol(Gc<Symbol>),
+    BigInt(Gc<crate::bigint::BigInt>),
     Date(f64),
     Arguments,
     ForIn(Box<ForInIterator>),
@@ -313,6 +314,7 @@ pub enum MapKey {
     /// Primitive compared by its bits (numbers normalized, strings by content)
     Bits(u64),
     String(Box<[u16]>),
+    BigInt(crate::bigint::BigInt),
 }
 
 /// Symbol value
@@ -412,6 +414,7 @@ impl Trace for JsObject {
             }
             ObjectKind::String(s) => tracer.mark(*s),
             ObjectKind::Symbol(s) => tracer.mark(*s),
+            ObjectKind::BigInt(b) => tracer.mark(*b),
             ObjectKind::ForIn(it) => {
                 tracer.mark_values(&it.keys);
                 tracer.mark_value(it.object);

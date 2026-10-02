@@ -129,7 +129,7 @@ macro_rules! realm {
 
 realm! {
     object_proto, function_proto, array_proto, string_proto, number_proto, boolean_proto,
-    symbol_proto, error_proto, type_error_proto, range_error_proto, reference_error_proto,
+    symbol_proto, bigint_proto, error_proto, type_error_proto, range_error_proto, reference_error_proto,
     syntax_error_proto, eval_error_proto, uri_error_proto, iterator_proto, array_iterator_proto,
     string_iterator_proto, map_proto, set_proto, map_iterator_proto, set_iterator_proto,
     weakmap_proto, weakset_proto, date_proto, regexp_proto, promise_proto,
@@ -251,6 +251,7 @@ impl Vm {
             number_proto: mk(object_proto, ObjectKind::Number(0.0)),
             boolean_proto: mk(object_proto, ObjectKind::Boolean(false)),
             symbol_proto: mk(object_proto, ObjectKind::Ordinary),
+            bigint_proto: mk(object_proto, ObjectKind::Ordinary),
             error_proto,
             type_error_proto: mk(error_proto, ObjectKind::Ordinary),
             range_error_proto: mk(error_proto, ObjectKind::Ordinary),
@@ -465,6 +466,14 @@ impl Vm {
         o.get_mut().elements = elements;
         self.heap.note_growth(extra);
         o
+    }
+
+    /// A BigInt value (temp-rooted like every allocation)
+    pub fn new_bigint(&mut self, b: crate::bigint::BigInt) -> Value {
+        let extra = b.limb_bytes();
+        let v = Value::bigint(self.heap.alloc(b, extra));
+        self.temp_roots.push(v);
+        v
     }
 
     pub fn new_string(&mut self, s: &str) -> Gc<JsString> {

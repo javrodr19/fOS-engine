@@ -434,23 +434,34 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != 0 && i != i32::MIN => Value::int(-i),
-                            _ => Value::number(-tri!(self.to_number(x))),
+                            _ => tri!(self.unary_numeric(x, |n| -n, |b| b.neg())),
                         };
                         w!(dst, v);
                     }
-                    Insn::Plus { dst, src } | Insn::ToNumeric { dst, src } => {
+                    Insn::Plus { dst, src } => {
                         let x = r!(src);
                         let v = if x.is_number() { x } else { Value::number(tri!(self.to_number(x))) };
+                        w!(dst, v);
+                    }
+                    Insn::ToNumeric { dst, src } => {
+                        let x = r!(src);
+                        let v = if x.is_number() { x } else { tri!(self.unary_numeric(x, |n| n, |b| b.clone())) };
                         w!(dst, v);
                     }
                     Insn::Not { dst, src } => w!(dst, Value::bool(!ops::truthy(r!(src)))),
                     Insn::BitNot { dst, src } => {
                         let x = r!(src);
-                        let i = match x.as_int() {
-                            Some(i) => i,
-                            None => tri!(self.to_int32(x)),
+                        let v = match x.as_int() {
+                            Some(i) => Value::int(!i),
+                            None => match tri!(self.to_numeric(x)) {
+                                ops::Numeric::Number(n) => Value::int(!ops::f64_to_int32(n)),
+                                ops::Numeric::BigInt(b) => {
+                                    let r = b.get().not();
+                                    self.new_bigint(r)
+                                }
+                            },
                         };
-                        w!(dst, Value::int(!i));
+                        w!(dst, v);
                     }
                     Insn::Typeof { dst, src } => {
                         let atom = self.typeof_atom(r!(src));
@@ -460,7 +471,7 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != i32::MAX => Value::int(i + 1),
-                            _ => Value::number(tri!(self.to_number(x)) + 1.0),
+                            _ => tri!(self.unary_numeric(x, |n| n + 1.0, |b| b.add(&crate::bigint::BigInt::from_i64(1)))),
                         };
                         w!(dst, v);
                     }
@@ -468,7 +479,7 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != i32::MIN => Value::int(i - 1),
-                            _ => Value::number(tri!(self.to_number(x)) - 1.0),
+                            _ => tri!(self.unary_numeric(x, |n| n - 1.0, |b| b.sub(&crate::bigint::BigInt::from_i64(1)))),
                         };
                         w!(dst, v);
                     }
@@ -1147,6 +1158,17 @@ impl Vm {
         self.sp = f.base + unsafe { (&*f.proto).nregs as usize };
         self.set_slot(f.base + ret as usize, v);
         None
+    }
+
+    /// A unary numeric operator on a number or a BigInt
+    fn unary_numeric(&mut self, x: Value, num: impl Fn(f64) -> f64, big: impl Fn(&crate::bigint::BigInt) -> crate::bigint::BigInt) -> JsResult<Value> {
+        Ok(match self.to_numeric(x)? {
+            ops::Numeric::Number(n) => Value::number(num(n)),
+            ops::Numeric::BigInt(b) => {
+                let r = big(b.get());
+                self.new_bigint(r)
+            }
+        })
     }
 
     /// "x.y is not a function" for the call at `call_pc`, naming the

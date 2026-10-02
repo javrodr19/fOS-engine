@@ -1,6 +1,7 @@
 //! Built-in objects
 
 pub(crate) mod array;
+mod bigint;
 mod collections;
 mod date;
 mod error;
@@ -33,6 +34,7 @@ pub(crate) fn init(vm: &mut Vm) {
     array::init(vm);
     string::init(vm);
     number::init(vm);
+    bigint::init(vm);
     math::init(vm);
     json::init(vm);
     collections::init(vm);
@@ -156,6 +158,11 @@ impl Vm {
             } else {
                 out.push_str(&crate::number::number_to_string(n));
             }
+            return;
+        }
+        if let Some(b) = v.as_bigint() {
+            out.push_str(&b.get().to_string_radix(10));
+            out.push('n');
             return;
         }
         if let Some(s) = v.as_symbol() {

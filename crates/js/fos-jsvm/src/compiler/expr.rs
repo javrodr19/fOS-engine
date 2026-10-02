@@ -135,7 +135,13 @@ impl<'a, 'h> Compiler<'a, 'h> {
             Expr::Null => {
                 self.emit(Insn::LoadNull { dst });
             }
-            Expr::BigInt(_) => return self.error("BigInt is not supported yet"),
+            Expr::BigInt(text) => {
+                let Some(b) = crate::bigint::BigInt::parse_digits(text, 10) else { return self.error("invalid BigInt literal") };
+                let extra = b.limb_bytes();
+                let v = Value::bigint(self.heap.alloc(b, extra));
+                let idx = self.const_index(v)?;
+                self.emit(Insn::LoadConst { dst, idx });
+            }
             Expr::Template(t) => self.template(t, dst)?,
             Expr::TaggedTemplate { tag, template } => self.tagged_template(tag, template, dst)?,
             Expr::Regex { pattern, flags } => {

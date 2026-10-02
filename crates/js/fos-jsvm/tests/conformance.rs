@@ -1191,5 +1191,56 @@ fn regex_unicode_properties() {
         ("'a+b=$5 ©→😀'.match(/\\p{S}/gu).join('')", "'+=$©→😀'"),
         ("'a+b=$5'.match(/\\p{Sc}/gu).join('')", "'$'"),
         ("/\\p{Sm}/u.test('∑')", "true"),
+        ("'a\\u0000b\\u200dc\\u3000d'.replace(/[\\p{Cc}\\p{Cf}\\p{Zs}]/gu, '_')", "'a_b_c_d'"),
+        ("'(x)-[y]'.replace(/[\\p{Ps}\\p{Pe}\\p{Pd}]/gu, '')", "'xy'"),
+        ("'a\\u200bb\\ufe0fc'.replace(/\\p{Default_Ignorable_Code_Point}/gu, '')", "'abc'"),
+        ("/^\\p{RI}\\p{RI}$/u.test('🇪🇸')", "true"),
+    ]);
+}
+
+#[test]
+fn bigint() {
+    check(&[
+        // Literals and arithmetic
+        ("typeof 10n", "'bigint'"),
+        ("0x1fn + 0o7n + 0b11n", "41n"),
+        ("2n ** 64n", "18446744073709551616n"),
+        ("(2n ** 100n) / 3n", "422550200076076467165567735125n"),
+        ("-7n / 2n", "-3n"),
+        ("-7n % 2n", "-1n"),
+        ("(-5n) & 3n", "3n"),
+        ("(-5n) | 3n", "-5n"),
+        ("5n ^ -3n", "-8n"),
+        ("~5n", "-6n"),
+        ("-9n >> 1n", "-5n"),
+        ("1n << 70n", "1180591620717411303424n"),
+        ("let x = 9007199254740993n; x++; x", "9007199254740994n"),
+        ("let y = 1n; y--; -y", "0n"),
+        ("'n=' + 12345678901234567890n", "'n=12345678901234567890'"),
+        ("`${-1n}`", "'-1'"),
+        // Errors
+        ("1n + 1", "throws TypeError: Cannot mix BigInt and other types, use explicit conversions"),
+        ("1n / 0n", "throws RangeError: Division by zero"),
+        ("2n ** -1n", "throws RangeError*"),
+        ("1n >>> 0n", "throws TypeError*"),
+        ("+1n", "throws TypeError: Cannot convert a BigInt value to a number"),
+        ("Math.max(1n)", "throws TypeError*"),
+        ("JSON.stringify({a: 1n})", "throws TypeError: Do not know how to serialize a BigInt"),
+        ("new BigInt(1)", "throws TypeError: BigInt is not a constructor"),
+        ("BigInt(1.5)", "throws RangeError*"),
+        ("BigInt('1.5')", "throws SyntaxError*"),
+        ("BigInt(undefined)", "throws TypeError*"),
+        // Equality and comparison
+        ("[1n === 1n, 1n == 1, 1n == '1', 2n > 1, 1n < 1.5, 2n > '1', 1n == 1.5, 0n == '', 1n < NaN, 10n > 9.99]", "[ true, true, true, true, true, true, false, true, false, true ]"),
+        ("[Object.is(0n, -0n), [1n, 2n].includes(2n), 0n ? 'y' : 'n', !!1n]", "[ true, true, 'n', true ]"),
+        ("const m = new Map([[10n, 'a']]); m.get(10n) + m.has(BigInt(10)) + new Set([1n, 1n, 2n]).size", "'atrue2'"),
+        // Conversions and builtins
+        ("[BigInt(42), BigInt('0x10'), BigInt(' -12 '), BigInt(true), BigInt(1e21)]", "[ 42n, 16n, -12n, 1n, 1000000000000000000000n ]"),
+        ("[Number(2n ** 64n), Number(-5n), parseInt('12n'), String(7n)]", "[ 18446744073709552000, -5, 12, '7' ]"),
+        ("[(255n).toString(16), (-255n).toString(2), (1234567n).toLocaleString(), Object(3n) + 1n]", "[ 'ff', '-11111111', '1,234,567', 4n ]"),
+        ("[BigInt.asIntN(8, 255n), BigInt.asUintN(64, -1n), BigInt.asIntN(64, 2n ** 63n)]", "[ -1n, 18446744073709551615n, -9223372036854775808n ]"),
+        ("({[10n]: 'k'})['10']", "'k'"),
+        ("Object.prototype.toString.call(1n)", "'[object BigInt]'"),
+        ("let big = 1n; for (let i = 0; i < 100; i++) big *= 3n; big % 1000000007n", "886041711n"),
     ]);
 }

@@ -14,6 +14,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+use crate::bigint::BigInt;
 use crate::object::{JsObject, Symbol, Upvalue};
 use crate::string::JsString;
 use crate::value::Value;
@@ -26,6 +27,7 @@ pub enum CellKind {
     Object,
     Upvalue,
     Symbol,
+    BigInt,
 }
 
 #[repr(C)]
@@ -170,6 +172,8 @@ impl Tracer {
             self.mark(o);
         } else if let Some(s) = value.as_symbol() {
             self.mark(s);
+        } else if let Some(b) = value.as_bigint() {
+            self.mark(b);
         }
     }
 
@@ -325,6 +329,7 @@ unsafe fn trace_cell(header: *mut Header, tracer: &mut Tracer) {
             CellKind::Object => (*(*(header as *mut GcBox<JsObject>)).value.get()).trace(tracer),
             CellKind::Upvalue => (*(*(header as *mut GcBox<Upvalue>)).value.get()).trace(tracer),
             CellKind::Symbol => (*(*(header as *mut GcBox<Symbol>)).value.get()).trace(tracer),
+            CellKind::BigInt => {}
         }
     }
 }
@@ -336,6 +341,7 @@ unsafe fn free_cell(header: *mut Header) {
             CellKind::Object => drop(Box::from_raw(header as *mut GcBox<JsObject>)),
             CellKind::Upvalue => drop(Box::from_raw(header as *mut GcBox<Upvalue>)),
             CellKind::Symbol => drop(Box::from_raw(header as *mut GcBox<Symbol>)),
+            CellKind::BigInt => drop(Box::from_raw(header as *mut GcBox<BigInt>)),
         }
     }
 }

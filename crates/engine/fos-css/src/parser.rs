@@ -281,7 +281,9 @@ fn split_words<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
         match b[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
-            _ if depth == 0 && s[i..].starts_with(sep) => {
+            // Bytes, not str slices: `i` may be inside a multi-byte
+            // character (the ASCII separator never is)
+            _ if depth == 0 && b[i..].starts_with(sep.as_bytes()) => {
                 out.push(&s[start..i]);
                 i += sep.len();
                 start = i;
@@ -892,6 +894,16 @@ mod tests {
             PropertyValue::Color(c) => (c.r, c.g, c.b, c.a),
             _ => panic!("not a color"),
         }
+    }
+
+    #[test]
+    fn media_queries_with_non_ascii_text() {
+        let ctx = MediaContext { width: 800.0, height: 600.0 };
+        // Malformed, but must not panic
+        for q in ["\u{fffd}", "é and (min-width: 1px)", "screen and (wïdth: 5px)", "(min-width: 1px) or ✓"] {
+            let _ = media_matches(q, &ctx);
+        }
+        assert!(media_matches("screen and (min-width: 100px)", &ctx));
     }
 
     #[test]

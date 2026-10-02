@@ -114,7 +114,7 @@ pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, module: &Module
             }
             Stmt::Class(c) => {
                 if let Some(name) = &c.name {
-                    add(name, ModuleBindingKind::Lexical, BindKind::Class)?;
+                    add(name, ModuleBindingKind::Lexical, BindKind::Let)?;
                 }
             }
             _ => {}
@@ -1568,9 +1568,11 @@ impl<'a, 'h> Compiler<'a, 'h> {
                         self.declare_lexical(&n, bk)?;
                     }
                 }
+                // A class declaration binds like `let`; only the class's
+                // own name inside its body is immutable
                 Stmt::Class(c) if !script_top => {
                     if let Some(n) = &c.name {
-                        self.declare_lexical(n, BindKind::Class)?;
+                        self.declare_lexical(n, BindKind::Let)?;
                     }
                 }
                 Stmt::Function(func) if !function_top && !script_top => {

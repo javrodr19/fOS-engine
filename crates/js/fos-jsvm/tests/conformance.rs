@@ -1168,3 +1168,28 @@ fn huge_functions_compile() {
     src.push_str("})(); [s, o.b]");
     assert_eq!(run(&src), "[ 35000, 35000 ]");
 }
+
+#[test]
+fn class_bindings() {
+    check(&[
+        // Declarations bind like `let` (decorators reassign them)
+        ("{ class A {} A = 1; A }", "1"),
+        ("function f() { class B { static k = 2 } B = B.k; return B; } f()", "2"),
+        ("class G {} G = 3; G", "3"),
+        // The class's own name is immutable inside its body
+        ("class C { static m() { C = 1; } } C.m()", "throws TypeError: Assignment to constant variable."),
+        ("(class D { static m() { D = 1; } }).m()", "throws TypeError: Assignment to constant variable."),
+        ("{ new E(); class E {} }", "throws ReferenceError: Cannot access 'E' before initialization*"),
+    ]);
+}
+
+#[test]
+fn regex_unicode_properties() {
+    check(&[
+        ("/^\\p{ID_Start}\\p{ID_Continue}*$/u.test('ñame_1')", "true"),
+        ("/^\\p{ID_Start}/u.test('1a')", "false"),
+        ("'a+b=$5 ©→😀'.match(/\\p{S}/gu).join('')", "'+=$©→😀'"),
+        ("'a+b=$5'.match(/\\p{Sc}/gu).join('')", "'$'"),
+        ("/\\p{Sm}/u.test('∑')", "true"),
+    ]);
+}

@@ -14,6 +14,8 @@ pub struct Document {
     head_element: NodeId,
     /// Cached reference to <body> element
     body_element: NodeId,
+    /// The contents fragment of each `<template>` element (outside the tree)
+    template_contents: std::collections::HashMap<NodeId, NodeId>,
 }
 
 impl Document {
@@ -36,6 +38,7 @@ impl Document {
             html_element: html,
             head_element: head,
             body_element: body,
+            template_contents: Default::default(),
         }
     }
     
@@ -47,9 +50,20 @@ impl Document {
             html_element: NodeId::NONE,
             head_element: NodeId::NONE,
             body_element: NodeId::NONE,
+            template_contents: Default::default(),
         }
     }
     
+    /// The contents fragment of `<template>` element `template`
+    pub fn template_content(&self, template: NodeId) -> Option<NodeId> {
+        self.template_contents.get(&template).copied()
+    }
+
+    /// Set the contents fragment of `<template>` element `template`
+    pub fn set_template_content(&mut self, template: NodeId, fragment: NodeId) {
+        self.template_contents.insert(template, fragment);
+    }
+
     /// Finalize the document after parsing - finds html, head, body elements
     pub fn finalize(&mut self) {
         // Find <html> element (first child of root that is an element)

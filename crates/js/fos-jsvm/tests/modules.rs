@@ -343,3 +343,18 @@ fn dynamic_import_from_scripts() {
     let v = vm.eval("out").unwrap();
     assert_eq!(vm.display(v), "42");
 }
+
+#[test]
+fn decorated_classes() {
+    check(&[(
+        &[(
+            "main.js",
+            "const tag = (name) => (cls) => { cls.tagName = name; return cls; };
+             class R { on() { return 'on'; } }
+             R = tag('toggle-switch')(R);
+             export { R };
+             globalThis.result = R.tagName + ' ' + new R().on();",
+        )],
+        "'toggle-switch on'",
+    )]);
+}

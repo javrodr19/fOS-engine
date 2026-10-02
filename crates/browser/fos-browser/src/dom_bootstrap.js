@@ -544,6 +544,298 @@
   for (const f of [Image, Audio, Option]) f.prototype = HTMLElement.prototype;
   Object.assign(global, { Image, Audio, Option });
 
+  // ---- custom elements ----
+  //
+  // A registry of element definitions. Elements are upgraded (their
+  // wrapper gets the class's prototype and the constructor runs on it)
+  // when a definition arrives for elements already in the document, when
+  // created with createElement or `new`, and when inserted. Lifecycle
+  // callbacks run synchronously after the DOM operation that causes them.
+  // Nothing here costs anything until a page defines an element.
+  const NativeHTMLElement = global.HTMLElement;
+  const ceDefs = new Map();      // name -> definition
+  const ceByCtor = new Map();    // constructor -> definition
+  const ceWaiting = new Map();   // name -> { promise, resolve }
+  const ceState = new WeakMap(); // element -> 'custom' | 'failed'
+  let ceDefining = false;
+  const ceReserved = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri',
+    'font-face-format', 'font-face-name', 'missing-glyph']);
+  const ceValidName = (n) => /^[a-z][-.0-9_a-z·À-￿]*$/.test(n) && n.includes('-') && !ceReserved.has(n);
+  const rawCreateElement = Document.prototype.createElement;
+
+  // `super()` in a custom element class: the element being upgraded, or a
+  // new one for `new MyElement()`
+  const HTMLElementCtor = function HTMLElement() {
+    const def = new.target && ceByCtor.get(new.target);
+    if (!def) throw new TypeError('Illegal constructor');
+    let el = def.stack.pop();
+    if (!el) {
+      el = rawCreateElement.call(document, def.extends || def.name);
+      if (def.extends) el.setAttribute('is', def.name);
+      ceState.set(el, 'custom');
+    }
+    Object.setPrototypeOf(el, new.target.prototype);
+    return el;
+  };
+  HTMLElementCtor.prototype = NativeHTMLElement.prototype;
+  Object.defineProperty(NativeHTMLElement.prototype, 'constructor', { value: HTMLElementCtor, writable: true, configurable: true });
+  global.HTMLElement = HTMLElementCtor;
+  for (const k of Object.getOwnPropertyNames(global)) {
+    if (global[k] === NativeHTMLElement && /^(HTML|SVG)\w*Element$/.test(k)) global[k] = HTMLElementCtor;
+  }
+
+  function ceDefinitionOf(el) {
+    if (el.nodeType !== 1) return undefined;
+    const def = ceDefs.get(el.localName);
+    if (def && !def.extends) return def;
+    const is = el.getAttribute('is');
+    const custom = is && ceDefs.get(is);
+    return custom && custom.extends === el.localName ? custom : undefined;
+  }
+
+  function ceCallback(el, name, args) {
+    if (ceState.get(el) !== 'custom') return;
+    const def = ceDefinitionOf(el);
+    const f = def && def.callbacks[name];
+    if (!f) return;
+    try { f.apply(el, args); } catch (e) { reportError(e); }
+  }
+
+  function ceUpgrade(el) {
+    if (ceState.has(el)) return;
+    const def = ceDefinitionOf(el);
+    if (!def) return;
+    ceState.set(el, 'failed');
+    def.stack.push(el);
+    try {
+      const made = new def.ctor();
+      if (made !== el) throw new DOMException('The custom element constructor did not produce the element being upgraded.', 'InvalidStateError');
+    } catch (e) {
+      reportError(e);
+      def.stack.length = 0;
+      return;
+    }
+    ceState.set(el, 'custom');
+    for (const attr of def.observed) {
+      if (el.hasAttribute(attr)) ceCallback(el, 'attributeChangedCallback', [attr, null, el.getAttribute(attr)]);
+    }
+    if (el.isConnected) ceCallback(el, 'connectedCallback', []);
+  }
+
+  // Elements of `root`'s subtree (root included), in tree order
+  function ceSubtree(root) {
+    if (!root || (root.nodeType !== 1 && root.nodeType !== 11 && root.nodeType !== 9)) return [];
+    const all = Array.from(root.querySelectorAll('*'));
+    if (root.nodeType === 1) all.unshift(root);
+    return all;
+  }
+
+  // `nodes` were inserted: upgrade what was waiting, connect what is custom
+  function ceInserted(nodes) {
+    if (!ceDefs.size) return;
+    for (const node of nodes) {
+      if (!node || !node.isConnected) continue;
+      for (const el of ceSubtree(node)) {
+        if (ceState.get(el) === 'custom') ceCallback(el, 'connectedCallback', []);
+        else ceUpgrade(el);
+      }
+    }
+  }
+
+  // The custom elements under `nodes` that are connected (before a removal)
+  function ceConnectedIn(nodes) {
+    if (!ceDefs.size) return [];
+    const out = [];
+    for (const node of nodes) {
+      if (!node || !node.isConnected) continue;
+      for (const el of ceSubtree(node)) if (ceState.get(el) === 'custom') out.push(el);
+    }
+    return out;
+  }
+  function ceRemoved(list) {
+    for (const el of list) if (!el.isConnected) ceCallback(el, 'disconnectedCallback', []);
+  }
+
+  // Nodes an insertion call adds (fragments add their children)
+  const ceArgNodes = (args) => {
+    const out = [];
+    for (const a of args) {
+      if (a && typeof a === 'object' && a.nodeType) {
+        if (a.nodeType === 11) out.push(...a.childNodes); else out.push(a);
+      }
+    }
+    return out;
+  };
+  const NodeP = Node.prototype, ElementP = NativeHTMLElement.prototype;
+  const ceWrap = (proto, name, plan) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    define(proto, { [name](...args) {
+      if (!ceDefs.size) return original.apply(this, args);
+      const { added, removed } = plan.call(this, args);
+      const gone = ceConnectedIn(removed);
+      const r = original.apply(this, args);
+      ceRemoved(gone);
+      ceInserted(added);
+      return r;
+    } });
+  };
+  ceWrap(NodeP, 'appendChild', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [] }));
+  ceWrap(NodeP, 'insertBefore', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [] }));
+  ceWrap(NodeP, 'replaceChild', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [a[1]] }));
+  ceWrap(NodeP, 'removeChild', (a) => ({ added: [], removed: [a[0]] }));
+  for (const name of ['append', 'prepend', 'before', 'after']) {
+    ceWrap(NodeP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+    ceWrap(ElementP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+  }
+  for (const proto of [NodeP, ElementP]) {
+    ceWrap(proto, 'replaceWith', function (a) { return { added: ceArgNodes(a), removed: [this] }; });
+    ceWrap(proto, 'remove', function () { return { added: [], removed: [this] }; });
+  }
+  ceWrap(ElementP, 'insertAdjacentHTML', function (a) {
+    const where = String(a[0]).toLowerCase();
+    return { added: [where === 'beforebegin' || where === 'afterend' ? this.parentNode : this], removed: [] };
+  });
+  // Markup setters replace the children
+  for (const [proto, name] of [[ElementP, 'innerHTML'], [NodeP, 'textContent'], [ElementP, 'outerHTML']]) {
+    let owner = proto, d;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+    if (!d || !d.set) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      get: d.get,
+      set(v) {
+        if (!ceDefs.size) return d.set.call(this, v);
+        const outer = name === 'outerHTML';
+        const parent = this.parentNode;
+        const gone = ceConnectedIn(outer ? [this] : Array.from(this.childNodes));
+        d.set.call(this, v);
+        ceRemoved(gone);
+        ceInserted([outer ? parent : this]);
+      },
+    });
+  }
+  // Observed attributes
+  for (const name of ['setAttribute', 'removeAttribute', 'toggleAttribute']) {
+    const original = ElementP[name] || NodeP[name];
+    if (typeof original !== 'function') continue;
+    define(ElementP, { [name](...args) {
+      if (ceState.get(this) !== 'custom') return original.apply(this, args);
+      const attr = String(args[0]).toLowerCase();
+      const old = this.getAttribute(attr);
+      const r = original.apply(this, args);
+      const def = ceDefinitionOf(this);
+      if (def && def.observed.has(attr)) {
+        const now = this.getAttribute(attr);
+        if (!(old === null && now === null)) ceCallback(this, 'attributeChangedCallback', [attr, old, now]);
+      }
+      return r;
+    } });
+  }
+  define(Document.prototype, { createElement(name, options) {
+    const el = rawCreateElement.call(this, name);
+    if (options && typeof options === 'object' && options.is) el.setAttribute('is', String(options.is));
+    if (ceDefs.size) ceUpgrade(el);
+    return el;
+  } });
+
+  class CustomElementRegistry {
+    define(name, ctor, options) {
+      name = String(name);
+      if (typeof ctor !== 'function') throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': The provided value is not a constructor.");
+      if (!ceValidName(name)) throw new DOMException(`Failed to execute 'define' on 'CustomElementRegistry': "${name}" is not a valid custom element name`, 'SyntaxError');
+      if (ceDefs.has(name)) throw new DOMException(`Failed to execute 'define' on 'CustomElementRegistry': the name "${name}" has already been used with this registry`, 'NotSupportedError');
+      if (ceByCtor.has(ctor)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': this constructor has already been used with this registry", 'NotSupportedError');
+      if (ceDefining) throw new DOMException('Custom element definitions cannot be nested', 'NotSupportedError');
+      const ext = options && options.extends ? String(options.extends).toLowerCase() : null;
+      ceDefining = true;
+      let callbacks, observed;
+      try {
+        const proto = ctor.prototype;
+        if (proto === null || typeof proto !== 'object') throw new TypeError('The constructor\'s prototype is not an object');
+        callbacks = {};
+        for (const k of ['connectedCallback', 'disconnectedCallback', 'adoptedCallback', 'attributeChangedCallback']) {
+          const f = proto[k];
+          if (f !== undefined && typeof f !== 'function') throw new TypeError(`${k} is not a function`);
+          callbacks[k] = f;
+        }
+        observed = new Set(callbacks.attributeChangedCallback && ctor.observedAttributes ? Array.from(ctor.observedAttributes, a => String(a)) : []);
+      } finally {
+        ceDefining = false;
+      }
+      const def = { name, ctor, extends: ext, callbacks, observed, stack: [] };
+      ceDefs.set(name, def);
+      ceByCtor.set(ctor, def);
+      const selector = ext ? `${ext}[is="${name}"]` : CSS.escape(name);
+      for (const el of document.querySelectorAll(selector)) ceUpgrade(el);
+      const waiting = ceWaiting.get(name);
+      if (waiting) { ceWaiting.delete(name); waiting.resolve(ctor); }
+    }
+    get(name) { return ceDefs.get(String(name))?.ctor; }
+    getName(ctor) { return ceByCtor.get(ctor)?.name ?? null; }
+    whenDefined(name) {
+      name = String(name);
+      if (!ceValidName(name)) return Promise.reject(new DOMException(`"${name}" is not a valid custom element name`, 'SyntaxError'));
+      if (ceDefs.has(name)) return Promise.resolve(ceDefs.get(name).ctor);
+      let w = ceWaiting.get(name);
+      if (!w) {
+        let resolve;
+        const promise = new Promise(r => { resolve = r; });
+        ceWaiting.set(name, w = { promise, resolve });
+      }
+      return w.promise;
+    }
+    upgrade(root) { for (const el of ceSubtree(root)) ceUpgrade(el); }
+  }
+  // ElementInternals, as far as scripts commonly use it
+  class ElementInternals {
+    constructor(el) { Object.defineProperty(this, '_el', { value: el }); this.states = new Set(); this.validity = { valid: true }; this.validationMessage = ''; this.willValidate = false; }
+    get form() { return this._el.closest('form'); }
+    get labels() { return []; }
+    get shadowRoot() { return null; }
+    setFormValue() {}
+    setValidity(flags = {}, message = '') { this.validity = { ...flags, valid: !Object.values(flags).some(Boolean) }; this.validationMessage = String(message); }
+    checkValidity() { return this.validity.valid; }
+    reportValidity() { return this.validity.valid; }
+  }
+  define(ElementP, {
+    attachInternals() {
+      if (!ceDefinitionOf(this)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", 'NotSupportedError');
+      return new ElementInternals(this);
+    },
+  });
+  Object.assign(global, { customElements: new CustomElementRegistry(), CustomElementRegistry, ElementInternals });
+
+  // <template>: its parsed children live in a fragment outside the page
+  Object.defineProperty(ElementP, 'content', {
+    configurable: true,
+    get() { return this.localName === 'template' ? __fosTemplateContent(this) : undefined; },
+  });
+
+  // ---- crypto (random values only; no SubtleCrypto yet) ----
+  const integerArrays = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
+  class Crypto {
+    getRandomValues(array) {
+      const kind = array && Object.prototype.toString.call(array).slice(8, -1);
+      if (!integerArrays.includes(kind)) {
+        throw new DOMException("Failed to execute 'getRandomValues' on 'Crypto': The provided ArrayBufferView is not an integer array type.", 'TypeMismatchError');
+      }
+      if (array.byteLength > 65536) {
+        throw new DOMException(`Failed to execute 'getRandomValues' on 'Crypto': The ArrayBufferView's byte length (${array.byteLength}) exceeds the number of bytes of entropy available via this API (65536).`, 'QuotaExceededError');
+      }
+      new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(new Uint8Array(__fosRandomBytes(array.byteLength)));
+      return array;
+    }
+    randomUUID() {
+      const b = new Uint8Array(__fosRandomBytes(16));
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+    }
+  }
+  Object.assign(global, { crypto: new Crypto(), Crypto });
+
   // ---- document ----
 
   let readyState = 'loading';

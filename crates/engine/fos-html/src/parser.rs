@@ -140,6 +140,9 @@ impl DomSink {
     }
 }
 
+/// Name of fragment elements (as the DOM bindings name them)
+const TEMPLATE_FRAGMENT: &str = "#document-fragment";
+
 impl TreeSink for DomSink {
     type Handle = NodeId;
     type Output = Document;
@@ -147,13 +150,36 @@ impl TreeSink for DomSink {
 
     fn finish(self) -> Document {
         let mut tree = self.tree.into_inner();
-        // Drop what is not part of the document (template contents, nodes
-        // the tree builder removed) and inter-element whitespace, and store
-        // the rest in document order
+        // Template contents ride along as the template's child through
+        // compaction, then move out of the tree
+        for (&template, &contents) in self.template_contents.borrow().iter() {
+            tree.append_child(template, contents);
+        }
+        // Drop what is not part of the document (nodes the tree builder
+        // removed) and inter-element whitespace, and store the rest in
+        // document order
         tree.compact(|node| !matches!(&node.data, NodeData::Text(t) if is_inter_element_whitespace(&t.content)));
+
+        let mut contents = Vec::new();
+        fos_dom::selector::walk_elements(&tree, tree.root(), &mut |id| {
+            let is_template = tree.get(id).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "template");
+            if is_template {
+                let fragment = tree.children(id).find(|(_, n)| n.as_element().is_some_and(|e| tree.resolve(e.name.local) == TEMPLATE_FRAGMENT));
+                if let Some((fragment, _)) = fragment {
+                    contents.push((id, fragment));
+                }
+            }
+            true
+        });
+        for &(_, fragment) in &contents {
+            tree.remove(fragment);
+        }
 
         let mut document = Document::empty(&self.url);
         document.tree = tree;
+        for (template, fragment) in contents {
+            document.set_template_content(template, fragment);
+        }
         document.finalize();
         document
     }
@@ -183,7 +209,8 @@ impl TreeSink for DomSink {
         }
 
         if flags.template {
-            let contents = tree.create_node(NodeData::Document);
+            // A fragment, as scripts see `template.content`
+            let contents = tree.create_element(TEMPLATE_FRAGMENT);
             self.template_contents.borrow_mut().insert(id, contents);
         }
         if flags.mathml_annotation_xml_integration_point {

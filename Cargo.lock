@@ -733,6 +733,7 @@ dependencies = [
  "fos-render",
  "fos-security",
  "fos-text",
+ "getrandom 0.2.16",
  "log",
  "serde_json",
  "smol",

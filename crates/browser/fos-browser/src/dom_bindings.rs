@@ -1050,6 +1050,34 @@ fn set_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<V
     Ok(Value::UNDEFINED)
 }
 
+/// `__fosTemplateContent(template)`: the template's contents fragment
+fn template_content(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let fragment = with_doc(vm, |d| match d.template_content(id) {
+        Some(f) => f,
+        None => {
+            let f = d.tree_mut().create_element(FRAGMENT);
+            d.set_template_content(id, f);
+            f
+        }
+    });
+    Ok(wrap(vm, fragment))
+}
+
+/// `__fosRandomBytes(n)`: an ArrayBuffer of `n` bytes from the OS's
+/// secure random source (`crypto.getRandomValues`, at most 64 KiB)
+fn random_bytes(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let n = vm.to_number(arg(args, 0))?;
+    if !(0.0..=65536.0).contains(&n) {
+        return Err(vm.range_error("random byte count out of range"));
+    }
+    let mut bytes = vec![0u8; n as usize];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return Err(vm.type_error("No secure random source is available"));
+    }
+    Ok(new_array_buffer(vm, bytes))
+}
+
 /// `__fosCookie()`: what `document.cookie` reads (no HttpOnly cookies)
 fn get_cookie(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let h = host(vm);
@@ -1546,6 +1574,8 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosResolveURL", 2, resolve_url),
         ("__fosCookie", 0, get_cookie),
         ("__fosSetURL", 1, set_url),
+        ("__fosRandomBytes", 1, random_bytes),
+        ("__fosTemplateContent", 1, template_content),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

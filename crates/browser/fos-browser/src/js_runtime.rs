@@ -852,6 +852,80 @@ mod tests {
     }
 
     #[test]
+    fn custom_elements() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><my-card title="a">x</my-card><div id="host"></div>
+            <script>
+              window.log = [];
+              customElements.whenDefined('my-card').then(c => log.push('defined:' + c.name));
+              class MyCard extends HTMLElement {
+                static get observedAttributes() { return ['title']; }
+                constructor() { super(); this.ready = true; log.push('ctor'); }
+                connectedCallback() { log.push('connected:' + this.getAttribute('title')); }
+                disconnectedCallback() { log.push('disconnected'); }
+                attributeChangedCallback(n, o, v) { log.push(`attr:${n}:${o}:${v}`); }
+                greet() { return 'hi ' + this.textContent; }
+              }
+              customElements.define('my-card', MyCard);
+              const first = document.querySelector('my-card');
+              log.push('upgraded:' + (first instanceof MyCard) + ':' + first.ready + ':' + first.greet());
+              first.setAttribute('title', 'b');
+              first.setAttribute('other', '1');
+              const made = new MyCard();
+              log.push('new:' + made.tagName + ':' + made.isConnected);
+              document.getElementById('host').appendChild(made);
+              made.remove();
+              document.getElementById('host').innerHTML = '<my-card title="c"></my-card>';
+              const created = document.createElement('my-card');
+              log.push('created:' + (created instanceof MyCard) + ':' + (created instanceof HTMLElement));
+              const errors = [];
+              for (const [n, c] of [['nodash', MyCard], ['my-card', class extends HTMLElement {}], ['x-y', MyCard], ['x-z', 5]]) {
+                try { customElements.define(n, c); } catch (e) { errors.push(e.name); }
+              }
+              try { new HTMLElement(); } catch (e) { errors.push(e.name); }
+              log.push('errors:' + errors.join());
+              log.push('get:' + (customElements.get('my-card') === MyCard) + ':' + customElements.getName(MyCard));
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(
+            rt.eval("log.join(' | ')").unwrap(),
+            "ctor | attr:title:null:a | connected:a | upgraded:true:true:hi x | attr:title:a:b | ctor | new:MY-CARD:false | \
+             connected:null | disconnected | ctor | attr:title:null:c | connected:c | ctor | created:true:true | \
+             errors:SyntaxError,NotSupportedError,NotSupportedError,TypeError,TypeError | get:true:my-card | defined:MyCard"
+        );
+    }
+
+    #[test]
+    fn template_content_and_crypto() {
+        let (mut rt, _doc) = page(r#"<html><body><template id="t"><li>row</li></template><ul id="list"></ul></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(
+            rt.eval(
+                "const t = document.getElementById('t');
+                 const list = document.getElementById('list');
+                 list.appendChild(t.content.cloneNode(true));
+                 list.appendChild(t.content.cloneNode(true));
+                 [t.content.nodeType, t.childNodes.length, list.children.length, document.querySelectorAll('li').length].join()"
+            )
+            .unwrap(),
+            "11,0,2,2"
+        );
+        assert_eq!(
+            rt.eval(
+                "const a = crypto.getRandomValues(new Uint32Array(8));
+                 const uuid = crypto.randomUUID();
+                 const errors = [];
+                 try { crypto.getRandomValues(new Float64Array(2)); } catch (e) { errors.push(e.name); }
+                 try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { errors.push(e.name); }
+                 [a.some(x => x !== 0), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid), uuid !== crypto.randomUUID(), errors.join(' '), /\\p{ID_Start}\\p{ID_Continue}*/u.test('é1')].join()"
+            )
+            .unwrap(),
+            "true,true,true,TypeMismatchError QuotaExceededError,true"
+        );
+    }
+
+    #[test]
     fn dynamic_import_in_classic_scripts() {
         let (mut rt, _doc) = page(
             r#"<html><body><script>

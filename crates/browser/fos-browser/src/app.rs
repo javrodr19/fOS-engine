@@ -24,7 +24,6 @@ use fos_dom::Document;
 use crate::devtools::DevTools;
 use crate::accessibility::AccessibilityManager;
 use crate::media::MediaManager;
-use crate::canvas::CanvasManager;
 use crate::advanced_net::AdvancedNetworking;
 use crate::security::SecurityManager;
 use crate::memory::MemoryIntegration;
@@ -122,8 +121,6 @@ struct BrowserApp {
     a11y: AccessibilityManager,
     /// Media manager
     media: MediaManager,
-    /// Canvas manager
-    canvas: CanvasManager,
     /// Advanced networking (WebSocket, XHR, SSE)
     _advanced_net: AdvancedNetworking,
     /// Security manager (CSP, sandbox, privacy)
@@ -161,7 +158,6 @@ impl BrowserApp {
             devtools: DevTools::new(),
             a11y: AccessibilityManager::new(),
             media: MediaManager::new(),
-            canvas: CanvasManager::new(),
             _advanced_net: AdvancedNetworking::new(),
             _security: SecurityManager::new(),
             _memory: MemoryIntegration::new(),
@@ -325,7 +321,7 @@ impl BrowserApp {
         self.refresh_if_dom_changed();
         self.follow_script_navigation();
 
-        // Build accessibility tree and extract media/canvas from DOM
+        // Build accessibility tree and extract media from DOM
         let Some(doc) = self.current_document() else { return };
         let doc_guard = lock_document(&doc);
 
@@ -341,14 +337,6 @@ impl BrowserApp {
         if media_stats.video_count > 0 || media_stats.audio_count > 0 {
             log::info!("Found media: {} videos, {} audios",
                 media_stats.video_count, media_stats.audio_count);
-        }
-
-        // Canvas elements
-        self.canvas.extract_from_document(&doc_guard);
-        let canvas_stats = self.canvas.stats();
-        if canvas_stats.canvas_count > 0 {
-            log::info!("Found {} canvas elements ({} total pixels)",
-                canvas_stats.canvas_count, canvas_stats.total_pixels);
         }
     }
 

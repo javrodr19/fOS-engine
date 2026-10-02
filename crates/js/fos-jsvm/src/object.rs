@@ -166,6 +166,32 @@ pub enum ObjectKind {
     /// An object backed by embedder data (e.g. a DOM node): `class` tells
     /// the embedder's kinds apart, `id` names the thing it wraps
     Host { class: u32, id: u64 },
+    /// Embedder data owned by the object and freed with it (e.g. a canvas
+    /// bitmap)
+    HostData(Box<dyn HostData>),
+}
+
+/// Data an embedder attaches to an object (`ObjectKind::HostData`). It
+/// lives as long as the object; `trace` marks the JS values it holds.
+pub trait HostData: std::any::Any {
+    fn trace(&self, _tracer: &mut Tracer) {}
+}
+
+impl JsObject {
+    /// The object's host data, if it is a `T`
+    pub fn host_data<T: HostData>(&self) -> Option<&T> {
+        match &self.kind {
+            ObjectKind::HostData(d) => (&**d as &dyn std::any::Any).downcast_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn host_data_mut<T: HostData>(&mut self) -> Option<&mut T> {
+        match &mut self.kind {
+            ObjectKind::HostData(d) => (&mut **d as &mut dyn std::any::Any).downcast_mut(),
+            _ => None,
+        }
+    }
 }
 
 pub struct ProxyData {
@@ -506,6 +532,7 @@ impl Trace for JsObject {
                     p.trace(tracer);
                 }
             }
+            ObjectKind::HostData(d) => d.trace(tracer),
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }
             | ObjectKind::Boolean(_)

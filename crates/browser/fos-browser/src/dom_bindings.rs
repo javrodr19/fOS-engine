@@ -92,6 +92,8 @@ pub struct DomHost {
     /// Prototypes of element interfaces by tag (`HTMLScriptElement` for
     /// "script"; SVG elements under "svg:<tag>" and "svg:*")
     tag_protos: HashMap<String, Gc<JsObject>>,
+    /// Canvas prototypes and the contexts of canvas elements
+    pub(crate) canvas: crate::canvas_bindings::CanvasHost,
 }
 
 impl DomHost {
@@ -117,11 +119,12 @@ impl DomHost {
             scroll_request: None,
             cookies,
             url_changed: false,
+            canvas: Default::default(),
         }
     }
 }
 
-fn host(vm: &mut Vm) -> &mut DomHost {
+pub(crate) fn host(vm: &mut Vm) -> &mut DomHost {
     vm.host_mut::<DomHost>().expect("DOM host not installed")
 }
 
@@ -136,7 +139,7 @@ fn with_doc<R>(vm: &mut Vm, f: impl FnOnce(&mut Document) -> R) -> R {
     f(&mut d)
 }
 
-fn with_tree<R>(vm: &mut Vm, f: impl FnOnce(&mut DomTree) -> R) -> R {
+pub(crate) fn with_tree<R>(vm: &mut Vm, f: impl FnOnce(&mut DomTree) -> R) -> R {
     with_doc(vm, |d| f(d.tree_mut()))
 }
 
@@ -172,7 +175,7 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 
 /// An element's key in `tag_protos`: its tag, prefixed "svg:" for SVG
-fn element_tag(t: &fos_dom::DomTree, e: &fos_dom::ElementData) -> String {
+pub(crate) fn element_tag(t: &fos_dom::DomTree, e: &fos_dom::ElementData) -> String {
     let local = t.resolve(e.name.local);
     if t.resolve(e.name.ns) == SVG_NS { format!("svg:{local}") } else { local.to_string() }
 }
@@ -248,7 +251,7 @@ fn string(vm: &mut Vm, s: &str) -> Value {
     vm.str_value(s)
 }
 
-fn dom_error(vm: &mut Vm, name: &str, message: &str) -> Value {
+pub(crate) fn dom_error(vm: &mut Vm, name: &str, message: &str) -> Value {
     let e = vm.make_error(fos_jsvm::vm::ErrorKind::Error, message);
     if let Some(o) = e.as_object() {
         let n = vm.str_value(name);
@@ -636,6 +639,7 @@ fn set_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> J
     let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
     let value = arg_string(vm, args, 1)?;
     with_tree(vm, |t| t.set_attribute(id, &name, &value));
+    crate::canvas_bindings::attribute_changed(vm, id, &name);
     Ok(Value::UNDEFINED)
 }
 
@@ -643,6 +647,7 @@ fn remove_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -
     let id = this_node(vm, this)?;
     let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
     with_tree(vm, |t| t.remove_attribute(id, &name));
+    crate::canvas_bindings::attribute_changed(vm, id, &name);
     Ok(Value::UNDEFINED)
 }
 
@@ -1514,7 +1519,7 @@ fn scroll_to(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult
 
 // ---- installation ----
 
-fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
+pub(crate) fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
     let o = vm.new_object_with(Some(parent), ObjectKind::Ordinary);
     vm.host_roots.push(Value::object(o));
     o
@@ -1522,7 +1527,7 @@ fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
 
 /// An interface object (`Node`, `HTMLElement`, ...) with its prototype,
 /// installed as a global. Constructing one is not allowed, as in browsers.
-fn interface(vm: &mut Vm, name: &str, proto: Gc<JsObject>) {
+pub(crate) fn interface(vm: &mut Vm, name: &str, proto: Gc<JsObject>) {
     fn illegal(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
         Err(vm.type_error("Illegal constructor"))
     }
@@ -1721,6 +1726,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
     methods(vm, performance, &[("now", 0, performance_now)]);
     vm.def_value(g, "performance", Value::object(performance), PropFlags::HIDDEN);
 
+    crate::canvas_bindings::install(vm);
     vm.eval_named(include_str!("dom_bootstrap.js"), "fos://dom_bootstrap.js")?;
     Ok(())
 }

@@ -55,9 +55,9 @@ pub mod devtools;
 pub mod accessibility;
 /// Media element handling (video, audio)
 pub mod media;
-/// Canvas 2D rendering
-pub mod canvas;
 pub mod web_crypto;
+/// Canvas 2D script bindings
+pub mod canvas_bindings;
 /// Security policies (CSP, CORS, sandbox)
 pub mod security;
 /// Memory management and pressure handling
@@ -235,7 +235,6 @@ pub use network::NetworkManager;
 pub use devtools::DevTools;
 pub use accessibility::AccessibilityManager;
 pub use media::MediaManager;
-pub use canvas::CanvasManager;
 pub use advanced_net::AdvancedNetworking;
 pub use security::SecurityManager;
 pub use memory::MemoryIntegration;

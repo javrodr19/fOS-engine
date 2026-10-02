@@ -45,11 +45,13 @@ const CALL: &str = r#"
   const d = Object.getOwnPropertyDescriptor(o, keys[keys.length - 1]);
   const f = kind === 'get' ? d.get : kind === 'set' ? d.set : d.value;
   const div = document.getElementById('d');
+  const ctx = document.createElement('canvas').getContext('2d');
   const vals = [undefined, null, 0, -1, 1.5, NaN, 2 ** 31 - 1, '', 'abc', '<b>x</b>', 'div', '#d', '\uD800', true, Symbol('s'), 10n,
     {}, [], () => 1, new ArrayBuffer(8), new Uint8Array(4), new Proxy({}, {}), new Map(), /x/g, new Error('e'),
     document, document.documentElement, div, div.firstChild, div.querySelector('p'), div.childNodes[2], document.createDocumentFragment(),
     document.createElement('span'), document.createTextNode('t'), document.querySelector('template'), document.querySelector('circle'),
-    document.getElementById('i'), new Event('x'), new Blob(['b']), window, Object.create(HTMLElement.prototype), Object.create(Node.prototype)];
+    document.getElementById('i'), new Event('x'), new Blob(['b']), window, Object.create(HTMLElement.prototype), Object.create(Node.prototype),
+    ctx, new Path2D('M0 0L5 5'), new OffscreenCanvas(3, 3), new ImageData(2, 2), ctx.createLinearGradient(0, 0, 1, 1), document.createElement('canvas')];
   let n = 0;
   const attempt = (thisArg, args, construct) => {
     n++;

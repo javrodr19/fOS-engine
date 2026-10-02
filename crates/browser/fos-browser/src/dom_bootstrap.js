@@ -4857,3 +4857,87 @@
   }
   Object.assign(global, { MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
 })(globalThis);
+
+// ---- canvas (contexts, paths and bitmaps are native: canvas_bindings.rs) ----
+(function (global) {
+  'use strict';
+  const define = (o, props) => {
+    for (const k of Object.keys(props)) {
+      const d = Object.getOwnPropertyDescriptor(props, k);
+      d.enumerable = false;
+      Object.defineProperty(o, k, d);
+    }
+  };
+  const getContext = __fosCanvasGetContext, dataURL = __fosCanvasDataURL, png = __fosCanvasPNG;
+  const imageBitmap = __fosImageBitmap, transfer = __fosTransferToImageBitmap;
+  const pngBlob = (buf) => buf ? new Blob([buf], { type: 'image/png' }) : null;
+  const C = HTMLCanvasElement.prototype;
+  define(C, {
+    getContext(type, options) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getContext' on 'HTMLCanvasElement': 1 argument required, but only 0 present.");
+      return getContext(this, String(type), options);
+    },
+    toDataURL() { return dataURL(this); },
+    toBlob(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': The callback provided as parameter 1 is not a function.");
+      const blob = pngBlob(png(this));
+      setTimeout(() => callback(blob), 0);
+    },
+    captureStream() { throw new DOMException("Failed to execute 'captureStream' on 'HTMLCanvasElement': Media streams are not supported.", 'NotSupportedError'); },
+    transferControlToOffscreen() { throw new DOMException("Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Not supported.", 'NotSupportedError'); },
+  });
+  define(OffscreenCanvas.prototype, {
+    getContext(type, options) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getContext' on 'OffscreenCanvas': 1 argument required, but only 0 present.");
+      return getContext(this, String(type), options);
+    },
+    convertToBlob() {
+      try {
+        const buf = png(this);
+        if (!buf) throw new DOMException("Failed to execute 'convertToBlob' on 'OffscreenCanvas': The canvas has no pixels.", 'IndexSizeError');
+        return Promise.resolve(pngBlob(buf));
+      } catch (e) { return Promise.reject(e); }
+    },
+    transferToImageBitmap() { return transfer(this); },
+  });
+
+  const MAX_PIXELS = 2 ** 28;
+  const dim = (v, what) => {
+    const n = Math.trunc(Number(v)) >>> 0;
+    if (n === 0) throw new DOMException(`Failed to construct 'ImageData': The source ${what} is zero or not a number.`, 'IndexSizeError');
+    return n;
+  };
+  class ImageData {
+    constructor(a, b, c) {
+      if (arguments.length < 2) throw new TypeError(`Failed to construct 'ImageData': 2 arguments required, but only ${arguments.length} present.`);
+      let data, width, height;
+      if (ArrayBuffer.isView(a)) {
+        if (!(a instanceof Uint8ClampedArray)) throw new TypeError("Failed to construct 'ImageData': parameter 1 is not of type 'Uint8ClampedArray'.");
+        if (a.length === 0 || a.length % 4) throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of 4.", 'InvalidStateError');
+        width = dim(b, 'width');
+        const pixels = a.length / 4;
+        if (pixels % width) throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of (4 * width).", 'IndexSizeError');
+        height = pixels / width;
+        if (c !== undefined && dim(c, 'height') !== height) throw new DOMException("Failed to construct 'ImageData': The input data length is not equal to (4 * width * height).", 'IndexSizeError');
+        data = a;
+      } else {
+        width = dim(a, 'width');
+        height = dim(b, 'height');
+        if (width * height > MAX_PIXELS) throw new RangeError("Failed to construct 'ImageData': Out of memory at ImageData creation");
+        data = new Uint8ClampedArray(width * height * 4);
+      }
+      Object.defineProperties(this, { data: { value: data }, width: { value: width }, height: { value: height }, colorSpace: { value: 'srgb' } });
+    }
+    get [Symbol.toStringTag]() { return 'ImageData'; }
+  }
+
+  global.createImageBitmap = function createImageBitmap(image, ...rest) {
+    try {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'createImageBitmap' on 'Window': 1 argument required, but only 0 present.");
+      const crop = rest.length >= 4 ? rest.slice(0, 4) : [];
+      if (image instanceof Blob) return image.arrayBuffer().then(buf => imageBitmap(buf, ...crop));
+      return Promise.resolve(imageBitmap(image, ...crop));
+    } catch (e) { return Promise.reject(e); }
+  };
+  define(global, { ImageData });
+})(globalThis);

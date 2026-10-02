@@ -1851,4 +1851,108 @@ mod tests {
         let msgs = rt.console_messages();
         assert!(msgs.iter().any(|m| format!("{m:?}").contains("undefinedFn")), "{msgs:?}");
     }
+
+    #[test]
+    fn canvas_2d() {
+        let (mut rt, _doc) = page("<html><body><canvas id=c width=40 height=20></canvas></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let px = "const px = (ctx, x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data).join(',');";
+        // Contexts: one per canvas, styles serialized, state saved and restored
+        rt.eval(&format!(r#"{{ {px} window.out = {{}};
+            const c = document.getElementById('c');
+            const ctx = c.getContext('2d');
+            out.ctx = [ctx === c.getContext('2d'), c.getContext('webgl'), ctx instanceof CanvasRenderingContext2D, ctx.canvas === c, String(ctx)].join();
+            ctx.fillStyle = 'red'; out.fill = ctx.fillStyle;
+            ctx.fillStyle = 'rgba(0, 0, 255, 0.5)'; out.fill += '|' + ctx.fillStyle;
+            ctx.fillStyle = 'not a color'; out.fill += '|' + ctx.fillStyle;
+            ctx.save(); ctx.fillStyle = '#0f0'; ctx.lineWidth = 7; ctx.restore();
+            out.restored = [ctx.fillStyle, ctx.lineWidth].join();
+            ctx.lineWidth = -1; ctx.lineCap = 'nope'; ctx.globalAlpha = 2; ctx.font = 'bold 12pt serif'; ctx.font = 'garbage';
+            out.state = [ctx.lineWidth, ctx.lineCap, ctx.globalAlpha, ctx.font, ctx.textAlign, ctx.direction, ctx.globalCompositeOperation, ctx.imageSmoothingQuality].join();
+            ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 10, 10);
+            out.pixels = [px(ctx, 5, 5), px(ctx, 15, 5)].join('|');
+            ctx.translate(20, 0); ctx.fillStyle = 'blue'; ctx.fillRect(0, 0, 5, 5);
+            out.transform = [px(ctx, 22, 2), ctx.getTransform().e, ctx.getTransform() instanceof DOMMatrix].join('|');
+            ctx.resetTransform(); }}"#)).unwrap();
+        assert_eq!(rt.eval("out.ctx").unwrap(), "true,,true,true,[object CanvasRenderingContext2D]");
+        assert_eq!(rt.eval("out.fill").unwrap(), "#ff0000|rgba(0, 0, 255, 0.5)|rgba(0, 0, 255, 0.5)");
+        assert_eq!(rt.eval("out.restored").unwrap(), "rgba(0, 0, 255, 0.5),1");
+        assert_eq!(rt.eval("out.state").unwrap(), "1,butt,1,bold 16px serif,start,inherit,source-over,low");
+        assert_eq!(rt.eval("out.pixels").unwrap(), "255,0,0,255|0,0,0,0");
+        assert_eq!(rt.eval("out.transform").unwrap(), "0,0,255,255|20|true");
+        // Paths, Path2D (with SVG data), hit testing, gradients and patterns
+        rt.eval(&format!(r#"{{ {px}
+            const c = document.getElementById('c'), ctx = c.getContext('2d');
+            ctx.clearRect(0, 0, 40, 20);
+            ctx.beginPath(); ctx.arc(10, 10, 8, 0, Math.PI * 2); ctx.fillStyle = 'lime'; ctx.fill();
+            out.arc = [px(ctx, 10, 10), px(ctx, 1, 1), ctx.isPointInPath(10, 10), ctx.isPointInPath(30, 10)].join('|');
+            const p = new Path2D('M20 0 h10 v10 h-10 z');
+            const p2 = new Path2D(p); p2.rect(32, 12, 4, 4);
+            ctx.fillStyle = '#000080'; ctx.fill(p2);
+            out.path2d = [px(ctx, 25, 5), px(ctx, 34, 14), ctx.isPointInPath(p, 25, 5), ctx.isPointInPath(p, 35, 15), p instanceof Path2D].join('|');
+            let err; try {{ ctx.arc(0, 0, -1, 0, 1); }} catch (e) {{ err = e.name; }}
+            let err2; try {{ ctx.fillRect(1); }} catch (e) {{ err2 = e.constructor.name; }}
+            out.errors = [err, err2].join();
+            const g = ctx.createLinearGradient(0, 0, 40, 0);
+            g.addColorStop(0, 'black'); g.addColorStop(1, 'white');
+            ctx.fillStyle = g;
+            out.gradient = [ctx.fillStyle === g, g instanceof CanvasGradient].join();
+            ctx.fillRect(0, 0, 40, 20);
+            const mid = ctx.getImageData(20, 10, 1, 1).data;
+            out.gradient += '|' + (Math.abs(mid[0] - 128) < 8);
+            let gerr; try {{ g.addColorStop(2, 'red'); }} catch (e) {{ gerr = e.name; }}
+            let gerr2; try {{ g.addColorStop(0.5, 'nope'); }} catch (e) {{ gerr2 = e.name; }}
+            out.gradient += '|' + gerr + ',' + gerr2;
+            const tile = new OffscreenCanvas(2, 2), tctx = tile.getContext('2d');
+            tctx.fillStyle = 'red'; tctx.fillRect(0, 0, 1, 1);
+            const pat = ctx.createPattern(tile, 'repeat');
+            ctx.imageSmoothingEnabled = false;
+            ctx.fillStyle = pat; ctx.clearRect(0, 0, 40, 20); ctx.fillRect(0, 0, 40, 20);
+            out.pattern = [pat instanceof CanvasPattern, px(ctx, 4, 4), px(ctx, 5, 4), tctx instanceof OffscreenCanvasRenderingContext2D, tctx.canvas === tile].join('|'); }}"#)).unwrap();
+        assert_eq!(rt.eval("out.arc").unwrap(), "0,255,0,255|0,0,0,0|true|false");
+        assert_eq!(rt.eval("out.path2d").unwrap(), "0,0,128,255|0,0,128,255|true|false|true");
+        assert_eq!(rt.eval("out.errors").unwrap(), "IndexSizeError,TypeError");
+        assert_eq!(rt.eval("out.gradient").unwrap(), "true,true|true|IndexSizeError,SyntaxError");
+        assert_eq!(rt.eval("out.pattern").unwrap(), "true|255,0,0,255|0,0,0,0|true|true");
+        // ImageData round trip, drawImage between canvases, encoding, resizing
+        rt.eval(&format!(r#"{{ {px}
+            const c = document.getElementById('c'), ctx = c.getContext('2d');
+            ctx.reset();
+            const img = ctx.createImageData(2, 1);
+            img.data.set([10, 20, 30, 255, 0, 0, 0, 0]);
+            ctx.putImageData(img, 3, 3);
+            const back = ctx.getImageData(3, 3, 2, 1);
+            out.imageData = [back.width, back.height, Array.from(back.data).join(' '), back instanceof ImageData, new ImageData(4, 2).data.length].join('|');
+            const off = new OffscreenCanvas(4, 4), octx = off.getContext('2d');
+            octx.fillStyle = 'yellow'; octx.fillRect(0, 0, 4, 4);
+            ctx.drawImage(off, 10, 10); ctx.drawImage(off, 0, 0, 4, 4, 30, 0, 8, 8);
+            out.drawImage = [px(ctx, 11, 11), px(ctx, 37, 7), px(ctx, 38, 9)].join('|');
+            ctx.drawImage(c, 0, 0, 40, 20, 0, 0, 20, 10);
+            out.self = px(ctx, 6, 6);
+            out.url = c.toDataURL().slice(0, 22);
+            const blank = document.createElement('canvas');
+            out.blank = [blank.width, blank.height, blank.toDataURL().length > 50, document.createElement('canvas').getContext('2d').canvas.width].join();
+            const m = ctx.measureText('Hello');
+            out.metrics = [m instanceof TextMetrics, m.width > 10, typeof m.actualBoundingBoxAscent].join();
+            c.width = 10;
+            out.resized = [c.width, ctx.getImageData(0, 0, 1, 1).data[3], ctx.fillStyle].join();
+            c.setAttribute('height', '5');
+            out.resized += '|' + ctx.getImageData(0, 0, 10, 5).data.length;
+            createImageBitmap(off).then(b => {{ out.bitmap = [b.width, b.height, b instanceof ImageBitmap].join(); b.close(); out.bitmap += '|' + b.width; }});
+            c.toBlob(b => {{ out.blob = [b.type, b.size > 50].join(); }});
+            off.convertToBlob().then(b => createImageBitmap(b)).then(b => {{ out.decoded = [b.width, b.height].join(); }}, e => {{ out.decoded = String(e); }}); }}"#)).unwrap();
+        for _ in 0..3 {
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("out.imageData").unwrap(), "2|1|10 20 30 255 0 0 0 0|true|32");
+        assert_eq!(rt.eval("out.drawImage").unwrap(), "255,255,0,255|255,255,0,255|0,0,0,0");
+        assert_eq!(rt.eval("out.self").unwrap(), "255,255,0,255");
+        assert_eq!(rt.eval("out.url").unwrap(), "data:image/png;base64,");
+        assert_eq!(rt.eval("out.blank").unwrap(), "300,150,true,300");
+        assert_eq!(rt.eval("out.metrics").unwrap(), "true,true,number");
+        assert_eq!(rt.eval("out.resized").unwrap(), "10,0,#000000|200");
+        assert_eq!(rt.eval("out.bitmap").unwrap(), "4,4,true|0");
+        assert_eq!(rt.eval("out.blob").unwrap(), "image/png,true");
+        assert_eq!(rt.eval("out.decoded").unwrap(), "4,4");
+    }
 }

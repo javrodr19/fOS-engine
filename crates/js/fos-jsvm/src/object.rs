@@ -652,7 +652,11 @@ impl JsObject {
     /// Switch to dictionary mode (after deletions, attribute changes or
     /// too many properties). Elements stay where they are.
     pub fn to_dictionary(&mut self, shapes: &Shapes) {
-        if self.dict.is_some() && self.shape == ShapeId::DICT {
+        if self.shape == ShapeId::DICT {
+            // Already a dictionary (proxies start out with no table)
+            if self.dict.is_none() {
+                self.dict = Some(Box::default());
+            }
             return;
         }
         let mut dict = self.dict.take().map(|d| *d).unwrap_or_default();

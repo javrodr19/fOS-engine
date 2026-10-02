@@ -57,6 +57,7 @@ pub mod accessibility;
 pub mod media;
 /// Canvas 2D rendering
 pub mod canvas;
+pub mod web_crypto;
 /// Security policies (CSP, CORS, sandbox)
 pub mod security;
 /// Memory management and pressure handling

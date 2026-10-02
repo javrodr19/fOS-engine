@@ -3959,4 +3959,500 @@
     }
   }
   Object.assign(global, { DOMParser, XMLSerializer });
+
+  // ---- crypto.subtle (natives in web_crypto.rs) ----
+  //
+  // Digests, HMAC, AES-GCM, PBKDF2, HKDF and ECDSA (P-256, P-384). Other
+  // algorithms reject with NotSupportedError.
+  const keyMaterial = new WeakMap(); // CryptoKey -> { secret } | { pkcs8, point, d }
+  class CryptoKey {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get type() { return keyMaterial.get(this).type; }
+    get extractable() { return keyMaterial.get(this).extractable; }
+    get algorithm() { return keyMaterial.get(this).algorithm; }
+    get usages() { return keyMaterial.get(this).usages.slice(); }
+  }
+  const makeKey = (type, extractable, algorithm, usages, material) => {
+    const k = Object.create(CryptoKey.prototype);
+    keyMaterial.set(k, { type, extractable: !!extractable, algorithm: Object.freeze(algorithm), usages: Array.from(usages), ...material });
+    return k;
+  };
+  const cryptoError = (name, message) => new DOMException(message, name);
+  // Natives throw TypeErrors whose message starts with a DOMException name
+  const native = (f) => {
+    try { return f(); } catch (e) {
+      const m = /^(OperationError|NotSupportedError|DataError|InvalidAccessError): (.*)$/.exec(e && e.message);
+      throw m ? cryptoError(m[1], m[2]) : e;
+    }
+  };
+  const algName = (alg) => {
+    const n = typeof alg === 'string' ? alg : alg && alg.name;
+    if (typeof n !== 'string') throw new TypeError('Algorithm: name is missing');
+    const known = ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512', 'HMAC', 'AES-GCM', 'AES-CBC', 'AES-CTR', 'AES-KW', 'PBKDF2', 'HKDF', 'ECDSA', 'ECDH',
+      'RSASSA-PKCS1-V1_5', 'RSA-PSS', 'RSA-OAEP', 'ED25519', 'X25519'];
+    const upper = n.toUpperCase();
+    return known.includes(upper) ? upper : n;
+  };
+  const hashName = (h) => algName(h);
+  const bytesOf = (data, what = 'data') => {
+    if (data instanceof ArrayBuffer) return data;
+    if (ArrayBuffer.isView(data)) return data;
+    throw new TypeError(`Failed to execute on 'SubtleCrypto': The provided value for ${what} is not of type '(ArrayBuffer or ArrayBufferView)'.`);
+  };
+  // A copy of the bytes, as an ArrayBuffer
+  const copyBytes = (data, what) => { bytesOf(data, what); return data instanceof ArrayBuffer ? data.slice(0) : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength); };
+  const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const fromB64url = (s) => Uint8Array.from(atob(String(s).replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((String(s).length + 3) % 4)), c => c.charCodeAt(0));
+  const hmacBlock = (hash) => hash === 'SHA-384' || hash === 'SHA-512' ? 1024 : 512;
+  const checkUsage = (key, usage, alg) => {
+    const m = keyMaterial.get(key);
+    if (!m) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+    if (!m.usages.includes(usage) || (alg && m.algorithm.name !== alg)) throw cryptoError('InvalidAccessError', `The requested operation is not valid for the provided key`);
+    return m;
+  };
+  const ecUsages = { public: ['verify'], private: ['sign'] };
+  class SubtleCrypto {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    digest(alg, data) {
+      return new Promise(resolve => resolve(native(() => __fosDigest(algName(alg), bytesOf(data)))));
+    }
+    generateKey(alg, extractable, usages) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        if (name === 'HMAC') {
+          const hash = hashName(alg.hash), length = alg.length ?? hmacBlock(hash);
+          resolve(makeKey('secret', extractable, { name, hash: { name: hash }, length }, usages, { secret: __fosRandomBytes(length / 8) }));
+        } else if (name === 'AES-GCM') {
+          if (![128, 192, 256].includes(alg.length)) throw cryptoError('OperationError', 'AES key length must be 128, 192 or 256 bits');
+          resolve(makeKey('secret', extractable, { name, length: alg.length }, usages, { secret: __fosRandomBytes(alg.length / 8) }));
+        } else if (name === 'ECDSA') {
+          const curve = alg.namedCurve;
+          const [pkcs8, point, d] = native(() => __fosEcGenerate(curve));
+          const algorithm = { name, namedCurve: curve };
+          resolve({
+            publicKey: makeKey('public', true, algorithm, usages.filter(u => ecUsages.public.includes(u)), { point }),
+            privateKey: makeKey('private', extractable, algorithm, usages.filter(u => ecUsages.private.includes(u)), { pkcs8, point, d }),
+          });
+        } else throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    importKey(format, keyData, alg, extractable, usages) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        if (['HMAC', 'AES-GCM', 'PBKDF2', 'HKDF'].includes(name)) {
+          let secret;
+          if (format === 'raw') secret = copyBytes(keyData, 'keyData');
+          else if (format === 'jwk' && keyData && keyData.kty === 'oct') secret = fromB64url(keyData.k).buffer;
+          else throw cryptoError('NotSupportedError', `Unsupported import key format for ${name}`);
+          const algorithm = name === 'HMAC' ? { name, hash: { name: hashName(alg.hash) }, length: secret.byteLength * 8 }
+            : name === 'AES-GCM' ? { name, length: secret.byteLength * 8 } : { name };
+          if (name === 'AES-GCM' && ![16, 24, 32].includes(secret.byteLength)) throw cryptoError('DataError', 'AES key data must be 128, 192 or 256 bits');
+          resolve(makeKey('secret', (name === 'PBKDF2' || name === 'HKDF') ? false : extractable, algorithm, usages, { secret }));
+        } else if (name === 'ECDSA') {
+          const curve = alg.namedCurve;
+          const algorithm = { name, namedCurve: curve };
+          if (format === 'raw') resolve(makeKey('public', true, algorithm, usages, { point: copyBytes(keyData, 'keyData') }));
+          else if (format === 'spki') resolve(makeKey('public', true, algorithm, usages, { point: native(() => __fosEcSpki(curve, undefined, bytesOf(keyData, 'keyData'))) }));
+          else if (format === 'pkcs8') {
+            const [pkcs8, point, d] = native(() => __fosEcImportPkcs8(curve, bytesOf(keyData, 'keyData')));
+            resolve(makeKey('private', extractable, algorithm, usages, { pkcs8, point, d }));
+          } else if (format === 'jwk' && keyData && keyData.kty === 'EC') {
+            const x = fromB64url(keyData.x), y = fromB64url(keyData.y);
+            const point = new Uint8Array(1 + x.length + y.length);
+            point[0] = 4; point.set(x, 1); point.set(y, 1 + x.length);
+            if (keyData.d) {
+              const [pkcs8, p, d] = native(() => __fosEcImportPrivate(curve, fromB64url(keyData.d), point));
+              resolve(makeKey('private', extractable, algorithm, usages, { pkcs8, point: p, d }));
+            } else resolve(makeKey('public', true, algorithm, usages, { point: point.buffer }));
+          } else throw cryptoError('NotSupportedError', `Unsupported import key format for ${name}`);
+        } else throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    exportKey(format, key) {
+      return new Promise(resolve => {
+        const m = keyMaterial.get(key);
+        if (!m) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+        if (!m.extractable) throw cryptoError('InvalidAccessError', 'key is not extractable');
+        const name = m.algorithm.name;
+        if (m.type === 'secret') {
+          if (format === 'raw') return resolve(m.secret.slice(0));
+          if (format === 'jwk') {
+            const alg = name === 'HMAC' ? 'HS' + m.algorithm.hash.name.slice(4) : name === 'AES-GCM' ? `A${m.algorithm.length}GCM` : undefined;
+            return resolve({ kty: 'oct', k: b64url(m.secret), alg, ext: true, key_ops: m.usages.slice() });
+          }
+        } else {
+          const size = m.algorithm.namedCurve === 'P-384' ? 48 : 32;
+          const point = new Uint8Array(m.point);
+          if (format === 'raw' && m.type === 'public') return resolve(m.point.slice(0));
+          if (format === 'spki' && m.type === 'public') return resolve(__fosEcSpki(m.algorithm.namedCurve, m.point));
+          if (format === 'pkcs8' && m.type === 'private') return resolve(m.pkcs8.slice(0));
+          if (format === 'jwk') {
+            const jwk = { kty: 'EC', crv: m.algorithm.namedCurve, x: b64url(point.slice(1, 1 + size)), y: b64url(point.slice(1 + size)), ext: true, key_ops: m.usages.slice() };
+            if (m.type === 'private') jwk.d = b64url(m.d);
+            return resolve(jwk);
+          }
+        }
+        throw cryptoError('NotSupportedError', `Unsupported export key format ${format}`);
+      });
+    }
+    sign(alg, key, data) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'sign', name);
+        if (name === 'HMAC') return resolve(native(() => __fosHmac(m.algorithm.hash.name, m.secret, bytesOf(data))));
+        if (name === 'ECDSA') {
+          if (hashName(alg.hash) !== (m.algorithm.namedCurve === 'P-384' ? 'SHA-384' : 'SHA-256')) throw cryptoError('NotSupportedError', 'ECDSA signing uses the curve\'s own hash');
+          return resolve(native(() => __fosEcSign(m.algorithm.namedCurve, m.pkcs8, bytesOf(data))));
+        }
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    verify(alg, key, signature, data) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'verify', name);
+        if (name === 'HMAC') return resolve(native(() => __fosHmac(m.algorithm.hash.name, m.secret, bytesOf(data), bytesOf(signature, 'signature'))));
+        if (name === 'ECDSA') return resolve(native(() => __fosEcVerify(m.algorithm.namedCurve, hashName(alg.hash), m.point, bytesOf(signature, 'signature'), bytesOf(data))));
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    encrypt(alg, key, data) { return this._aes(alg, key, data, true); }
+    decrypt(alg, key, data) { return this._aes(alg, key, data, false); }
+    _aes(alg, key, data, encrypt) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, encrypt ? 'encrypt' : 'decrypt', name);
+        if (name !== 'AES-GCM') throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+        resolve(native(() => __fosAesGcm(encrypt, m.secret, bytesOf(alg.iv, 'iv'), bytesOf(data), alg.additionalData === undefined ? undefined : bytesOf(alg.additionalData, 'additionalData'), alg.tagLength)));
+      });
+    }
+    deriveBits(alg, key, length) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'deriveBits', name);
+        if (name === 'PBKDF2') return resolve(native(() => __fosPbkdf2(hashName(alg.hash), m.secret, bytesOf(alg.salt, 'salt'), alg.iterations, length)));
+        if (name === 'HKDF') return resolve(native(() => __fosHkdf(hashName(alg.hash), m.secret, bytesOf(alg.salt, 'salt'), bytesOf(alg.info, 'info'), length)));
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    async deriveKey(alg, key, derivedAlg, extractable, usages) {
+      const m = keyMaterial.get(key);
+      if (!m || !m.usages.includes('deriveKey')) throw cryptoError('InvalidAccessError', 'The requested operation is not valid for the provided key');
+      const name = algName(derivedAlg);
+      const length = name === 'HMAC' ? (derivedAlg.length ?? hmacBlock(hashName(derivedAlg.hash))) : derivedAlg.length;
+      const bits = await this.deriveBits(alg, makeKey('secret', false, m.algorithm, ['deriveBits'], { secret: m.secret }), length);
+      return this.importKey('raw', bits, derivedAlg, extractable, usages);
+    }
+    wrapKey() { return Promise.reject(cryptoError('NotSupportedError', 'wrapKey is not supported')); }
+    unwrapKey() { return Promise.reject(cryptoError('NotSupportedError', 'unwrapKey is not supported')); }
+  }
+  const subtle = Object.create(SubtleCrypto.prototype);
+  Object.defineProperty(Crypto.prototype, 'subtle', { get() { return subtle; }, configurable: true });
+  Object.assign(global, { SubtleCrypto, CryptoKey });
+
+  // ---- matchMedia with the CSS engine's media queries ----
+  class MediaQueryList extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get media() { return this._media; }
+    get matches() { return __fosMatchMedia(this._media); }
+    get onchange() { return this._onchange ?? null; }
+    set onchange(f) { this._onchange = typeof f === 'function' ? f : null; }
+    addListener(f) { if (f) this.addEventListener('change', f); }
+    removeListener(f) { if (f) this.removeEventListener('change', f); }
+  }
+  class MediaQueryListEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.media = String(init.media ?? ''); this.matches = !!init.matches; }
+  }
+  // Lists that may fire `change`, re-evaluated when the window resizes
+  const liveQueries = new Set();
+  global.matchMedia = function matchMedia(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+    const mql = Object.create(MediaQueryList.prototype);
+    Object.defineProperties(mql, { _media: { value: String(query).trim() }, _last: { value: __fosMatchMedia(String(query)), writable: true }, _onchange: { value: null, writable: true } });
+    liveQueries.add(new WeakRef(mql));
+    return mql;
+  };
+  global.addEventListener('resize', () => {
+    for (const ref of liveQueries) {
+      const mql = ref.deref();
+      if (!mql) { liveQueries.delete(ref); continue; }
+      const now = mql.matches;
+      if (now === mql._last) continue;
+      mql._last = now;
+      const ev = new MediaQueryListEvent('change', { media: mql.media, matches: now });
+      mql.dispatchEvent(ev);
+      if (mql._onchange) { try { mql._onchange.call(mql, ev); } catch (e) { reportError(e); } }
+    }
+  });
+  Object.assign(global, { MediaQueryList, MediaQueryListEvent });
+
+  // ---- FileReader ----
+  class FileReader extends EventTargetCtor {
+    constructor() {
+      super();
+      Object.defineProperties(this, { _state: { value: 0, writable: true }, _result: { value: null, writable: true }, _error: { value: null, writable: true }, _abort: { value: false, writable: true } });
+      for (const t of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) this['on' + t] = null;
+    }
+    get readyState() { return this._state; }
+    get result() { return this._result; }
+    get error() { return this._error; }
+    _read(blob, as, encoding) {
+      if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
+      if (this._state === 1) throw new DOMException("Failed to execute 'read' on 'FileReader': The object is already busy reading Blobs.", 'InvalidStateError');
+      this._state = 1; this._result = null; this._abort = false;
+      const fire = (type) => {
+        const ev = Object.assign(new ProgressEvent(type, { lengthComputable: true, loaded: blob.size, total: blob.size }), {});
+        this.dispatchEvent(ev);
+        const h = this['on' + type];
+        if (typeof h === 'function') { try { h.call(this, ev); } catch (e) { reportError(e); } }
+      };
+      setTimeout(() => {
+        if (this._abort) return;
+        fire('loadstart');
+        const buf = blob._buf;
+        if (as === 'text') this._result = __fosDecode(buf, encoding || 'utf-8');
+        else if (as === 'buffer') this._result = buf.slice(0);
+        else if (as === 'binary') this._result = String.fromCharCode(...new Uint8Array(buf));
+        else this._result = `data:${blob.type || 'application/octet-stream'};base64,` + btoa(Array.from(new Uint8Array(buf), c => String.fromCharCode(c)).join(''));
+        this._state = 2;
+        fire('progress'); fire('load'); fire('loadend');
+      }, 0);
+    }
+    readAsText(blob, encoding) { this._read(blob, 'text', encoding); }
+    readAsArrayBuffer(blob) { this._read(blob, 'buffer'); }
+    readAsDataURL(blob) { this._read(blob, 'dataurl'); }
+    readAsBinaryString(blob) { this._read(blob, 'binary'); }
+    abort() {
+      if (this._state !== 1) return;
+      this._abort = true; this._state = 2; this._result = null;
+      for (const t of ['abort', 'loadend']) {
+        const ev = new ProgressEvent(t);
+        this.dispatchEvent(ev);
+        if (typeof this['on' + t] === 'function') this['on' + t].call(this, ev);
+      }
+    }
+  }
+  Object.assign(FileReader, { EMPTY: 0, LOADING: 1, DONE: 2 });
+  class FileList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.assign(global, { FileReader, FileList });
+
+  // ---- DOMStringMap (dataset), DOMImplementation, XMLDocument, importNode ----
+  function DOMStringMap() { throw new TypeError('Illegal constructor'); }
+  {
+    const desc = Object.getOwnPropertyDescriptor(E, 'dataset');
+    if (desc && desc.get) {
+      const get = desc.get;
+      Object.defineProperty(E, 'dataset', {
+        get() {
+          const d = get.call(this);
+          // The dataset proxy's target gets DOMStringMap.prototype once
+          if (!(d instanceof DOMStringMap)) try { Object.setPrototypeOf(d, DOMStringMap.prototype); } catch {}
+          return d;
+        },
+        configurable: true,
+      });
+    }
+  }
+  function DOMImplementation() { throw new TypeError('Illegal constructor'); }
+  Object.setPrototypeOf(document.implementation, DOMImplementation.prototype);
+  define(DOMImplementation.prototype, {
+    hasFeature() { return true; },
+    createHTMLDocument(title) { return createHTMLDocument(title); },
+    createDocument(ns, qualifiedName) {
+      const doc = createHTMLDocument();
+      if (qualifiedName) define(doc, { documentElement: document.createElementNS(ns, qualifiedName) });
+      return doc;
+    },
+    createDocumentType(name, publicId, systemId) {
+      const dt = Object.create(DocumentType.prototype);
+      define(dt, { name: String(name), publicId: String(publicId ?? ''), systemId: String(systemId ?? ''), nodeType: 10, nodeName: String(name) });
+      return dt;
+    },
+  });
+  function XMLDocument() { throw new TypeError('Illegal constructor'); }
+  XMLDocument.prototype = Object.create(Document.prototype);
+  define(Document.prototype, {
+    importNode(node, deep = false) {
+      if (!(node instanceof Node) || node.nodeType === 9) throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", 'NotSupportedError');
+      return node.cloneNode(!!deep);
+    },
+    adoptNode(node) {
+      if (!(node instanceof Node) || node.nodeType === 9) throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", 'NotSupportedError');
+      if (node.parentNode) node.parentNode.removeChild(node);
+      return node;
+    },
+    get fonts() { return fontFaceSet; },
+  });
+  Object.assign(global, { DOMStringMap, DOMImplementation, XMLDocument });
+
+  // ---- fonts: FontFace and document.fonts ----
+  //
+  // Web fonts are not downloaded yet; faces load as the page's fallback
+  // fonts, so "ready" resolves at once.
+  class FontFace {
+    constructor(family, source, descriptors = {}) {
+      Object.assign(this, { family: String(family), style: 'normal', weight: 'normal', stretch: 'normal', unicodeRange: 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal', display: 'auto', ...descriptors });
+      Object.defineProperties(this, { _status: { value: 'unloaded', writable: true }, _source: { value: source } });
+      let resolve;
+      Object.defineProperty(this, 'loaded', { value: new Promise(r => { resolve = r; }) });
+      Object.defineProperty(this, '_resolve', { value: resolve });
+    }
+    get status() { return this._status; }
+    load() { this._status = 'loaded'; this._resolve(this); return this.loaded; }
+  }
+  class FontFaceSet extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get ready() { return Promise.resolve(this); }
+    get status() { return 'loaded'; }
+    get size() { return this._faces.size; }
+    add(face) { this._faces.add(face); return this; }
+    delete(face) { return this._faces.delete(face); }
+    has(face) { return this._faces.has(face); }
+    clear() { this._faces.clear(); }
+    forEach(f, t) { this._faces.forEach(v => f.call(t, v, v, this)); }
+    values() { return this._faces.values(); }
+    keys() { return this._faces.values(); }
+    entries() { return Array.from(this._faces, f => [f, f]).values(); }
+    [Symbol.iterator]() { return this._faces.values(); }
+    check() { return true; }
+    load(font) { return Promise.resolve(Array.from(this._faces).filter(f => String(font).includes(f.family))); }
+  }
+  const fontFaceSet = Object.create(FontFaceSet.prototype);
+  Object.defineProperty(fontFaceSet, '_faces', { value: new Set() });
+  for (const t of ['loading', 'loadingdone', 'loadingerror']) fontFaceSet['on' + t] = null;
+  Object.assign(global, { FontFace, FontFaceSet });
+
+  // ---- scheduling: scheduler.postTask/yield, TaskController ----
+  class TaskSignal extends AbortSignal {
+    get priority() { return this._priority ?? 'user-visible'; }
+  }
+  class TaskController extends AbortController {
+    constructor(init = {}) {
+      super();
+      const signal = this.signal;
+      Object.setPrototypeOf(signal, TaskSignal.prototype);
+      Object.defineProperty(signal, '_priority', { value: init.priority ?? 'user-visible', writable: true });
+      signal.onprioritychange = null;
+    }
+    setPriority(priority) {
+      const s = this.signal;
+      const previous = s._priority;
+      s._priority = String(priority);
+      const ev = Object.assign(new Event('prioritychange'), { previousPriority: previous });
+      s.dispatchEvent(ev);
+      if (typeof s.onprioritychange === 'function') s.onprioritychange(ev);
+    }
+  }
+  const priorityDelay = { 'user-blocking': 0, 'user-visible': 0, background: 10 };
+  class Scheduler {
+    postTask(callback, options = {}) {
+      const signal = options.signal;
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) return reject(signal.reason);
+        const priority = options.priority ?? (signal && signal.priority) ?? 'user-visible';
+        const id = setTimeout(() => {
+          try { resolve(callback()); } catch (e) { reject(e); }
+        }, (options.delay ?? 0) + (priorityDelay[priority] ?? 0));
+        if (signal) signal.addEventListener('abort', () => { clearTimeout(id); reject(signal.reason); }, { once: true });
+      });
+    }
+    yield() { return new Promise(r => setTimeout(r, 0)); }
+  }
+  Object.assign(global, { scheduler: Object.create(Scheduler.prototype), Scheduler, TaskController, TaskSignal });
+
+  // ---- Trusted Types (policies; nothing enforces them without CSP) ----
+  class TrustedHTML { toString() { return this._v; } toJSON() { return this._v; } }
+  class TrustedScript { toString() { return this._v; } toJSON() { return this._v; } }
+  class TrustedScriptURL { toString() { return this._v; } toJSON() { return this._v; } }
+  const trusted = (C, v) => { const o = Object.create(C.prototype); Object.defineProperty(o, '_v', { value: String(v) }); return o; };
+  class TrustedTypePolicy {
+    createHTML(s, ...a) { if (!this._p.createHTML) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createHTML' member.`); return trusted(TrustedHTML, this._p.createHTML(s, ...a)); }
+    createScript(s, ...a) { if (!this._p.createScript) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createScript' member.`); return trusted(TrustedScript, this._p.createScript(s, ...a)); }
+    createScriptURL(s, ...a) { if (!this._p.createScriptURL) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createScriptURL' member.`); return trusted(TrustedScriptURL, this._p.createScriptURL(s, ...a)); }
+  }
+  const policies = new Map();
+  class TrustedTypePolicyFactory {
+    createPolicy(name, options = {}) {
+      const p = Object.create(TrustedTypePolicy.prototype);
+      Object.defineProperties(p, { name: { value: String(name), enumerable: true }, _p: { value: options } });
+      if (name === 'default') policies.set('default', p);
+      return p;
+    }
+    isHTML(v) { return v instanceof TrustedHTML; }
+    isScript(v) { return v instanceof TrustedScript; }
+    isScriptURL(v) { return v instanceof TrustedScriptURL; }
+    get emptyHTML() { return trusted(TrustedHTML, ''); }
+    get emptyScript() { return trusted(TrustedScript, ''); }
+    get defaultPolicy() { return policies.get('default') ?? null; }
+    getAttributeType() { return null; }
+    getPropertyType() { return null; }
+  }
+  Object.assign(global, { trustedTypes: Object.create(TrustedTypePolicyFactory.prototype), TrustedHTML, TrustedScript, TrustedScriptURL, TrustedTypePolicy, TrustedTypePolicyFactory });
+
+  // ---- permission-gated APIs: present, and answering "no" ----
+  class PermissionStatus extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  class Permissions {
+    query(descriptor) {
+      if (!descriptor || typeof descriptor.name !== 'string') return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor'."));
+      const s = Object.create(PermissionStatus.prototype);
+      Object.assign(s, { name: descriptor.name, state: 'prompt', onchange: null });
+      return Promise.resolve(s);
+    }
+  }
+  class GeolocationPositionError {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  Object.assign(GeolocationPositionError, { PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 });
+  class Geolocation {
+    getCurrentPosition(success, error) {
+      if (typeof error === 'function') setTimeout(() => {
+        const e = Object.create(GeolocationPositionError.prototype);
+        Object.assign(e, { code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 });
+        error(e);
+      }, 0);
+    }
+    watchPosition(success, error) { this.getCurrentPosition(success, error); return 0; }
+    clearWatch() {}
+  }
+  class Notification extends EventTargetCtor {
+    constructor(title, options = {}) {
+      super();
+      Object.assign(this, { title: String(title), body: options.body ?? '', tag: options.tag ?? '', icon: options.icon ?? '', data: options.data ?? null, onclick: null, onshow: null, onerror: null, onclose: null });
+      setTimeout(() => this.dispatchEvent(new Event('error')), 0);
+    }
+    static get permission() { return 'default'; }
+    static requestPermission(cb) { if (typeof cb === 'function') setTimeout(() => cb('denied'), 0); return Promise.resolve('denied'); }
+    close() {}
+  }
+  class Clipboard extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    readText() { return Promise.reject(new DOMException('Read permission denied.', 'NotAllowedError')); }
+    read() { return this.readText(); }
+    writeText() { return Promise.resolve(); }
+    write() { return Promise.resolve(); }
+  }
+  class ClipboardItem {
+    constructor(items) { Object.defineProperty(this, '_items', { value: items }); }
+    get types() { return Object.keys(this._items); }
+    getType(t) { return Promise.resolve(this._items[t]); }
+    static supports() { return true; }
+  }
+  define(Navigator.prototype, {
+    permissions: Object.create(Permissions.prototype),
+    geolocation: Object.create(Geolocation.prototype),
+    clipboard: Object.create(Clipboard.prototype),
+    userActivation: { hasBeenActive: false, isActive: false },
+    mediaDevices: { enumerateDevices: () => Promise.resolve([]), getUserMedia: () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError')), addEventListener() {}, removeEventListener() {} },
+    canShare() { return false; },
+    vibrate() { return false; },
+    pdfViewerEnabled: false,
+    deviceMemory: 8,
+    connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'unknown', addEventListener() {}, removeEventListener() {} },
+  });
+  Object.assign(global, { Permissions, PermissionStatus, Geolocation, GeolocationPositionError, Notification, Clipboard, ClipboardItem });
 })(globalThis);

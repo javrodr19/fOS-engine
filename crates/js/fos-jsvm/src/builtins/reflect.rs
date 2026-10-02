@@ -6,7 +6,7 @@ use crate::value::Value;
 use crate::vm::{JsResult, NativeFn, Vm};
 
 use super::arg;
-use super::object::{define_from_descriptor, from_descriptor, set_proto, to_descriptor};
+use super::object::{define_from_descriptor, from_descriptor, to_descriptor};
 
 pub(super) fn init(vm: &mut Vm) {
     let r = vm.new_object();
@@ -96,7 +96,7 @@ fn has(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<V
 
 fn is_extensible(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = target(vm, args)?;
-    Ok(Value::bool(o.get().extensible))
+    Ok(Value::bool(vm.is_extensible(o)?))
 }
 
 fn own_keys(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -108,9 +108,7 @@ fn own_keys(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsRes
 
 fn prevent_extensions(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let o = target(vm, args)?;
-    o.get_mut().extensible = false;
-    o.get_mut().to_dictionary(&vm.shapes);
-    Ok(Value::TRUE)
+    Ok(Value::bool(vm.prevent_extensions(o)?))
 }
 
 fn set(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -126,5 +124,5 @@ fn set_prototype_of(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) 
     if !p.is_object() && !p.is_null() {
         return Err(vm.type_error("Object prototype may only be an Object or null"));
     }
-    Ok(Value::bool(set_proto(vm, o, p)))
+    Ok(Value::bool(vm.set_prototype(o, p)?))
 }

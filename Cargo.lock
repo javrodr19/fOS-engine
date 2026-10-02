@@ -735,6 +735,7 @@ dependencies = [
  "fos-text",
  "getrandom 0.2.16",
  "log",
+ "ring",
  "serde_json",
  "smol",
  "softbuffer",

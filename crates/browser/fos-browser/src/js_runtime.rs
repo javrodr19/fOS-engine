@@ -1097,6 +1097,81 @@ mod tests {
     }
 
     #[test]
+    fn web_crypto_and_misc_apis() {
+        let (mut rt, _doc) = page("<html><body><div id=d data-user-id=7></div></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        rt.eval(r#"window.out = {};
+            const enc = s => new TextEncoder().encode(s);
+            const hex = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, '0')).join('');
+            const s = crypto.subtle;
+            (async () => {
+              out.sha = hex(await s.digest('SHA-256', enc('abc')));
+              const hk = await s.importKey('raw', enc('key'), { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']);
+              const mac = await s.sign('HMAC', hk, enc('The quick brown fox jumps over the lazy dog'));
+              out.hmac = hex(mac);
+              out.hmacOk = [await s.verify('HMAC', hk, mac, enc('The quick brown fox jumps over the lazy dog')), await s.verify('HMAC', hk, mac, enc('other'))].join();
+              out.jwk = JSON.stringify(await s.exportKey('jwk', hk));
+              const pw = await s.importKey('raw', enc('password'), 'PBKDF2', false, ['deriveBits']);
+              out.pbkdf2 = hex(await s.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc('salt'), iterations: 1 }, pw, 256));
+              const ikm = await s.importKey('raw', new Uint8Array(22).fill(11), 'HKDF', false, ['deriveBits']);
+              out.hkdf = hex(await s.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: Uint8Array.from({ length: 13 }, (_, i) => i), info: Uint8Array.from({ length: 10 }, (_, i) => 0xf0 + i) }, ikm, 336));
+              const aes = await s.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+              const iv = crypto.getRandomValues(new Uint8Array(12));
+              const ct = await s.encrypt({ name: 'AES-GCM', iv }, aes, enc('secret message'));
+              const pt = await s.decrypt({ name: 'AES-GCM', iv }, aes, ct);
+              const bad = new Uint8Array(ct); bad[0] ^= 1;
+              let tamper; try { await s.decrypt({ name: 'AES-GCM', iv }, aes, bad); } catch (e) { tamper = e.name; }
+              out.aes = [ct.byteLength, new TextDecoder().decode(pt), tamper].join();
+              const pair = await s.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+              const sig = await s.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, enc('msg'));
+              const pubJwk = await s.exportKey('jwk', pair.publicKey);
+              const pub2 = await s.importKey('jwk', pubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+              const spki = await s.exportKey('spki', pair.publicKey);
+              const pub3 = await s.importKey('spki', spki, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+              const privJwk = await s.exportKey('jwk', pair.privateKey);
+              const priv2 = await s.importKey('jwk', privJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+              const sig2 = await s.sign({ name: 'ECDSA', hash: 'SHA-256' }, priv2, enc('msg'));
+              out.ec = [sig.byteLength, await s.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub2, sig, enc('msg')), await s.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub3, sig2, enc('msg')),
+                await s.verify({ name: 'ECDSA', hash: 'SHA-256' }, pair.publicKey, sig, enc('msh')), privJwk.d.length, pair.privateKey instanceof CryptoKey, pair.privateKey.type].join();
+              const errs = [];
+              for (const f of [() => s.digest('MD5', enc('x')), () => s.exportKey('raw', priv2), () => s.sign('HMAC', aes, enc('x'))]) { try { await f(); errs.push('ok'); } catch (e) { errs.push(e.name); } }
+              out.errs = errs.join();
+            })().catch(e => { out.fail = String(e && e.stack || e); });"#).unwrap();
+        for _ in 0..3 {
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("out.fail || 'none'").unwrap(), "none");
+        assert_eq!(rt.eval("out.sha").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(rt.eval("out.hmac").unwrap(), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+        assert_eq!(rt.eval("out.hmacOk").unwrap(), "true,false");
+        assert_eq!(rt.eval("out.jwk").unwrap(), r#"{"kty":"oct","k":"a2V5","alg":"HS256","ext":true,"key_ops":["sign","verify"]}"#);
+        assert_eq!(rt.eval("out.pbkdf2").unwrap(), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+        assert_eq!(rt.eval("out.hkdf").unwrap(), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+        assert_eq!(rt.eval("out.aes").unwrap(), "30,secret message,OperationError");
+        assert_eq!(rt.eval("out.ec").unwrap(), "64,true,true,false,43,true,private");
+        assert_eq!(rt.eval("out.errs").unwrap(), "NotSupportedError,InvalidAccessError,InvalidAccessError");
+        // matchMedia from the CSS engine; FileReader; dataset; importNode; misc interfaces
+        rt.eval(r#"out.mq = [matchMedia('(min-width: 600px) and (orientation: landscape)').matches, matchMedia('(max-width: 100px)').matches, matchMedia('print').matches,
+                matchMedia('screen').media, matchMedia('all') instanceof MediaQueryList].join();
+            const fr = new FileReader(); fr.onload = () => { out.fr = fr.result; }; fr.readAsDataURL(new Blob(['hi'], { type: 'text/plain' }));
+            const fr2 = new FileReader(); fr2.addEventListener('loadend', () => { out.fr2 = fr2.result + '|' + fr2.readyState; }); fr2.readAsText(new Blob(['héllo']));
+            scheduler.postTask(() => 'task', { priority: 'background' }).then(v => { out.task = v; });
+            const tc = new TaskController(); scheduler.postTask(() => 1, { signal: tc.signal }).catch(e => { out.aborted = e.name; }); tc.abort();
+            const d = document.getElementById('d');
+            const p = trustedTypes.createPolicy('x', { createHTML: s => s.replace(/</g, '&lt;') });
+            out.misc = [d.dataset.userId, d.dataset instanceof DOMStringMap, document.importNode(d, true) !== d, document.importNode(d, true).dataset.userId,
+              document.implementation instanceof DOMImplementation, typeof document.fonts.ready.then, String(p.createHTML('<b>')), trustedTypes.isHTML(p.createHTML('')),
+              Notification.permission, typeof navigator.permissions.query, navigator.geolocation instanceof Geolocation].join();"#).unwrap();
+        for _ in 0..4 {
+            rt.process_timers(&mut |_: &str| None).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        assert_eq!(rt.eval("out.mq").unwrap(), "true,false,false,screen,true");
+        assert_eq!(rt.eval("[out.fr, out.fr2, out.task, out.aborted].join(' ')").unwrap(), "data:text/plain;base64,aGk= héllo|2 task AbortError");
+        assert_eq!(rt.eval("out.misc").unwrap(), "7,true,true,7,true,function,&lt;b>,true,default,function,true");
+    }
+
+    #[test]
     fn broadcast_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();

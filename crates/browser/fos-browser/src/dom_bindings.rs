@@ -1149,6 +1149,13 @@ fn set_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> Js
     Ok(Value::UNDEFINED)
 }
 
+/// `__fosMatchMedia(query)`: whether a media query matches the viewport
+fn match_media(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let q = arg_string(vm, args, 0)?;
+    let (width, height) = host(vm).viewport;
+    Ok(Value::bool(fos_css::media_matches(&q, &fos_css::MediaContext { width, height })))
+}
+
 /// `__fosParseDocument(html)`: parse a whole HTML document (DOMParser) and
 /// return its `<html>` element, detached in the page's tree. Its scripts
 /// never run.
@@ -1680,6 +1687,18 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetSheetCSS", 2, set_sheet_css),
         ("__fosSetAdoptedCSS", 1, set_adopted_css),
         ("__fosParseDocument", 1, parse_document),
+        ("__fosMatchMedia", 1, match_media),
+        ("__fosDigest", 2, crate::web_crypto::digest_native),
+        ("__fosHmac", 4, crate::web_crypto::hmac_native),
+        ("__fosAesGcm", 6, crate::web_crypto::aes_gcm_native),
+        ("__fosPbkdf2", 5, crate::web_crypto::pbkdf2_native),
+        ("__fosHkdf", 5, crate::web_crypto::hkdf_native),
+        ("__fosEcGenerate", 1, crate::web_crypto::ec_generate),
+        ("__fosEcImportPkcs8", 2, crate::web_crypto::ec_import_pkcs8),
+        ("__fosEcImportPrivate", 3, crate::web_crypto::ec_import_private),
+        ("__fosEcSign", 3, crate::web_crypto::ec_sign),
+        ("__fosEcVerify", 5, crate::web_crypto::ec_verify),
+        ("__fosEcSpki", 3, crate::web_crypto::ec_spki),
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),

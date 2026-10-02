@@ -1468,5 +1468,12 @@ fn proxy_prototype_chain() {
         ("class B {} new Proxy({}, { getPrototypeOf() { return B.prototype; } }) instanceof B", "true"),
         ("class C {} const p = new Proxy(Object.create(C.prototype), {}); Object.create(p) instanceof C", "true"),
         ("var log = []; class D {} new Proxy({}, { getPrototypeOf(t) { log.push('trap'); return null; } }) instanceof D; log.join()", "'trap'"),
+        // Prototype and extensibility operations reach the target or the traps
+        ("function C() {} var t = {}; Object.setPrototypeOf(new Proxy(t, {}), C.prototype); Object.getPrototypeOf(t) === C.prototype", "true"),
+        ("var log = []; var p = new Proxy({}, { setPrototypeOf(t, v) { log.push('set'); return Reflect.setPrototypeOf(t, v); }, preventExtensions(t) { log.push('pe'); return Reflect.preventExtensions(t); }, isExtensible(t) { log.push('ie'); return Reflect.isExtensible(t); } }); Object.setPrototypeOf(p, null); Object.preventExtensions(p); [Object.isExtensible(p), log.join()]", "[ false, 'set,pe,ie' ]"),
+        ("var t = {}; Object.preventExtensions(new Proxy(t, {})); [Object.isExtensible(t), Reflect.preventExtensions(new Proxy({}, { preventExtensions() { return false; } }))]", "[ false, false ]"),
+        ("try { Object.preventExtensions(new Proxy({}, { preventExtensions() { return false; } })); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+        ("var t = { a: 1, get g() { return 1; } }; var p = Object.freeze(new Proxy(t, {})); [Object.isFrozen(t), Object.isFrozen(p), Object.isSealed(p), Object.getOwnPropertyDescriptor(t, 'a').writable]", "[ true, true, true, false ]"),
+        ("var t = { a: 1 }; Object.seal(new Proxy(t, {})); [Object.isSealed(t), Object.isFrozen(t), Object.isFrozen(new Proxy({}, {}))]", "[ true, false, false ]"),
     ]);
 }

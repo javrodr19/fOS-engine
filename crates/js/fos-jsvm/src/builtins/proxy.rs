@@ -204,6 +204,45 @@ impl Vm {
         }
     }
 
+    /// [[SetPrototypeOf]] of any object (through a proxy's trap)
+    pub(crate) fn set_prototype(&mut self, o: Gc<JsObject>, proto: Value) -> JsResult<bool> {
+        if !is_proxy(o) {
+            return Ok(super::object::set_proto(self, o, proto));
+        }
+        let (target, trap, handler) = self.trap(o, "setPrototypeOf")?;
+        match trap {
+            Some(t) => Ok(crate::vm::ops::truthy(self.call(t, handler, &[target, proto])?)),
+            None => self.set_prototype(target.as_object().unwrap(), proto),
+        }
+    }
+
+    /// [[PreventExtensions]] of any object
+    pub(crate) fn prevent_extensions(&mut self, o: Gc<JsObject>) -> JsResult<bool> {
+        if !is_proxy(o) {
+            let ob = o.get_mut();
+            ob.extensible = false;
+            ob.to_dictionary(&self.shapes);
+            return Ok(true);
+        }
+        let (target, trap, handler) = self.trap(o, "preventExtensions")?;
+        match trap {
+            Some(t) => Ok(crate::vm::ops::truthy(self.call(t, handler, &[target])?)),
+            None => self.prevent_extensions(target.as_object().unwrap()),
+        }
+    }
+
+    /// [[IsExtensible]] of any object
+    pub(crate) fn is_extensible(&mut self, o: Gc<JsObject>) -> JsResult<bool> {
+        if !is_proxy(o) {
+            return Ok(o.get().extensible);
+        }
+        let (target, trap, handler) = self.trap(o, "isExtensible")?;
+        match trap {
+            Some(t) => Ok(crate::vm::ops::truthy(self.call(t, handler, &[target])?)),
+            None => self.is_extensible(target.as_object().unwrap()),
+        }
+    }
+
     pub(crate) fn proxy_call(&mut self, p: Gc<JsObject>, this: Value, args: &[Value]) -> JsResult<Value> {
         let (target, trap, handler) = self.trap(p, "apply")?;
         match trap {

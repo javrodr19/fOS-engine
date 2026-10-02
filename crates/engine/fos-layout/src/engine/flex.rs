@@ -94,11 +94,8 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for &i in &order {
         let b = &items[i];
         if b.style.is_out_of_flow() {
-            // At the container's start (absolute positioning places it)
-            let mut laid = layout_sized(ctx, b, width, height, Sizing::Shrink, false, Forced::default());
-            let dy = laid.mt.size();
-            laid.frag.translate(0.0, dy);
-            frags.push(Fragment::Box(laid.frag));
+            // Its static position is the container's content start
+            frags.push(Fragment::Box(super::block::placeholder(b, super::fragment::Rect::default())));
             continue;
         }
         let s = &b.style;

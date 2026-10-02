@@ -16,6 +16,7 @@ pub mod box_tree;
 pub mod fonts;
 pub mod fragment;
 pub mod inline;
+pub mod position;
 
 pub use block::LayoutCtx;
 pub use box_tree::{build_box_tree, BoxKind, LayoutBox, Styler};
@@ -30,7 +31,8 @@ pub fn layout_document<S: Styler>(tree: &DomTree, root: NodeId, styler: &mut S, 
         return FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0 };
     };
     let mut ctx = LayoutCtx { fonts, viewport };
-    let (frag, bottom) = block::layout_root(&mut ctx, &boxes);
+    let (mut frag, bottom) = block::layout_root(&mut ctx, &boxes);
+    position::place_absolutes(&mut ctx, &mut frag, &boxes);
     let document_height = bottom.max(frag.ink.bottom()).max(viewport.1);
     let document_width = frag.ink.right().max(viewport.0);
     FragmentTree { root: Some(frag), document_height, document_width }

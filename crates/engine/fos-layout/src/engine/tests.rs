@@ -474,3 +474,44 @@ fn flex_items_from_text_and_inline_children() {
     assert!((rb.x - ra.right() - 20.0).abs() < 0.01, "{ra:?} {rb:?}");
     assert!(ra.w < 100.0);
 }
+
+#[test]
+fn absolute_boxes_use_the_nearest_positioned_ancestor() {
+    let (mut tree, html, body) = doc();
+    let rel = el(&mut tree, body, "div", "position: relative; margin-top: 50px; height: 200px; padding: 10px; border: 2px solid");
+    let tl = el(&mut tree, rel, "div", "position: absolute; top: 5px; left: 7px; width: 20px; height: 20px");
+    let br = el(&mut tree, rel, "div", "position: absolute; bottom: 0; right: 0; width: 30px; height: 10px");
+    let stretched = el(&mut tree, rel, "div", "position: absolute; top: 0; bottom: 0; left: 10%; right: 10%");
+    let centered = el(&mut tree, rel, "div", "position: absolute; left: 0; right: 0; width: 100px; height: 10px; margin: 0 auto");
+    let after = el(&mut tree, body, "div", "height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, rel);
+    let pad = Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 4.0);
+    assert_eq!((rect_of(&t, tl).x, rect_of(&t, tl).y), (pad.x + 7.0, pad.y + 5.0));
+    assert_eq!((rect_of(&t, br).right(), rect_of(&t, br).bottom()), (pad.right(), pad.bottom()));
+    let s = rect_of(&t, stretched);
+    assert_eq!((s.y, s.h), (pad.y, pad.h));
+    assert!((s.w - pad.w * 0.8).abs() < 0.01);
+    let c = rect_of(&t, centered);
+    assert!((c.x - (pad.x + (pad.w - 100.0) / 2.0)).abs() < 0.01, "{c:?} {pad:?}");
+    // Out of flow: the next block follows the container directly
+    assert_eq!(rect_of(&t, after).y, r.bottom());
+}
+
+#[test]
+fn absolute_boxes_without_insets_stay_at_their_static_position() {
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "height: 30px");
+    let abs = el(&mut tree, body, "div", "position: absolute");
+    text(&mut tree, abs, "menu");
+    let next = el(&mut tree, body, "div", "height: 10px");
+    let fixed = el(&mut tree, body, "div", "position: fixed; bottom: 0; left: 0; right: 0; height: 40px");
+    let t = layout(&tree, html, 800.0);
+    let a = rect_of(&t, abs);
+    assert_eq!((a.x, a.y), (8.0, 38.0));
+    // Shrink-to-fit
+    assert!(a.w < 100.0 && a.w > 0.0);
+    assert_eq!(rect_of(&t, next).y, 38.0);
+    let f = rect_of(&t, fixed);
+    assert_eq!((f.x, f.y, f.w), (0.0, 560.0, 800.0));
+}

@@ -68,6 +68,9 @@ pub enum BoxFragmentKind {
     InlinePart,
     /// An image, canvas, video, form control...
     Replaced,
+    /// Where an absolutely positioned box would have been (its static
+    /// position), until positioning replaces it with the box
+    Placeholder,
 }
 
 /// A box: its border box and what it contains
@@ -274,15 +277,37 @@ impl FragmentTree {
         out
     }
 
-    /// The deepest element at document point (x, y): text first, then the
-    /// innermost box, later (painted on top) siblings winning
+    /// The deepest element at document point (x, y), topmost first:
+    /// positioned boxes by z-index, then in-flow content (later siblings
+    /// paint over earlier ones); boxes with `pointer-events: none` are
+    /// transparent to hits
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        fn hits(b: &BoxFragment) -> bool {
+            b.node.is_valid() && b.style.inherited.pointer_events != fos_css::style::PointerEvents::None && b.kind != BoxFragmentKind::Placeholder
+        }
         fn walk(b: &BoxFragment, x: f32, y: f32) -> Option<NodeId> {
             if !b.ink.contains(x, y) {
                 return None;
             }
+            let mut layers: Vec<&BoxFragment> = b
+                .children
+                .iter()
+                .filter_map(|c| match c {
+                    Fragment::Box(cb) if cb.style.is_positioned() => Some(cb),
+                    _ => None,
+                })
+                .collect();
+            // Highest z-index first; later in tree order first among equals
+            layers.reverse();
+            layers.sort_by_key(|l| std::cmp::Reverse(l.style.box_.z_index.unwrap_or(0)));
+            for l in layers {
+                if let Some(n) = walk(l, x, y) {
+                    return Some(n);
+                }
+            }
             for c in b.children.iter().rev() {
                 match c {
+                    Fragment::Box(cb) if cb.style.is_positioned() => {}
                     Fragment::Box(cb) => {
                         if let Some(n) = walk(cb, x, y) {
                             return Some(n);
@@ -295,7 +320,7 @@ impl FragmentTree {
                     }
                 }
             }
-            (b.node.is_valid() && b.border_box.contains(x, y)).then_some(b.node)
+            (hits(b) && b.border_box.contains(x, y)).then_some(b.node)
         }
         walk(self.root.as_ref()?, x, y)
     }

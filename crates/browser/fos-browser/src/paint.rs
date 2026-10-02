@@ -166,7 +166,7 @@ impl<'a> Painter<'a> {
     pub fn paint(&mut self, tree: &FragmentTree) {
         let Some(root) = &tree.root else { return };
         let clip = Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]);
-        self.paint_box(root, clip, 1.0);
+        self.paint_layer(root, clip, 1.0);
     }
 
     /// Document rectangle to device
@@ -229,42 +229,109 @@ impl<'a> Painter<'a> {
         }
     }
 
-    fn paint_box(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+    fn culled(&self, b: &BoxFragment, clip: Clip) -> bool {
         let ink = self.dev(b.ink);
-        if ink.bottom() < clip.0[1] || ink.y > clip.0[3] {
+        ink.bottom() < clip.0[1] || ink.y > clip.0[3]
+    }
+
+    /// Clip for a box's contents
+    fn inner_clip(&self, b: &BoxFragment, clip: Clip) -> Clip {
+        if b.style.clips() {
+            clip.intersect(self.dev(b.padding_box()))
+        } else {
+            clip
+        }
+    }
+
+    /// A positioned box paints as a layer of its stacking context
+    fn is_layer(b: &BoxFragment) -> bool {
+        b.style.is_positioned() && b.kind != BoxFragmentKind::Placeholder
+    }
+
+    /// Paint a box as a layer (CSS 2.1 Appendix E, simplified): its
+    /// background and borders, positioned descendants with negative
+    /// z-index, the in-flow content, then positioned descendants by
+    /// z-index (tree order among equals)
+    fn paint_layer(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        if self.culled(b, clip) {
             return;
         }
         let alpha = alpha * b.style.box_.opacity;
         if alpha <= 0.0 {
             return;
         }
-        let visible = b.style.inherited.visibility == Visibility::Visible;
-        if visible {
-            if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
-                self.background(b, clip, alpha);
-            } else {
-                // The color went to the canvas; gradients still paint here
-                self.background_images(b, clip, alpha);
-            }
-            self.border(b, clip, alpha);
-            if let Some(r) = &b.replaced {
-                self.replaced(b, r, clip, alpha);
+        self.paint_own(b, clip, alpha);
+        let inner = self.inner_clip(b, clip);
+        let mut layers: Vec<(i32, &BoxFragment, Clip, f32)> = Vec::new();
+        self.collect_layers(b, inner, alpha, &mut layers);
+        layers.sort_by_key(|l| l.0);
+        for &(_, l, c, a) in layers.iter().filter(|l| l.0 < 0) {
+            self.paint_layer(l, c, a);
+        }
+        self.paint_flow(b, inner, alpha);
+        for &(_, l, c, a) in layers.iter().filter(|l| l.0 >= 0) {
+            self.paint_layer(l, c, a);
+        }
+        if b.style.inherited.visibility == Visibility::Visible {
+            self.outline(b, clip, alpha);
+        }
+    }
+
+    /// The positioned boxes under `b` that are not inside another layer
+    fn collect_layers<'t>(&self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<(i32, &'t BoxFragment, Clip, f32)>) {
+        for c in &b.children {
+            let Fragment::Box(cb) = c else { continue };
+            if Self::is_layer(cb) {
+                out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha));
+            } else if !self.culled(cb, clip) {
+                self.collect_layers(cb, self.inner_clip(cb, clip), alpha * cb.style.box_.opacity, out);
             }
         }
-        let inner_clip = if b.style.clips() { clip.intersect(self.dev(b.padding_box())) } else { clip };
+    }
+
+    /// Background, borders and replaced content of one box
+    fn paint_own(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        if b.style.inherited.visibility != Visibility::Visible {
+            return;
+        }
+        if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
+            self.background(b, clip, alpha);
+        } else {
+            // The color went to the canvas; gradients still paint here
+            self.background_images(b, clip, alpha);
+        }
+        self.border(b, clip, alpha);
+        if let Some(r) = &b.replaced {
+            self.replaced(b, r, clip, alpha);
+        }
+    }
+
+    /// The in-flow contents of `b` (its children that are not layers)
+    fn paint_flow(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        if clip.is_empty() {
+            return;
+        }
         if let Some(m) = &b.marker {
             self.text(m, clip, alpha);
         }
-        if !inner_clip.is_empty() {
-            for c in &b.children {
-                match c {
-                    Fragment::Box(cb) => self.paint_box(cb, inner_clip, alpha),
-                    Fragment::Text(t) => self.text(t, inner_clip, alpha),
+        for c in &b.children {
+            match c {
+                Fragment::Text(t) => self.text(t, clip, alpha),
+                Fragment::Box(cb) => {
+                    if Self::is_layer(cb) || self.culled(cb, clip) {
+                        continue;
+                    }
+                    let a = alpha * cb.style.box_.opacity;
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    self.paint_own(cb, clip, a);
+                    self.paint_flow(cb, self.inner_clip(cb, clip), a);
+                    if cb.style.inherited.visibility == Visibility::Visible {
+                        self.outline(cb, clip, a);
+                    }
                 }
             }
-        }
-        if visible {
-            self.outline(b, clip, alpha);
         }
     }
 

@@ -55,13 +55,13 @@ pub enum Sizing {
 
 /// Used margins (auto resolved later), borders and padding
 #[derive(Clone, Copy)]
-struct Edges {
-    margin: [Option<f32>; 4],
-    border: [f32; 4],
-    padding: [f32; 4],
+pub(crate) struct Edges {
+    pub margin: [Option<f32>; 4],
+    pub border: [f32; 4],
+    pub padding: [f32; 4],
 }
 
-fn edges(style: &Style, cb_w: f32) -> Edges {
+pub(crate) fn edges(style: &Style, cb_w: f32) -> Edges {
     let b = &style.box_;
     Edges {
         margin: b.margin.map(|m| m.resolve(cb_w)),
@@ -71,11 +71,11 @@ fn edges(style: &Style, cb_w: f32) -> Edges {
 }
 
 impl Edges {
-    fn horizontal_bp(&self) -> f32 {
+    pub fn horizontal_bp(&self) -> f32 {
         self.border[1] + self.border[3] + self.padding[1] + self.padding[3]
     }
 
-    fn vertical_bp(&self) -> f32 {
+    pub fn vertical_bp(&self) -> f32 {
         self.border[0] + self.border[2] + self.padding[0] + self.padding[2]
     }
 }
@@ -328,17 +328,13 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
     let mut top = Margin::default();
     let mut placed = false;
     for child in children {
-        let out_of_flow = child.style.is_out_of_flow();
-        let sizing = if out_of_flow || child.style.box_.float != Float::None { Sizing::Shrink } else { Sizing::Stretch };
-        let mut laid = layout_block_level(ctx, child, width, cb_h, sizing, false);
-        if out_of_flow {
-            // At its static position, taking no room (positioning comes
-            // with stage C)
-            let at = y + pending.adjoin(laid.mt).size();
-            laid.frag.translate(0.0, at);
-            frags.push(Fragment::Box(laid.frag));
+        if child.style.is_out_of_flow() {
+            // Positioned later, from its static position
+            frags.push(Fragment::Box(placeholder(child, Rect::new(0.0, y + pending.size(), 0.0, 0.0))));
             continue;
         }
+        let sizing = if child.style.box_.float != Float::None { Sizing::Shrink } else { Sizing::Stretch };
+        let mut laid = layout_block_level(ctx, child, width, cb_h, sizing, false);
         let rel = relative_offset(&child.style, width, cb_h);
         if laid.through {
             let at = y + pending.adjoin(laid.mt).size();
@@ -374,6 +370,22 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
         Flow { frags, height: y, top, bottom: pending, through: false }
     } else {
         Flow { frags, height: (y + pending.size()).max(y.min(0.0)), top, bottom: Margin::default(), through: false }
+    }
+}
+
+/// The stand-in for an absolutely positioned box at its static position
+pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
+    BoxFragment {
+        node: b.node,
+        kind: BoxFragmentKind::Placeholder,
+        style: b.style.clone(),
+        border_box: at,
+        border: [0.0; 4],
+        padding: [0.0; 4],
+        children: Vec::new(),
+        ink: at,
+        marker: None,
+        replaced: None,
     }
 }
 

@@ -7,7 +7,7 @@ mod collections;
 mod weakref;
 mod date;
 mod error;
-mod function;
+pub(crate) mod function;
 pub(crate) mod generator;
 pub(crate) mod promise;
 pub(crate) mod json;

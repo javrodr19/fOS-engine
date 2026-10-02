@@ -526,7 +526,9 @@ impl Vm {
             return Err(self.type_error("Right-hand side of 'instanceof' is not an object"));
         };
         let custom = self.get(target, PropertyKey::Symbol(self.sym.has_instance))?;
-        if !custom.is_nullish() {
+        // Function.prototype's own: no call needed
+        let builtin = custom.as_object().is_some_and(|f| matches!(&f.get().kind, ObjectKind::Native(n) if std::ptr::fn_addr_eq(n.call, crate::builtins::function::has_instance as crate::vm::NativeFn)));
+        if !custom.is_nullish() && !builtin {
             let r = self.call(custom, target, &[v])?;
             return Ok(truthy(r));
         }

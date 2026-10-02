@@ -161,6 +161,8 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
         Some(NodeData::Text(_)) => (protos.text, None),
         Some(NodeData::Comment(_)) => (protos.comment, None),
         Some(NodeData::Document) => (protos.document, None),
+        // DocumentType.prototype comes from the bootstrap, by this name
+        Some(NodeData::Doctype { .. }) => (protos.node, by_tag.then(|| "#doctype".to_string())),
         _ => (protos.node, None),
     });
     let proto = tag.and_then(|tag| tag_proto(&host(vm).tag_protos, &tag)).unwrap_or(proto);

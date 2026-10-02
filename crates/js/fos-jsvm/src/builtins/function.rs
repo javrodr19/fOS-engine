@@ -15,9 +15,21 @@ pub(super) fn init(vm: &mut Vm) {
     vm.def_method(proto, "apply", 2, apply);
     vm.def_method(proto, "bind", 1, bind);
     vm.def_method(proto, "toString", 0, to_string);
+    // Function.prototype[@@hasInstance]: OrdinaryHasInstance, fixed
+    let f = vm.new_native("[Symbol.hasInstance]", 1, has_instance, None);
+    let key = PropertyKey::Symbol(vm.sym.has_instance);
+    vm.define_value(proto, key, Value::object(f), PropFlags::FROZEN);
     let tte = vm.realm.throw_type_error;
     if let ObjectKind::Native(n) = &mut tte.get_mut().kind {
         n.call = throw_type_error;
+    }
+}
+
+/// `Function.prototype[Symbol.hasInstance](v)`
+pub(crate) fn has_instance(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    match this.as_object().filter(|o| o.get().is_callable()) {
+        Some(f) => Ok(Value::bool(vm.ordinary_has_instance(f, arg(args, 0))?)),
+        None => Ok(Value::FALSE),
     }
 }
 

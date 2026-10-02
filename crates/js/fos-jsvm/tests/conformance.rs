@@ -1251,6 +1251,9 @@ fn intl() {
         // Built on first use, then an ordinary property
         ("[typeof Intl, Object.getOwnPropertyDescriptor(globalThis, 'Intl').get === undefined, String(Intl)]", "[ 'object', true, '[object Intl]' ]"),
         ("Intl = 5; Intl", "5"),
+        // NumberFormat, DateTimeFormat and Collator work without `new`; the others throw
+        ("[Intl.DateTimeFormat().resolvedOptions().timeZone, Intl.NumberFormat('en', { style: 'percent' }).format(0.5), Intl.Collator().compare('a', 'b'), Intl.DateTimeFormat() instanceof Intl.DateTimeFormat, Intl.NumberFormat.name, typeof Intl.Collator.supportedLocalesOf, Intl.NumberFormat.prototype.constructor === Intl.NumberFormat]", "[ 'UTC', '50%', -1, true, 'NumberFormat', 'function', true ]"),
+        ("try { Intl.PluralRules(); } catch (e) { e.name }", "'TypeError'"),
         // NumberFormat
         ("new Intl.NumberFormat().format(1234567.891)", "'1,234,567.891'"),
         ("new Intl.NumberFormat('de-DE').format(-0.5)", "'-0.5'"),
@@ -1464,6 +1467,9 @@ fn frozen_arrays() {
 #[test]
 fn proxy_prototype_chain() {
     check(&[
+        // Function.prototype[@@hasInstance], fixed and reachable (as Symbol[Symbol.hasInstance])
+        ("const d = Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance); [typeof d.value, d.writable, d.configurable, Symbol[Symbol.hasInstance].call(Array, []), Function.prototype[Symbol.hasInstance].call({}, []), [] instanceof Array, ({ [Symbol.hasInstance]: () => true }) instanceof Object]", "[ 'function', false, false, true, false, true, true ]"),
+        ("class A { static [Symbol.hasInstance](v) { return v === 1; } } [1 instanceof A, new A() instanceof A]", "[ true, false ]"),
         ("class A {} [new Proxy(new A(), {}) instanceof A, A.prototype.isPrototypeOf(new Proxy(new A(), {}))]", "[ true, true ]"),
         ("class B {} new Proxy({}, { getPrototypeOf() { return B.prototype; } }) instanceof B", "true"),
         ("class C {} const p = new Proxy(Object.create(C.prototype), {}); Object.create(p) instanceof C", "true"),

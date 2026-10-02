@@ -1973,4 +1973,39 @@ mod tests {
         assert_eq!(rt.eval("[counts.window, counts.capture, counts.script, ran, counts.doc].join()").unwrap(), "1,1,1,2,2");
         assert_eq!(rt.eval("const e = new Event('x'); let n = 0; addEventListener('x', () => n++); document.body.dispatchEvent(new Event('x', { bubbles: true })); n").unwrap(), "1");
     }
+
+    #[test]
+    fn cookie_store() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        rt.eval(r#"window.out = {};
+            const et = new EventTarget(); let hits = 0; et.addEventListener('x', () => hits++); et.dispatchEvent(new Event('x'));
+            out.et = hits;
+            document.cookie = 'a=1; path=/';
+            cookieStore.onchange = (e) => { out.change = e.changed.map(c => c.name + '=' + c.value).join() + '|' + e.deleted.map(c => c.name).join(); };
+            (async () => {
+              out.get = (await cookieStore.get('a')).value;
+              await cookieStore.set('b', '2');
+              out.all = (await cookieStore.getAll()).map(c => c.name + '=' + c.value).join();
+              await cookieStore.delete('a');
+              out.after = [document.cookie, await cookieStore.get('a'), cookieStore instanceof CookieStore].join('|');
+              try { await cookieStore.set('x=y', '1'); } catch (e) { out.err = e.name; }
+            })().catch(e => { out.fail = String(e); });"#).unwrap();
+        rt.process_timers(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("out.fail || 'none'").unwrap(), "none");
+        assert_eq!(rt.eval("[out.et, out.get, out.all, out.after, out.err, out.change].join(' ; ')").unwrap(), "1 ; 1 ; a=1,b=2 ; b=2||true ; TypeError ; |a");
+    }
+
+    #[test]
+    fn interface_attributes_are_prototype_accessors() {
+        // Consent managers and sandboxes read getters off prototypes
+        let (mut rt, _doc) = page("<!DOCTYPE html><html><body><svg data-a=1></svg></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let r = rt.eval(r#"const g = (C, k) => Object.getOwnPropertyDescriptor(C.prototype, k).get;
+            [g(Node, 'baseURI').call(document.body), g(Document, 'doctype').call(document).name, g(SVGElement, 'dataset').call(document.querySelector('svg')).a,
+             g(NodeList, 'length').call(document.body.childNodes), g(Navigator, 'languages').call(navigator).join('+'), g(XMLHttpRequest, 'readyState').call(new XMLHttpRequest()),
+             g(Response, 'url').call(new Response('x')) === '', g(StorageEvent, 'url').call(new StorageEvent('storage', { url: 'u' })), g(ValidityState, 'valid').call(document.createElement('input').validity),
+             new Response('', { status: 201 }).clone().status, Object.keys(new Response('')).includes('status'), typeof Function.prototype[Symbol.hasInstance]].join()"#).unwrap();
+        assert_eq!(r, "https://example.com/dir/page.html,html,1,1,en-US+en,0,true,u,true,201,false,function");
+    }
 }

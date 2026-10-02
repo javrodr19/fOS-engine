@@ -475,6 +475,16 @@
     minimize() { return this; }
   }
 
+  // NumberFormat, DateTimeFormat and Collator may be called without `new`
+  // (ECMA-402's legacy behavior; analytics scripts rely on it)
+  const callable = (C) => {
+    const F = { [C.name]: function (...args) { return new.target ? Reflect.construct(C, args, new.target) : new C(...args); } }[C.name];
+    for (const k of Reflect.ownKeys(C)) if (k !== 'prototype' && k !== 'length' && k !== 'name') Object.defineProperty(F, k, Object.getOwnPropertyDescriptor(C, k));
+    Object.defineProperty(F, 'prototype', { value: C.prototype, writable: false, enumerable: false, configurable: false });
+    Object.defineProperty(C.prototype, 'constructor', { value: F, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(F, 'length', { value: 0, configurable: true });
+    return F;
+  };
   const Intl = {
     getCanonicalLocales(locales) { return [...new Set(canonicalize(locales))]; },
     supportedValuesOf(key) {
@@ -482,7 +492,7 @@
       if (!values) throw new RangeError(`Invalid key : ${key}`);
       return values;
     },
-    NumberFormat, DateTimeFormat, PluralRules, RelativeTimeFormat, ListFormat, Collator, Segmenter, DisplayNames, Locale,
+    NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), PluralRules, RelativeTimeFormat, ListFormat, Collator: callable(Collator), Segmenter, DisplayNames, Locale,
   };
   for (const k of Object.keys(Intl)) Object.defineProperty(Intl, k, { enumerable: false });
   Object.defineProperty(Intl, Symbol.toStringTag, { value: 'Intl', configurable: true });

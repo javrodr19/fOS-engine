@@ -9,6 +9,20 @@
       Object.defineProperty(o, k, d);
     }
   };
+  // Attributes that browsers expose as prototype accessors (scripts read
+  // their descriptors, e.g. Object.getOwnPropertyDescriptor(Response.prototype,
+  // 'url').get), kept per object in a hidden slot
+  const slots = new WeakMap();
+  const slotOf = (o) => { let s = slots.get(o); if (!s) slots.set(o, s = {}); return s; };
+  const accessorize = (proto, names) => {
+    for (const name of names) {
+      Object.defineProperty(proto, name, {
+        get() { return slotOf(this)[name]; },
+        set(v) { slotOf(this)[name] = v; },
+        enumerable: true, configurable: true,
+      });
+    }
+  };
   const E = HTMLElement.prototype;
 
   // ---- events ----
@@ -844,6 +858,12 @@
     Object.setPrototypeOf(ctor, parent);
     global[name] = ctor;
   }
+  Object.defineProperties(DocumentType.prototype, {
+    name: { get() { return this.nodeName; }, enumerable: true, configurable: true },
+    publicId: { get() { return ''; }, enumerable: true, configurable: true },
+    systemId: { get() { return ''; }, enumerable: true, configurable: true },
+  });
+  __fosSetElementPrototype('#doctype', DocumentType.prototype);
   // `window instanceof Window`, with Window.prototype on the global's chain
   {
     const WindowCtor = function Window() { throw new TypeError('Illegal constructor'); };
@@ -1637,6 +1657,20 @@
   // ---- document ----
 
   let readyState = 'loading';
+  Object.defineProperty(Node.prototype, 'baseURI', {
+    get() { return (this.nodeType === 9 ? this : this.ownerDocument || document).baseURI; },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(Document.prototype, 'doctype', {
+    get() { for (const n of this.childNodes) if (n.nodeType === 10) return n; return null; },
+    enumerable: true, configurable: true,
+  });
+  // NodeLists are arrays here, with an own length; the accessor serves
+  // scripts that call it from the descriptor
+  Object.defineProperty(NodeList.prototype, 'length', {
+    get() { const d = Object.getOwnPropertyDescriptor(this, 'length'); return d ? d.value : 0; },
+    configurable: true,
+  });
   define(Document.prototype, {
     get readyState() { return readyState; },
     get defaultView() { return global; },
@@ -2657,6 +2691,7 @@
     }
   }
   define(Request.prototype, bodyMixin);
+  accessorize(Request.prototype, ['url', 'method', 'headers', 'mode', 'credentials', 'redirect', 'cache', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'bodyUsed']);
 
   class Response {
     constructor(body = null, init = {}) {
@@ -2678,6 +2713,7 @@
     clone() {
       if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
       const r = Object.create(Response.prototype);
+      slots.set(r, { ...slotOf(this) });
       Object.assign(r, this, { headers: new Headers(this.headers), bodyUsed: false, _stream: undefined });
       return r;
     }
@@ -2697,6 +2733,7 @@
     }
   }
   define(Response.prototype, bodyMixin);
+  accessorize(Response.prototype, ['status', 'statusText', 'headers', 'type', 'url', 'redirected', 'bodyUsed']);
 
   // A Response from what __fosFetch delivers
   function hostResponse(r) {
@@ -2887,6 +2924,7 @@
     }
     get responseXML() { return null; }
   }
+  accessorize(XMLHttpRequest.prototype, ['readyState', 'status', 'statusText', 'responseURL', 'timeout', 'withCredentials', 'upload']);
   for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
     Object.defineProperty(XMLHttpRequest, k, { value: v });
     Object.defineProperty(XMLHttpRequest.prototype, k, { value: v });
@@ -3107,7 +3145,13 @@
     const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
     const proto = Object.create(parentProto);
     for (const k of Reflect.ownKeys(instance)) {
-      Object.defineProperty(proto, k, Object.getOwnPropertyDescriptor(instance, k));
+      const d = Object.getOwnPropertyDescriptor(instance, k);
+      if ('value' in d && typeof d.value !== 'function') {
+        const value = d.value;
+        Object.defineProperty(proto, k, { get() { return value; }, enumerable: true, configurable: true });
+      } else {
+        Object.defineProperty(proto, k, d);
+      }
       delete instance[k];
     }
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
@@ -3126,20 +3170,25 @@
   }
 
   // ---- more event interfaces ----
-  const eventFields = (target, init, fields) => { for (const [k, d] of Object.entries(fields)) target[k] = init[k] ?? d; };
+  // Each event class's own fields (accessors on its prototype, made by
+  // eventAccessors once the classes exist)
+  const eventFields = (target, init, cls, fields) => {
+    const slot = slotOf(target);
+    for (const [k, d] of Object.entries(fields)) slot[k] = init[k] ?? d;
+  };
   class MessageEvent extends Event {
-    constructor(type, init = {}) { super(type, init); eventFields(this, init, { data: null, origin: '', lastEventId: '', source: null, ports: [] }); }
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, MessageEvent, { data: null, origin: '', lastEventId: '', source: null, ports: [] }); }
   }
   class PointerEvent extends MouseEvent {
     constructor(type, init = {}) {
       super(type, init);
-      eventFields(this, init, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false });
+      eventFields(this, init, PointerEvent, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false });
     }
     getCoalescedEvents() { return []; }
     getPredictedEvents() { return []; }
   }
   class WheelEvent extends MouseEvent {
-    constructor(type, init = {}) { super(type, init); eventFields(this, init, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }); }
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, WheelEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }); }
   }
   Object.assign(WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
   class DragEvent extends MouseEvent {
@@ -3148,17 +3197,17 @@
   class TouchEvent extends UIEvent {
     constructor(type, init = {}) {
       super(type, init);
-      eventFields(this, init, { touches: [], targetTouches: [], changedTouches: [], altKey: false, metaKey: false, ctrlKey: false, shiftKey: false });
+      eventFields(this, init, TouchEvent, { touches: [], targetTouches: [], changedTouches: [], altKey: false, metaKey: false, ctrlKey: false, shiftKey: false });
     }
   }
   class CompositionEvent extends UIEvent {
     constructor(type, init = {}) { super(type, init); this.data = String(init.data ?? ''); }
   }
   class AnimationEvent extends Event {
-    constructor(type, init = {}) { super(type, init); eventFields(this, init, { animationName: '', elapsedTime: 0, pseudoElement: '' }); }
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, AnimationEvent, { animationName: '', elapsedTime: 0, pseudoElement: '' }); }
   }
   class TransitionEvent extends Event {
-    constructor(type, init = {}) { super(type, init); eventFields(this, init, { propertyName: '', elapsedTime: 0, pseudoElement: '' }); }
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, TransitionEvent, { propertyName: '', elapsedTime: 0, pseudoElement: '' }); }
   }
   class SubmitEvent extends Event {
     constructor(type, init = {}) { super(type, init); this.submitter = init.submitter ?? null; }
@@ -3170,7 +3219,7 @@
     constructor(type, init = {}) { super(type, init); this.persisted = !!init.persisted; }
   }
   class StorageEvent extends Event {
-    constructor(type, init = {}) { super(type, init); eventFields(this, init, { key: null, oldValue: null, newValue: null, url: '', storageArea: null }); }
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, StorageEvent, { key: null, oldValue: null, newValue: null, url: '', storageArea: null }); }
   }
   class PromiseRejectionEvent extends Event {
     constructor(type, init = {}) { super(type, init); this.promise = init.promise; this.reason = init.reason; }
@@ -3178,9 +3227,17 @@
   class SecurityPolicyViolationEvent extends Event {
     constructor(type, init = {}) {
       super(type, init);
-      eventFields(this, init, { documentURI: '', referrer: '', blockedURI: '', violatedDirective: '', effectiveDirective: '', originalPolicy: '', sourceFile: '', sample: '', disposition: 'enforce', statusCode: 0, lineNumber: 0, columnNumber: 0 });
+      eventFields(this, init, SecurityPolicyViolationEvent, { documentURI: '', referrer: '', blockedURI: '', violatedDirective: '', effectiveDirective: '', originalPolicy: '', sourceFile: '', sample: '', disposition: 'enforce', statusCode: 0, lineNumber: 0, columnNumber: 0 });
     }
   }
+  accessorize(MessageEvent.prototype, ['data', 'origin', 'lastEventId', 'source', 'ports']);
+  accessorize(PointerEvent.prototype, ['pointerId', 'width', 'height', 'pressure', 'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'pointerType', 'isPrimary']);
+  accessorize(WheelEvent.prototype, ['deltaX', 'deltaY', 'deltaZ', 'deltaMode']);
+  accessorize(TouchEvent.prototype, ['touches', 'targetTouches', 'changedTouches', 'altKey', 'metaKey', 'ctrlKey', 'shiftKey']);
+  accessorize(AnimationEvent.prototype, ['animationName', 'elapsedTime', 'pseudoElement']);
+  accessorize(TransitionEvent.prototype, ['propertyName', 'elapsedTime', 'pseudoElement']);
+  accessorize(StorageEvent.prototype, ['key', 'oldValue', 'newValue', 'url', 'storageArea']);
+  accessorize(SecurityPolicyViolationEvent.prototype, ['documentURI', 'referrer', 'blockedURI', 'violatedDirective', 'effectiveDirective', 'originalPolicy', 'sourceFile', 'sample', 'disposition', 'statusCode', 'lineNumber', 'columnNumber']);
   class BeforeUnloadEvent extends Event {}
   Object.assign(global, {
     MessageEvent, PointerEvent, WheelEvent, DragEvent, TouchEvent, CompositionEvent, AnimationEvent, TransitionEvent,
@@ -3298,6 +3355,9 @@
   class ValidityState {
     constructor() { throw new TypeError('Illegal constructor'); }
   }
+  for (const k of ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort', 'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError', 'valid']) {
+    Object.defineProperty(ValidityState.prototype, k, { get() { return !!slotOf(this)[k]; }, enumerable: true, configurable: true });
+  }
   const customValidity = new WeakMap();
   const emailRe = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
   function validityOf(el) {
@@ -3320,7 +3380,7 @@
       customError: !!customValidity.get(el),
     };
     flags.valid = !barred ? !Object.values(flags).some(Boolean) : true;
-    for (const [k, b] of Object.entries(flags)) Object.defineProperty(v, k, { value: b, enumerable: true });
+    Object.assign(slotOf(v), flags);
     return v;
   }
   const validationMessage = (el) => {
@@ -4274,7 +4334,7 @@
     },
     createDocumentType(name, publicId, systemId) {
       const dt = Object.create(DocumentType.prototype);
-      define(dt, { name: String(name), publicId: String(publicId ?? ''), systemId: String(systemId ?? ''), nodeType: 10, nodeName: String(name) });
+      Object.defineProperties(dt, { name: { value: String(name) }, publicId: { value: String(publicId ?? '') }, systemId: { value: String(systemId ?? '') }, nodeType: { value: 10 }, nodeName: { value: String(name) } });
       return dt;
     },
   });
@@ -4862,6 +4922,8 @@
     }
   }
   Object.assign(global, { MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
+  // dataset belongs to both HTML and SVG elements (HTMLOrSVGElement)
+  Object.defineProperty(SVGElement.prototype, 'dataset', Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'dataset'));
 })(globalThis);
 
 // ---- canvas (contexts, paths and bitmaps are native: canvas_bindings.rs) ----
@@ -4946,4 +5008,80 @@
     } catch (e) { return Promise.reject(e); }
   };
   define(global, { ImageData });
+})(globalThis);
+
+// ---- Cookie Store API, over document.cookie (the jar applies its rules) ----
+(function (global) {
+  'use strict';
+  const listCookies = () => document.cookie.split(';').map(c => c.trim()).filter(Boolean).map(c => {
+    const i = c.indexOf('=');
+    return i < 0 ? { name: '', value: c } : { name: c.slice(0, i), value: c.slice(i + 1) };
+  });
+  const describe = (c) => ({ name: c.name, value: c.value, domain: null, path: '/', expires: null, secure: location.protocol === 'https:', sameSite: 'lax', partitioned: false });
+  const query = (arg) => {
+    if (arg === undefined) return {};
+    if (arg !== null && typeof arg === 'object') return { name: arg.name === undefined ? undefined : String(arg.name), url: arg.url };
+    return { name: String(arg) };
+  };
+  const eventData = new WeakMap();
+  class CookieChangeEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventData.set(this, { changed: init.changed || [], deleted: init.deleted || [] }); }
+    get changed() { return eventData.get(this)?.changed ?? []; }
+    get deleted() { return eventData.get(this)?.deleted ?? []; }
+  }
+  class CookieStore extends EventTarget {
+    constructor(key) {
+      if (key !== listCookies) throw new TypeError('Illegal constructor');
+      super();
+      this.onchange = null;
+    }
+    get(arg) {
+      try {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'get' on 'CookieStore': Options must not be empty.");
+        const q = query(arg);
+        const c = listCookies().find(c => q.name === undefined || c.name === q.name);
+        return Promise.resolve(c ? describe(c) : null);
+      } catch (e) { return Promise.reject(e); }
+    }
+    getAll(arg) {
+      const q = query(arg);
+      return Promise.resolve(listCookies().filter(c => q.name === undefined || c.name === q.name).map(describe));
+    }
+    set(a, b) {
+      try {
+        const o = (a !== null && typeof a === 'object') ? a : { name: a, value: b };
+        const name = String(o.name ?? ''), value = String(o.value ?? '');
+        if (name.includes('=') || /[;\x00-\x1f]/.test(name + value)) throw new TypeError("Failed to execute 'set' on 'CookieStore': Cookie name or value is invalid.");
+        let cookie = `${name}=${value}; path=${o.path ?? '/'}`;
+        if (o.domain) cookie += `; domain=${o.domain}`;
+        if (o.expires != null) cookie += `; expires=${new Date(o.expires).toUTCString()}`;
+        cookie += `; samesite=${o.sameSite || 'strict'}`;
+        if (location.protocol === 'https:') cookie += '; secure';
+        if (o.partitioned) cookie += '; partitioned';
+        const before = listCookies().find(c => c.name === name);
+        document.cookie = cookie;
+        const after = listCookies().find(c => c.name === name);
+        this._notify(after && (!before || before.value !== after.value) ? [describe(after)] : [], before && !after ? [describe(before)] : []);
+        return Promise.resolve();
+      } catch (e) { return Promise.reject(e); }
+    }
+    delete(arg) {
+      const o = (arg !== null && typeof arg === 'object') ? arg : { name: arg };
+      return this.set({ ...o, value: '', expires: 0 });
+    }
+    _notify(changed, deleted) {
+      if (!changed.length && !deleted.length) return;
+      queueMicrotask(() => {
+        const ev = new CookieChangeEvent('change', { changed, deleted });
+        this.dispatchEvent(ev);
+        if (typeof this.onchange === 'function') this.onchange(ev);
+      });
+    }
+  }
+  const store = new CookieStore(listCookies);
+  Object.defineProperty(global, 'cookieStore', { value: store, configurable: true, enumerable: false, writable: true });
+  Object.defineProperties(global, {
+    CookieStore: { value: CookieStore, configurable: true, writable: true },
+    CookieChangeEvent: { value: CookieChangeEvent, configurable: true, writable: true },
+  });
 })(globalThis);

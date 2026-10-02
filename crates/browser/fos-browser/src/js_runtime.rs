@@ -926,6 +926,65 @@ mod tests {
     }
 
     #[test]
+    fn traversal_and_document_position() {
+        let (mut rt, _doc) = page(r#"<html><body><div id="r"><p id="a">one<b id="b">two</b></p><!--c--><p id="d">three</p></div></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let run = |rt: &mut PageJsRuntime, src: &str| rt.eval(src).unwrap();
+        run(&mut rt, "var r = document.getElementById('r'), a = document.getElementById('a'), b = document.getElementById('b'), d = document.getElementById('d');
+            var walk = (w, step = 'nextNode') => { const out = []; for (let n; (n = w[step]());) out.push(n.id || n.nodeValue); return out.join(); };");
+        // Walking in document order, by node type and through filters
+        assert_eq!(
+            run(&mut rt, "[walk(document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT)), walk(document.createTreeWalker(r, NodeFilter.SHOW_TEXT)),
+                walk(document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, n => n === a ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)),
+                walk(document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, { acceptNode: n => n === a ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT })),
+                walk(document.createTreeWalker(r, NodeFilter.SHOW_COMMENT))].join(' | ')"),
+            "a,b,d | one,two,three | d | b,d | c"
+        );
+        // Backwards, and the relative moves
+        assert_eq!(
+            run(&mut rt, "const w = document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT); w.currentNode = d;
+                const back = walk(w, 'previousNode');
+                const moves = [];
+                w.currentNode = r;
+                for (const m of ['firstChild', 'nextSibling', 'nextSibling', 'previousSibling', 'firstChild', 'parentNode', 'parentNode', 'parentNode']) { const n = w[m](); moves.push(n ? n.id : 'null'); }
+                w.currentNode = r;
+                [back, moves.join(), w.lastChild().id, w.root === r, w.whatToShow, w.filter].join(' | ')"),
+            "b,a,r | a,d,null,a,b,a,r,null | d | true | 1 | "
+        );
+        // A NodeIterator, and how it follows removals
+        assert_eq!(
+            run(&mut rt, "const it = document.createNodeIterator(r);
+                const names = []; for (let n; (n = it.nextNode());) names.push(n.nodeName);
+                const iterBack = []; for (let n; (n = it.previousNode());) iterBack.push(n.nodeName);
+                const it2 = document.createNodeIterator(r, NodeFilter.SHOW_ELEMENT);
+                it2.nextNode(); it2.nextNode(); const at = it2.nextNode().id;
+                a.remove();
+                const moved = [it2.referenceNode.id, it2.pointerBeforeReferenceNode, it2.nextNode().id, it2.nextNode()];
+                r.prepend(a);
+                [names.join(), iterBack.length, at, moved.join()].join(' | ')"),
+            "DIV,P,#text,B,#text,#comment,P,#text | 8 | b | r,false,d,"
+        );
+        // Filters that throw or re-enter
+        assert_eq!(
+            run(&mut rt, "const errors = [];
+                try { document.createTreeWalker(r, NodeFilter.SHOW_ALL, () => { throw new Error('boom'); }).nextNode(); } catch (e) { errors.push(e.message); }
+                const w2 = document.createTreeWalker(r, NodeFilter.SHOW_ALL, () => { w2.nextNode(); return 1; });
+                try { w2.nextNode(); } catch (e) { errors.push(e.name); }
+                try { document.createTreeWalker(null); } catch (e) { errors.push(e.name); }
+                errors.join()"),
+            "boom,InvalidStateError,TypeError"
+        );
+        // Document position and node constants
+        assert_eq!(
+            run(&mut rt, "const x = document.createElement('x');
+                [a.compareDocumentPosition(d), d.compareDocumentPosition(a), r.compareDocumentPosition(b), b.compareDocumentPosition(r), a.compareDocumentPosition(a),
+                 x.compareDocumentPosition(r) & 0x21, b.firstChild.compareDocumentPosition(d),
+                 Node.ELEMENT_NODE, document.body.TEXT_NODE, Node.DOCUMENT_POSITION_CONTAINED_BY, NodeFilter.SHOW_TEXT].join()"),
+            "4,2,20,10,0,33,4,1,3,16,4"
+        );
+    }
+
+    #[test]
     fn streams_and_message_channel() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();

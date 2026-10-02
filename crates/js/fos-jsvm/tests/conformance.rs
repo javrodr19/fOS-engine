@@ -1309,3 +1309,65 @@ fn normalize_and_locale_compare() {
         ("'v10'.localeCompare('v9', undefined, { numeric: true })", "1"),
     ]);
 }
+
+/// Weak references let go of their targets once nothing else holds them
+#[test]
+fn weak_references() {
+    let mut vm = Vm::new();
+    let mut eval = |vm: &mut Vm, src: &str| -> String {
+        match vm.eval(src) {
+            Ok(v) => vm.display(v),
+            Err(e) => format!("throws {}", vm.display(e)),
+        }
+    };
+    let setup = r#"
+        var log = [];
+        var registry = new FinalizationRegistry(held => log.push(held));
+        var kept = { name: 'kept' };
+        var refKept = new WeakRef(kept);
+        var refLost = new WeakRef({ name: 'lost' });
+        (function () {
+            const a = {}, b = {}, c = {};
+            registry.register(a, 'a');
+            registry.register(b, 'b', b);
+            registry.register(c, 'c', kept);
+            registry.unregister(kept);
+        })();
+        registry.register(kept, 'never');
+        // An ephemeron: the value refers back to its key, and nothing else
+        // holds either; the map must not keep both alive
+        var wm = new WeakMap();
+        var probe = new WeakRef((() => { const k = {}; wm.set(k, { k }); return k; })());
+        // A value reachable only through a live key stays
+        var liveKey = {};
+        wm.set(liveKey, { tag: 'value' });
+        var valueRef = new WeakRef(wm.get(liveKey));
+        var sym = Symbol('weak');
+        var symRef = new WeakRef(sym);
+        typeof refLost.deref()
+    "#;
+    // A new WeakRef's target survives the script (until the job queue,
+    // drained after each script, is empty)
+    assert_eq!(eval(&mut vm, setup), "object");
+    vm.collect_garbage();
+    vm.run_jobs();
+    assert_eq!(eval(&mut vm, "[refKept.deref() === kept, refLost.deref(), probe.deref(), valueRef.deref().tag, symRef.deref() === sym]"), "[ true, undefined, undefined, 'value', true ]");
+    // The cleanup callback ran for a and b, but not c (unregistered) or kept
+    assert_eq!(eval(&mut vm, "log.sort().join()"), "a,b");
+    let errors = [
+        ("new WeakRef(1)", "throws TypeError: WeakRef: target must be an object or non-registered symbol"),
+        ("new WeakRef(Symbol.for('x'))", "throws TypeError: WeakRef: target must be an object or non-registered symbol"),
+        ("WeakRef({})", "throws TypeError: Constructor requires 'new'"),
+        ("new FinalizationRegistry(1)", "throws TypeError: FinalizationRegistry: cleanup must be callable"),
+        ("var o = {}; registry.register(o, o)", "throws TypeError: FinalizationRegistry.prototype.register: target and holdings must not be same"),
+        ("registry.unregister(1)", "throws TypeError: Invalid unregisterToken ('1')"),
+        ("registry.register({}, 1, 2)", "throws TypeError: FinalizationRegistry.prototype.register: invalid unregister token"),
+        ("[registry.register({}, 1), registry.unregister({})]", "[ undefined, false ]"),
+        ("Object.prototype.toString.call(refKept) + Object.prototype.toString.call(registry)", "[object WeakRef][object FinalizationRegistry]"),
+        ("var s = Symbol(); new WeakMap([[s, 1]]).get(s)", "1"),
+        ("new WeakSet().add(Symbol.for('y'))", "throws TypeError: Invalid value used as weak map key"),
+    ];
+    for (src, want) in errors {
+        assert_eq!(eval(&mut vm, src), want, "{src}");
+    }
+}

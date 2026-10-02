@@ -150,7 +150,7 @@ fn data<'a>(vm: &mut Vm, this: Value, method: &str) -> JsResult<(&'a mut MapData
 }
 
 fn check_weak_key(vm: &mut Vm, weak: bool, k: Value) -> JsResult<()> {
-    if weak && !k.is_object() {
+    if weak && !vm.can_be_held_weakly(k) {
         return Err(vm.type_error("Invalid value used as weak map key"));
     }
     Ok(())

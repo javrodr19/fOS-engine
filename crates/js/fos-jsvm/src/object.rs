@@ -145,10 +145,14 @@ pub enum ObjectKind {
     MapIterator { map: Gc<JsObject>, pos: u32, kind: u8 },
     /// A user-defined iterator with its `next` method and state
     IterRecord { iter: Value, next: Value, done: bool },
-    /// Keys of WeakMap/WeakSet entries are not traced (see the VM's
-    /// collector, which prunes dead keys)
+    /// WeakMap/WeakSet entries are not traced: the collector marks a
+    /// WeakMap value only once its key is marked (an ephemeron) and prunes
+    /// entries whose keys die
     WeakMap(Box<MapData>),
     WeakSet(Box<MapData>),
+    /// A WeakRef's target (untraced; cleared when the target dies)
+    WeakRef(Value),
+    FinalizationRegistry(Box<FinalizationData>),
     RegExp(Box<RegExpData>),
     ArrayBuffer(Box<Vec<u8>>),
     TypedArray(Box<TypedArrayData>),
@@ -301,6 +305,19 @@ pub struct ForInIterator {
 
 /// Insertion-ordered hash map for Map and Set (deleted entries are holes
 /// so iterators stay valid)
+/// A FinalizationRegistry: its cleanup callback and registered cells
+pub struct FinalizationData {
+    pub cleanup: Value,
+    pub cells: Vec<FinalizationCell>,
+}
+
+pub struct FinalizationCell {
+    pub target: Value,
+    pub held: Value,
+    /// Unregister token, or undefined
+    pub token: Value,
+}
+
 #[derive(Default)]
 pub struct MapData {
     pub index: FxHashMap<MapKey, u32>,
@@ -432,14 +449,14 @@ impl Trace for JsObject {
                 tracer.mark_value(*iter);
                 tracer.mark_value(*next);
             }
-            ObjectKind::WeakMap(m) => {
-                // Values stay alive while the entry does; dead keys are
-                // pruned after marking
-                for (_, v) in m.entries.iter().flatten() {
-                    tracer.mark_value(*v);
+            ObjectKind::WeakMap(_) | ObjectKind::WeakSet(_) | ObjectKind::WeakRef(_) => {}
+            ObjectKind::FinalizationRegistry(f) => {
+                // Held values are strong; targets and tokens are weak
+                tracer.mark_value(f.cleanup);
+                for c in &f.cells {
+                    tracer.mark_value(c.held);
                 }
             }
-            ObjectKind::WeakSet(_) => {}
             ObjectKind::RegExp(r) => {
                 tracer.mark(r.source);
                 tracer.mark(r.flags);

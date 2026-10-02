@@ -132,7 +132,7 @@ realm! {
     symbol_proto, bigint_proto, error_proto, type_error_proto, range_error_proto, reference_error_proto,
     syntax_error_proto, eval_error_proto, uri_error_proto, iterator_proto, array_iterator_proto,
     string_iterator_proto, map_proto, set_proto, map_iterator_proto, set_iterator_proto,
-    weakmap_proto, weakset_proto, date_proto, regexp_proto, promise_proto,
+    weakmap_proto, weakset_proto, weakref_proto, finalization_registry_proto, date_proto, regexp_proto, promise_proto,
     /// %GeneratorPrototype%
     generator_proto,
     /// %AsyncIteratorPrototype%
@@ -182,6 +182,15 @@ pub struct Vm {
     native_depth: u32,
     pub(crate) symbol_registry: FxHashMap<Atom, Gc<Symbol>>,
     pub(crate) weak_maps: std::cell::RefCell<Vec<Gc<JsObject>>>,
+    /// Live WeakRefs and FinalizationRegistries (pruned at each collection)
+    pub(crate) weak_refs: std::cell::RefCell<Vec<Gc<JsObject>>>,
+    pub(crate) finalization_registries: std::cell::RefCell<Vec<Gc<JsObject>>>,
+    /// Cleanup calls owed for targets that died (callback, held value);
+    /// queued as jobs once the collection finishes
+    finalizations: std::cell::RefCell<Vec<(Value, Value)>>,
+    /// WeakRef targets read during the current job, kept alive until the
+    /// job queue drains (the spec's [[KeptAlive]] list)
+    pub(crate) kept_alive: Vec<Value>,
     /// `arguments` / rest array being built during frame setup
     pending_rest: Option<Gc<JsObject>>,
     pending_arguments: Option<Gc<JsObject>>,
@@ -268,6 +277,8 @@ impl Vm {
             set_iterator_proto: mk(iterator_proto, ObjectKind::Ordinary),
             weakmap_proto: mk(object_proto, ObjectKind::Ordinary),
             weakset_proto: mk(object_proto, ObjectKind::Ordinary),
+            weakref_proto: mk(object_proto, ObjectKind::Ordinary),
+            finalization_registry_proto: mk(object_proto, ObjectKind::Ordinary),
             date_proto: mk(object_proto, ObjectKind::Ordinary),
             regexp_proto: mk(object_proto, ObjectKind::Ordinary),
             promise_proto: mk(object_proto, ObjectKind::Ordinary),
@@ -324,6 +335,10 @@ impl Vm {
             native_depth: 0,
             symbol_registry: FxHashMap::default(),
             weak_maps: Default::default(),
+            weak_refs: Default::default(),
+            finalization_registries: Default::default(),
+            finalizations: Default::default(),
+            kept_alive: Vec::new(),
             pending_rest: None,
             pending_arguments: None,
             char_strings,
@@ -416,6 +431,8 @@ impl Vm {
             self.run_job(job);
             self.temp_roots.truncate(mark);
         }
+        // ClearKeptObjects
+        self.kept_alive.clear();
     }
 
     // ---- stack ----
@@ -955,7 +972,11 @@ impl Vm {
     pub fn collect_garbage(&mut self) {
         let heap = &self.heap;
         let this: &Vm = self;
-        heap.collect(|t| this.trace_roots(t), || this.prune_weak());
+        heap.collect(|t| this.trace_roots(t), |t| this.trace_ephemerons(t), || this.prune_weak());
+        let owed = std::mem::take(&mut *self.finalizations.borrow_mut());
+        for (cleanup, held) in owed {
+            self.jobs.push_back(Job::Call(cleanup, held));
+        }
     }
 
     fn trace_roots(&self, t: &mut Tracer) {
@@ -992,6 +1013,7 @@ impl Vm {
         }
         t.mark_values(&self.temp_roots);
         t.mark_values(&self.host_roots);
+        t.mark_values(&self.kept_alive);
         self.modules.trace(t);
         for job in &self.jobs {
             match job {
@@ -1023,14 +1045,32 @@ impl Vm {
         self.shapes.trace(t);
     }
 
-    /// Drop WeakMap/WeakSet entries whose keys are about to be freed
+    /// Mark the values of WeakMap entries whose keys are marked
+    fn trace_ephemerons(&self, t: &mut Tracer) {
+        for &m in self.weak_maps.borrow().iter() {
+            if !m.is_marked() {
+                continue;
+            }
+            if let ObjectKind::WeakMap(data) = &m.get().kind {
+                for &(k, v) in data.entries.iter().flatten() {
+                    if weak_target_marked(k) {
+                        t.mark_value(v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop weak entries whose targets are about to be freed: WeakMap and
+    /// WeakSet entries, WeakRef targets, and registry cells (whose cleanup
+    /// calls are queued)
     fn prune_weak(&self) {
         let mut maps = self.weak_maps.borrow_mut();
         maps.retain(|m| m.is_marked());
         for &m in maps.iter() {
             if let ObjectKind::WeakMap(data) | ObjectKind::WeakSet(data) = &mut m.get_mut().kind {
                 for i in 0..data.entries.len() {
-                    let dead = matches!(&data.entries[i], Some((k, _)) if k.as_object().is_some_and(|o| !o.is_marked()));
+                    let dead = matches!(&data.entries[i], Some((k, _)) if !weak_target_marked(*k));
                     if dead {
                         let (k, _) = data.entries[i].take().unwrap();
                         data.index.remove(&MapKey::Bits(k.raw()));
@@ -1039,6 +1079,45 @@ impl Vm {
                 }
             }
         }
+        let mut refs = self.weak_refs.borrow_mut();
+        refs.retain(|r| r.is_marked());
+        for &r in refs.iter() {
+            if let ObjectKind::WeakRef(target) = &mut r.get_mut().kind {
+                if !weak_target_marked(*target) {
+                    *target = Value::UNDEFINED;
+                }
+            }
+        }
+        let mut regs = self.finalization_registries.borrow_mut();
+        regs.retain(|r| r.is_marked());
+        let mut owed = self.finalizations.borrow_mut();
+        for &r in regs.iter() {
+            if let ObjectKind::FinalizationRegistry(f) = &mut r.get_mut().kind {
+                let cleanup = f.cleanup;
+                f.cells.retain_mut(|c| {
+                    if !weak_target_marked(c.token) {
+                        c.token = Value::UNDEFINED;
+                    }
+                    if weak_target_marked(c.target) {
+                        return true;
+                    }
+                    owed.push((cleanup, c.held));
+                    false
+                });
+            }
+        }
+    }
+}
+
+/// Whether a weakly held value survives this collection (values that are
+/// not cells always do)
+fn weak_target_marked(v: Value) -> bool {
+    if let Some(o) = v.as_object() {
+        o.is_marked()
+    } else if let Some(s) = v.as_symbol() {
+        s.is_marked()
+    } else {
+        true
     }
 }
 

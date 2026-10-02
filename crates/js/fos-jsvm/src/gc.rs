@@ -269,14 +269,22 @@ impl Heap {
         self.collections.get()
     }
 
-    /// Collect garbage. `mark_roots` marks every root; `before_sweep`
-    /// runs after marking completes, when `Gc::is_marked` tells what will
-    /// survive (for weak tables).
-    pub fn collect(&self, mark_roots: impl FnOnce(&mut Tracer), before_sweep: impl FnOnce()) {
+    /// Collect garbage. `mark_roots` marks every root. `ephemerons` runs
+    /// whenever marking runs dry and marks what weakly keyed entries keep
+    /// alive (a WeakMap value whose key is marked); marking ends when it
+    /// adds nothing. `before_sweep` then runs, when `Gc::is_marked` tells
+    /// what will survive (for weak tables).
+    pub fn collect(&self, mark_roots: impl FnOnce(&mut Tracer), mut ephemerons: impl FnMut(&mut Tracer), before_sweep: impl FnOnce()) {
         let mut tracer = Tracer { stack: Vec::with_capacity(256), epoch: self.collections.get() + 1 };
         mark_roots(&mut tracer);
-        while let Some(header) = tracer.stack.pop() {
-            unsafe { trace_cell(header, &mut tracer) };
+        loop {
+            while let Some(header) = tracer.stack.pop() {
+                unsafe { trace_cell(header, &mut tracer) };
+            }
+            ephemerons(&mut tracer);
+            if tracer.stack.is_empty() {
+                break;
+            }
         }
         before_sweep();
 

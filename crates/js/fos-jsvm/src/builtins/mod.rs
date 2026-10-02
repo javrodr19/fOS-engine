@@ -4,6 +4,7 @@ pub(crate) mod array;
 mod bigint;
 mod intl;
 mod collections;
+mod weakref;
 mod date;
 mod error;
 mod function;
@@ -39,6 +40,7 @@ pub(crate) fn init(vm: &mut Vm) {
     math::init(vm);
     json::init(vm);
     collections::init(vm);
+    weakref::init(vm);
     reflect::init(vm);
     proxy::init(vm);
     regexp::init(vm);

@@ -62,6 +62,9 @@ pub enum BoxKind {
     /// A block container establishing an inline formatting context
     Inline(InlineContent),
     Replaced(Replaced),
+    /// A flex container and its items (blockified; text runs wrapped in
+    /// anonymous blocks)
+    Flex(Vec<LayoutBox>),
 }
 
 #[derive(Debug)]
@@ -368,6 +371,22 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else if matches!(self.tag(node), "ul" | "menu" | "dir") {
             self.list_counters.push(1);
         }
+        if matches!(style.display(), Display::Flex | Display::InlineFlex) {
+            let mut items = Vec::new();
+            let mut text = InlineBuilder::new(&style, self.deco);
+            self.styler.enter(self.tree, node);
+            self.flex_items(node, &style, &mut items, &mut text);
+            self.styler.leave();
+            let content = text.take(&style);
+            if !content.is_blank() {
+                items.push(LayoutBox::anonymous(&style, BoxKind::Inline(content)));
+            }
+            self.deco = saved;
+            if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
+                self.list_counters.pop();
+            }
+            return LayoutBox { node, style, kind: BoxKind::Flex(items), marker: None };
+        }
         let mut c = Container { style: &style, blocks: Vec::new(), inline: InlineBuilder::new(&style, self.deco) };
         // Inside markers lead the content
         if let Some(m) = marker.as_ref().filter(|m| !m.outside) {
@@ -440,6 +459,45 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 let b = self.element_box(child, style, true);
                 c.blocks.push(b);
             }
+        }
+    }
+
+    /// A flex container's children as items: each element is blockified;
+    /// runs of text between them become anonymous items
+    fn flex_items(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder) {
+        let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
+        for child in kids {
+            let Some(n) = self.tree.get(child) else { continue };
+            if let Some(t) = n.as_text() {
+                if !t.is_empty() {
+                    text.push_text(t, parent);
+                }
+                continue;
+            }
+            if !n.is_element() {
+                continue;
+            }
+            let mut style = self.styler.style(self.tree, child, parent_style);
+            let display = style.display();
+            if display == Display::None {
+                continue;
+            }
+            if display == Display::Contents {
+                self.styler.enter(self.tree, child);
+                self.flex_items(child, &style, items, text);
+                self.styler.leave();
+                continue;
+            }
+            let content = text.take(parent_style);
+            if !content.is_blank() {
+                items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
+            }
+            let blockified = display.blockified();
+            if blockified != display {
+                std::sync::Arc::make_mut(&mut style.box_).display = blockified;
+            }
+            let b = self.element_box(child, style, true);
+            items.push(b);
         }
     }
 

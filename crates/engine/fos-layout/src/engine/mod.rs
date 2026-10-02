@@ -11,6 +11,7 @@
 //! ```
 
 pub mod block;
+pub mod flex;
 pub mod box_tree;
 pub mod fonts;
 pub mod fragment;

@@ -380,3 +380,97 @@ fn spaces_between_inline_elements_are_kept() {
     let rb = runs.iter().find(|r| r.0 == b).unwrap().1;
     assert!(rb.x - ra.right() > 2.0, "{ra:?} {rb:?}");
 }
+
+fn boxes(t: &FragmentTree, ns: &[NodeId]) -> Vec<Rect> {
+    ns.iter().map(|n| rect_of(t, *n)).collect()
+}
+
+#[test]
+fn flex_row_grows_and_shrinks() {
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 600px; height: 50px");
+    let a = el(&mut tree, row, "div", "flex: 1; height: 10px");
+    let b = el(&mut tree, row, "div", "flex: 2");
+    let c = el(&mut tree, row, "div", "width: 100px; flex-shrink: 0");
+    let t = layout(&tree, html, 800.0);
+    let r = boxes(&t, &[a, b, c]);
+    assert_eq!((r[0].x, r[0].w), (8.0, 500.0 / 3.0));
+    assert!((r[1].w - 1000.0 / 3.0).abs() < 0.01);
+    assert_eq!((r[2].x, r[2].w), (508.0, 100.0));
+    // Stretch fills the line unless a height is given
+    assert_eq!((r[0].h, r[1].h, r[2].h), (10.0, 50.0, 50.0));
+
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 300px");
+    let a = el(&mut tree, row, "div", "width: 200px; height: 1px");
+    let b = el(&mut tree, row, "div", "width: 200px; height: 1px; flex-shrink: 3");
+    let t = layout(&tree, html, 800.0);
+    let r = boxes(&t, &[a, b]);
+    // 100px overflow shared 1:3 (weighted by base size)
+    assert_eq!((r[0].w, r[1].w), (175.0, 125.0));
+}
+
+#[test]
+fn flex_justify_and_align() {
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 400px; height: 100px; justify-content: space-between; align-items: center");
+    let a = el(&mut tree, row, "div", "width: 50px; height: 20px");
+    let b = el(&mut tree, row, "div", "width: 50px; height: 40px");
+    let c = el(&mut tree, row, "div", "width: 50px; height: 60px");
+    let t = layout(&tree, html, 800.0);
+    let r = boxes(&t, &[a, b, c]);
+    assert_eq!((r[0].x, r[1].x, r[2].x), (8.0, 183.0, 358.0));
+    assert_eq!((r[0].y, r[1].y, r[2].y), (8.0 + 40.0, 8.0 + 30.0, 8.0 + 20.0));
+
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 400px; justify-content: center");
+    let a = el(&mut tree, row, "div", "width: 100px; height: 10px");
+    let right = el(&mut tree, row, "div", "width: 50px; height: 10px; margin-left: auto");
+    let t = layout(&tree, html, 800.0);
+    // Auto margins win over justify-content
+    assert_eq!(rect_of(&t, a).x, 8.0);
+    assert_eq!(rect_of(&t, right).x, 358.0);
+}
+
+#[test]
+fn flex_wraps_columns_and_reverses() {
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; flex-wrap: wrap; width: 250px; gap: 10px");
+    let items: Vec<NodeId> = (0..5).map(|_| el(&mut tree, row, "div", "width: 100px; height: 20px")).collect();
+    let t = layout(&tree, html, 800.0);
+    let r = boxes(&t, &items);
+    assert_eq!((r[0].x, r[1].x, r[2].x), (8.0, 118.0, 8.0));
+    assert_eq!((r[0].y, r[2].y, r[4].y), (8.0, 38.0, 68.0));
+    assert_eq!(rect_of(&t, row).h, 80.0);
+
+    let (mut tree, html, body) = doc();
+    let col = el(&mut tree, body, "div", "display: flex; flex-direction: column; height: 200px");
+    let a = el(&mut tree, col, "div", "height: 30px");
+    let b = el(&mut tree, col, "div", "flex-grow: 1");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, a).w, rect_of(&t, b).y, rect_of(&t, b).h), (784.0, 38.0, 170.0));
+
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; flex-direction: row-reverse; width: 300px");
+    let a = el(&mut tree, row, "div", "width: 100px; height: 5px");
+    let b = el(&mut tree, row, "div", "width: 100px; height: 5px; order: -1");
+    let t = layout(&tree, html, 800.0);
+    // order puts b first, which row-reverse places at the right
+    assert_eq!((rect_of(&t, b).x, rect_of(&t, a).x), (208.0, 108.0));
+}
+
+#[test]
+fn flex_items_from_text_and_inline_children() {
+    let (mut tree, html, body) = doc();
+    let nav = el(&mut tree, body, "div", "display: flex; gap: 20px");
+    let a = el(&mut tree, nav, "a", "");
+    text(&mut tree, a, "Home");
+    let b = el(&mut tree, nav, "a", "");
+    text(&mut tree, b, "About us");
+    let t = layout(&tree, html, 800.0);
+    let (ra, rb) = (rect_of(&t, a), rect_of(&t, b));
+    // Side by side, each as wide as its text
+    assert_eq!(ra.y, rb.y);
+    assert!((rb.x - ra.right() - 20.0).abs() < 0.01, "{ra:?} {rb:?}");
+    assert!(ra.w < 100.0);
+}

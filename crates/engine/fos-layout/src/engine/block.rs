@@ -81,7 +81,7 @@ impl Edges {
 }
 
 /// A content-box size from a specified one (box-sizing)
-fn content_size(style: &Style, specified: f32, bp: f32) -> f32 {
+pub(crate) fn content_size(style: &Style, specified: f32, bp: f32) -> f32 {
     match style.box_.box_sizing {
         BoxSizing::ContentBox => specified,
         BoxSizing::BorderBox => (specified - bp).max(0.0),
@@ -89,7 +89,7 @@ fn content_size(style: &Style, specified: f32, bp: f32) -> f32 {
 }
 
 /// Clamp a content width by min/max-width
-fn clamp_width(style: &Style, w: f32, cb_w: f32, bp: f32) -> f32 {
+pub(crate) fn clamp_width(style: &Style, w: f32, cb_w: f32, bp: f32) -> f32 {
     let b = &style.box_;
     let max = content_size(style, b.max_width.resolve(cb_w), bp);
     let min = b.min_width.resolve(cb_w).map_or(0.0, |m| content_size(style, m, bp));
@@ -98,7 +98,7 @@ fn clamp_width(style: &Style, w: f32, cb_w: f32, bp: f32) -> f32 {
 
 /// Clamp a content height by min/max-height (percentages need a definite
 /// containing block height)
-fn clamp_height(style: &Style, h: f32, cb_h: Option<f32>, bp: f32) -> f32 {
+pub(crate) fn clamp_height(style: &Style, h: f32, cb_h: Option<f32>, bp: f32) -> f32 {
     let b = &style.box_;
     let max = match b.max_height {
         fos_css::style::MaxSize::None => f32::INFINITY,
@@ -145,20 +145,47 @@ pub fn layout_root(ctx: &mut LayoutCtx, root: &LayoutBox) -> (BoxFragment, f32) 
 /// Lay out a block-level box (or an atomic inline) for a containing block
 /// `cb_w` wide (and `cb_h` tall, when definite)
 pub fn layout_block_level(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<f32>, sizing: Sizing, is_root: bool) -> Laid {
+    layout_sized(ctx, b, cb_w, cb_h, sizing, is_root, Forced::default())
+}
+
+/// Border-box sizes a parent formatting context decided (flex items)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Forced {
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+}
+
+/// [`layout_block_level`] with sizes imposed by the parent (auto margins
+/// are then left to the parent too)
+#[allow(clippy::too_many_arguments)]
+pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<f32>, sizing: Sizing, is_root: bool, forced: Forced) -> Laid {
     let style = &b.style;
     let e = edges(style, cb_w);
     let hbp = e.horizontal_bp();
     let vbp = e.vertical_bp();
+    let sizing = if forced.width.is_some() { Sizing::Shrink } else { sizing };
 
     if let BoxKind::Replaced(r) = &b.kind {
-        return layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
+        let mut laid = layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
+        if forced.width.is_some() || forced.height.is_some() {
+            let bb = &mut laid.frag.border_box;
+            bb.w = forced.width.unwrap_or(bb.w).max(hbp);
+            bb.h = forced.height.unwrap_or(bb.h).max(vbp);
+            laid.frag.children.clear();
+            laid.frag.update_ink();
+        }
+        return laid;
     }
 
     // Width (§10.3.3), or shrink-to-fit (§10.3.5)
-    let specified = style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp));
+    let specified = match forced.width {
+        Some(w) => Some((w - hbp).max(0.0)),
+        None => style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp)),
+    };
     let (ml_auto, mr_auto) = (e.margin[3].is_none(), e.margin[1].is_none());
     let (mut ml, mut mr) = (e.margin[3].unwrap_or(0.0), e.margin[1].unwrap_or(0.0));
     let width = match specified {
+        Some(w) if forced.width.is_some() => w,
         Some(w) => clamp_width(style, w, cb_w, hbp),
         None => {
             let avail = (cb_w - ml - mr - hbp).max(0.0);
@@ -189,8 +216,11 @@ pub fn layout_block_level(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: O
 
     // Height: specified (percentages of a definite containing block) or
     // the content's
-    let specified_h = style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp));
-    let inner_cb_h = specified_h.map(|h| clamp_height(style, h, cb_h, vbp)).or(if is_root { cb_h.map(|h| (h - vbp).max(0.0)) } else { None });
+    let specified_h = match forced.height {
+        Some(h) => Some((h - vbp).max(0.0)),
+        None => style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp)),
+    };
+    let inner_cb_h = specified_h.map(|h| if forced.height.is_some() { h } else { clamp_height(style, h, cb_h, vbp) }).or(if is_root { cb_h.map(|h| (h - vbp).max(0.0)) } else { None });
 
     let bfc = is_root || b.is_bfc_root();
     let collapse_top = !bfc && e.border[0] == 0.0 && e.padding[0] == 0.0;
@@ -226,9 +256,17 @@ pub fn layout_block_level(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: O
             frag.children = lines.frags;
             lines.height
         }
+        BoxKind::Flex(items) => {
+            let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, cb_w);
+            frag.children = flex.frags;
+            flex.height
+        }
         BoxKind::Replaced(_) => unreachable!(),
     };
-    let height = clamp_height(style, specified_h.unwrap_or(content_h), cb_h, vbp);
+    let height = match forced.height {
+        Some(_) => specified_h.unwrap_or(content_h),
+        None => clamp_height(style, specified_h.unwrap_or(content_h), cb_h, vbp),
+    };
     let through = through && collapse_top && collapse_bottom && height <= 0.0;
     for c in &mut frag.children {
         c.translate(content_x, content_y);
@@ -486,6 +524,7 @@ pub fn intrinsic_content(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
             }
             (min, max)
         }
+        BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items),
         BoxKind::Replaced(r) => {
             let e = edges(&b.style, 0.0);
             let (w, _) = replaced_content_size(ctx, &b.style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());

@@ -30,14 +30,14 @@ use fos_dom::{DomTree, NodeId};
 /// Lay out the document rooted at element `root` in a viewport
 pub fn layout_document<S: Styler>(tree: &DomTree, root: NodeId, styler: &mut S, fonts: &mut FontContext, viewport: (f32, f32)) -> FragmentTree {
     let Some(boxes) = build_box_tree(tree, root, styler) else {
-        return FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0 };
+        return FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 };
     };
     let mut ctx = LayoutCtx::new(fonts, viewport);
     let (mut frag, bottom) = block::layout_root(&mut ctx, &boxes);
     position::place_absolutes(&mut ctx, &mut frag, &boxes);
     let document_height = bottom.max(frag.ink.bottom()).max(viewport.1);
     let document_width = frag.ink.right().max(viewport.0);
-    FragmentTree { root: Some(frag), document_height, document_width }
+    FragmentTree { root: Some(frag), document_height, document_width, viewport_height: viewport.1 }
 }
 
 #[cfg(test)]

@@ -102,6 +102,33 @@ impl BoxFragment {
         Rect::new(r.x + b[3], r.y + b[0], (r.w - b[1] - b[3]).max(0.0), (r.h - b[0] - b[2]).max(0.0))
     }
 
+    /// How far a `position: sticky` box moves down (or up) to stay in
+    /// `view` (top, height: the visible part of its scroll container, in
+    /// the same coordinates as the box) without leaving `container` (its
+    /// parent's content box)
+    pub fn sticky_offset(&self, container: Rect, view: (f32, f32)) -> f32 {
+        if self.style.box_.position != fos_css::style::Position::Sticky {
+            return 0.0;
+        }
+        let r = self.border_box;
+        let inset = &self.style.box_.inset;
+        if let Some(t) = inset[0].resolve(view.1) {
+            let room = (container.bottom() - r.bottom()).max(0.0);
+            let want = view.0 + t - r.y;
+            if want > 0.0 {
+                return want.min(room);
+            }
+        }
+        if let Some(b) = inset[2].resolve(view.1) {
+            let room = (container.y - r.y).min(0.0);
+            let want = view.0 + view.1 - b - r.bottom();
+            if want < 0.0 {
+                return want.max(room);
+            }
+        }
+        0.0
+    }
+
     pub fn content_box(&self) -> Rect {
         let (p, r) = (self.padding, self.padding_box());
         Rect::new(r.x + p[3], r.y + p[0], (r.w - p[1] - p[3]).max(0.0), (r.h - p[0] - p[2]).max(0.0))
@@ -256,6 +283,8 @@ pub struct FragmentTree {
     /// The height of the scrollable document
     pub document_height: f32,
     pub document_width: f32,
+    /// The viewport height layout used (sticky boxes stick within it)
+    pub viewport_height: f32,
 }
 
 impl FragmentTree {
@@ -349,22 +378,24 @@ impl FragmentTree {
         fn hits(b: &BoxFragment) -> bool {
             b.node.is_valid() && b.style.inherited.pointer_events != fos_css::style::PointerEvents::None && b.kind != BoxFragmentKind::Placeholder
         }
-        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32, offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Option<NodeId> {
+        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32, view: (f32, f32), offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Option<NodeId> {
             if b.style.box_.position == fos_css::style::Position::Fixed && scroll != 0.0 {
-                return walk(b, x, y - scroll, 0.0, offsets);
+                return walk(b, x, y - scroll, 0.0, (0.0, view.1), offsets);
             }
             if !b.ink.contains(x, y) && !(scroll != 0.0 && b.children.iter().any(|c| matches!(c, Fragment::Box(_)))) {
                 return None;
             }
             // Inside a scrolled box, its content has moved
             let (bx, by) = (x, y);
-            let (x, y) = match b.scroll_extent {
+            let (x, y, view) = match b.scroll_extent {
                 Some(_) => {
                     let (ox, oy) = offsets(b.node);
-                    (x + ox, y + oy)
+                    let pad = b.padding_box();
+                    (x + ox, y + oy, (pad.y + oy, pad.h))
                 }
-                None => (x, y),
+                None => (x, y, view),
             };
+            let container = b.content_box();
             let mut layers: Vec<&BoxFragment> = b
                 .children
                 .iter()
@@ -377,7 +408,9 @@ impl FragmentTree {
             layers.reverse();
             layers.sort_by_key(|l| std::cmp::Reverse(l.style.box_.z_index.unwrap_or(0)));
             for l in layers {
-                if let Some(n) = walk(l, x, y, scroll, offsets) {
+                // A sticky box is shown moved
+                let y = y - l.sticky_offset(container, view);
+                if let Some(n) = walk(l, x, y, scroll, view, offsets) {
                     return Some(n);
                 }
             }
@@ -385,7 +418,7 @@ impl FragmentTree {
                 match c {
                     Fragment::Box(cb) if cb.style.is_positioned() => {}
                     Fragment::Box(cb) => {
-                        if let Some(n) = walk(cb, x, y, scroll, offsets) {
+                        if let Some(n) = walk(cb, x, y, scroll, view, offsets) {
                             return Some(n);
                         }
                     }
@@ -398,7 +431,7 @@ impl FragmentTree {
             }
             (hits(b) && b.border_box.contains(bx, by)).then_some(b.node)
         }
-        walk(self.root.as_ref()?, x, y, scroll, offsets)
+        walk(self.root.as_ref()?, x, y, scroll, (scroll, self.viewport_height), offsets)
     }
 }
 

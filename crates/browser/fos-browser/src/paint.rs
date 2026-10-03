@@ -43,11 +43,17 @@ pub struct Painter<'a> {
     box_scroll: Option<&'a std::collections::HashMap<NodeId, (f32, f32)>>,
     /// Horizontal shift from document to canvas (inside scrolled boxes)
     dx: f32,
+    /// The visible part (top, height) of the scroll container being
+    /// painted, which sticky boxes stick within
+    view: (f32, f32),
 }
 
+/// Where painting is: origin, dx and view
+type At = (f32, f32, (f32, f32));
+
 /// A positioned box to paint as a layer: z-index, box, clip, opacity, and
-/// the (origin, dx) shift in effect where it sits
-type Layer<'t> = (i32, &'t BoxFragment, Clip, f32, (f32, f32));
+/// the position state in effect where it sits
+type Layer<'t> = (i32, &'t BoxFragment, Clip, f32, At);
 
 /// A device-space clip rectangle: x0, y0, x1, y1
 #[derive(Clone, Copy, PartialEq)]
@@ -181,7 +187,7 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0 }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0) }
     }
 
     /// Images for CSS `url()`s
@@ -211,6 +217,7 @@ impl<'a> Painter<'a> {
 
     pub fn paint(&mut self, tree: &FragmentTree) {
         let Some(root) = &tree.root else { return };
+        self.view = (self.scroll, tree.viewport_height);
         let clip = Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]);
         self.paint_layer(root, clip, 1.0);
     }
@@ -222,15 +229,24 @@ impl<'a> Painter<'a> {
 
     /// Shift for the contents of `b` if it is a scrolled box; returns what
     /// to restore
-    fn enter_scroll(&mut self, b: &BoxFragment) -> (f32, f32) {
-        let saved = (self.origin, self.dx);
+    fn enter_scroll(&mut self, b: &BoxFragment) -> At {
+        let saved = self.at();
         if b.scroll_extent.is_some() {
-            if let Some(&(ox, oy)) = self.box_scroll.and_then(|m| m.get(&b.node)) {
-                self.origin += oy;
-                self.dx -= ox;
-            }
+            let (ox, oy) = self.box_scroll.and_then(|m| m.get(&b.node)).copied().unwrap_or((0.0, 0.0));
+            self.origin += oy;
+            self.dx -= ox;
+            let pad = b.padding_box();
+            self.view = (pad.y + oy, pad.h);
         }
         saved
+    }
+
+    fn at(&self) -> At {
+        (self.origin, self.dx, self.view)
+    }
+
+    fn go(&mut self, (origin, dx, view): At) {
+        (self.origin, self.dx, self.view) = (origin, dx, view);
     }
 
     fn mask_for(&mut self, clip: Clip) -> Option<&Mask> {
@@ -315,13 +331,14 @@ impl<'a> Painter<'a> {
         if b.style.box_.position == fos_css::style::Position::Fixed && self.scroll != 0.0 {
             // Laid out against the viewport at the top of the page: drawn
             // where the viewport is now
-            let saved = self.origin;
+            let (saved, view) = (self.origin, self.view);
             self.origin -= self.scroll;
+            self.view = (0.0, view.1);
             let full = Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]);
             self.scroll = 0.0;
             self.paint_layer(b, full, alpha);
             self.scroll = saved - self.origin;
-            self.origin = saved;
+            (self.origin, self.view) = (saved, view);
             return;
         }
         if self.culled(b, clip) {
@@ -337,18 +354,18 @@ impl<'a> Painter<'a> {
         let mut layers: Vec<Layer> = Vec::new();
         self.collect_layers(b, inner, alpha, &mut layers);
         layers.sort_by_key(|l| l.0);
-        let here = (self.origin, self.dx);
+        let here = self.at();
         for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 < 0) {
-            (self.origin, self.dx) = at;
+            self.go(at);
             self.paint_layer(l, c, a);
         }
-        (self.origin, self.dx) = here;
+        self.go(here);
         self.paint_flow(b, inner, alpha);
         for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 >= 0) {
-            (self.origin, self.dx) = at;
+            self.go(at);
             self.paint_layer(l, c, a);
         }
-        (self.origin, self.dx) = saved;
+        self.go(saved);
         self.scroll_thumbs(b, clip);
         if b.style.inherited.visibility == Visibility::Visible {
             self.outline(b, clip, alpha);
@@ -360,12 +377,15 @@ impl<'a> Painter<'a> {
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
             if Self::is_layer(cb) {
-                out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha, (self.origin, self.dx)));
+                // A sticky box is drawn moved to stay in view
+                let mut at = self.at();
+                at.0 -= cb.sticky_offset(b.content_box(), self.view);
+                out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha, at));
             } else if self.find_fixed || !self.culled(cb, clip) {
                 let inner = self.inner_clip(cb, clip);
                 let saved = self.enter_scroll(cb);
                 self.collect_layers(cb, inner, alpha * cb.style.box_.opacity, out);
-                (self.origin, self.dx) = saved;
+                self.go(saved);
             }
         }
     }
@@ -443,7 +463,7 @@ impl<'a> Painter<'a> {
                     let inner = self.inner_clip(cb, clip);
                     let saved = self.enter_scroll(cb);
                     self.paint_flow(cb, inner, a);
-                    (self.origin, self.dx) = saved;
+                    self.go(saved);
                     self.scroll_thumbs(cb, clip);
                     if cb.style.inherited.visibility == Visibility::Visible {
                         self.outline(cb, clip, a);

@@ -708,7 +708,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images
     let fragments = if root.is_valid() {
         layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)
     } else {
-        FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0 }
+        FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 }
     };
     drop(styler);
 
@@ -754,7 +754,8 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images
     let mut css_images: Vec<String> = Vec::new();
     fragments.for_each(|f| {
         if let Fragment::Box(b) = f {
-            has_fixed |= b.style.box_.position == fos_css::style::Position::Fixed;
+            // Sticky boxes move with scrolling too: no scroll blitting
+            has_fixed |= matches!(b.style.box_.position, fos_css::style::Position::Fixed | fos_css::style::Position::Sticky);
             let bg = &b.style.background;
             let urls = bg.images.iter().filter_map(|i| if let fos_css::style::Image::Url(u) = i { Some(u) } else { None }).chain(bg.mask.iter());
             for u in urls {
@@ -982,6 +983,31 @@ mod tests {
         assert_ne!(far.pixels[50 * 200 + 5], 0xffff0000);
         let fixed = renderer.node_at(10.0, 1010.0).unwrap();
         assert_eq!(document.tree().get(fixed).and_then(|n| n.as_element()).map(|e| document.tree().resolve(e.name.local).to_string()).as_deref(), Some("div"));
+    }
+
+    #[test]
+    fn test_sticky_boxes_stick_within_their_parent() {
+        let html = "<html><body style='margin:0'><div style='height: 1000px'>\
+            <div id=h style='position: sticky; top: 0; height: 20px; background: #f00'></div>\
+            <div style='height: 500px'></div></div><div style='height: 2000px'></div></body></html>";
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let h = document.get_element_by_id("h").unwrap();
+        let mut renderer = PageRenderer::new(200, 100);
+        let top = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(top.pixels[5 * 200 + 5], 0xffff0000);
+        // Scrolled: pinned to the viewport's top, and hit there
+        let mid = renderer.render_document(&document, 300.0).unwrap();
+        assert_eq!(mid.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(mid.pixels[50 * 200 + 5], 0xffff0000);
+        assert_eq!(renderer.node_at(10.0, 305.0), Some(h));
+        // Past its parent's end it scrolls away with it
+        let past = renderer.render_document(&document, 1100.0).unwrap();
+        assert!(past.pixels.iter().all(|&p| p != 0xffff0000));
+        assert_ne!(renderer.node_at(10.0, 1105.0), Some(h));
+        // At the parent's end it sits on the parent's bottom edge
+        let end = renderer.render_document(&document, 990.0).unwrap();
+        assert_eq!(end.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(end.pixels[12 * 200 + 5], 0xffff0000);
     }
 
     #[test]

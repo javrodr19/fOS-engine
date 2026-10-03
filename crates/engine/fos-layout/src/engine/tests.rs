@@ -616,6 +616,28 @@ fn table_spans_and_widths() {
 }
 
 #[test]
+fn collapsed_borders_are_shared() {
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; border-collapse: collapse; border: 1px solid black");
+    let mut cells = Vec::new();
+    for _ in 0..2 {
+        let tr = el(&mut tree, table, "tr", "display: table-row");
+        for _ in 0..2 {
+            let td = el(&mut tree, tr, "td", "display: table-cell; border: 1px solid black; width: 20px; height: 10px");
+            cells.push(td);
+        }
+    }
+    let t = layout(&tree, html, 800.0);
+    let r = |i: usize| rect_of(&t, cells[i]);
+    // Neighbours overlap by one border; the outer cells cover the table's
+    assert_eq!(r(1).x, r(0).right() - 1.0);
+    assert_eq!(r(2).y, r(0).bottom() - 1.0);
+    let tb = rect_of(&t, table);
+    assert_eq!((r(0).x, r(0).y), (tb.x, tb.y));
+    assert_eq!((r(3).right(), r(3).bottom()), (tb.right(), tb.bottom()));
+}
+
+#[test]
 fn webkit_center_centers_block_children() {
     let (mut tree, html, body) = doc();
     let c = el(&mut tree, body, "div", "text-align: -webkit-center");

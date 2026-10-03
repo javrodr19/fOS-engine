@@ -44,11 +44,21 @@ fn grid(t: &TableBox) -> Grid<'_> {
     Grid { cols, cells }
 }
 
-/// Horizontal and vertical spacing between cells
-fn spacing(style: &Style) -> (f32, f32) {
+/// Horizontal and vertical spacing between cells. Collapsed borders are
+/// shared: neighbouring cells (and the outer cells and the table) overlap
+/// by the cells' border width, so a border is drawn once
+fn spacing(style: &Style, t: &TableBox) -> (f32, f32) {
     match style.inherited.border_collapse {
         BorderCollapse::Separate => style.inherited.border_spacing,
-        BorderCollapse::Collapse => (0.0, 0.0),
+        BorderCollapse::Collapse => {
+            let (mut h, mut v) = (0.0f32, 0.0f32);
+            for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                let w = &cell.b.style.border.width;
+                h = h.max(w[1].min(w[3]));
+                v = v.max(w[0].min(w[2]));
+            }
+            (-h, -v)
+        }
     }
 }
 
@@ -106,7 +116,7 @@ fn column_widths(ctx: &mut LayoutCtx, g: &Grid) -> (Vec<f32>, Vec<f32>) {
 pub fn intrinsic_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox) -> (f32, f32) {
     let g = grid(t);
     let (min, max) = column_widths(ctx, &g);
-    let hs = spacing(style).0 * (g.cols + 1) as f32;
+    let hs = spacing(style, t).0 * (g.cols + 1) as f32;
     let (mut tmin, tmax) = (min.iter().sum::<f32>() + hs, max.iter().sum::<f32>() + hs);
     for c in &t.captions {
         tmin = tmin.max(intrinsic_outer(ctx, c).0);
@@ -124,7 +134,7 @@ pub struct TableLayoutResult {
 /// Lay out a table's contents in a content box `width` wide
 pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32, auto_width: bool) -> TableLayoutResult {
     let g = grid(t);
-    let (hs, vs) = spacing(style);
+    let (hs, vs) = spacing(style, t);
     let (min, max) = column_widths(ctx, &g);
     let spacing_w = hs * (g.cols + 1) as f32;
     let sum_min: f32 = min.iter().sum();

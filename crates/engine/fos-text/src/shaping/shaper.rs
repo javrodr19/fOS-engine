@@ -344,8 +344,19 @@ impl TextShaper {
         }
         
         // Apply GSUB substitutions (enabled features only)
-        for lookup in &plan.gsub {
-            Self::apply_gsub_lookup(lookup, &mut glyphs);
+        if !plan.gsub.is_empty() {
+            let before: Vec<GlyphId> = glyphs.iter().map(|g| g.glyph_id).collect();
+            for lookup in &plan.gsub {
+                Self::apply_gsub_lookup(lookup, &mut glyphs);
+            }
+            // Substituted glyphs (ligatures, alternates) advance by their
+            // own width, not the replaced character's
+            let changed = glyphs.len() != before.len() || glyphs.iter().zip(&before).any(|(g, b)| g.glyph_id != *b);
+            if changed {
+                for g in &mut glyphs {
+                    g.x_advance = font.glyph_hor_advance(g.glyph_id).unwrap_or(0) as i32;
+                }
+            }
         }
         
         // Apply GPOS kerning
@@ -567,5 +578,9 @@ mod tests {
         let without = TextShaper::new().no_ligatures().shape(&db, font, text, 16.0).unwrap();
         assert_eq!(without.glyphs.len(), text.chars().count());
         assert_eq!(with.glyphs.len(), without.glyphs.len() - 3);
+        // A ligature is about as wide as the letters it replaces
+        let width = |r: &ShapedRun| r.glyphs.iter().map(|g| g.x_advance).sum::<i32>() as f32;
+        let (w, wo) = (width(&with), width(&without));
+        assert!((w - wo).abs() < wo * 0.05, "{w} vs {wo}");
     }
 }

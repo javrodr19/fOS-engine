@@ -146,6 +146,9 @@ pub enum PropertyId {
     GridTemplateRows,
     GridTemplateAreas,
     Content,
+    CounterReset,
+    CounterIncrement,
+    CounterSet,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,
@@ -307,6 +310,9 @@ pub enum PropertyValue {
     Grid(std::sync::Arc<str>),
     /// `content`: what a `::before`/`::after` box shows (empty: none)
     Content(std::sync::Arc<[crate::style::ContentItem]>),
+    /// `counter-reset`/`-increment`/`-set`: counter names and values
+    /// (empty: none)
+    Counters(std::sync::Arc<[(std::sync::Arc<str>, i32)]>),
     /// A transform property's (validated) text, computed per element
     Transform(std::sync::Arc<str>),
 }

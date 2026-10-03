@@ -542,6 +542,8 @@ pub enum ContentItem {
     /// A counter's value, in a list style (the `ListStyleType`
     /// discriminant; decimal when absent)
     Counter(Arc<str>, Option<u8>),
+    /// All of a counter's nested values joined by a string
+    Counters(Arc<str>, Arc<str>, Option<u8>),
 }
 
 /// Box model, positioning, flex and other non-inherited properties
@@ -586,6 +588,11 @@ pub struct BoxStyle {
     pub grid: crate::grid::GridStyle,
     /// What a `::before`/`::after` box shows (`None`: none or normal)
     pub content: Option<Arc<[ContentItem]>>,
+    /// `counter-reset`, `counter-increment` and `counter-set` (`None`:
+    /// none)
+    pub counter_reset: Option<Arc<[(Arc<str>, i32)]>>,
+    pub counter_increment: Option<Arc<[(Arc<str>, i32)]>>,
+    pub counter_set: Option<Arc<[(Arc<str>, i32)]>>,
     /// `box-shadow`s, front to back (`None`: none)
     pub box_shadow: Option<Arc<[Shadow]>>,
     /// `transform` functions (`None`: none)
@@ -640,6 +647,9 @@ impl Default for BoxStyle {
             table_layout: TableLayout::Auto,
             grid: Default::default(),
             content: None,
+            counter_reset: None,
+            counter_increment: None,
+            counter_set: None,
             box_shadow: None,
             transform: None,
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
@@ -1288,6 +1298,16 @@ impl Style {
                     set!(box_, [content], (!items.is_empty()).then(|| items.clone()));
                 }
             }
+            PropertyId::CounterReset | PropertyId::CounterIncrement | PropertyId::CounterSet => {
+                if let PropertyValue::Counters(list) = v {
+                    let list = (!list.is_empty()).then(|| list.clone());
+                    match id {
+                        PropertyId::CounterReset => set!(box_, [counter_reset], list),
+                        PropertyId::CounterIncrement => set!(box_, [counter_increment], list),
+                        _ => set!(box_, [counter_set], list),
+                    }
+                }
+            }
             PropertyId::GridTemplateAreas => {
                 if let PropertyValue::Grid(text) = v {
                     if let Some(areas) = crate::grid::parse_areas(text) {
@@ -1607,6 +1627,9 @@ impl Style {
             PropertyId::GridTemplateRows => copy!(box_, [grid.template_rows]),
             PropertyId::GridTemplateAreas => copy!(box_, [grid.areas]),
             PropertyId::Content => copy!(box_, [content]),
+            PropertyId::CounterReset => copy!(box_, [counter_reset]),
+            PropertyId::CounterIncrement => copy!(box_, [counter_increment]),
+            PropertyId::CounterSet => copy!(box_, [counter_set]),
             PropertyId::Transform => copy!(box_, [transform]),
             PropertyId::BoxShadow => copy!(box_, [box_shadow]),
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),

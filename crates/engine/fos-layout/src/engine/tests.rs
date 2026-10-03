@@ -27,6 +27,18 @@ impl Styler for TestStyler {
         style
     }
 
+    /// `::before` takes its declarations from `data-before`
+    fn pseudo(&mut self, tree: &DomTree, node: NodeId, pe: fos_dom::PseudoElement, style: &Style) -> Option<Style> {
+        if pe != fos_dom::PseudoElement::Before {
+            return None;
+        }
+        let decls = fos_css::parse_declarations(tree.get_attribute(node, "data-before")?);
+        let refs: Vec<&fos_css::Declaration> = decls.iter().collect();
+        let mut ps = Style::inherit_from(style);
+        ps.cascade(&refs, style, &StyleContext::default(), &mut Default::default());
+        Some(ps)
+    }
+
     fn natural_size(&mut self, tree: &DomTree, node: NodeId) -> Option<(f32, f32)> {
         let v = tree.get_attribute(node, "data-natural")?;
         let (w, h) = v.split_once('x')?;
@@ -734,3 +746,48 @@ fn floats_in_a_flex_item_sit_side_by_side() {
     assert!(r[1].x > r[0].x && r[2].x > r[1].x);
 }
 
+
+/// All inline text of a box tree, block by block
+fn box_texts(b: &LayoutBox, out: &mut Vec<String>) {
+    match &b.kind {
+        BoxKind::Inline(c) => out.push(c.text.trim().to_string()),
+        BoxKind::Block(kids) | BoxKind::Flex(kids) | BoxKind::Grid(kids) => kids.iter().for_each(|k| box_texts(k, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn counters_number_generated_content() {
+    let (mut tree, html, body) = doc();
+    // Nested lists numbered with counters(): ol { counter-reset: item }
+    // li { counter-increment: item } li::before { counters(item, ".") }
+    let list = |tree: &mut DomTree, parent: NodeId| {
+        let ol = el(tree, parent, "div", "counter-reset: item");
+        let mut items = Vec::new();
+        for _ in 0..2 {
+            let li = el(tree, ol, "div", "counter-increment: item");
+            tree.set_attribute(li, "data-before", r#"content: counters(item, ".") " " counter(item, lower-alpha)"#);
+            items.push(li);
+        }
+        items
+    };
+    let items = list(&mut tree, body);
+    list(&mut tree, items[0]);
+    let after = el(&mut tree, body, "p", "");
+    tree.set_attribute(after, "data-before", r#"content: "[" counter(item) "]""#);
+    // A ::before that increments its own counter, and list-item
+    let ol = el(&mut tree, body, "ol", "");
+    tree.set_attribute(ol, "start", "5");
+    for _ in 0..2 {
+        let li = el(&mut tree, ol, "li", "list-style-type: none");
+        tree.set_attribute(li, "data-before", r#"content: counter(list-item) "/" counter(n); counter-increment: n 2"#);
+    }
+    let mut builder = TestStyler;
+    let root = build_box_tree(&tree, html, &mut builder).unwrap();
+    let mut texts = Vec::new();
+    box_texts(&root, &mut texts);
+    texts.retain(|t| !t.is_empty());
+    // The inner list nests a new instance; it ends with its element, and
+    // the outer list's counter stays in scope for the following sibling
+    assert_eq!(texts, ["1 a", "1.1 a", "1.2 b", "2 b", "[2]", "5/2", "6/2"]);
+}

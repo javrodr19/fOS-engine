@@ -229,6 +229,9 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "grid-template-rows" => GridTemplateRows,
         "grid-template-areas" => GridTemplateAreas,
         "content" => Content,
+        "counter-reset" => CounterReset,
+        "counter-increment" => CounterIncrement,
+        "counter-set" => CounterSet,
         "transform" | "-webkit-transform" | "-ms-transform" => Transform,
         "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
         "translate" => Translate,
@@ -517,6 +520,8 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
         P::Content => content(raw).map(|c| PropertyValue::Content(Arc::from(c))),
+        P::CounterReset | P::CounterSet => counters(raw, 0).map(|c| PropertyValue::Counters(Arc::from(c))),
+        P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         P::Transform => crate::transform::valid(raw).then(|| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::TransformOrigin | P::Translate => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Rotate => crate::transform::parse_rotate(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
@@ -726,17 +731,23 @@ fn content(raw: &str) -> Option<Vec<ContentItem>> {
                     return None;
                 }
                 if b.get(i) == Some(&b'(') {
-                    let close = raw[i..].find(')')? + i;
-                    let args = raw[i + 1..close].trim();
-                    i = close + 1;
-                    let arg = |n: usize| args.split(',').nth(n).map(|a| a.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+                    let (args, end) = function_args(raw, i + 1)?;
+                    i = end;
+                    let arg = |n: usize| args.get(n).map(|a| a.trim().to_string());
+                    let style = |a: Option<String>| a.and_then(|s| enum_value::<ListStyleType>(&s.to_ascii_lowercase())).map(|v| match v {
+                        PropertyValue::Enum(e) => e,
+                        _ => 0,
+                    });
+                    let ident = |a: Option<String>| a.filter(|s| !s.is_empty() && !s.starts_with(['"', '\''])).map(|s| Arc::<str>::from(s.as_str()));
+                    let string = |a: Option<String>| -> Option<String> {
+                        let a = a?;
+                        let q = *a.as_bytes().first()?;
+                        matches!(q, b'"' | b'\'').then(|| css_string(&a, 1, q).map(|(t, _)| t)).flatten()
+                    };
                     match name.as_str() {
                         "attr" => out.push(ContentItem::Attr(Arc::from(arg(0)?.split_whitespace().next()?.to_ascii_lowercase()))),
-                        "counter" => out.push(ContentItem::Counter(Arc::from(arg(0)?), arg(1).and_then(|s| enum_value::<ListStyleType>(&s.to_ascii_lowercase())).map(|v| match v {
-                            PropertyValue::Enum(e) => e,
-                            _ => 0,
-                        }))),
-                        "counters" => out.push(ContentItem::Counter(Arc::from(arg(0)?), None)),
+                        "counter" => out.push(ContentItem::Counter(ident(arg(0))?, style(arg(1)))),
+                        "counters" => out.push(ContentItem::Counters(ident(arg(0))?, Arc::from(string(arg(1))?), style(arg(2)))),
                         // Images and other functions show nothing
                         _ => {}
                     }
@@ -752,6 +763,61 @@ fn content(raw: &str) -> Option<Vec<ContentItem>> {
         }
     }
     Some(out)
+}
+
+/// The comma-separated arguments of a function whose `(` ends before
+/// byte `i` (commas and parentheses inside strings do not count), and
+/// the index after its `)`
+fn function_args(raw: &str, mut i: usize) -> Option<(Vec<&str>, usize)> {
+    let b = raw.as_bytes();
+    let (mut args, mut start, mut depth) = (Vec::new(), i, 0);
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'\'') => i = css_string(raw, i + 1, q)?.1,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' if depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            b')' => {
+                args.push(&raw[start..i]);
+                return Some((args, i + 1));
+            }
+            b',' if depth == 0 => {
+                args.push(&raw[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// A `counter-reset`/`-increment`/`-set` value: `none` (empty), or names
+/// each followed by an optional integer (`default` when absent)
+fn counters(raw: &str, default: i32) -> Option<Vec<(Arc<str>, i32)>> {
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    if words.len() == 1 && words[0].eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<(Arc<str>, i32)> = Vec::new();
+    for w in words {
+        if let Ok(n) = w.parse::<i32>() {
+            out.last_mut()?.1 = n;
+            continue;
+        }
+        let valid = w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '-' || !c.is_ascii())
+            && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || !c.is_ascii());
+        if !valid || ["none", "inherit", "initial", "unset", "default"].iter().any(|k| w.eq_ignore_ascii_case(k)) {
+            return None;
+        }
+        out.push((Arc::from(w), default));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// A CSS string from byte `i` (after its opening quote `q`): its text
@@ -1526,6 +1592,19 @@ mod tests {
     }
 
     #[test]
+    fn counter_values() {
+        let value = |d: &str| match crate::parse_declarations(d).first().map(|d| d.value.clone()) {
+            Some(PropertyValue::Counters(c)) => Some(c.iter().map(|(n, v)| (n.to_string(), *v)).collect::<Vec<_>>()),
+            _ => None,
+        };
+        assert_eq!(value("counter-reset: none"), Some(vec![]));
+        assert_eq!(value("counter-reset: a b 3"), Some(vec![("a".into(), 0), ("b".into(), 3)]));
+        assert_eq!(value("counter-increment: item"), Some(vec![("item".into(), 1)]));
+        assert_eq!(value("counter-increment: item -2"), Some(vec![("item".into(), -2)]));
+        assert_eq!(value("counter-set: 3"), None);
+    }
+
+    #[test]
     fn content_values() {
         let content = |v: &str| match crate::parse_declarations(&format!("content: {v}")).first().map(|d| d.value.clone()) {
             Some(PropertyValue::Content(items)) => Some(items.to_vec()),
@@ -1536,6 +1615,8 @@ mod tests {
         assert_eq!(content(r#""\201C  x" 'y'"#), Some(vec![ContentItem::Text(Arc::from("\u{201C} x")), ContentItem::Text(Arc::from("y"))]));
         assert_eq!(content("attr(data-Label) open-quote"), Some(vec![ContentItem::Attr(Arc::from("data-label")), ContentItem::OpenQuote]));
         assert_eq!(content(r#"counter(item) ". ""#), Some(vec![ContentItem::Counter(Arc::from("item"), None), ContentItem::Text(Arc::from(". "))]));
+        assert_eq!(content(r#"counters(sec, ", ", upper-roman) ")""#), Some(vec![ContentItem::Counters(Arc::from("sec"), Arc::from(", "), Some(ListStyleType::UpperRoman as u8)), ContentItem::Text(Arc::from(")"))]));
+        assert_eq!(content("counter(x, lower-alpha)"), Some(vec![ContentItem::Counter(Arc::from("x"), Some(ListStyleType::LowerAlpha as u8))]));
         // Alternative text is dropped; images show nothing
         assert_eq!(content(r#""\2192" / "next""#), Some(vec![ContentItem::Text(Arc::from("\u{2192}"))]));
         assert_eq!(content("url(a.svg)"), Some(vec![]));

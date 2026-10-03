@@ -40,8 +40,12 @@ pub trait Styler {
     }
 }
 
-/// The text of a generated box's `content`
-pub fn generated_text(tree: &DomTree, node: NodeId, style: &Style) -> String {
+/// Counters in scope, outermost first: name, value and the nesting level
+/// of the element that created it
+pub type Counters = Vec<(std::sync::Arc<str>, i32, u32)>;
+
+/// The text of a generated box's `content`, with the counters in scope
+pub fn generated_text(tree: &DomTree, node: NodeId, style: &Style, counters: &[(std::sync::Arc<str>, i32, u32)]) -> String {
     use fos_css::style::ContentItem;
     let mut out = String::new();
     for item in style.box_.content.iter().flat_map(|c| c.iter()) {
@@ -50,8 +54,18 @@ pub fn generated_text(tree: &DomTree, node: NodeId, style: &Style) -> String {
             ContentItem::Attr(name) => out.push_str(tree.get_attribute(node, name).unwrap_or("")),
             ContentItem::OpenQuote => out.push('\u{201C}'),
             ContentItem::CloseQuote => out.push('\u{201D}'),
-            // Counters are not kept
-            ContentItem::Counter(..) => {}
+            ContentItem::Counter(name, kind) => {
+                let v = counters.iter().rev().find(|c| c.0 == *name).map_or(0, |c| c.1);
+                out.push_str(&counter_text(*kind, v));
+            }
+            ContentItem::Counters(name, sep, kind) => {
+                let values: Vec<String> = counters.iter().filter(|c| c.0 == *name).map(|c| counter_text(*kind, c.1)).collect();
+                if values.is_empty() {
+                    out.push_str(&counter_text(*kind, 0));
+                } else {
+                    out.push_str(&values.join(sep));
+                }
+            }
         }
     }
     out
@@ -395,15 +409,17 @@ impl Container<'_> {
 pub struct BoxTreeBuilder<'a, S: Styler> {
     tree: &'a DomTree,
     styler: &'a mut S,
-    /// Ordinals of open ordered lists
-    list_counters: Vec<i32>,
+    /// CSS counters in scope
+    counters: Counters,
+    /// Nesting level of the element whose children are being built
+    depth: u32,
     /// Decorations in effect from block ancestors
     deco: (u8, Color),
 }
 
 /// Build the box tree of the document whose root element is `root`
 pub fn build_box_tree<S: Styler>(tree: &DomTree, root: NodeId, styler: &mut S) -> Option<LayoutBox> {
-    let mut b = BoxTreeBuilder { tree, styler, list_counters: Vec::new(), deco: (0, Color::BLACK) };
+    let mut b = BoxTreeBuilder { tree, styler, counters: Vec::new(), depth: 0, deco: (0, Color::BLACK) };
     let parent = Style::default();
     let mut style = b.styler.style(tree, root, &parent);
     if style.display() == Display::None {
@@ -425,6 +441,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     /// The box of element `node` (a block container, or replaced);
     /// `in_flow` boxes get their ancestors' text decorations
     fn element_box(&mut self, node: NodeId, style: Style, in_flow: bool) -> LayoutBox {
+        self.counters_for(Some(node), &style);
         if let Some(r) = self.replaced(node, &style) {
             return LayoutBox { node, style, kind: BoxKind::Replaced(r), marker: None };
         }
@@ -435,38 +452,25 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else {
             own
         };
-        let marker = (style.display() == Display::ListItem).then(|| self.marker(node, &style)).flatten();
-        let is_ol = self.tag(node) == "ol";
-        if is_ol {
-            let start = self.tree.get_attribute(node, "start").and_then(|s| s.trim().parse().ok()).unwrap_or(1);
-            self.list_counters.push(start);
-        } else if matches!(self.tag(node), "ul" | "menu" | "dir") {
-            self.list_counters.push(1);
-        }
+        let marker = (style.display() == Display::ListItem).then(|| self.marker(&style)).flatten();
         if matches!(style.display(), Display::Table | Display::InlineTable) {
-            self.styler.enter(self.tree, node);
+            self.enter(node);
             let table = self.table(node, &style);
-            self.styler.leave();
+            self.leave();
             self.deco = saved;
-            if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
-                self.list_counters.pop();
-            }
             return LayoutBox { node, style, kind: BoxKind::Table(Box::new(table)), marker: None };
         }
         if matches!(style.display(), Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid) {
             let mut items = Vec::new();
             let mut text = InlineBuilder::new(&style, self.deco);
-            self.styler.enter(self.tree, node);
+            self.enter(node);
             self.flex_items(node, &style, &mut items, &mut text);
-            self.styler.leave();
+            self.leave();
             let content = text.take(&style);
             if !content.is_blank() {
                 items.push(LayoutBox::anonymous(&style, BoxKind::Inline(content)));
             }
             self.deco = saved;
-            if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
-                self.list_counters.pop();
-            }
             let kind = if matches!(style.display(), Display::Grid | Display::InlineGrid) { BoxKind::Grid(items) } else { BoxKind::Flex(items) };
             return LayoutBox { node, style, kind, marker: None };
         }
@@ -477,15 +481,82 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             c.inline.push_text(&format!("{} ", m.text.trim_end()), NodeId::NONE);
             c.inline.close();
         }
-        self.styler.enter(self.tree, node);
+        self.enter(node);
         self.children(node, &style, &mut c);
-        self.styler.leave();
-        if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
-            self.list_counters.pop();
-        }
+        self.leave();
         let kind = c.finish();
         self.deco = saved;
         LayoutBox { node, style: style.clone(), kind, marker: marker.filter(|m| m.outside) }
+    }
+
+    /// Descend into element `node`'s children
+    fn enter(&mut self, node: NodeId) {
+        self.styler.enter(self.tree, node);
+        self.depth += 1;
+    }
+
+    /// Come back from an element's children, ending the counters they
+    /// created
+    fn leave(&mut self) {
+        self.styler.leave();
+        self.depth -= 1;
+        while self.counters.last().is_some_and(|c| c.2 > self.depth) {
+            self.counters.pop();
+        }
+    }
+
+    /// Apply an element's (or, with no node, a generated box's)
+    /// `counter-reset`, `counter-increment` and `counter-set`, in that
+    /// order, with the `list-item` counter HTML lists imply (CSS Lists
+    /// §4.4)
+    fn counters_for(&mut self, node: Option<NodeId>, style: &Style) {
+        use std::sync::Arc;
+        let list_item = || Arc::<str>::from("list-item");
+        let names = |l: &Option<Arc<[(Arc<str>, i32)]>>| l.as_deref().unwrap_or(&[]).to_vec();
+        let (mut resets, mut increments, mut sets) = (names(&style.box_.counter_reset), names(&style.box_.counter_increment), names(&style.box_.counter_set));
+        if let Some(node) = node {
+            let mentions = |l: &[(Arc<str>, i32)]| l.iter().any(|c| &*c.0 == "list-item");
+            match self.tag(node) {
+                "ol" if !mentions(&resets) => {
+                    let start: i32 = self.tree.get_attribute(node, "start").and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+                    resets.push((list_item(), start.saturating_sub(1)));
+                }
+                "ul" | "menu" | "dir" if !mentions(&resets) => resets.push((list_item(), 0)),
+                _ => {}
+            }
+            if style.display() == Display::ListItem {
+                if !mentions(&increments) {
+                    increments.push((list_item(), 1));
+                }
+                if let Some(v) = self.tree.get_attribute(node, "value").and_then(|v| v.trim().parse::<i32>().ok()) {
+                    sets.push((list_item(), v));
+                }
+            }
+        }
+        let depth = self.depth;
+        for (name, v) in resets {
+            // A sibling's counter of the same name is replaced
+            match self.counters.last_mut().filter(|c| c.2 == depth && c.0 == name) {
+                Some(c) => c.1 = v,
+                None => {
+                    self.counters.retain(|c| !(c.2 == depth && c.0 == name));
+                    self.counters.push((name, v, depth));
+                }
+            }
+        }
+        for (list, add) in [(increments, true), (sets, false)] {
+            for (name, v) in list {
+                let i = match self.counters.iter().rposition(|c| c.0 == name) {
+                    Some(i) => i,
+                    None => {
+                        self.counters.push((name, 0, depth));
+                        self.counters.len() - 1
+                    }
+                };
+                let c = &mut self.counters[i].1;
+                *c = if add { c.saturating_add(v) } else { v };
+            }
+        }
     }
 
     fn tag(&self, node: NodeId) -> &str {
@@ -500,7 +571,8 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         if ps.display() == Display::None {
             return None;
         }
-        let text = generated_text(self.tree, node, &ps);
+        self.counters_for(None, &ps);
+        let text = generated_text(self.tree, node, &ps, &self.counters);
         Some((ps, text))
     }
 
@@ -568,17 +640,19 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 _ => {}
             }
             if display == Display::Contents {
-                self.styler.enter(self.tree, child);
+                self.counters_for(Some(child), &style);
+                self.enter(child);
                 self.children(child, &style, c);
-                self.styler.leave();
+                self.leave();
                 continue;
             }
             let replaced = self.is_replaced(child);
             if display == Display::Inline && !replaced {
+                self.counters_for(Some(child), &style);
                 c.inline.open(style.clone(), child);
-                self.styler.enter(self.tree, child);
+                self.enter(child);
                 self.children(child, &style, c);
-                self.styler.leave();
+                self.leave();
                 c.inline.close();
             } else if display.is_inline_level() || (replaced && display == Display::Inline) {
                 let b = self.element_box(child, style, false);
@@ -629,9 +703,10 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 }
                 Display::TableHeaderGroup | Display::TableRowGroup | Display::TableFooterGroup => {
                     body.extend(anon.take());
-                    self.styler.enter(self.tree, child);
+                    self.counters_for(Some(child), &cstyle);
+                    self.enter(child);
                     let rows = self.row_group(child, &cstyle);
-                    self.styler.leave();
+                    self.leave();
                     match cstyle.display() {
                         Display::TableHeaderGroup if head.is_empty() => head = rows,
                         Display::TableFooterGroup if foot.is_empty() => foot = rows,
@@ -673,9 +748,10 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     }
 
     fn row(&mut self, node: NodeId, style: Style) -> TableRow {
-        self.styler.enter(self.tree, node);
+        self.counters_for(Some(node), &style);
+        self.enter(node);
         let cells = self.styled_children(node, &style).into_iter().map(|(c, cs)| self.cell(c, cs)).collect();
-        self.styler.leave();
+        self.leave();
         TableRow { node, style, cells }
     }
 
@@ -730,9 +806,10 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 continue;
             }
             if display == Display::Contents {
-                self.styler.enter(self.tree, child);
+                self.counters_for(Some(child), &style);
+                self.enter(child);
                 self.flex_items(child, &style, items, text);
-                self.styler.leave();
+                self.leave();
                 continue;
             }
             let content = text.take(parent_style);
@@ -851,23 +928,27 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         first.unwrap_or_default()
     }
 
-    fn marker(&mut self, node: NodeId, style: &Style) -> Option<Marker> {
-        let ordinal = match self.list_counters.last_mut() {
-            Some(c) => {
-                if let Some(v) = self.tree.get_attribute(node, "value").and_then(|v| v.trim().parse().ok()) {
-                    *c = v;
-                }
-                let n = *c;
-                *c += 1;
-                n
-            }
-            None => 1,
-        };
+    fn marker(&mut self, style: &Style) -> Option<Marker> {
+        let ordinal = self.counters.iter().rev().find(|c| &*c.0 == "list-item").map_or(1, |c| c.1);
         let text = marker_text(style.inherited.list_style_type, ordinal)?;
         let mut mstyle = Style::inherit_from(style);
         // Markers keep the list item's font but not its decorations
         std::sync::Arc::make_mut(&mut mstyle.inherited).white_space = WhiteSpace::Pre;
         Some(Marker { text, style: mstyle, outside: style.inherited.list_style_position == ListStylePosition::Outside })
+    }
+}
+
+/// A counter's value in list style `kind` (a `ListStyleType`
+/// discriminant; decimal when absent)
+pub fn counter_text(kind: Option<u8>, n: i32) -> String {
+    let kind = kind.and_then(ListStyleType::from_u8).unwrap_or(ListStyleType::Decimal);
+    match marker_text(kind, n) {
+        None => String::new(),
+        Some(t) => {
+            let t = t.trim_end();
+            // Bullets stand alone; numbers lose the marker's period
+            if matches!(kind, ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square) { t.to_string() } else { t.trim_end_matches('.').to_string() }
+        }
     }
 }
 

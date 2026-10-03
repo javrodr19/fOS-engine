@@ -149,6 +149,10 @@ pub enum PropertyId {
     GridRowEnd,
     JustifyItems,
     JustifySelf,
+    MaskImage,
+    MaskSize,
+    MaskPosition,
+    MaskRepeat,
 }
 
 impl PropertyId {

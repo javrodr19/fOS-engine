@@ -614,6 +614,11 @@ pub struct BackgroundStyle {
     pub repeat: Arc<[(BackgroundRepeat, BackgroundRepeat)]>,
     pub position: Arc<[(Lp, Lp)]>,
     pub size: Arc<[BackgroundSize]>,
+    /// `mask-image` (one layer, a URL) and its size, position and repeat
+    pub mask: Option<Arc<str>>,
+    pub mask_size: BackgroundSize,
+    pub mask_position: (Lp, Lp),
+    pub mask_repeat: (BackgroundRepeat, BackgroundRepeat),
 }
 
 impl Default for BackgroundStyle {
@@ -624,6 +629,10 @@ impl Default for BackgroundStyle {
             repeat: Arc::from([(BackgroundRepeat::Repeat, BackgroundRepeat::Repeat)]),
             position: Arc::from([(Lp::ZERO, Lp::ZERO)]),
             size: Arc::from([BackgroundSize::Auto]),
+            mask: None,
+            mask_size: BackgroundSize::Auto,
+            mask_position: (Lp::ZERO, Lp::ZERO),
+            mask_repeat: (BackgroundRepeat::Repeat, BackgroundRepeat::Repeat),
         }
     }
 }
@@ -856,6 +865,50 @@ impl Style {
             LengthUnit::Ex => l.value * fs * 0.5,
         };
         Lp::px(px)
+    }
+
+    fn repeat_layers(v: &PropertyValue) -> Option<Vec<(BackgroundRepeat, BackgroundRepeat)>> {
+        let PropertyValue::List(layers) = v else { return None };
+        let r: Option<Vec<_>> = layers
+            .iter()
+            .map(|l| match l {
+                PropertyValue::List(p) if p.len() == 2 => match (&p[0], &p[1]) {
+                    (PropertyValue::Enum(x), PropertyValue::Enum(y)) => Some((BackgroundRepeat::from_u8(*x)?, BackgroundRepeat::from_u8(*y)?)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        r.filter(|r| !r.is_empty())
+    }
+
+    fn position_layers(&self, v: &PropertyValue, ctx: &StyleContext) -> Option<Vec<(Lp, Lp)>> {
+        let PropertyValue::List(layers) = v else { return None };
+        let p: Option<Vec<_>> = layers
+            .iter()
+            .map(|l| match l {
+                PropertyValue::List(p) if p.len() == 2 => Some((self.lp(&p[0], ctx)?, self.lp(&p[1], ctx)?)),
+                _ => None,
+            })
+            .collect();
+        p.filter(|p| !p.is_empty())
+    }
+
+    fn size_layers(&self, v: &PropertyValue, ctx: &StyleContext) -> Option<Vec<BackgroundSize>> {
+        let PropertyValue::List(layers) = v else { return None };
+        let s: Option<Vec<_>> = layers
+            .iter()
+            .map(|l| match l {
+                PropertyValue::Integer(1) => Some(BackgroundSize::Cover),
+                PropertyValue::Integer(2) => Some(BackgroundSize::Contain),
+                PropertyValue::List(p) if p.len() == 2 => {
+                    let (w, h) = (self.lp_auto(&p[0], ctx)?, self.lp_auto(&p[1], ctx)?);
+                    Some(if w.is_auto() && h.is_auto() { BackgroundSize::Auto } else { BackgroundSize::Explicit(w, h) })
+                }
+                _ => None,
+            })
+            .collect();
+        s.filter(|s| !s.is_empty())
     }
 
     /// A length-percentage in text (grid tracks), including resolved
@@ -1198,53 +1251,39 @@ impl Style {
                 }
             }
             PropertyId::BackgroundRepeat => {
-                if let PropertyValue::List(layers) = v {
-                    let r: Option<Vec<_>> = layers
-                        .iter()
-                        .map(|l| match l {
-                            PropertyValue::List(p) if p.len() == 2 => match (&p[0], &p[1]) {
-                                (PropertyValue::Enum(x), PropertyValue::Enum(y)) => Some((BackgroundRepeat::from_u8(*x)?, BackgroundRepeat::from_u8(*y)?)),
-                                _ => None,
-                            },
-                            _ => None,
-                        })
-                        .collect();
-                    if let Some(r) = r.filter(|r| !r.is_empty()) {
-                        set!(background, [repeat], Arc::from(r));
-                    }
+                if let Some(r) = Self::repeat_layers(v) {
+                    set!(background, [repeat], Arc::from(r));
                 }
             }
             PropertyId::BackgroundPosition => {
-                if let PropertyValue::List(layers) = v {
-                    let p: Option<Vec<_>> = layers
-                        .iter()
-                        .map(|l| match l {
-                            PropertyValue::List(p) if p.len() == 2 => Some((self.lp(&p[0], ctx)?, self.lp(&p[1], ctx)?)),
-                            _ => None,
-                        })
-                        .collect();
-                    if let Some(p) = p.filter(|p| !p.is_empty()) {
-                        set!(background, [position], Arc::from(p));
-                    }
+                if let Some(p) = self.position_layers(v, ctx) {
+                    set!(background, [position], Arc::from(p));
                 }
             }
             PropertyId::BackgroundSize => {
-                if let PropertyValue::List(layers) = v {
-                    let s: Option<Vec<_>> = layers
-                        .iter()
-                        .map(|l| match l {
-                            PropertyValue::Integer(1) => Some(BackgroundSize::Cover),
-                            PropertyValue::Integer(2) => Some(BackgroundSize::Contain),
-                            PropertyValue::List(p) if p.len() == 2 => {
-                                let (w, h) = (self.lp_auto(&p[0], ctx)?, self.lp_auto(&p[1], ctx)?);
-                                Some(if w.is_auto() && h.is_auto() { BackgroundSize::Auto } else { BackgroundSize::Explicit(w, h) })
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    if let Some(s) = s.filter(|s| !s.is_empty()) {
-                        set!(background, [size], Arc::from(s));
-                    }
+                if let Some(s) = self.size_layers(v, ctx) {
+                    set!(background, [size], Arc::from(s));
+                }
+            }
+            PropertyId::MaskImage => {
+                if let PropertyValue::Images(images) = v {
+                    let url = images.iter().find_map(|i| if let Image::Url(u) = i { Some(u.clone()) } else { None });
+                    set!(background, [mask], url);
+                }
+            }
+            PropertyId::MaskRepeat => {
+                if let Some(r) = Self::repeat_layers(v).and_then(|r| r.into_iter().next()) {
+                    set!(background, [mask_repeat], r);
+                }
+            }
+            PropertyId::MaskPosition => {
+                if let Some(p) = self.position_layers(v, ctx).and_then(|p| p.into_iter().next()) {
+                    set!(background, [mask_position], p);
+                }
+            }
+            PropertyId::MaskSize => {
+                if let Some(sz) = self.size_layers(v, ctx).and_then(|sz| sz.into_iter().next()) {
+                    set!(background, [mask_size], sz);
                 }
             }
 
@@ -1455,6 +1494,10 @@ impl Style {
             PropertyId::BackgroundRepeat => copy!(background, [repeat]),
             PropertyId::BackgroundPosition => copy!(background, [position]),
             PropertyId::BackgroundSize => copy!(background, [size]),
+            PropertyId::MaskImage => copy!(background, [mask]),
+            PropertyId::MaskSize => copy!(background, [mask_size]),
+            PropertyId::MaskPosition => copy!(background, [mask_position]),
+            PropertyId::MaskRepeat => copy!(background, [mask_repeat]),
             PropertyId::Color => copy!(inherited, [color]),
             PropertyId::FontFamily => copy!(inherited, [font_family]),
             PropertyId::FontSize => copy!(inherited, [font_size]),

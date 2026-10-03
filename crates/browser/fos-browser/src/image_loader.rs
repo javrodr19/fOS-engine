@@ -185,10 +185,16 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
 
 /// Fetch and decode the images of `page` (in parallel, through the HTTP
 /// cache), keeping those in `previous` that are still used
-pub fn load_for_page(network: &mut crate::network::NetworkManager, page: &crate::page::Page, viewport_w: f32, previous: &Images) -> Images {
+/// (`css_urls` are images the page's CSS uses: backgrounds and masks)
+pub fn load_for_page(network: &mut crate::network::NetworkManager, page: &crate::page::Page, viewport_w: f32, previous: &Images, css_urls: &[String]) -> Images {
     use crate::loader::Loader;
     let Some(doc) = page.document() else { return Default::default() };
-    let urls = image_urls(&doc.lock().unwrap_or_else(|p| p.into_inner()), viewport_w);
+    let mut urls = image_urls(&doc.lock().unwrap_or_else(|p| p.into_inner()), viewport_w);
+    for u in css_urls {
+        if !urls.contains(u) && urls.len() < MAX_IMAGES * 2 {
+            urls.push(u.clone());
+        }
+    }
     let mut images: HashMap<String, Arc<LoadedImage>> = HashMap::new();
     let mut missing = Vec::new();
     for url in urls {

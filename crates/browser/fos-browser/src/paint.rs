@@ -33,6 +33,10 @@ pub struct Painter<'a> {
     /// Fixed boxes may sit inside boxes scrolled out of view: layers are
     /// then looked for everywhere
     find_fixed: bool,
+    /// Loaded images (CSS backgrounds and masks), and the URL relative
+    /// ones resolve against
+    images: Option<&'a std::collections::HashMap<String, std::sync::Arc<crate::image_loader::LoadedImage>>>,
+    base: &'a str,
 }
 
 /// A device-space clip rectangle: x0, y0, x1, y1
@@ -167,7 +171,14 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "" }
+    }
+
+    /// Images for CSS `url()`s
+    pub fn with_images(mut self, images: &'a crate::image_loader::Images, base: &'a str) -> Self {
+        self.images = Some(&**images);
+        self.base = base;
+        self
     }
 
     /// The page has fixed boxes
@@ -319,6 +330,11 @@ impl<'a> Painter<'a> {
         if b.style.inherited.visibility != Visibility::Visible {
             return;
         }
+        if let Some(url) = &b.style.background.mask {
+            // Only what the mask lets through shows
+            self.masked_background(b, url, clip, alpha);
+            return;
+        }
         if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
             self.background(b, clip, alpha);
         } else {
@@ -382,53 +398,41 @@ impl<'a> Painter<'a> {
 
     /// Gradient layers, bottom first (`url()` images come with image
     /// loading)
+    /// A loaded CSS image by its (possibly relative) URL
+    fn css_image(&self, url: &str) -> Option<&'a crate::image_loader::LoadedImage> {
+        let images = self.images?;
+        images.get(url).or_else(|| images.get(&fos_net::url_util::resolve(self.base, url))).map(|i| &**i)
+    }
+
+    /// Background layers (gradients and images), bottom first
     fn background_images(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
         let bg = &b.style.background;
         if bg.images.is_empty() {
             return;
         }
         let border_box = self.dev(b.border_box);
-        let area = {
-            let p = b.padding_box();
-            self.dev(p)
-        };
+        let area = self.dev(b.padding_box());
         let rad = radii(b, border_box);
-        let shape = rounded_path(border_box, rad);
+        let shape = rad.iter().any(|c| c.0 > 0.0).then(|| rounded_path(border_box, rad)).flatten();
         let n = bg.images.len();
         for i in (0..n).rev() {
             let image = &bg.images[i];
-            if matches!(image, Image::None | Image::Url(_)) {
-                continue;
-            }
+            let loaded = match image {
+                Image::None => continue,
+                Image::Url(u) => match self.css_image(u) {
+                    Some(img) => Some(img),
+                    None => continue,
+                },
+                _ => None,
+            };
             let size = bg.size.get(i % bg.size.len().max(1)).copied().unwrap_or_default();
             let pos = bg.position.get(i % bg.position.len().max(1)).copied().unwrap_or((Lp::ZERO, Lp::ZERO));
             let repeat = bg.repeat.get(i % bg.repeat.len().max(1)).copied().unwrap_or((BackgroundRepeat::Repeat, BackgroundRepeat::Repeat));
-            let (tw, th) = match size {
-                BackgroundSize::Auto | BackgroundSize::Cover | BackgroundSize::Contain => (area.w, area.h),
-                BackgroundSize::Explicit(w, h) => (w.resolve(area.w).unwrap_or(area.w), h.resolve(area.h).unwrap_or(area.h)),
-            };
+            let (tw, th) = tile_size(size, area, loaded.map(|l| l.natural));
             if tw < 0.5 || th < 0.5 {
                 continue;
             }
-            let x0 = area.x + pos.0.resolve(area.w - tw);
-            let y0 = area.y + pos.1.resolve(area.h - th);
-            let tiles = |start: f32, len: f32, lo: f32, hi: f32, rep: BackgroundRepeat| -> Vec<f32> {
-                if rep == BackgroundRepeat::NoRepeat || len <= 0.0 {
-                    return vec![start];
-                }
-                let first = start - ((start - lo) / len).ceil() * len;
-                let mut v = Vec::new();
-                let mut p = first;
-                while p < hi && v.len() < 512 {
-                    v.push(p);
-                    p += len;
-                }
-                v
-            };
-            let rx = matches!(repeat.0, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX | BackgroundRepeat::Space | BackgroundRepeat::Round);
-            let ry = matches!(repeat.1, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY | BackgroundRepeat::Space | BackgroundRepeat::Round);
-            let xs = tiles(x0, tw, border_box.x, border_box.right(), if rx { BackgroundRepeat::Repeat } else { BackgroundRepeat::NoRepeat });
-            let ys = tiles(y0, th, border_box.y, border_box.bottom(), if ry { BackgroundRepeat::Repeat } else { BackgroundRepeat::NoRepeat });
+            let (xs, ys) = tile_positions(area, border_box, (tw, th), pos, repeat);
             let painting_clip = clip.intersect(border_box);
             for &ty in &ys {
                 if ty > painting_clip.0[3] || ty + th < painting_clip.0[1] {
@@ -436,14 +440,24 @@ impl<'a> Painter<'a> {
                 }
                 for &tx in &xs {
                     let tile = Rect::new(tx, ty, tw, th);
-                    let Some(shader) = gradient_shader(image, tile, alpha) else { continue };
+                    let shader = match loaded {
+                        Some(img) => {
+                            let pm = &img.pixmap;
+                            let t = Transform::from_row(tw / pm.width() as f32, 0.0, 0.0, th / pm.height() as f32, tx, ty);
+                            tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, alpha, t)
+                        }
+                        None => match gradient_shader(image, tile, alpha) {
+                            Some(s) => s,
+                            None => continue,
+                        },
+                    };
                     let mut paint = Paint::default();
                     paint.shader = shader;
                     paint.anti_alias = true;
                     let tile_clip = painting_clip.intersect(tile);
                     match &shape {
-                        Some(path) if rad.iter().any(|c| c.0 > 0.0) => self.fill(path, &paint, FillRule::Winding, tile_clip),
-                        _ => {
+                        Some(path) => self.fill(path, &paint, FillRule::Winding, tile_clip),
+                        None => {
                             if let Some(path) = rounded_path(tile, [(0.0, 0.0); 4]) {
                                 self.fill(&path, &paint, FillRule::Winding, tile_clip);
                             }
@@ -452,6 +466,50 @@ impl<'a> Painter<'a> {
                 }
             }
         }
+    }
+
+    /// A masked box's background color shaped by its mask image (icons);
+    /// false when the mask is not loaded (the box is then invisible)
+    fn masked_background(&mut self, b: &BoxFragment, url: &str, clip: Clip, alpha: f32) -> bool {
+        let Some(img) = self.css_image(url) else { return false };
+        let bg = &b.style.background;
+        let color = if bg.color.a > 0 { bg.color } else { return true };
+        let border_box = self.dev(b.border_box);
+        let area = self.dev(b.padding_box());
+        let (tw, th) = tile_size(bg.mask_size, area, Some(img.natural));
+        if tw < 0.5 || th < 0.5 || tw > 4096.0 || th > 4096.0 {
+            return true;
+        }
+        // The tile: the mask's alpha as coverage of the color
+        let (pw, ph) = (tw.ceil() as u32, th.ceil() as u32);
+        let Some(mut tile_pm) = tiny_skia::Pixmap::new(pw, ph) else { return true };
+        let pm = &img.pixmap;
+        let scale = Transform::from_scale(tw / pm.width() as f32, th / pm.height() as f32);
+        tile_pm.draw_pixmap(0, 0, pm.as_ref(), &tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() }, scale, None);
+        let c = skia_color(color, alpha).premultiply().to_color_u8();
+        for px in tile_pm.pixels_mut() {
+            let a = px.alpha() as u32;
+            let f = |v: u8| ((v as u32 * a + 127) / 255) as u8;
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(f(c.red()), f(c.green()), f(c.blue()), f(c.alpha())).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
+        let (xs, ys) = tile_positions(area, border_box, (tw, th), bg.mask_position, bg.mask_repeat);
+        let painting_clip = clip.intersect(border_box);
+        for &ty in &ys {
+            for &tx in &xs {
+                let tile = Rect::new(tx, ty, tw, th);
+                let vis = painting_clip.intersect(tile);
+                if vis.is_empty() {
+                    continue;
+                }
+                let t = Transform::from_row(tw / pw as f32, 0.0, 0.0, th / ph as f32, tx, ty);
+                let mut paint = Paint::default();
+                paint.shader = tiny_skia::Pattern::new(tile_pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, t);
+                if let (Some(rect), Some(mut canvas)) = (tiny_skia::Rect::from_ltrb(vis.0[0], vis.0[1], vis.0[2], vis.0[3]), self.canvas.pixmap_mut()) {
+                    canvas.fill_rect(rect, &paint, Transform::identity(), None);
+                }
+            }
+        }
+        true
     }
 
     fn border(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
@@ -739,6 +797,57 @@ fn is_axis_rect(path: &Path) -> bool {
         let corners = (0..4).all(|i| (0..i).all(|j| (pts[i].x - pts[j].x).abs() > 1e-3 || (pts[i].y - pts[j].y).abs() > 1e-3));
         distinct(&xs) == 2 && distinct(&ys) == 2 && corners
     }
+}
+
+/// A background layer's tile size in a positioning `area`: images of
+/// natural size `natural` keep their ratio; gradients fill the area
+fn tile_size(size: BackgroundSize, area: Rect, natural: Option<(f32, f32)>) -> (f32, f32) {
+    match natural {
+        None => match size {
+            BackgroundSize::Auto | BackgroundSize::Cover | BackgroundSize::Contain => (area.w, area.h),
+            BackgroundSize::Explicit(w, h) => (w.resolve(area.w).unwrap_or(area.w), h.resolve(area.h).unwrap_or(area.h)),
+        },
+        Some((nw, nh)) if nw > 0.0 && nh > 0.0 => match size {
+            BackgroundSize::Auto => (nw, nh),
+            BackgroundSize::Cover => {
+                let s = (area.w / nw).max(area.h / nh);
+                (nw * s, nh * s)
+            }
+            BackgroundSize::Contain => {
+                let s = (area.w / nw).min(area.h / nh);
+                (nw * s, nh * s)
+            }
+            BackgroundSize::Explicit(w, h) => match (w.resolve(area.w), h.resolve(area.h)) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w * nh / nw),
+                (None, Some(h)) => (h * nw / nh, h),
+                (None, None) => (nw, nh),
+            },
+        },
+        Some(_) => (0.0, 0.0),
+    }
+}
+
+/// Where a layer's tiles go: x and y positions covering `paint_area`
+fn tile_positions(area: Rect, paint_area: Rect, (tw, th): (f32, f32), pos: (Lp, Lp), repeat: (BackgroundRepeat, BackgroundRepeat)) -> (Vec<f32>, Vec<f32>) {
+    let x0 = area.x + pos.0.resolve(area.w - tw);
+    let y0 = area.y + pos.1.resolve(area.h - th);
+    let tiles = |start: f32, len: f32, lo: f32, hi: f32, rep: bool| -> Vec<f32> {
+        if !rep || len <= 0.0 {
+            return vec![start];
+        }
+        let first = start - ((start - lo) / len).ceil() * len;
+        let mut v = Vec::new();
+        let mut p = first;
+        while p < hi && v.len() < 512 {
+            v.push(p);
+            p += len;
+        }
+        v
+    };
+    let rx = matches!(repeat.0, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX | BackgroundRepeat::Space | BackgroundRepeat::Round);
+    let ry = matches!(repeat.1, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY | BackgroundRepeat::Space | BackgroundRepeat::Round);
+    (tiles(x0, tw, paint_area.x, paint_area.right(), rx), tiles(y0, th, paint_area.y, paint_area.bottom(), ry))
 }
 
 /// Stops as fractions along a gradient line of length `len`, positions

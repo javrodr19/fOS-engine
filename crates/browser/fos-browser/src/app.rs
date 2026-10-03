@@ -299,7 +299,8 @@ impl BrowserApp {
         let width = self.content_width() as f32;
         let Some(page) = self.current_page.as_ref() else { return };
         let previous = self.renderer.images().clone();
-        let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous);
+        let css_urls = self.renderer.css_image_urls();
+        let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous, &css_urls);
         if !Arc::ptr_eq(&images, &previous) {
             self.renderer.set_images(images);
             self.rerender_at(self.render_start_y);

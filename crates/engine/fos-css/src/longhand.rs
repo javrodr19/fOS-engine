@@ -53,6 +53,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "border-left" => &[BorderLeftWidth, BorderLeftStyle, BorderLeftColor],
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "background" => &[BackgroundColor, BackgroundImage, BackgroundRepeat, BackgroundPosition, BackgroundSize],
+        "mask" => &[MaskImage, MaskRepeat, MaskPosition, MaskSize],
         "font" => &[FontStyle, FontWeight, FontSize, LineHeight, FontFamily],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
@@ -83,6 +84,11 @@ fn physical(name: &str) -> &str {
         "padding-block-end" => "padding-bottom",
         "padding-inline-start" => "padding-left",
         "padding-inline-end" => "padding-right",
+        "-webkit-mask" => "mask",
+        "-webkit-mask-image" => "mask-image",
+        "-webkit-mask-size" => "mask-size",
+        "-webkit-mask-position" => "mask-position",
+        "-webkit-mask-repeat" => "mask-repeat",
         "inset-block-start" => "top",
         "inset-block-end" => "bottom",
         "inset-inline-start" => "left",
@@ -231,6 +237,10 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "grid-row-end" => GridRowEnd,
         "justify-items" => JustifyItems,
         "justify-self" => JustifySelf,
+        "mask-image" => MaskImage,
+        "mask-size" => MaskSize,
+        "mask-position" => MaskPosition,
+        "mask-repeat" => MaskRepeat,
         _ => return None,
     })
 }
@@ -322,6 +332,27 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
         }
         "background" => {
             background_shorthand(value.trim(), important, out);
+            true
+        }
+        "mask" => {
+            // A background layer without color; mask modes, origins and
+            // compositing keywords do not change what is drawn here
+            let layer: Vec<&str> = components(value.trim())
+                .into_iter()
+                .filter(|c| !matches!(c.to_ascii_lowercase().as_str(), "alpha" | "luminance" | "match-source" | "add" | "subtract" | "intersect" | "exclude" | "no-clip" | "border-box" | "padding-box" | "content-box" | "fill-box" | "stroke-box" | "view-box"))
+                .collect();
+            let mut tmp = Vec::new();
+            background_shorthand(&layer.join(" "), important, &mut tmp);
+            for d in tmp {
+                let id = match d.property {
+                    PropertyId::BackgroundImage => PropertyId::MaskImage,
+                    PropertyId::BackgroundRepeat => PropertyId::MaskRepeat,
+                    PropertyId::BackgroundPosition => PropertyId::MaskPosition,
+                    PropertyId::BackgroundSize => PropertyId::MaskSize,
+                    _ => continue,
+                };
+                push(out, id, d.value, important);
+            }
             true
         }
         "font" => {
@@ -515,10 +546,10 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
                 _ => None,
             }
         }
-        P::BackgroundImage => background_images(raw).map(|i| PropertyValue::Images(Arc::from(i))),
-        P::BackgroundRepeat => layers(v, background_repeat),
-        P::BackgroundPosition => layers(v, |l| background_position(&components(l))),
-        P::BackgroundSize => layers(v, background_size),
+        P::BackgroundImage | P::MaskImage => background_images(raw).map(|i| PropertyValue::Images(Arc::from(i))),
+        P::BackgroundRepeat | P::MaskRepeat => layers(v, background_repeat),
+        P::BackgroundPosition | P::MaskPosition => layers(v, |l| background_position(&components(l))),
+        P::BackgroundSize | P::MaskSize => layers(v, background_size),
         P::FontFamily => font_family(raw),
         P::FontSize => font_size(v),
         P::FontWeight => match v {
@@ -1385,6 +1416,18 @@ mod tests {
         let mut s = Style::inherit_from(&parent);
         s.cascade(&refs, &parent, &StyleContext::default(), &mut crate::values::ResolveCache::default());
         s
+    }
+
+    #[test]
+    fn masks_compute() {
+        let s = computed("-webkit-mask: url(icon.svg) no-repeat center / 20px 20px; background-color: red");
+        let b = &s.background;
+        assert_eq!(b.mask.as_deref(), Some("icon.svg"));
+        assert_eq!(b.mask_repeat, (BackgroundRepeat::NoRepeat, BackgroundRepeat::NoRepeat));
+        assert_eq!(b.mask_position, (Lp::pct(50.0), Lp::pct(50.0)));
+        assert_eq!(b.mask_size, BackgroundSize::Explicit(LpAuto::Lp(Lp::px(20.0)), LpAuto::Lp(Lp::px(20.0))));
+        let s = computed("mask-image: url(a.svg); mask-size: contain");
+        assert_eq!((s.background.mask.as_deref(), s.background.mask_size), (Some("a.svg"), BackgroundSize::Contain));
     }
 
     #[test]

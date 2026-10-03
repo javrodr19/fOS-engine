@@ -80,6 +80,10 @@ pub struct PageLayout {
     background_box: Option<NodeId>,
     /// Some box is `position: fixed` (scrolling must repaint it)
     has_fixed: bool,
+    /// The images the page's CSS uses (absolute URLs)
+    css_images: Vec<String>,
+    /// What relative CSS URLs (inline styles) resolve against
+    base: String,
 }
 
 impl PageLayout {
@@ -342,6 +346,11 @@ impl PageRenderer {
         Some(page)
     }
 
+    /// Images the current layout's CSS uses (backgrounds, masks)
+    pub fn css_image_urls(&self) -> Vec<String> {
+        self.cached.as_ref().map(|c| c.layout.css_images.clone()).unwrap_or_default()
+    }
+
     /// Use `images` for the page's images (fetched by the browser); the
     /// layout is redone if they changed
     pub fn set_images(&mut self, images: crate::image_loader::Images) {
@@ -455,7 +464,7 @@ impl PageRenderer {
     fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
         let bg = layout.background;
         let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
-        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed);
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base);
         painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
     }
@@ -626,12 +635,22 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images
     let body = document.body();
     let (background, background_box) = crate::paint::canvas_background(&fragments, |b| b.node == body);
     let mut has_fixed = false;
+    let base = crate::css_loader::base_url(document);
+    let mut css_images: Vec<String> = Vec::new();
     fragments.for_each(|f| {
         if let Fragment::Box(b) = f {
             has_fixed |= b.style.box_.position == fos_css::style::Position::Fixed;
+            let bg = &b.style.background;
+            let urls = bg.images.iter().filter_map(|i| if let fos_css::style::Image::Url(u) = i { Some(u) } else { None }).chain(bg.mask.iter());
+            for u in urls {
+                let abs = fos_net::url_util::resolve(&base, u);
+                if !css_images.contains(&abs) && css_images.len() < 400 {
+                    css_images.push(abs);
+                }
+            }
         }
     });
-    PageLayout { fragments, links, anchors, background, background_box, has_fixed }
+    PageLayout { fragments, links, anchors, background, background_box, has_fixed, css_images, base }
 }
 
 #[cfg(test)]

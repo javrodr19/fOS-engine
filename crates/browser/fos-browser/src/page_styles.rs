@@ -113,10 +113,12 @@ impl PageStyles {
         };
         let mut skipped = 0;
         for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
+            // Matching needs only the compiled selectors from here on
+            let selectors = std::mem::take(&mut rule.selectors);
             if rule.declarations.is_empty() {
                 continue;
             }
-            for selector in &mut rule.selectors {
+            for mut selector in selectors {
                 // Browsers drop selectors they cannot parse
                 let Some(list) = selector.parsed.take().or_else(|| SelectorList::parse(&selector.text)) else {
                     skipped += 1;
@@ -151,6 +153,14 @@ impl PageStyles {
         }
         if skipped > 0 {
             log::debug!("Skipped {skipped} unsupported selectors");
+        }
+        styles.selectors.shrink_to_fit();
+        styles.universal.shrink_to_fit();
+        for m in [&mut styles.by_id, &mut styles.by_class, &mut styles.by_tag, &mut styles.by_attr] {
+            for v in m.values_mut() {
+                v.shrink_to_fit();
+            }
+            m.shrink_to_fit();
         }
         styles.stylesheet = stylesheet;
         styles

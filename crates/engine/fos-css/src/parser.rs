@@ -241,7 +241,10 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
         // Rules are kept even when none of their declarations is modeled
         // (the stylesheet mirrors the source); matching skips them
         if !selectors.is_empty() {
-            let declarations = parse_declarations(block);
+            let mut declarations = parse_declarations(block);
+            declarations.shrink_to_fit();
+            let mut selectors = selectors;
+            selectors.shrink_to_fit();
             out.push(Rule { selectors, declarations });
         }
     }

@@ -510,6 +510,7 @@ impl Parser<'_> {
         loop {
             self.ws();
             if !self.eat(b',') {
+                out.shrink_to_fit();
                 return Some(SelectorList(out));
             }
             out.push(self.complex()?);
@@ -635,6 +636,10 @@ impl Parser<'_> {
             }
             any = true;
         }
+        // Stylesheets keep thousands of these: no spare capacity
+        c.classes.shrink_to_fit();
+        c.attrs.shrink_to_fit();
+        c.pseudos.shrink_to_fit();
         any.then_some(c)
     }
 

@@ -1083,6 +1083,35 @@ mod tests {
     }
 
     #[test]
+    fn test_transforms_paint_and_hit() {
+        let html = r#"<html><body style="margin:0">
+            <div style="position: relative; height: 100px">
+              <div id="c" style="position: absolute; left: 50%; top: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); background: red"></div>
+              <div id="r" style="position: absolute; left: 20px; top: 20px; width: 20px; height: 20px; transform: rotate(45deg); background: blue"></div>
+              <div id="s" style="margin-left: 150px; width: 10px; height: 10px; scale: 2; transform-origin: 0 0; background: lime"></div>
+            </div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let id = |s: &str| document.get_element_by_id(s);
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // Centered by translate(-50%, -50%): 90..110 x 40..60
+        assert_eq!(px(100, 50), 0xffff0000);
+        assert_eq!(px(91, 41), 0xffff0000);
+        assert_ne!(px(112, 50), 0xffff0000);
+        assert_eq!(renderer.node_at(92.0, 42.0), id("c"));
+        // Rotated: a diamond around (30, 30) reaching y = 16
+        assert_eq!(px(30, 30), 0xff0000ff);
+        assert_eq!(px(30, 18), 0xff0000ff);
+        assert_ne!(px(21, 21), 0xff0000ff);
+        assert_eq!(renderer.node_at(30.0, 17.5), id("r"));
+        assert_ne!(renderer.node_at(21.0, 21.0), id("r"));
+        // Scaled from its top-left corner to 20px
+        assert_eq!(px(168, 18), 0xff00ff00);
+        assert_eq!(renderer.node_at(168.0, 18.0), id("s"));
+    }
+
+    #[test]
     fn test_inline_svg_is_drawn() {
         let html = r#"<html><body style="margin:0; color: #f00">
             <svg width="20" height="20" viewBox="0 0 10 10"><rect width="10" height="10" fill="currentColor"/></svg><br>

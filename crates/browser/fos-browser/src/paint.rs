@@ -46,6 +46,8 @@ pub struct Painter<'a> {
     /// The visible part (top, height) of the scroll container being
     /// painted, which sticky boxes stick within
     view: (f32, f32),
+    /// The box whose transform is being applied (painted plainly)
+    untransformed: usize,
 }
 
 /// Where painting is: origin, dx and view
@@ -187,7 +189,7 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0) }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0 }
     }
 
     /// Images for CSS `url()`s
@@ -318,9 +320,74 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// A positioned box paints as a layer of its stacking context
+    /// A positioned or transformed box paints as a layer of its stacking
+    /// context
     fn is_layer(b: &BoxFragment) -> bool {
-        b.style.is_positioned() && b.kind != BoxFragmentKind::Placeholder
+        (b.style.is_positioned() || b.style.has_transform()) && b.kind != BoxFragmentKind::Placeholder
+    }
+
+    /// Paint `b` through its transform `m` (document coordinates): moved,
+    /// when it only translates; otherwise drawn offscreen and mapped
+    fn paint_transformed(&mut self, b: &BoxFragment, m: fos_css::transform::Matrix, clip: Clip, alpha: f32) {
+        use fos_css::transform::multiply;
+        let key = b as *const BoxFragment as usize;
+        let prev = std::mem::replace(&mut self.untransformed, key);
+        if m[..4] == [1.0, 0.0, 0.0, 1.0] {
+            let saved = (self.origin, self.dx);
+            self.origin -= m[5];
+            self.dx += m[4];
+            self.paint_layer(b, clip, alpha);
+            (self.origin, self.dx) = saved;
+            self.untransformed = prev;
+            return;
+        }
+        // Device space: document x + dx, y - origin
+        let to_dev = [1.0, 0.0, 0.0, 1.0, self.dx, -self.origin];
+        let from_dev = [1.0, 0.0, 0.0, 1.0, -self.dx, self.origin];
+        let d = multiply(to_dev, multiply(m, from_dev));
+        let ink = self.dev(b.ink);
+        let painted = self.dev(b.transformed_ink());
+        let (w, h) = (ink.w.ceil(), ink.h.ceil());
+        let off_screen = painted.bottom() < clip.0[1] || painted.y > clip.0[3] || painted.right() < clip.0[0] || painted.x > clip.0[2];
+        // Huge or degenerate boxes are painted untransformed
+        if off_screen || !(w >= 1.0 && h >= 1.0) || w * h > 16_000_000.0 || w > 8192.0 || h > 8192.0 {
+            if !off_screen {
+                self.paint_layer(b, clip, alpha);
+            }
+            self.untransformed = prev;
+            return;
+        }
+        let Some(mut off) = Canvas::new(w as u32, h as u32) else {
+            self.untransformed = prev;
+            return;
+        };
+        {
+            let mut p = Painter {
+                canvas: &mut off,
+                text: &mut *self.text,
+                origin: b.ink.y,
+                mask: None,
+                canvas_background_box: self.canvas_background_box,
+                scroll: self.scroll,
+                find_fixed: self.find_fixed,
+                images: self.images,
+                base: self.base,
+                canvases: self.canvases,
+                box_scroll: self.box_scroll,
+                dx: -b.ink.x,
+                view: self.view,
+                untransformed: key,
+            };
+            p.paint_layer(b, Clip([0.0, 0.0, w, h]), alpha);
+        }
+        let t = Transform::from_row(d[0], d[1], d[2], d[3], d[4], d[5]).pre_translate(ink.x, ink.y);
+        let full = clip.contains(Rect::new(0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32));
+        let mask = if full { None } else { self.mask_for(clip).cloned() };
+        let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+        if let Some(mut pm) = self.canvas.pixmap_mut() {
+            pm.draw_pixmap(0, 0, off.pixmap(), &paint, t, mask.as_ref());
+        }
+        self.untransformed = prev;
     }
 
     /// Paint a box as a layer (CSS 2.1 Appendix E, simplified): its
@@ -340,6 +407,11 @@ impl<'a> Painter<'a> {
             self.scroll = saved - self.origin;
             (self.origin, self.view) = (saved, view);
             return;
+        }
+        if self.untransformed != b as *const BoxFragment as usize {
+            if let Some(m) = b.transform() {
+                return self.paint_transformed(b, m, clip, alpha);
+            }
         }
         if self.culled(b, clip) {
             return;

@@ -81,6 +81,10 @@ pub enum PropertyId {
     // Transform
     Transform,
     TransformOrigin,
+    /// The individual `translate`, `rotate` and `scale` properties
+    Translate,
+    Rotate,
+    Scale,
     
     // Transition & Animation
     Transition,
@@ -302,6 +306,8 @@ pub enum PropertyValue {
     Grid(std::sync::Arc<str>),
     /// `content`: what a `::before`/`::after` box shows (empty: none)
     Content(std::sync::Arc<[crate::style::ContentItem]>),
+    /// A transform property's (validated) text, computed per element
+    Transform(std::sync::Arc<str>),
 }
 
 /// CSS keyword values

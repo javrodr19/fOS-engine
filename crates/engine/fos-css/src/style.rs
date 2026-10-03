@@ -541,6 +541,13 @@ pub struct BoxStyle {
     pub grid: crate::grid::GridStyle,
     /// What a `::before`/`::after` box shows (`None`: none or normal)
     pub content: Option<Arc<[ContentItem]>>,
+    /// `transform` functions (`None`: none)
+    pub transform: Option<Arc<[crate::transform::TransformFn]>>,
+    pub transform_origin: (Lp, Lp),
+    /// The individual `translate`, `rotate` (radians) and `scale`
+    pub translate: Option<(Lp, Lp)>,
+    pub rotate: Option<f32>,
+    pub scale: Option<(f32, f32)>,
     pub text_decoration_line: u8,
     /// `None` is currentcolor
     pub text_decoration_color: Option<Color>,
@@ -586,6 +593,11 @@ impl Default for BoxStyle {
             table_layout: TableLayout::Auto,
             grid: Default::default(),
             content: None,
+            transform: None,
+            transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
+            translate: None,
+            rotate: None,
+            scale: None,
             text_decoration_line: 0,
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
@@ -764,6 +776,39 @@ impl Style {
         self.box_.position != Position::Static
     }
 
+    /// The element's transform for a border box at (x, y), w × h, in the
+    /// same coordinates; `None` when it has none
+    pub fn transform_matrix(&self, x: f32, y: f32, w: f32, h: f32) -> Option<crate::transform::Matrix> {
+        use crate::transform::{multiply, TransformFn, IDENTITY};
+        let b = &self.box_;
+        if b.transform.is_none() && b.translate.is_none() && b.rotate.is_none() && b.scale.is_none() {
+            return None;
+        }
+        let (ox, oy) = (x + b.transform_origin.0.resolve(w), y + b.transform_origin.1.resolve(h));
+        let mut m = [1.0, 0.0, 0.0, 1.0, ox, oy];
+        if let Some((tx, ty)) = b.translate {
+            m = multiply(m, TransformFn::Translate(tx, ty).matrix(w, h));
+        }
+        if let Some(r) = b.rotate {
+            m = multiply(m, TransformFn::Rotate(r).matrix(w, h));
+        }
+        if let Some((sx, sy)) = b.scale {
+            m = multiply(m, TransformFn::Scale(sx, sy).matrix(w, h));
+        }
+        for f in b.transform.iter().flat_map(|t| t.iter()) {
+            m = multiply(m, f.matrix(w, h));
+        }
+        let m = multiply(m, [1.0, 0.0, 0.0, 1.0, -ox, -oy]);
+        (m != IDENTITY).then_some(m)
+    }
+
+    /// Has a transform (which makes it a stacking context and a
+    /// containing block)
+    pub fn has_transform(&self) -> bool {
+        let b = &self.box_;
+        b.transform.is_some() || b.translate.is_some() || b.rotate.is_some() || b.scale.is_some()
+    }
+
     pub fn is_out_of_flow(&self) -> bool {
         matches!(self.box_.position, Position::Absolute | Position::Fixed)
     }
@@ -775,7 +820,7 @@ impl Style {
 
     /// Establishes a stacking context
     pub fn is_stacking_context(&self) -> bool {
-        (self.is_positioned() && self.box_.z_index.is_some()) || self.box_.opacity < 1.0 || matches!(self.box_.position, Position::Fixed | Position::Sticky)
+        (self.is_positioned() && self.box_.z_index.is_some()) || self.box_.opacity < 1.0 || matches!(self.box_.position, Position::Fixed | Position::Sticky) || self.has_transform()
     }
 
     /// Apply an element's declarations in cascade order (lowest priority
@@ -1152,6 +1197,37 @@ impl Style {
                     }
                 }
             }
+            PropertyId::Transform | PropertyId::TransformOrigin | PropertyId::Translate | PropertyId::Rotate | PropertyId::Scale => {
+                let PropertyValue::Transform(text) = v else { return };
+                let len = |t: &str| self.lp_text(t, ctx);
+                match id {
+                    PropertyId::Transform => {
+                        if let Some(list) = crate::transform::parse_list(text, &len) {
+                            set!(box_, [transform], (!list.is_empty()).then(|| Arc::from(list)));
+                        }
+                    }
+                    PropertyId::TransformOrigin => {
+                        if let Some(o) = crate::transform::parse_origin(text, &len) {
+                            set!(box_, [transform_origin], o);
+                        }
+                    }
+                    PropertyId::Translate => {
+                        if let Some(t) = crate::transform::parse_translate(text, &len) {
+                            set!(box_, [translate], t);
+                        }
+                    }
+                    PropertyId::Rotate => {
+                        if let Some(r) = crate::transform::parse_rotate(text) {
+                            set!(box_, [rotate], r);
+                        }
+                    }
+                    _ => {
+                        if let Some(sc) = crate::transform::parse_scale(text) {
+                            set!(box_, [scale], sc);
+                        }
+                    }
+                }
+            }
             PropertyId::Content => {
                 if let PropertyValue::Content(items) = v {
                     set!(box_, [content], (!items.is_empty()).then(|| items.clone()));
@@ -1476,6 +1552,11 @@ impl Style {
             PropertyId::GridTemplateRows => copy!(box_, [grid.template_rows]),
             PropertyId::GridTemplateAreas => copy!(box_, [grid.areas]),
             PropertyId::Content => copy!(box_, [content]),
+            PropertyId::Transform => copy!(box_, [transform]),
+            PropertyId::TransformOrigin => copy!(box_, [transform_origin]),
+            PropertyId::Translate => copy!(box_, [translate]),
+            PropertyId::Rotate => copy!(box_, [rotate]),
+            PropertyId::Scale => copy!(box_, [scale]),
             PropertyId::GridAutoColumns => copy!(box_, [grid.auto_columns]),
             PropertyId::GridAutoRows => copy!(box_, [grid.auto_rows]),
             PropertyId::GridAutoFlow => {

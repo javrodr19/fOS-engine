@@ -181,6 +181,29 @@ impl BoxFragment {
 
     /// Recompute the ink rectangle from the children (a box that clips
     /// keeps its overflow inside: its ink is its own box)
+    /// The box's transform, in document coordinates
+    pub fn transform(&self) -> Option<fos_css::transform::Matrix> {
+        // Transforms apply to block-level and atomic boxes, not inline ones
+        if !self.style.has_transform() || self.kind == BoxFragmentKind::InlinePart {
+            return None;
+        }
+        let r = self.border_box;
+        self.style.transform_matrix(r.x, r.y, r.w, r.h)
+    }
+
+    /// Its ink as painted: the bounds of its transformed ink
+    pub fn transformed_ink(&self) -> Rect {
+        let Some(m) = self.transform() else { return self.ink };
+        let r = self.ink;
+        let pts = [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())].map(|p| fos_css::transform::apply(m, p));
+        let (x0, x1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
+        let (y0, y1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.1), b.max(p.1)));
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return r;
+        }
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
+    }
+
     pub fn update_ink(&mut self) {
         let mut ink = self.border_box;
         if self.style.clips() && self.kind != BoxFragmentKind::InlinePart {
@@ -267,9 +290,10 @@ impl Fragment {
         }
     }
 
+    /// What the fragment covers as painted (through its transform)
     pub fn ink(&self) -> Rect {
         match self {
-            Fragment::Box(b) => b.ink,
+            Fragment::Box(b) => b.transformed_ink(),
             Fragment::Text(t) => t.rect,
         }
     }
@@ -382,6 +406,11 @@ impl FragmentTree {
             if b.style.box_.position == fos_css::style::Position::Fixed && scroll != 0.0 {
                 return walk(b, x, y - scroll, 0.0, (0.0, view.1), offsets);
             }
+            // A transformed box is hit where it is painted
+            let (x, y) = match b.transform().and_then(fos_css::transform::invert) {
+                Some(inv) => fos_css::transform::apply(inv, (x, y)),
+                None => (x, y),
+            };
             if !b.ink.contains(x, y) && !(scroll != 0.0 && b.children.iter().any(|c| matches!(c, Fragment::Box(_)))) {
                 return None;
             }
@@ -400,7 +429,7 @@ impl FragmentTree {
                 .children
                 .iter()
                 .filter_map(|c| match c {
-                    Fragment::Box(cb) if cb.style.is_positioned() => Some(cb),
+                    Fragment::Box(cb) if cb.style.is_positioned() || cb.style.has_transform() => Some(cb),
                     _ => None,
                 })
                 .collect();
@@ -416,7 +445,7 @@ impl FragmentTree {
             }
             for c in b.children.iter().rev() {
                 match c {
-                    Fragment::Box(cb) if cb.style.is_positioned() => {}
+                    Fragment::Box(cb) if cb.style.is_positioned() || cb.style.has_transform() => {}
                     Fragment::Box(cb) => {
                         if let Some(n) = walk(cb, x, y, scroll, view, offsets) {
                             return Some(n);

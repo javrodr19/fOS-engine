@@ -229,6 +229,11 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "grid-template-rows" => GridTemplateRows,
         "grid-template-areas" => GridTemplateAreas,
         "content" => Content,
+        "transform" | "-webkit-transform" | "-ms-transform" => Transform,
+        "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
+        "translate" => Translate,
+        "rotate" => Rotate,
+        "scale" => Scale,
         "grid-auto-columns" => GridAutoColumns,
         "grid-auto-rows" => GridAutoRows,
         "grid-auto-flow" => GridAutoFlow,
@@ -511,6 +516,10 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
         P::Content => content(raw).map(|c| PropertyValue::Content(Arc::from(c))),
+        P::Transform => crate::transform::valid(raw).then(|| PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::TransformOrigin | P::Translate => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::Rotate => crate::transform::parse_rotate(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::Scale => crate::transform::parse_scale(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::GridTemplateColumns | P::GridTemplateRows | P::GridTemplateAreas | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridColumnStart | P::GridColumnEnd | P::GridRowStart | P::GridRowEnd => {
             let name = grid_name(id);
             crate::grid::valid(name, raw.trim()).then(|| PropertyValue::Grid(Arc::from(raw.trim())))

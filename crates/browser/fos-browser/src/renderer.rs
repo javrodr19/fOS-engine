@@ -481,11 +481,32 @@ struct BrowserStyler<'a> {
     /// What lengths are computed against (the root's font size once known)
     ctx: StyleContext,
     root_styled: bool,
+    /// The document is in quirks mode
+    quirks: bool,
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
     fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
         let Some(element) = tree.get(node).and_then(|n| n.as_element()) else { return Style::inherit_from(parent) };
+        // Quirks mode: tables do not inherit fonts, white-space and
+        // text-align (the HTML standard's rendering quirk, as UA rules that
+        // author rules still override)
+        let quirk_parent;
+        let parent = if self.quirks && tree.resolve(element.name.local) == "table" {
+            let mut p = parent.clone();
+            let i = Arc::make_mut(&mut p.inherited);
+            let initial = &Style::initial_ref().inherited;
+            i.font_weight = initial.font_weight;
+            i.font_style = initial.font_style;
+            i.font_size = initial.font_size;
+            i.line_height = initial.line_height;
+            i.white_space = initial.white_space;
+            i.text_align = initial.text_align;
+            quirk_parent = p;
+            &quirk_parent
+        } else {
+            parent
+        };
         let mut style = Style::inherit_from(parent);
         let inline: Vec<fos_css::Declaration> = element
             .attrs
@@ -526,6 +547,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, fonts:
         resolved: Default::default(),
         ctx: StyleContext { root_font_size: 16.0, viewport },
         root_styled: false,
+        quirks: document.is_quirks(),
     };
     let fragments = if root.is_valid() {
         layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)

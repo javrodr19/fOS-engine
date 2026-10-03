@@ -840,6 +840,7 @@ version = "0.1.0"
 dependencies = [
  "fos-css",
  "fos-dom",
+ "fos-text",
  "thiserror 2.0.17",
  "tracing",
 ]

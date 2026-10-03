@@ -1502,6 +1502,11 @@ fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<
     Ok(Value::object(vm.new_array(vals)))
 }
 
+/// `__fosQuirks()`: whether the document is in quirks mode
+fn quirks(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    Ok(Value::bool(with_doc(vm, |d| d.is_quirks())))
+}
+
 /// `__fosViewport()`: `[width, height, scrollX, scrollY, documentHeight]`
 fn viewport(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let h = host(vm);
@@ -1714,6 +1719,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),
         ("__fosViewport", 0, viewport),
+        ("__fosQuirks", 0, quirks),
         ("__fosScrollTo", 1, scroll_to),
         ("__fosDecode", 2, decode_text),
         ("__fosEncode", 1, encode_text),

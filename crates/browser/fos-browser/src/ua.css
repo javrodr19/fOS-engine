@@ -59,7 +59,7 @@ big { font-size: larger; }
 u, ins { text-decoration: underline; }
 s, strike, del { text-decoration: line-through; }
 mark { background-color: yellow; color: black; }
-center { text-align: center; }
+center { text-align: -webkit-center; }
 
 a[href] { color: #0000ee; text-decoration: underline; }
 

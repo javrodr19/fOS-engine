@@ -17,6 +17,7 @@ pub mod fonts;
 pub mod fragment;
 pub mod inline;
 pub mod position;
+pub mod table;
 
 pub use block::LayoutCtx;
 pub use box_tree::{build_box_tree, BoxKind, LayoutBox, Styler};

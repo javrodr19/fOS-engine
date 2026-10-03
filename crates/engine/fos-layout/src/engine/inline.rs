@@ -365,7 +365,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             0.0
         } else {
             match (align, rtl) {
-                (TextAlign::Center, _) => free / 2.0,
+                (TextAlign::Center | TextAlign::WebkitCenter, _) => free / 2.0,
                 (TextAlign::Right, _) | (TextAlign::End, false) | (TextAlign::Start, true) | (TextAlign::MatchParent, true) => free,
                 (TextAlign::Justify, true) if !justify => free,
                 _ => 0.0,

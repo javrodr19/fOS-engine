@@ -231,6 +231,7 @@ impl TreeSink for DomSink {
 
         let mut document = Document::empty(&self.url);
         document.tree = tree;
+        document.set_quirks(self.quirks_mode.get() == QuirksMode::Quirks);
         for (template, fragment) in contents {
             document.set_template_content(template, fragment);
         }

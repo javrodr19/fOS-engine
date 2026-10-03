@@ -25,11 +25,14 @@ pub struct LayoutCtx<'a> {
     /// Min- and max-content widths by box (addresses in the box tree,
     /// which lives unchanged through one layout)
     intrinsic: std::collections::HashMap<usize, (f32, f32)>,
+    /// The box about to be laid out is in a block whose text-align is
+    /// -webkit-center (<center>, align=center): it is centered
+    pub center_in_parent: bool,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default() }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false }
     }
 }
 
@@ -255,6 +258,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let hbp = e.horizontal_bp();
     let vbp = e.vertical_bp();
     let sizing = if forced.width.is_some() { Sizing::Shrink } else { sizing };
+    let centered = std::mem::take(&mut ctx.center_in_parent);
 
     if let BoxKind::Replaced(r) = &b.kind {
         let mut laid = layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
@@ -275,14 +279,16 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     };
     let (ml_auto, mr_auto) = (e.margin[3].is_none(), e.margin[1].is_none());
     let (mut ml, mut mr) = (e.margin[3].unwrap_or(0.0), e.margin[1].unwrap_or(0.0));
-    let width = match specified {
+    // Tables are as wide as their content needs (up to the space there is)
+    let is_table = matches!(b.kind, BoxKind::Table(_));
+    let mut width = match specified {
         Some(w) if forced.width.is_some() => w,
         Some(w) => clamp_width(style, w, cb_w, hbp),
         None => {
             let avail = (cb_w - ml - mr - hbp).max(0.0);
             let w = match sizing {
-                Sizing::Stretch => avail,
-                Sizing::Shrink => {
+                Sizing::Stretch if !is_table => avail,
+                _ => {
                     let (min, max) = intrinsic_content(ctx, b);
                     max.min(avail).max(min)
                 }
@@ -301,6 +307,11 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             }
             (true, false) => ml = free,
             (false, true) => mr = free,
+            // Inside <center> (and align=center) blocks are centered
+            (false, false) if free > 0.0 && centered => {
+                ml += free / 2.0;
+                mr += free / 2.0;
+            }
             (false, false) => mr += free,
         }
     }
@@ -338,7 +349,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let mut through = false;
     let content_h = match &b.kind {
         BoxKind::Block(children) => {
-            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base);
+            let center = style.inherited.text_align == fos_css::style::TextAlign::WebkitCenter;
+            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base, center);
             escaped_top = flow.top;
             escaped_bottom = flow.bottom;
             through = flow.through;
@@ -354,6 +366,12 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, cb_w);
             frag.children = flex.frags;
             flex.height
+        }
+        BoxKind::Table(t) => {
+            let table = super::table::layout_table(ctx, style, t, width, specified.is_none());
+            frag.children = table.frags;
+            width = width.max(table.width);
+            table.height
         }
         BoxKind::Replaced(_) => unreachable!(),
     };
@@ -426,7 +444,7 @@ struct Flow {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32)) -> Flow {
+fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), center: bool) -> Flow {
     let mut frags = Vec::with_capacity(children.len());
     let mut y = 0.0f32;
     let mut pending = Margin::default();
@@ -469,6 +487,7 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             cw = r - l;
             shift = l - base.0;
         }
+        ctx.center_in_parent = center;
         let mut laid = layout_block_level(ctx, child, cw, cb_h, Sizing::Stretch, false);
         laid.frag.translate(shift, 0.0);
         if let Some(c) = cleared {
@@ -693,6 +712,7 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
             (min, max)
         }
         BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items),
+        BoxKind::Table(t) => super::table::intrinsic_table(ctx, &b.style, t),
         BoxKind::Replaced(r) => {
             let e = edges(&b.style, 0.0);
             let (w, _) = replaced_content_size(ctx, &b.style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());

@@ -304,8 +304,11 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
             },
             ("align", _) => {
                 let v = value.to_ascii_lowercase();
-                if matches!(v.as_str(), "left" | "right" | "center" | "justify") {
-                    css += &format!("text-align: {v};");
+                match v.as_str() {
+                    // Centers block children too, as in other browsers
+                    "center" | "middle" => css += "text-align: -webkit-center;",
+                    "left" | "right" | "justify" => css += &format!("text-align: {v};"),
+                    _ => {}
                 }
             }
             ("valign", "td" | "th" | "tr" | "thead" | "tbody" | "tfoot") => {

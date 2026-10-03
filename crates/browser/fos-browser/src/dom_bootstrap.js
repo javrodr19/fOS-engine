@@ -1689,7 +1689,7 @@
     get scripts() { return this.querySelectorAll('script'); },
     get characterSet() { return 'UTF-8'; },
     get charset() { return 'UTF-8'; },
-    get compatMode() { return 'CSS1Compat'; },
+    get compatMode() { return __fosQuirks() ? 'BackCompat' : 'CSS1Compat'; },
     get contentType() { return 'text/html'; },
     get visibilityState() { return 'visible'; },
     get hidden() { return false; },

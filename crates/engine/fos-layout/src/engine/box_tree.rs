@@ -65,6 +65,30 @@ pub enum BoxKind {
     /// A flex container and its items (blockified; text runs wrapped in
     /// anonymous blocks)
     Flex(Vec<LayoutBox>),
+    /// A table: captions and rows of cells (row groups flattened, header
+    /// rows first and footer rows last)
+    Table(Box<TableBox>),
+}
+
+#[derive(Debug, Default)]
+pub struct TableBox {
+    pub captions: Vec<LayoutBox>,
+    pub rows: Vec<TableRow>,
+}
+
+#[derive(Debug)]
+pub struct TableRow {
+    /// `NodeId::NONE` for anonymous rows
+    pub node: NodeId,
+    pub style: Style,
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug)]
+pub struct TableCell {
+    pub b: LayoutBox,
+    pub colspan: u32,
+    pub rowspan: u32,
 }
 
 #[derive(Debug)]
@@ -371,6 +395,16 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else if matches!(self.tag(node), "ul" | "menu" | "dir") {
             self.list_counters.push(1);
         }
+        if matches!(style.display(), Display::Table | Display::InlineTable) {
+            self.styler.enter(self.tree, node);
+            let table = self.table(node, &style);
+            self.styler.leave();
+            self.deco = saved;
+            if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
+                self.list_counters.pop();
+            }
+            return LayoutBox { node, style, kind: BoxKind::Table(Box::new(table)), marker: None };
+        }
         if matches!(style.display(), Display::Flex | Display::InlineFlex) {
             let mut items = Vec::new();
             let mut text = InlineBuilder::new(&style, self.deco);
@@ -460,6 +494,101 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 c.blocks.push(b);
             }
         }
+    }
+
+    /// Element children with their styles, skipping `display: none`
+    /// (and text, which tables do not render outside cells)
+    fn styled_children(&mut self, parent: NodeId, parent_style: &Style) -> Vec<(NodeId, Style)> {
+        let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
+        let mut out = Vec::new();
+        for child in kids {
+            if !self.tree.get(child).is_some_and(|n| n.is_element()) {
+                continue;
+            }
+            let style = self.styler.style(self.tree, child, parent_style);
+            if style.display() != Display::None {
+                out.push((child, style));
+            }
+        }
+        out
+    }
+
+    fn anonymous_row(style: &Style) -> TableRow {
+        TableRow { node: NodeId::NONE, style: Style::inherit_from(style), cells: Vec::new() }
+    }
+
+    /// A table's captions and rows (CSS 2.1 §17.2.1, simplified: stray
+    /// cells get anonymous rows, other stray elements become cells)
+    fn table(&mut self, node: NodeId, style: &Style) -> TableBox {
+        let mut t = TableBox::default();
+        let (mut head, mut body, mut foot) = (Vec::new(), Vec::new(), Vec::new());
+        let mut anon: Option<TableRow> = None;
+        for (child, cstyle) in self.styled_children(node, style) {
+            match cstyle.display() {
+                Display::TableCaption => {
+                    let mut cs = cstyle;
+                    std::sync::Arc::make_mut(&mut cs.box_).display = Display::Block;
+                    t.captions.push(self.element_box(child, cs, true));
+                }
+                Display::TableHeaderGroup | Display::TableRowGroup | Display::TableFooterGroup => {
+                    body.extend(anon.take());
+                    self.styler.enter(self.tree, child);
+                    let rows = self.row_group(child, &cstyle);
+                    self.styler.leave();
+                    match cstyle.display() {
+                        Display::TableHeaderGroup if head.is_empty() => head = rows,
+                        Display::TableFooterGroup if foot.is_empty() => foot = rows,
+                        _ => body.extend(rows),
+                    }
+                }
+                Display::TableRow => {
+                    body.extend(anon.take());
+                    body.push(self.row(child, cstyle));
+                }
+                Display::TableColumn | Display::TableColumnGroup => {}
+                _ => {
+                    let cell = self.cell(child, cstyle);
+                    anon.get_or_insert_with(|| Self::anonymous_row(style)).cells.push(cell);
+                }
+            }
+        }
+        body.extend(anon);
+        t.rows = head;
+        t.rows.extend(body);
+        t.rows.extend(foot);
+        t
+    }
+
+    fn row_group(&mut self, node: NodeId, style: &Style) -> Vec<TableRow> {
+        let mut rows = Vec::new();
+        let mut anon: Option<TableRow> = None;
+        for (child, cstyle) in self.styled_children(node, style) {
+            if cstyle.display() == Display::TableRow {
+                rows.extend(anon.take());
+                rows.push(self.row(child, cstyle));
+            } else {
+                let cell = self.cell(child, cstyle);
+                anon.get_or_insert_with(|| Self::anonymous_row(style)).cells.push(cell);
+            }
+        }
+        rows.extend(anon);
+        rows
+    }
+
+    fn row(&mut self, node: NodeId, style: Style) -> TableRow {
+        self.styler.enter(self.tree, node);
+        let cells = self.styled_children(node, &style).into_iter().map(|(c, cs)| self.cell(c, cs)).collect();
+        self.styler.leave();
+        TableRow { node, style, cells }
+    }
+
+    fn cell(&mut self, node: NodeId, mut style: Style) -> TableCell {
+        if style.display() != Display::TableCell {
+            std::sync::Arc::make_mut(&mut style.box_).display = Display::TableCell;
+        }
+        let span = |name: &str, max: u32| self.tree.get_attribute(node, name).and_then(|v| v.trim().parse::<u32>().ok()).map_or(1, |v| v.clamp(1, max));
+        let (colspan, rowspan) = (span("colspan", 1000), span("rowspan", 65534));
+        TableCell { b: self.element_box(node, style, true), colspan, rowspan }
     }
 
     /// A flex container's children as items: each element is blockified;

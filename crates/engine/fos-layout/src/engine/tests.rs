@@ -560,3 +560,69 @@ fn clear_and_formatting_contexts_contain_floats() {
     let b = rect_of(&t, bfc);
     assert_eq!((b.y, b.w), (78.0, 734.0));
 }
+
+#[test]
+fn tables_size_columns_from_content() {
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; border-spacing: 2px");
+    let tbody = el(&mut tree, table, "tbody", "display: table-row-group");
+    let mut cells = Vec::new();
+    for r in 0..3 {
+        let tr = el(&mut tree, tbody, "tr", "display: table-row");
+        for c in 0..2 {
+            let td = el(&mut tree, tr, "td", "display: table-cell; padding: 1px");
+            text(&mut tree, td, if c == 0 { "a" } else if r == 1 { "a much longer cell text" } else { "b" });
+            cells.push(td);
+        }
+    }
+    let t = layout(&tree, html, 800.0);
+    let r = |i: usize| rect_of(&t, cells[i]);
+    // Cells of a column line up and share its width; rows line up
+    assert_eq!(r(0).x, r(2).x);
+    assert_eq!(r(1).x, r(3).x);
+    assert_eq!(r(1).w, r(3).w);
+    assert!(r(1).w > r(0).w * 3.0, "{:?} {:?}", r(0), r(1));
+    assert_eq!(r(0).y, r(1).y);
+    assert!(r(2).y > r(0).bottom());
+    // Spacing between and around cells; the table shrinks to fit
+    assert_eq!(r(1).x - r(0).right(), 2.0);
+    let tr = rect_of(&t, table);
+    assert!((tr.right() - r(1).right() - 2.0).abs() < 0.01);
+    assert!(tr.w < 400.0);
+}
+
+#[test]
+fn table_spans_and_widths() {
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; width: 400px; border-spacing: 0");
+    let tr1 = el(&mut tree, table, "tr", "display: table-row");
+    let wide = el(&mut tree, tr1, "td", "display: table-cell");
+    tree.set_attribute(wide, "colspan", "2");
+    let tall = el(&mut tree, tr1, "td", "display: table-cell; vertical-align: middle");
+    tree.set_attribute(tall, "rowspan", "2");
+    text(&mut tree, tall, "x");
+    let tr2 = el(&mut tree, table, "tr", "display: table-row");
+    let a = el(&mut tree, tr2, "td", "display: table-cell; height: 50px");
+    let b = el(&mut tree, tr2, "td", "display: table-cell");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, table).w, 400.0);
+    let (rw, ra, rb, rt) = (rect_of(&t, wide), rect_of(&t, a), rect_of(&t, b), rect_of(&t, tall));
+    assert_eq!(rw.x, ra.x);
+    assert!((rw.right() - rb.right()).abs() < 0.01);
+    assert_eq!(rt.x, rb.right());
+    // The row-spanning cell covers both rows
+    assert!((rt.bottom() - ra.bottom()).abs() < 0.01 && rt.y == rw.y);
+    assert_eq!(ra.h, 50.0);
+}
+
+#[test]
+fn webkit_center_centers_block_children() {
+    let (mut tree, html, body) = doc();
+    let c = el(&mut tree, body, "div", "text-align: -webkit-center");
+    let child = el(&mut tree, c, "div", "width: 200px; height: 5px; text-align: left");
+    let plain = el(&mut tree, body, "div", "text-align: center");
+    let child2 = el(&mut tree, plain, "div", "width: 200px; height: 5px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, child).x, 8.0 + 292.0);
+    assert_eq!(rect_of(&t, child2).x, 8.0);
+}

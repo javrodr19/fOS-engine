@@ -575,7 +575,7 @@ fn display(v: &str) -> Option<PropertyValue> {
 
 fn text_align(v: &str) -> Option<PropertyValue> {
     enum_value::<TextAlign>(match v {
-        "-webkit-center" | "-moz-center" => "center",
+        "-moz-center" => "-webkit-center",
         "-webkit-left" | "-moz-left" => "left",
         "-webkit-right" | "-moz-right" => "right",
         "justify-all" => "justify",
@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!((i.font_style, i.font_weight, i.font_size), (FontStyle::Italic, 700, 32.0));
         assert_eq!(i.line_height, LineHeight::Number(1.5));
         assert_eq!(&*i.font_family.iter().map(|f| f.to_string()).collect::<Vec<_>>(), ["Helvetica Neue", "Arial", "sans-serif"]);
-        assert_eq!((i.text_align, i.white_space), (TextAlign::Center, WhiteSpace::Nowrap));
+        assert_eq!((i.text_align, i.white_space), (TextAlign::WebkitCenter, WhiteSpace::Nowrap));
         let s = computed("font-size: 20px; line-height: 150%; text-decoration: underline dotted red; letter-spacing: .1em");
         assert_eq!(s.inherited.line_height, LineHeight::Px(30.0));
         assert_eq!(s.inherited.letter_spacing, 2.0);

@@ -44,6 +44,11 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
                 }
             }
         }
+        BoxKind::Table(t) => {
+            for c in t.captions.iter().chain(t.rows.iter().flat_map(|r| r.cells.iter().map(|c| &c.b))) {
+                collect(c, map);
+            }
+        }
         BoxKind::Replaced(_) => {}
     }
 }

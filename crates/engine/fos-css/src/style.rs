@@ -242,7 +242,7 @@ css_enum!(Clear { None = "none", Left = "left", Right = "right", Both = "both" }
 css_enum!(BoxSizing { ContentBox = "content-box", BorderBox = "border-box" });
 css_enum!(Overflow { Visible = "visible", Hidden = "hidden", Clip = "clip", Scroll = "scroll", Auto = "auto" });
 css_enum!(Visibility { Visible = "visible", Hidden = "hidden", Collapse = "collapse" });
-css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent" });
+css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent", WebkitCenter = "-webkit-center" });
 css_enum!(WhiteSpace { Normal = "normal", Pre = "pre", Nowrap = "nowrap", PreWrap = "pre-wrap", PreLine = "pre-line", BreakSpaces = "break-spaces" });
 
 impl WhiteSpace {

@@ -22,6 +22,8 @@ pub struct Document {
     sheet_overrides: std::collections::HashMap<NodeId, (String, String)>,
     /// CSS of the document's adopted (constructed) style sheets
     adopted_css: String,
+    /// Parsed in quirks mode (no or a legacy doctype)
+    quirks: bool,
 }
 
 impl Document {
@@ -47,6 +49,7 @@ impl Document {
             template_contents: Default::default(),
             sheet_overrides: Default::default(),
             adopted_css: String::new(),
+            quirks: false,
         }
     }
     
@@ -61,6 +64,7 @@ impl Document {
             template_contents: Default::default(),
             sheet_overrides: Default::default(),
             adopted_css: String::new(),
+            quirks: false,
         }
     }
     
@@ -97,6 +101,16 @@ impl Document {
     /// CSS of the adopted style sheets, applied after the page's own
     pub fn adopted_css(&self) -> &str {
         &self.adopted_css
+    }
+
+    /// Whether the document renders in quirks mode (`compatMode` is
+    /// "BackCompat")
+    pub fn is_quirks(&self) -> bool {
+        self.quirks
+    }
+
+    pub fn set_quirks(&mut self, quirks: bool) {
+        self.quirks = quirks;
     }
 
     pub fn set_adopted_css(&mut self, css: String) {

@@ -486,6 +486,51 @@ impl Default for InheritedStyle {
     }
 }
 
+/// One `box-shadow`
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shadow {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    /// `None` is currentcolor
+    pub color: Option<Color>,
+    pub inset: bool,
+}
+
+/// Parse a `box-shadow` list (`none` is empty); `len` computes lengths
+pub fn parse_shadows(text: &str, len: &dyn Fn(&str) -> Option<f32>) -> Option<Vec<Shadow>> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in crate::parser::split_top(text, b',') {
+        let mut lengths = Vec::new();
+        let (mut color, mut inset) = (None, false);
+        for token in crate::parser::split_top(part.trim(), b' ') {
+            let t = token.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.eq_ignore_ascii_case("inset") {
+                inset = true;
+            } else if let Some(l) = len(t) {
+                lengths.push(l);
+            } else if t.eq_ignore_ascii_case("currentcolor") {
+                color = None;
+            } else {
+                color = Some(crate::parser::parse_color(t)?);
+            }
+        }
+        if !(2..=4).contains(&lengths.len()) {
+            return None;
+        }
+        out.push(Shadow { x: lengths[0], y: lengths[1], blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0), spread: lengths.get(3).copied().unwrap_or(0.0), color, inset });
+    }
+    Some(out)
+}
+
 /// A piece of generated content
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContentItem {
@@ -541,6 +586,8 @@ pub struct BoxStyle {
     pub grid: crate::grid::GridStyle,
     /// What a `::before`/`::after` box shows (`None`: none or normal)
     pub content: Option<Arc<[ContentItem]>>,
+    /// `box-shadow`s, front to back (`None`: none)
+    pub box_shadow: Option<Arc<[Shadow]>>,
     /// `transform` functions (`None`: none)
     pub transform: Option<Arc<[crate::transform::TransformFn]>>,
     pub transform_origin: (Lp, Lp),
@@ -593,6 +640,7 @@ impl Default for BoxStyle {
             table_layout: TableLayout::Auto,
             grid: Default::default(),
             content: None,
+            box_shadow: None,
             transform: None,
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
             translate: None,
@@ -1197,6 +1245,13 @@ impl Style {
                     }
                 }
             }
+            PropertyId::BoxShadow => {
+                let PropertyValue::Transform(text) = v else { return };
+                let len = |t: &str| self.lp_text(t, ctx).filter(|l| l.pct == 0.0).map(|l| l.px);
+                if let Some(list) = parse_shadows(text, &len) {
+                    set!(box_, [box_shadow], (!list.is_empty()).then(|| Arc::from(list)));
+                }
+            }
             PropertyId::Transform | PropertyId::TransformOrigin | PropertyId::Translate | PropertyId::Rotate | PropertyId::Scale => {
                 let PropertyValue::Transform(text) = v else { return };
                 let len = |t: &str| self.lp_text(t, ctx);
@@ -1553,6 +1608,7 @@ impl Style {
             PropertyId::GridTemplateAreas => copy!(box_, [grid.areas]),
             PropertyId::Content => copy!(box_, [content]),
             PropertyId::Transform => copy!(box_, [transform]),
+            PropertyId::BoxShadow => copy!(box_, [box_shadow]),
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),
             PropertyId::Translate => copy!(box_, [translate]),
             PropertyId::Rotate => copy!(box_, [rotate]),

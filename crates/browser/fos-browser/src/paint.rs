@@ -500,11 +500,18 @@ impl<'a> Painter<'a> {
             self.masked_background(b, url, clip, alpha);
             return;
         }
+        let shadows = b.style.box_.box_shadow.is_some();
+        if shadows {
+            self.shadows(b, clip, alpha, false);
+        }
         if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
             self.background(b, clip, alpha);
         } else {
             // The color went to the canvas; gradients still paint here
             self.background_images(b, clip, alpha);
+        }
+        if shadows {
+            self.shadows(b, clip, alpha, true);
         }
         self.border(b, clip, alpha);
         if let Some(r) = &b.replaced {
@@ -541,6 +548,80 @@ impl<'a> Painter<'a> {
                         self.outline(cb, clip, a);
                     }
                 }
+            }
+        }
+    }
+
+    /// `box-shadow`s: outer ones (outside the border box, under the
+    /// background) or inset ones (inside the padding box, above it); the
+    /// first in the list is on top
+    fn shadows(&mut self, b: &BoxFragment, clip: Clip, alpha: f32, inset: bool) {
+        let Some(list) = b.style.box_.box_shadow.clone() else { return };
+        let border = self.dev(b.border_box);
+        let rad = radii(b, b.border_box);
+        let (w, h) = (self.canvas.width(), self.canvas.height());
+        let clip_path = |c: Clip| tiny_skia::Rect::from_ltrb(c.0[0], c.0[1], c.0[2], c.0[3]).map(PathBuilder::from_rect);
+        for s in list.iter().rev().filter(|s| s.inset == inset) {
+            let color = skia_color(s.color.unwrap_or(b.style.color()), alpha);
+            if color.alpha() == 0.0 {
+                continue;
+            }
+            let grow = |r: [(f32, f32); 4], d: f32| r.map(|(x, y)| if x > 0.0 && y > 0.0 { ((x + d).max(0.0), (y + d).max(0.0)) } else { (0.0, 0.0) });
+            // Where the shadow may show
+            let Some(mut area) = Mask::new(w, h) else { return };
+            let (shape, shape_radii, area_rect) = if !inset {
+                let Some(p) = rounded_path(border, rad) else { continue };
+                area.fill_path(&p, FillRule::Winding, true, Transform::identity());
+                area.invert();
+                let shape = Rect::new(border.x + s.x - s.spread, border.y + s.y - s.spread, border.w + 2.0 * s.spread, border.h + 2.0 * s.spread);
+                (shape, grow(rad, s.spread), shape)
+            } else {
+                let pad = self.dev(b.padding_box());
+                let prad = inset_radii(rad, b.border);
+                let Some(p) = rounded_path(pad, prad) else { continue };
+                area.fill_path(&p, FillRule::Winding, true, Transform::identity());
+                let hole = Rect::new(pad.x + s.x + s.spread, pad.y + s.y + s.spread, pad.w - 2.0 * s.spread, pad.h - 2.0 * s.spread);
+                (hole, grow(prad, -s.spread), pad)
+            };
+            if let Some(cp) = clip_path(clip) {
+                area.intersect_path(&cp, FillRule::Winding, false, Transform::identity());
+            }
+            // The region to compute: the shape (or, inset, the box) with
+            // room for the blur, within the clip
+            let margin = (s.blur * 1.5).ceil() + 1.0;
+            let x0 = (area_rect.x - margin).max(clip.0[0]).max(0.0).floor();
+            let y0 = (area_rect.y - margin).max(clip.0[1]).max(0.0).floor();
+            let x1 = (area_rect.right() + margin).min(clip.0[2]).min(w as f32).ceil();
+            let y1 = (area_rect.bottom() + margin).min(clip.0[3]).min(h as f32).ceil();
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let (rw, rh) = ((x1 - x0) as u32, (y1 - y0) as u32);
+            let Some(mut cover) = Mask::new(rw, rh) else { continue };
+            let local = Rect::new(shape.x - x0, shape.y - y0, shape.w, shape.h);
+            if shape.w > 0.0 && shape.h > 0.0 {
+                if let Some(p) = rounded_path(local, shape_radii) {
+                    cover.fill_path(&p, FillRule::Winding, true, Transform::identity());
+                }
+            }
+            if inset {
+                // The shadow is everything outside the hole
+                cover.invert();
+            }
+            if s.blur > 0.0 {
+                box_blur(cover.data_mut(), rw as usize, rh as usize, s.blur / 2.0);
+            }
+            // The shadow color through its coverage, drawn where it may show
+            let Some(mut layer) = tiny_skia::Pixmap::new(rw, rh) else { continue };
+            let c = color.premultiply().to_color_u8();
+            for (px, &a) in layer.pixels_mut().iter_mut().zip(cover.data()) {
+                if a > 0 {
+                    let f = |v: u8| ((v as u32 * a as u32 + 127) / 255) as u8;
+                    *px = tiny_skia::PremultipliedColorU8::from_rgba(f(c.red()), f(c.green()), f(c.blue()), f(c.alpha())).unwrap_or(*px);
+                }
+            }
+            if let Some(mut pm) = self.canvas.pixmap_mut() {
+                pm.draw_pixmap(x0 as i32, y0 as i32, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), Some(&area));
             }
         }
     }
@@ -964,6 +1045,41 @@ impl<'a> Painter<'a> {
 }
 
 /// Whether a path is an axis-aligned rectangle (four corner points)
+/// Approximate a Gaussian blur of standard deviation `sigma` on an alpha
+/// buffer with three box blurs each way
+fn box_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
+    // Box widths for three passes (W3C filter effects' approximation)
+    let d = ((sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0) + 0.5).floor().max(1.0) as usize;
+    let r = d / 2;
+    let mut tmp = vec![0u8; data.len()];
+    for _ in 0..3 {
+        blur_pass(data, &mut tmp, w, h, r, true);
+        blur_pass(&tmp, data, w, h, r, false);
+    }
+}
+
+/// One box blur of radius `r`, along rows (`horizontal`) or columns
+fn blur_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (lines, len, step, stride) = if horizontal { (h, w, 1, w) } else { (w, h, w, 1) };
+    let div = (2 * r + 1) as u32;
+    for line in 0..lines {
+        let base = line * stride;
+        let at = |i: isize| -> u32 {
+            if i < 0 || i as usize >= len {
+                0
+            } else {
+                src[base + i as usize * step] as u32
+            }
+        };
+        let mut sum: u32 = (-(r as isize)..=r as isize).map(at).sum();
+        for i in 0..len {
+            dst[base + i * step] = ((sum + div / 2) / div) as u8;
+            sum += at(i as isize + r as isize + 1);
+            sum -= at(i as isize - r as isize);
+        }
+    }
+}
+
 fn is_axis_rect(path: &Path) -> bool {
     let pts = path.points();
     pts.len() == 4 && {

@@ -206,6 +206,12 @@ impl BoxFragment {
 
     pub fn update_ink(&mut self) {
         let mut ink = self.border_box;
+        // Outer shadows paint beyond the border box
+        for s in self.style.box_.box_shadow.iter().flat_map(|l| l.iter()).filter(|s| !s.inset) {
+            let grow = s.spread + s.blur * 1.5 + 1.0;
+            let r = self.border_box;
+            ink = ink.union(&Rect::new(r.x + s.x - grow, r.y + s.y - grow, r.w + 2.0 * grow, r.h + 2.0 * grow));
+        }
         if self.style.clips() && self.kind != BoxFragmentKind::InlinePart {
             let pad = self.padding_box();
             let mut content = Rect::new(pad.x, pad.y, 0.0, 0.0);

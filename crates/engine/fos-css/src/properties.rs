@@ -85,6 +85,7 @@ pub enum PropertyId {
     Translate,
     Rotate,
     Scale,
+    BoxShadow,
     
     // Transition & Animation
     Transition,

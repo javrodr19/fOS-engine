@@ -1083,6 +1083,31 @@ mod tests {
     }
 
     #[test]
+    fn test_box_shadows() {
+        let html = r#"<html><body style="margin:0; background: white">
+            <div style="margin: 20px; width: 40px; height: 20px; background: white; box-shadow: 10px 10px 0 0 rgb(255, 0, 0)"></div>
+            <div style="margin: 20px; width: 40px; height: 40px; box-shadow: inset 0 0 0 5px rgb(0, 0, 255)"></div>
+            <div style="margin: 20px; width: 40px; height: 20px; box-shadow: 0 0 8px black"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // A hard shadow offset down-right, not under the box
+        assert_eq!(px(65, 45), 0xffff0000);
+        assert_eq!(px(55, 35), 0xffffffff);
+        assert_ne!(px(25, 45), 0xffff0000);
+        // An inset ring 5px wide
+        let top = 60;
+        assert_eq!(px(22, top + 2), 0xff0000ff);
+        assert_ne!(px(40, top + 20), 0xff0000ff);
+        // A blurred shadow fades out around the box (third box: 20..60 x 120..140)
+        let gray = |p: u32| p & 0xff;
+        assert!(gray(px(40, 116)) < 0xff && gray(px(40, 116)) > 0x80, "{:x}", px(40, 116));
+        assert!(gray(px(40, 105)) == 0xff);
+    }
+
+    #[test]
     fn test_transforms_paint_and_hit() {
         let html = r#"<html><body style="margin:0">
             <div style="position: relative; height: 100px">

@@ -234,6 +234,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "translate" => Translate,
         "rotate" => Rotate,
         "scale" => Scale,
+        "box-shadow" | "-webkit-box-shadow" => BoxShadow,
         "grid-auto-columns" => GridAutoColumns,
         "grid-auto-rows" => GridAutoRows,
         "grid-auto-flow" => GridAutoFlow,
@@ -519,6 +520,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::Transform => crate::transform::valid(raw).then(|| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::TransformOrigin | P::Translate => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Rotate => crate::transform::parse_rotate(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::BoxShadow => crate::style::parse_shadows(raw, &|t| crate::parser::parse_length(t).map(|_| 0.0).or((t == "0").then_some(0.0))).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Scale => crate::transform::parse_scale(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::GridTemplateColumns | P::GridTemplateRows | P::GridTemplateAreas | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridColumnStart | P::GridColumnEnd | P::GridRowStart | P::GridRowEnd => {
             let name = grid_name(id);
@@ -1538,6 +1540,24 @@ mod tests {
         assert_eq!(content(r#""\2192" / "next""#), Some(vec![ContentItem::Text(Arc::from("\u{2192}"))]));
         assert_eq!(content("url(a.svg)"), Some(vec![]));
         assert_eq!(content("bogus"), None);
+    }
+
+    #[test]
+    fn shadows_and_transforms_compute() {
+        let s = computed("box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), inset 0 0 0 1em red; font-size: 10px");
+        let sh = s.box_.box_shadow.as_deref().unwrap();
+        assert_eq!(sh.len(), 2);
+        assert_eq!((sh[0].x, sh[0].y, sh[0].blur, sh[0].spread, sh[0].inset), (0.0, 1.0, 2.0, 0.0, false));
+        assert_eq!(sh[0].color.map(|c| c.a), Some(128));
+        assert_eq!((sh[1].spread, sh[1].inset, sh[1].color.map(|c| c.r)), (10.0, true, Some(255)));
+        assert!(computed("box-shadow: none").box_.box_shadow.is_none());
+        assert!(computed("box-shadow: 1px").box_.box_shadow.is_none());
+        let s = computed("transform: translate(calc(50% - 10px), 2em) rotate(90deg); font-size: 10px");
+        let m = s.transform_matrix(0.0, 0.0, 100.0, 20.0).unwrap();
+        // About the center (50, 10): (50, 10) moves by (40, 20)
+        let (x, y) = crate::transform::apply(m, (50.0, 10.0));
+        assert!((x - 90.0).abs() < 1e-3 && (y - 30.0).abs() < 1e-3, "{x} {y}");
+        assert!(computed("-webkit-transform: none").transform_matrix(0.0, 0.0, 1.0, 1.0).is_none());
     }
 
     #[test]

@@ -166,6 +166,92 @@ fn shrink(pixmap: Pixmap) -> Pixmap {
     out
 }
 
+/// Rasterized inline `<svg>` elements by markup (and color): a page's
+/// icons repeat, and relayouts reuse them
+#[derive(Default)]
+pub struct SvgCache {
+    pub(crate) map: HashMap<u64, Option<Arc<LoadedImage>>>,
+    /// Bitmap bytes held
+    bytes: usize,
+}
+
+/// Most inline SVG bitmap bytes kept between layouts
+const MAX_CACHED_SVG_BYTES: usize = 16 << 20;
+
+/// An inline `<svg>` element drawn as an image: its subtree serialized
+/// as SVG markup, `currentColor` being `color` (CSS rgba)
+pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
+    let mut markup = String::new();
+    serialize_svg(tree, node, true, color, &mut markup);
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        markup.hash(&mut h);
+        h.finish()
+    };
+    if let Some(hit) = cache.map.get(&key) {
+        return hit.clone();
+    }
+    let img = decode_svg(markup.as_bytes()).map(Arc::new);
+    let size = img.as_ref().map_or(0, |i| i.pixmap.data().len());
+    if cache.bytes + size > MAX_CACHED_SVG_BYTES || cache.map.len() >= 4096 {
+        cache.map.clear();
+        cache.bytes = 0;
+    }
+    cache.bytes += size;
+    cache.map.insert(key, img.clone());
+    img
+}
+
+fn escape_xml(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+}
+
+fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], out: &mut String) {
+    let Some(n) = tree.get(node) else { return };
+    if let Some(text) = n.as_text() {
+        escape_xml(text, out);
+        return;
+    }
+    let Some(e) = n.as_element() else { return };
+    let name = tree.resolve(e.name.local);
+    out.push('<');
+    out.push_str(name);
+    for a in &e.attrs {
+        let local = tree.resolve(a.name.local);
+        if root && (local == "xmlns" || local.starts_with("xmlns:") || local == "color") {
+            continue;
+        }
+        out.push(' ');
+        if tree.resolve(a.name.ns) == "http://www.w3.org/1999/xlink" && !local.contains(':') {
+            out.push_str("xlink:");
+        }
+        out.push_str(local);
+        out.push_str("=\"");
+        escape_xml(&a.value, out);
+        out.push('"');
+    }
+    if root {
+        out.push_str(" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+        out.push_str(&format!(" color=\"rgba({},{},{},{})\"", color[0], color[1], color[2], color[3] as f32 / 255.0));
+    }
+    out.push('>');
+    for (child, _) in tree.children(node) {
+        serialize_svg(tree, child, false, color, out);
+    }
+    out.push_str("</");
+    out.push_str(name);
+    out.push('>');
+}
+
 fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
     let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
     let size = tree.size();

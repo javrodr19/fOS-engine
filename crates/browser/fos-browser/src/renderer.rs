@@ -168,6 +168,8 @@ pub struct PageRenderer {
     scroll: f32,
     /// The current page's decoded images
     images: crate::image_loader::Images,
+    /// Inline `<svg>` elements, rasterized
+    svgs: crate::image_loader::SvgCache,
     /// What scripts drew on the page's canvas elements
     canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
     /// Scroll positions of the page's scroll containers
@@ -193,6 +195,7 @@ impl PageRenderer {
             scroll: 0.0,
             images: Default::default(),
             canvases: Default::default(),
+            svgs: Default::default(),
             box_scroll: Default::default(),
         }
     }
@@ -329,7 +332,7 @@ impl PageRenderer {
         let started = std::time::Instant::now();
         let stylesheet = self.compiled_stylesheet(document);
         let parsed = started.elapsed();
-        let layout = build_layout(document, stylesheet, &self.images, &mut self.fonts, (width as f32, self.viewport_height as f32));
+        let layout = build_layout(document, stylesheet, &self.images, &mut self.svgs, &mut self.fonts, (width as f32, self.viewport_height as f32));
         log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
@@ -627,6 +630,8 @@ struct BrowserStyler<'a> {
     /// Loaded images, and the URL their sources resolve against
     images: &'a crate::image_loader::Images,
     base: String,
+    /// Rasterized inline SVGs
+    svgs: &'a mut crate::image_loader::SvgCache,
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
@@ -678,6 +683,12 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         Some((img.natural, layout_engine::ImageHandle(img.clone())))
     }
 
+    fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        let c = style.color();
+        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], self.svgs)?;
+        Some((img.natural, layout_engine::ImageHandle(img)))
+    }
+
     fn pseudo(&mut self, tree: &DomTree, node: NodeId, pe: fos_dom::PseudoElement, style: &Style) -> Option<Style> {
         let element = tree.get(node)?.as_element()?;
         let filter = self.stylesheet.is_some().then_some(&self.ancestors);
@@ -698,7 +709,7 @@ impl layout_engine::Styler for BrowserStyler<'_> {
 }
 
 /// Lay out `document` in a viewport
-fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images: &crate::image_loader::Images, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images: &crate::image_loader::Images, svgs: &mut crate::image_loader::SvgCache, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
     let tree = document.tree();
     let root = document.document_element();
     let mut styler = BrowserStyler {
@@ -710,6 +721,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images
         quirks: document.is_quirks(),
         images,
         base: if images.is_empty() { String::new() } else { crate::css_loader::base_url(document) },
+        svgs,
     };
     let fragments = if root.is_valid() {
         layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)
@@ -923,7 +935,7 @@ mod tests {
     fn layout_of(document: &Document, width: f32) -> PageLayout {
         let renderer = PageRenderer::new(width as u32, 240);
         let sheet = renderer.page_stylesheet(document);
-        build_layout(document, sheet, &Default::default(), &mut FontContext::default(), (width, 240.0))
+        build_layout(document, sheet, &Default::default(), &mut Default::default(), &mut FontContext::default(), (width, 240.0))
     }
 
     /// The text fragments of the element whose text is `text`
@@ -1068,6 +1080,29 @@ mod tests {
         let mut renderer = PageRenderer::new(320, 240);
         let page = renderer.render_html("<html><body></body></html>", "about:blank", 0.0).unwrap();
         assert_eq!(page.pixels.len(), 320 * 240);
+    }
+
+    #[test]
+    fn test_inline_svg_is_drawn() {
+        let html = r#"<html><body style="margin:0; color: #f00">
+            <svg width="20" height="20" viewBox="0 0 10 10"><rect width="10" height="10" fill="currentColor"/></svg><br>
+            <svg viewBox="0 0 10 10" style="width: 40px; height: 40px; display: block; color: #00f"><path d="M0 0h10v10H0z" fill="currentColor"/></svg>
+            <a href="/x"><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="lime"/></svg></a>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // currentColor is the element's color; sizes come from attributes,
+        // or from CSS with the viewBox's aspect
+        assert_eq!(px(10, 10), 0xffff0000);
+        assert_ne!(px(25, 10), 0xffff0000);
+        let blue = (0..200).find(|&y| px(20, y) == 0xff0000ff).expect("blue svg");
+        assert!((0..40).all(|d| px(5, blue + d) == 0xff0000ff || d > 37));
+        // The same markup rasterizes once
+        let before = renderer.svgs.map.len();
+        renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(renderer.svgs.map.len(), before);
     }
 
     #[test]

@@ -28,6 +28,11 @@ pub trait Styler {
     fn image(&mut self, _tree: &DomTree, _node: NodeId) -> Option<((f32, f32), ImageHandle)> {
         None
     }
+    /// An inline `<svg>` element's picture: its natural size and what the
+    /// painter draws (`style` is the element's)
+    fn inline_svg(&mut self, _tree: &DomTree, _node: NodeId, _style: &Style) -> Option<((f32, f32), ImageHandle)> {
+        None
+    }
     /// The style of the element's `::before` or `::after` box (a child
     /// of `style`), when it has content
     fn pseudo(&mut self, _tree: &DomTree, _node: NodeId, _pe: fos_dom::PseudoElement, _style: &Style) -> Option<Style> {
@@ -749,7 +754,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         }
     }
 
-    fn replaced(&mut self, node: NodeId, _style: &Style) -> Option<Replaced> {
+    fn replaced(&mut self, node: NodeId, style: &Style) -> Option<Replaced> {
         if !self.is_replaced(node) {
             return None;
         }
@@ -773,7 +778,13 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             "canvas" => (ReplacedWhat::Canvas, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
             "video" => (ReplacedWhat::Video, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
             "iframe" | "embed" | "object" => (ReplacedWhat::Frame, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
-            "svg" => (ReplacedWhat::Svg, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
+            "svg" => match self.styler.inline_svg(self.tree, node, style) {
+                Some((size, handle)) => {
+                    image = Some(handle);
+                    (ReplacedWhat::Image, Some((w_attr.unwrap_or(size.0), h_attr.unwrap_or(size.1))))
+                }
+                None => (ReplacedWhat::Svg, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
+            },
             "select" => {
                 let selected = self.selected_option(node);
                 (ReplacedWhat::Select(selected), None)

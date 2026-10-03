@@ -91,6 +91,9 @@ pub struct BoxFragment {
     pub marker: Option<TextFragment>,
     /// A replaced element's content to paint, or a form control's text
     pub replaced: Option<Arc<ReplacedPaint>>,
+    /// For boxes that clip their overflow: the size of their content
+    /// (from the padding box's corner), which scrolling can reveal
+    pub scroll_extent: Option<(f32, f32)>,
 }
 
 impl BoxFragment {
@@ -149,9 +152,25 @@ impl BoxFragment {
         None
     }
 
-    /// Recompute the ink rectangle from the children
+    /// Recompute the ink rectangle from the children (a box that clips
+    /// keeps its overflow inside: its ink is its own box)
     pub fn update_ink(&mut self) {
         let mut ink = self.border_box;
+        if self.style.clips() && self.kind != BoxFragmentKind::InlinePart {
+            let pad = self.padding_box();
+            let mut content = Rect::new(pad.x, pad.y, 0.0, 0.0);
+            for c in &self.children {
+                content = content.union(&c.ink());
+            }
+            let w = (content.right() - pad.x + self.padding[1]).max(pad.w);
+            let h = (content.bottom() - pad.y + self.padding[2]).max(pad.h);
+            self.scroll_extent = Some((w, h));
+            if let Some(m) = &self.marker {
+                ink = ink.union(&m.rect);
+            }
+            self.ink = ink;
+            return;
+        }
         for c in &self.children {
             ink = ink.union(&c.ink());
         }
@@ -284,22 +303,68 @@ impl FragmentTree {
     /// paint over earlier ones); boxes with `pointer-events: none` are
     /// transparent to hits
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
-        self.hit_test_scrolled(x, y, 0.0)
+        self.hit_test_scrolled(x, y, 0.0, &|_| (0.0, 0.0))
+    }
+
+    /// The boxes under document point (x, y) that the user can scroll
+    /// (`overflow: auto/scroll` with more content than room), innermost
+    /// first: (element, visible size, content size)
+    pub fn scrollers_at(&self, x: f32, y: f32, scroll: f32, offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Vec<(NodeId, (f32, f32), (f32, f32))> {
+        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32, offsets: &dyn Fn(NodeId) -> (f32, f32), out: &mut Vec<(NodeId, (f32, f32), (f32, f32))>) {
+            if b.style.box_.position == fos_css::style::Position::Fixed && scroll != 0.0 {
+                return walk(b, x, y - scroll, 0.0, offsets, out);
+            }
+            if !b.ink.contains(x, y) {
+                return;
+            }
+            let (mut cx, mut cy) = (x, y);
+            if let Some(extent) = b.scroll_extent {
+                use fos_css::style::Overflow;
+                let user = |o: Overflow| matches!(o, Overflow::Auto | Overflow::Scroll);
+                let pad = b.padding_box();
+                if (user(b.style.box_.overflow_x) && extent.0 > pad.w + 0.5) || (user(b.style.box_.overflow_y) && extent.1 > pad.h + 0.5) {
+                    out.push((b.node, (pad.w, pad.h), extent));
+                }
+                let (ox, oy) = offsets(b.node);
+                cx += ox;
+                cy += oy;
+            }
+            for c in &b.children {
+                if let Fragment::Box(cb) = c {
+                    walk(cb, cx, cy, scroll, offsets, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(r) = &self.root {
+            walk(r, x, y, scroll, offsets, &mut out);
+        }
+        out.reverse();
+        out
     }
 
     /// [`Self::hit_test`] with the page scrolled by `scroll` (fixed boxes
-    /// stay in the viewport)
-    pub fn hit_test_scrolled(&self, x: f32, y: f32, scroll: f32) -> Option<NodeId> {
+    /// stay in the viewport) and scroll containers by `offsets`
+    pub fn hit_test_scrolled(&self, x: f32, y: f32, scroll: f32, offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Option<NodeId> {
         fn hits(b: &BoxFragment) -> bool {
             b.node.is_valid() && b.style.inherited.pointer_events != fos_css::style::PointerEvents::None && b.kind != BoxFragmentKind::Placeholder
         }
-        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32) -> Option<NodeId> {
+        fn walk(b: &BoxFragment, x: f32, y: f32, scroll: f32, offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Option<NodeId> {
             if b.style.box_.position == fos_css::style::Position::Fixed && scroll != 0.0 {
-                return walk(b, x, y - scroll, 0.0);
+                return walk(b, x, y - scroll, 0.0, offsets);
             }
             if !b.ink.contains(x, y) && !(scroll != 0.0 && b.children.iter().any(|c| matches!(c, Fragment::Box(_)))) {
                 return None;
             }
+            // Inside a scrolled box, its content has moved
+            let (bx, by) = (x, y);
+            let (x, y) = match b.scroll_extent {
+                Some(_) => {
+                    let (ox, oy) = offsets(b.node);
+                    (x + ox, y + oy)
+                }
+                None => (x, y),
+            };
             let mut layers: Vec<&BoxFragment> = b
                 .children
                 .iter()
@@ -312,7 +377,7 @@ impl FragmentTree {
             layers.reverse();
             layers.sort_by_key(|l| std::cmp::Reverse(l.style.box_.z_index.unwrap_or(0)));
             for l in layers {
-                if let Some(n) = walk(l, x, y, scroll) {
+                if let Some(n) = walk(l, x, y, scroll, offsets) {
                     return Some(n);
                 }
             }
@@ -320,7 +385,7 @@ impl FragmentTree {
                 match c {
                     Fragment::Box(cb) if cb.style.is_positioned() => {}
                     Fragment::Box(cb) => {
-                        if let Some(n) = walk(cb, x, y, scroll) {
+                        if let Some(n) = walk(cb, x, y, scroll, offsets) {
                             return Some(n);
                         }
                     }
@@ -331,9 +396,9 @@ impl FragmentTree {
                     }
                 }
             }
-            (hits(b) && b.border_box.contains(x, y)).then_some(b.node)
+            (hits(b) && b.border_box.contains(bx, by)).then_some(b.node)
         }
-        walk(self.root.as_ref()?, x, y, scroll)
+        walk(self.root.as_ref()?, x, y, scroll, offsets)
     }
 }
 
@@ -351,6 +416,7 @@ impl BoxFragment {
             ink: self.ink,
             marker: self.marker.clone(),
             replaced: self.replaced.clone(),
+            scroll_extent: self.scroll_extent,
         }
     }
 }

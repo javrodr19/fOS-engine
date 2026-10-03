@@ -39,7 +39,15 @@ pub struct Painter<'a> {
     base: &'a str,
     /// Canvas elements' bitmaps
     canvases: Option<&'a std::collections::HashMap<NodeId, std::sync::Arc<crate::image_loader::LoadedImage>>>,
+    /// Scroll offsets of scroll containers
+    box_scroll: Option<&'a std::collections::HashMap<NodeId, (f32, f32)>>,
+    /// Horizontal shift from document to canvas (inside scrolled boxes)
+    dx: f32,
 }
+
+/// A positioned box to paint as a layer: z-index, box, clip, opacity, and
+/// the (origin, dx) shift in effect where it sits
+type Layer<'t> = (i32, &'t BoxFragment, Clip, f32, (f32, f32));
 
 /// A device-space clip rectangle: x0, y0, x1, y1
 #[derive(Clone, Copy, PartialEq)]
@@ -173,13 +181,19 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0 }
     }
 
     /// Images for CSS `url()`s
     pub fn with_images(mut self, images: &'a crate::image_loader::Images, base: &'a str) -> Self {
         self.images = Some(&**images);
         self.base = base;
+        self
+    }
+
+    /// Scroll positions of scroll containers
+    pub fn with_box_scroll(mut self, offsets: &'a std::collections::HashMap<NodeId, (f32, f32)>) -> Self {
+        self.box_scroll = Some(offsets);
         self
     }
 
@@ -203,7 +217,20 @@ impl<'a> Painter<'a> {
 
     /// Document rectangle to device
     fn dev(&self, r: Rect) -> Rect {
-        Rect::new(r.x, r.y - self.origin, r.w, r.h)
+        Rect::new(r.x + self.dx, r.y - self.origin, r.w, r.h)
+    }
+
+    /// Shift for the contents of `b` if it is a scrolled box; returns what
+    /// to restore
+    fn enter_scroll(&mut self, b: &BoxFragment) -> (f32, f32) {
+        let saved = (self.origin, self.dx);
+        if b.scroll_extent.is_some() {
+            if let Some(&(ox, oy)) = self.box_scroll.and_then(|m| m.get(&b.node)) {
+                self.origin += oy;
+                self.dx -= ox;
+            }
+        }
+        saved
     }
 
     fn mask_for(&mut self, clip: Clip) -> Option<&Mask> {
@@ -306,30 +333,68 @@ impl<'a> Painter<'a> {
         }
         self.paint_own(b, clip, alpha);
         let inner = self.inner_clip(b, clip);
-        let mut layers: Vec<(i32, &BoxFragment, Clip, f32)> = Vec::new();
+        let saved = self.enter_scroll(b);
+        let mut layers: Vec<Layer> = Vec::new();
         self.collect_layers(b, inner, alpha, &mut layers);
         layers.sort_by_key(|l| l.0);
-        for &(_, l, c, a) in layers.iter().filter(|l| l.0 < 0) {
+        let here = (self.origin, self.dx);
+        for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 < 0) {
+            (self.origin, self.dx) = at;
             self.paint_layer(l, c, a);
         }
+        (self.origin, self.dx) = here;
         self.paint_flow(b, inner, alpha);
-        for &(_, l, c, a) in layers.iter().filter(|l| l.0 >= 0) {
+        for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 >= 0) {
+            (self.origin, self.dx) = at;
             self.paint_layer(l, c, a);
         }
+        (self.origin, self.dx) = saved;
+        self.scroll_thumbs(b, clip);
         if b.style.inherited.visibility == Visibility::Visible {
             self.outline(b, clip, alpha);
         }
     }
 
     /// The positioned boxes under `b` that are not inside another layer
-    fn collect_layers<'t>(&self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<(i32, &'t BoxFragment, Clip, f32)>) {
+    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
             if Self::is_layer(cb) {
-                out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha));
+                out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha, (self.origin, self.dx)));
             } else if self.find_fixed || !self.culled(cb, clip) {
-                self.collect_layers(cb, self.inner_clip(cb, clip), alpha * cb.style.box_.opacity, out);
+                let inner = self.inner_clip(cb, clip);
+                let saved = self.enter_scroll(cb);
+                self.collect_layers(cb, inner, alpha * cb.style.box_.opacity, out);
+                (self.origin, self.dx) = saved;
             }
+        }
+    }
+
+    /// Overlay scroll thumbs on a box whose content overflows it
+    fn scroll_thumbs(&mut self, b: &BoxFragment, clip: Clip) {
+        use fos_css::style::Overflow;
+        let Some((ew, eh)) = b.scroll_extent else { return };
+        let user = |o: Overflow| matches!(o, Overflow::Auto | Overflow::Scroll);
+        let pad = self.dev(b.padding_box());
+        let (ox, oy) = self.box_scroll.and_then(|m| m.get(&b.node)).copied().unwrap_or((0.0, 0.0));
+        let color = tiny_skia::Color::from_rgba8(0, 0, 0, 90);
+        let mut thumb = |r: Rect, painter: &mut Self| {
+            if let Some(p) = rounded_path(r, [(r.w.min(r.h) / 2.0, r.w.min(r.h) / 2.0); 4]) {
+                let mut paint = Paint::default();
+                paint.set_color(color);
+                paint.anti_alias = true;
+                painter.fill(&p, &paint, FillRule::Winding, clip.intersect(pad));
+            }
+        };
+        if user(b.style.box_.overflow_y) && eh > pad.h + 0.5 && pad.h > 16.0 {
+            let len = (pad.h * pad.h / eh).max(16.0);
+            let y = pad.y + (pad.h - len) * (oy / (eh - pad.h)).clamp(0.0, 1.0);
+            thumb(Rect::new(pad.right() - 6.0, y + 2.0, 4.0, len - 4.0), self);
+        }
+        if user(b.style.box_.overflow_x) && ew > pad.w + 0.5 && pad.w > 16.0 {
+            let len = (pad.w * pad.w / ew).max(16.0);
+            let x = pad.x + (pad.w - len) * (ox / (ew - pad.w)).clamp(0.0, 1.0);
+            thumb(Rect::new(x + 2.0, pad.bottom() - 6.0, len - 4.0, 4.0), self);
         }
     }
 
@@ -375,7 +440,11 @@ impl<'a> Painter<'a> {
                         continue;
                     }
                     self.paint_own(cb, clip, a);
-                    self.paint_flow(cb, self.inner_clip(cb, clip), a);
+                    let inner = self.inner_clip(cb, clip);
+                    let saved = self.enter_scroll(cb);
+                    self.paint_flow(cb, inner, a);
+                    (self.origin, self.dx) = saved;
+                    self.scroll_thumbs(cb, clip);
                     if cb.style.inherited.visibility == Visibility::Visible {
                         self.outline(cb, clip, a);
                     }
@@ -769,10 +838,10 @@ impl<'a> Painter<'a> {
         let pixel_clip = clip.pixels();
         for (word, x) in &t.words {
             let Some(font) = word.font else { continue };
-            if x + word.width < clip.0[0] || *x > clip.0[2] {
+            let x = *x + self.dx;
+            if x + word.width < clip.0[0] || x > clip.0[2] {
                 continue;
             }
-            let x = *x;
             if word.fallback.is_empty() {
                 self.text.draw_glyph_run(self.canvas, font, word.size, t.font.synthesis, color, word.glyphs.iter().map(|g| (g.id, x + g.x, baseline - g.y)), pixel_clip);
             } else {

@@ -85,6 +85,12 @@ pub struct DomHost {
     boxes: Option<HashMap<u32, [f32; 4]>>,
     /// A scroll position a script asked for
     pub scroll_request: Option<f32>,
+    /// Scroll containers' positions (mirrored from the renderer, updated
+    /// at once when scripts scroll them) and the scrolls scripts asked for
+    pub box_scroll: HashMap<u32, (f32, f32)>,
+    pub box_scroll_requests: Vec<(NodeId, f32, f32)>,
+    /// Per element: visible size and content size (from `layout`)
+    metrics: Option<HashMap<u32, [f32; 4]>>,
     /// The browser's cookies (`document.cookie`; `fetch` shares them)
     cookies: fos_net::SharedCookieJar,
     /// The URL changed without a navigation (`history.pushState`)
@@ -117,6 +123,9 @@ impl DomHost {
             scroll: (0.0, 0.0),
             boxes: None,
             scroll_request: None,
+            box_scroll: HashMap::new(),
+            box_scroll_requests: Vec::new(),
+            metrics: None,
             cookies,
             url_changed: false,
             canvas: Default::default(),
@@ -1447,6 +1456,7 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
     if !same {
         h.layout = layout;
         h.boxes = None;
+        h.metrics = None;
     }
     h.viewport = viewport;
     h.scroll = scroll;
@@ -1500,6 +1510,41 @@ fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<
     let Some(b) = host(vm).boxes.as_ref().unwrap().get(&id.0).copied() else { return Ok(Value::NULL) };
     let vals: Vec<Value> = b.iter().map(|&v| Value::number(v as f64)).collect();
     Ok(Value::object(vm.new_array(vals)))
+}
+
+fn metrics_of(vm: &mut Vm, id: NodeId) -> Option<[f32; 4]> {
+    let h = host(vm);
+    if h.metrics.is_none() {
+        let m = h.layout.as_ref()?.scroll_metrics();
+        h.metrics = Some(m);
+    }
+    h.metrics.as_ref()?.get(&id.0).copied()
+}
+
+/// `__fosScrollMetrics(el)`: `[scrollLeft, scrollTop, scrollWidth,
+/// scrollHeight, clientWidth, clientHeight]`, or null without a box
+fn scroll_metrics(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let Some(m) = metrics_of(vm, id) else { return Ok(Value::NULL) };
+    let (sx, sy) = host(vm).box_scroll.get(&id.0).copied().unwrap_or((0.0, 0.0));
+    let vals: Vec<Value> = [sx, sy, m[2], m[3], m[0], m[1]].iter().map(|&v| Value::number(v as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+/// `__fosSetBoxScroll(el, x, y)`: scroll an element's content (null keeps
+/// an axis)
+fn set_box_scroll(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let Some(m) = metrics_of(vm, id) else { return Ok(Value::UNDEFINED) };
+    let (cx, cy) = host(vm).box_scroll.get(&id.0).copied().unwrap_or((0.0, 0.0));
+    let x = if arg(args, 1).is_null() { cx } else { vm.to_number(arg(args, 1))? as f32 };
+    let y = if arg(args, 2).is_null() { cy } else { vm.to_number(arg(args, 2))? as f32 };
+    let x = if x.is_finite() { x.clamp(0.0, (m[2] - m[0]).max(0.0)).round() } else { cx };
+    let y = if y.is_finite() { y.clamp(0.0, (m[3] - m[1]).max(0.0)).round() } else { cy };
+    let h = host(vm);
+    h.box_scroll.insert(id.0, (x, y));
+    h.box_scroll_requests.push((id, x, y));
+    Ok(Value::UNDEFINED)
 }
 
 /// `__fosQuirks()`: whether the document is in quirks mode
@@ -1720,6 +1765,8 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosGeometry", 1, geometry),
         ("__fosViewport", 0, viewport),
         ("__fosQuirks", 0, quirks),
+        ("__fosScrollMetrics", 1, scroll_metrics),
+        ("__fosSetBoxScroll", 3, set_box_scroll),
         ("__fosScrollTo", 1, scroll_to),
         ("__fosDecode", 2, decode_text),
         ("__fosEncode", 1, encode_text),

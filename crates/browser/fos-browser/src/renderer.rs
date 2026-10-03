@@ -103,6 +103,22 @@ impl PageLayout {
         &self.fragments
     }
 
+    /// Scroll metrics of every element with a box: visible (padding box)
+    /// size and content size
+    pub fn scroll_metrics(&self) -> std::collections::HashMap<u32, [f32; 4]> {
+        let mut out = std::collections::HashMap::new();
+        self.fragments.for_each(|f| {
+            if let Fragment::Box(b) = f {
+                if b.node.is_valid() && b.kind != BoxFragmentKind::InlinePart {
+                    let pad = b.padding_box();
+                    let (ew, eh) = b.scroll_extent.unwrap_or((pad.w, pad.h));
+                    out.entry(b.node.0).or_insert([pad.w, pad.h, ew, eh]);
+                }
+            }
+        });
+        out
+    }
+
     /// The deepest element at document point (x, y)
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         self.fragments.hit_test(x, y)
@@ -154,6 +170,8 @@ pub struct PageRenderer {
     images: crate::image_loader::Images,
     /// What scripts drew on the page's canvas elements
     canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
+    /// Scroll positions of the page's scroll containers
+    box_scroll: std::collections::HashMap<NodeId, (f32, f32)>,
 }
 
 impl PageRenderer {
@@ -175,6 +193,7 @@ impl PageRenderer {
             scroll: 0.0,
             images: Default::default(),
             canvases: Default::default(),
+            box_scroll: Default::default(),
         }
     }
 
@@ -199,6 +218,7 @@ impl PageRenderer {
         self.cached = None;
         self.compiled_css = None;
         self.canvases.clear();
+        self.box_scroll.clear();
         self.text_renderer.clear_glyph_cache();
         self.fonts = FontContext::new(self.text_renderer.fonts.clone());
     }
@@ -271,7 +291,8 @@ impl PageRenderer {
     /// The element at `(x, y)` in document coordinates, per the current
     /// layout
     pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
-        self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll)
+        let offsets = &self.box_scroll;
+        self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)))
     }
 
     /// Whether the cached layout reflects `document` as it is now
@@ -369,6 +390,56 @@ impl PageRenderer {
             self.layout_generation += 1;
         }
         changed
+    }
+
+    /// Forget the previous page's scroll positions and canvases
+    pub fn new_page(&mut self) {
+        self.box_scroll.clear();
+        self.canvases.clear();
+        self.cached = None;
+    }
+
+    /// Scroll the innermost scroll container at document point (x, y) that
+    /// can move by (dx, dy); false if none can (the page should scroll)
+    pub fn scroll_box_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        let Some(cached) = self.cached.as_ref() else { return false };
+        let offsets = &self.box_scroll;
+        let chain = cached.layout.fragments.scrollers_at(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)));
+        for (node, visible, extent) in chain {
+            let (ox, oy) = self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0));
+            let nx = (ox + dx).clamp(0.0, (extent.0 - visible.0).max(0.0)).round();
+            let ny = (oy + dy).clamp(0.0, (extent.1 - visible.1).max(0.0)).round();
+            if (nx, ny) != (ox, oy) {
+                self.box_scroll.insert(node, (nx, ny));
+                // Painted buffers are stale
+                self.layout_generation += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scroll a box to (x, y) (clamped to its content); false if it
+    /// does not scroll
+    pub fn set_box_scroll(&mut self, node: NodeId, x: f32, y: f32) -> bool {
+        let Some(m) = self.cached.as_ref().and_then(|c| c.layout.scroll_metrics().get(&node.0).copied()) else { return false };
+        let to = (x.clamp(0.0, (m[2] - m[0]).max(0.0)).round(), y.clamp(0.0, (m[3] - m[1]).max(0.0)).round());
+        if self.box_scroll(node) == to {
+            return false;
+        }
+        self.box_scroll.insert(node, to);
+        self.layout_generation += 1;
+        true
+    }
+
+    /// Every scrolled box's position (for scripts)
+    pub fn box_scrolls(&self) -> std::collections::HashMap<u32, (f32, f32)> {
+        self.box_scroll.iter().map(|(n, v)| (n.0, *v)).collect()
+    }
+
+    /// An element's scroll position (scrollLeft, scrollTop)
+    pub fn box_scroll(&self, node: NodeId) -> (f32, f32) {
+        self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0))
     }
 
     /// Images the current layout's CSS uses (backgrounds, masks)
@@ -491,7 +562,7 @@ impl PageRenderer {
     fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
         let bg = layout.background;
         let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
-        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base).with_canvases(&self.canvases);
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base).with_canvases(&self.canvases).with_box_scroll(&self.box_scroll);
         painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
     }
@@ -894,6 +965,36 @@ mod tests {
         assert_ne!(far.pixels[50 * 200 + 5], 0xffff0000);
         let fixed = renderer.node_at(10.0, 1010.0).unwrap();
         assert_eq!(document.tree().get(fixed).and_then(|n| n.as_element()).map(|e| document.tree().resolve(e.name.local).to_string()).as_deref(), Some("div"));
+    }
+
+    #[test]
+    fn test_scroll_containers_scroll_their_content() {
+        let mut html = String::from("<html><body style='margin:0'><div id=s style='height: 50px; width: 100px; overflow: auto'>");
+        for i in 0..20 {
+            html.push_str(&format!("<div style='height: 20px; background: {}'>{i}</div>", if i == 0 { "#f00" } else { "#00f" }));
+        }
+        html.push_str("</div><p>after</p></body></html>");
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let before = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(before.pixels[5 * 200 + 5], 0xffff0000);
+        // Content below the box is clipped: the paragraph follows at 50px
+        let s = document.get_element_by_id("s").unwrap();
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 30.0));
+        assert_eq!(renderer.box_scroll(s), (0.0, 30.0));
+        let after = renderer.render_document(&document, 0.0).unwrap();
+        // Row 1 (blue) is now at the top
+        assert_eq!(after.pixels[5 * 200 + 5], 0xff0000ff);
+        // Clamped at the end (20 rows of 20px in a 50px box)
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 10_000.0));
+        assert_eq!(renderer.box_scroll(s), (0.0, 350.0));
+        assert!(!renderer.scroll_box_at(10.0, 10.0, 0.0, 10.0));
+        // Outside the box nothing scrolls
+        assert!(!renderer.scroll_box_at(150.0, 10.0, 0.0, 10.0));
+        // Hit testing sees the scrolled content: the last row
+        let last = renderer.node_at(10.0, 45.0).unwrap();
+        let text: String = document.tree().children(last).filter_map(|(_, n)| n.as_text()).collect();
+        assert_eq!(text, "19");
     }
 
     #[test]

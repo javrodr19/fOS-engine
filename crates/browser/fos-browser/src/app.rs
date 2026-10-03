@@ -276,6 +276,7 @@ impl BrowserApp {
         // Stylesheets block the first render, as in other browsers:
         // painting without them would show the page unstyled first
         page.stylesheets = self.load_stylesheets(&page);
+        self.renderer.new_page();
         self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
@@ -503,14 +504,25 @@ impl BrowserApp {
         let layout = self.renderer.layout_snapshot();
         let viewport = (self.content_width() as f32, self.viewport_height());
         let scroll = (0.0, self.scroll_offset);
+        let box_scrolls = self.renderer.box_scrolls();
         if let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
             rt.set_layout(layout, viewport, scroll);
+            rt.set_box_scrolls(box_scrolls);
         }
     }
 
     /// Go where the page's scripts asked to (`location.href = ...`), and
     /// scroll where they asked to (`scrollTo`, `scrollIntoView`)
     fn follow_script_navigation(&mut self) {
+        let box_scrolls = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).map(|r| r.take_box_scroll_requests()).unwrap_or_default();
+        let mut moved = false;
+        for (node, x, y) in box_scrolls {
+            moved |= self.renderer.set_box_scroll(node, x, y);
+        }
+        if moved {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
         let scroll = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).and_then(|r| r.take_scroll_request());
         if let Some(y) = scroll {
             self.scroll_offset = y;
@@ -1115,11 +1127,20 @@ impl ApplicationHandler for BrowserApp {
                 self.chrome.handle_mouse_move(self.mouse_x, self.mouse_y);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll_amount = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                 };
-                self.scroll_by(-scroll_amount);
+                // The innermost scroll container under the pointer that can
+                // move takes the scroll; otherwise the page does
+                let content_x = self.mouse_x - TAB_BAR_WIDTH as i32;
+                let doc_y = self.mouse_y as f32 + self.scroll_offset;
+                if content_x >= 0 && self.renderer.scroll_box_at(content_x as f32, doc_y, -dx, -dy) {
+                    self.rerender_at(self.render_start_y);
+                    self.request_redraw();
+                } else {
+                    self.scroll_by(-dy);
+                }
             }
             _ => {}
         }

@@ -540,6 +540,7 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         ink: Rect::default(),
         marker: None,
         replaced: None,
+        scroll_extent: None,
     };
     frag.update_ink();
     let parent = stack.last_mut().expect("root box");

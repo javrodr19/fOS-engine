@@ -232,6 +232,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             ink: Rect::default(),
             marker: None,
             replaced: None,
+            scroll_extent: None,
         })
         .collect();
     for (r, c, rs, mut f) in laid_cells {

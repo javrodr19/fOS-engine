@@ -565,6 +565,18 @@ impl PageJsRuntime {
         self.vm.as_mut().map(crate::canvas_bindings::take_canvas_updates).unwrap_or_default()
     }
 
+    /// Scroll containers' positions, for scripts to read
+    pub fn set_box_scrolls(&mut self, scrolls: std::collections::HashMap<u32, (f32, f32)>) {
+        if let Some(h) = self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()) {
+            h.box_scroll = scrolls;
+        }
+    }
+
+    /// Element scrolls the page's scripts asked for (taken)
+    pub fn take_box_scroll_requests(&mut self) -> Vec<(NodeId, f32, f32)> {
+        self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()).map(|h| std::mem::take(&mut h.box_scroll_requests)).unwrap_or_default()
+    }
+
     /// A scroll position the page's scripts asked for (taken)
     pub fn take_scroll_request(&mut self) -> Option<f32> {
         self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()).and_then(|h| h.scroll_request.take())
@@ -1855,6 +1867,27 @@ mod tests {
         assert_eq!(rt.eval("ok").unwrap(), "1");
         let msgs = rt.console_messages();
         assert!(msgs.iter().any(|m| format!("{m:?}").contains("undefinedFn")), "{msgs:?}");
+    }
+
+    #[test]
+    fn scripts_scroll_scroll_containers() {
+        let mut rows = String::new();
+        for i in 0..10 {
+            rows.push_str(&format!("<div style='height: 30px'>{i}</div>"));
+        }
+        let (mut rt, doc) = page(&format!("<html><body style='margin:0'><div id=s style='height: 100px; overflow-y: auto; padding: 0 5px'>{rows}</div></body></html>"));
+        let mut renderer = crate::renderer::PageRenderer::new(400, 300);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (400.0, 300.0), (0.0, 0.0));
+        rt.eval("const s = document.getElementById('s'); window.m = [s.clientHeight, s.scrollHeight, s.clientWidth, s.scrollTop].join(); s.scrollTop = 1e9; window.t = s.scrollTop; s.scrollBy(0, -50); window.t2 = s.scrollTop;").unwrap();
+        assert_eq!(rt.eval("m").unwrap(), "100,300,400,0");
+        assert_eq!(rt.eval("t").unwrap(), "200");
+        assert_eq!(rt.eval("t2").unwrap(), "150");
+        let requests = rt.take_box_scroll_requests();
+        assert_eq!(requests.len(), 2);
+        let (node, x, y) = requests[1];
+        assert!(renderer.set_box_scroll(node, x, y));
+        assert_eq!(renderer.box_scroll(node), (0.0, 150.0));
     }
 
     #[test]

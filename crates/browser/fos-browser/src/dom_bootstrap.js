@@ -294,27 +294,41 @@
     },
     get clientWidth() {
       if (this === document.documentElement) return __fosViewport()[0];
-      const g = __fosGeometry(this); return g ? Math.round(g[2]) : 0;
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[4]) : 0;
     },
     get clientHeight() {
       if (this === document.documentElement) return __fosViewport()[1];
-      const g = __fosGeometry(this); return g ? Math.round(g[3]) : 0;
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[5]) : 0;
     },
     get clientTop() { return 0; }, get clientLeft() { return 0; },
     get scrollWidth() {
       if (this === document.documentElement || this === document.body) return __fosViewport()[0];
-      return this.clientWidth;
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[2]) : 0;
     },
     get scrollHeight() {
       if (this === document.documentElement || this === document.body) return Math.round(__fosViewport()[4]);
-      return this.clientHeight;
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[3]) : 0;
     },
-    get scrollTop() { return this === document.documentElement || this === document.body ? __fosViewport()[3] : 0; },
-    set scrollTop(v) { if (this === document.documentElement || this === document.body) __fosScrollTo(+v || 0); },
-    get scrollLeft() { return 0; },
-    set scrollLeft(v) {},
+    get scrollTop() {
+      if (this === document.documentElement || this === document.body) return __fosViewport()[3];
+      const m = __fosScrollMetrics(this); return m ? m[1] : 0;
+    },
+    set scrollTop(v) {
+      if (this === document.documentElement || this === document.body) __fosScrollTo(+v || 0);
+      else __fosSetBoxScroll(this, null, +v || 0);
+    },
+    get scrollLeft() { const m = __fosScrollMetrics(this); return m ? m[0] : 0; },
+    set scrollLeft(v) { __fosSetBoxScroll(this, +v || 0, null); },
     scrollIntoView() { const g = __fosGeometry(this); if (g) __fosScrollTo(g[1]); },
-    scrollTo() {}, scrollBy() {},
+    scrollTo(a, b) {
+      const o = typeof a === 'object' && a ? a : { left: a, top: b };
+      if (this === document.documentElement || this === document.body) { if (o.top != null) __fosScrollTo(+o.top || 0); return; }
+      __fosSetBoxScroll(this, o.left == null ? null : +o.left, o.top == null ? null : +o.top);
+    },
+    scrollBy(a, b) {
+      const o = typeof a === 'object' && a ? a : { left: a, top: b };
+      this.scrollTo({ left: this.scrollLeft + (+o.left || 0), top: this.scrollTop + (+o.top || 0) });
+    },
     focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus')); },
     blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur')); },
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); },

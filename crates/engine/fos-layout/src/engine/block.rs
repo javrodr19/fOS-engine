@@ -339,6 +339,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         ink: Rect::default(),
         marker: None,
         replaced: None,
+        scroll_extent: None,
     };
     let (content_x, content_y) = (ml + e.border[3] + e.padding[3], e.border[0] + e.padding[0]);
     // A new formatting context has its own floats and coordinates
@@ -556,6 +557,7 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         ink: at,
         marker: None,
         replaced: None,
+        scroll_extent: None,
     }
 }
 
@@ -620,6 +622,7 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         ink: Rect::default(),
         marker: None,
         replaced: None,
+        scroll_extent: None,
     };
     let content = frag.content_box();
     let paint = match &r.what {

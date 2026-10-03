@@ -165,7 +165,9 @@ impl BoxFragment {
 /// What a replaced element shows
 #[derive(Debug)]
 pub enum ReplacedPaint {
-    /// An image, canvas or other bitmap the embedder supplies by node
+    /// An image the embedder loaded
+    Image(super::box_tree::ImageHandle),
+    /// A canvas, video or other bitmap the embedder supplies by node
     Bitmap,
     /// A checkbox or radio button, checked or not
     Check { radio: bool, checked: bool },

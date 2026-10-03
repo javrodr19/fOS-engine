@@ -146,6 +146,8 @@ pub struct PageRenderer {
     compiled_css: Option<(u64, Option<Arc<PageStyles>>)>,
     /// The scroll position last painted (where fixed boxes are)
     scroll: f32,
+    /// The current page's decoded images
+    images: crate::image_loader::Images,
 }
 
 impl PageRenderer {
@@ -165,6 +167,7 @@ impl PageRenderer {
             stylesheets: Default::default(),
             compiled_css: None,
             scroll: 0.0,
+            images: Default::default(),
         }
     }
 
@@ -280,7 +283,7 @@ impl PageRenderer {
         let started = std::time::Instant::now();
         let stylesheet = self.compiled_stylesheet(document);
         let parsed = started.elapsed();
-        let layout = build_layout(document, stylesheet, &mut self.fonts, (width as f32, self.viewport_height as f32));
+        let layout = build_layout(document, stylesheet, &self.images, &mut self.fonts, (width as f32, self.viewport_height as f32));
         log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
@@ -337,6 +340,20 @@ impl PageRenderer {
         page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
         page.origin = scroll_offset;
         Some(page)
+    }
+
+    /// Use `images` for the page's images (fetched by the browser); the
+    /// layout is redone if they changed
+    pub fn set_images(&mut self, images: crate::image_loader::Images) {
+        if !Arc::ptr_eq(&self.images, &images) {
+            self.images = images;
+            self.cached = None;
+        }
+    }
+
+    /// The images in use (to keep what is still needed when reloading)
+    pub fn images(&self) -> &crate::image_loader::Images {
+        &self.images
     }
 
     /// The page's CSS compiled for matching, reused while its text and
@@ -483,6 +500,9 @@ struct BrowserStyler<'a> {
     root_styled: bool,
     /// The document is in quirks mode
     quirks: bool,
+    /// Loaded images, and the URL their sources resolve against
+    images: &'a crate::image_loader::Images,
+    base: String,
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
@@ -524,6 +544,16 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         style
     }
 
+    fn image(&mut self, tree: &DomTree, node: NodeId) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        if self.images.is_empty() {
+            return None;
+        }
+        let tag = tree.get(node).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))?;
+        let src = if tag == "img" { crate::image_loader::image_source(tree, node, self.ctx.viewport.0)? } else { tree.get_attribute(node, "src")?.to_string() };
+        let img = self.images.get(&fos_net::url_util::resolve(&self.base, &src))?;
+        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+    }
+
     fn enter(&mut self, tree: &DomTree, node: NodeId) {
         if self.stylesheet.is_some() {
             self.ancestors.push(tree, node);
@@ -538,7 +568,7 @@ impl layout_engine::Styler for BrowserStyler<'_> {
 }
 
 /// Lay out `document` in a viewport
-fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images: &crate::image_loader::Images, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
     let tree = document.tree();
     let root = document.document_element();
     let mut styler = BrowserStyler {
@@ -548,6 +578,8 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, fonts:
         ctx: StyleContext { root_font_size: 16.0, viewport },
         root_styled: false,
         quirks: document.is_quirks(),
+        images,
+        base: if images.is_empty() { String::new() } else { crate::css_loader::base_url(document) },
     };
     let fragments = if root.is_valid() {
         layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)
@@ -750,7 +782,7 @@ mod tests {
     fn layout_of(document: &Document, width: f32) -> PageLayout {
         let renderer = PageRenderer::new(width as u32, 240);
         let sheet = renderer.page_stylesheet(document);
-        build_layout(document, sheet, &mut FontContext::default(), (width, 240.0))
+        build_layout(document, sheet, &Default::default(), &mut FontContext::default(), (width, 240.0))
     }
 
     /// The text fragments of the element whose text is `text`

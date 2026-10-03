@@ -293,6 +293,21 @@ impl BrowserApp {
         }
     }
 
+    /// Fetch and decode the page's images (after its first render: images
+    /// do not block it), then re-render with them
+    fn load_images(&mut self) {
+        let width = self.content_width() as f32;
+        let Some(page) = self.current_page.as_ref() else { return };
+        let previous = self.renderer.images().clone();
+        let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous);
+        if !Arc::ptr_eq(&images, &previous) {
+            self.renderer.set_images(images);
+            self.rerender_at(self.render_start_y);
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+    }
+
     /// Fetch the page's external stylesheets
     fn load_stylesheets(&mut self, page: &Page) -> crate::css_loader::Stylesheets {
         crate::css_loader::load_for_page(&mut self.network, page)
@@ -319,6 +334,7 @@ impl BrowserApp {
         }
 
         self.refresh_if_dom_changed();
+        self.load_images();
         self.follow_script_navigation();
 
         // Build accessibility tree and extract media from DOM
@@ -354,6 +370,8 @@ impl BrowserApp {
             self.rerender_at(self.render_start_y);
             self.ensure_render_covers_scroll();
             self.request_redraw();
+            // Scripts may have added images
+            self.load_images();
         }
     }
 

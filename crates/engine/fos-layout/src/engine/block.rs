@@ -618,7 +618,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
     };
     let content = frag.content_box();
     let paint = match &r.what {
-        ReplacedWhat::Image | ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg => ReplacedPaint::Bitmap,
+        ReplacedWhat::Image => r.image.clone().map_or(ReplacedPaint::Empty, ReplacedPaint::Image),
+        ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg => ReplacedPaint::Bitmap,
         ReplacedWhat::Frame => ReplacedPaint::Empty,
         ReplacedWhat::Check { radio, checked } => ReplacedPaint::Check { radio: *radio, checked: *checked },
         ReplacedWhat::TextField(text, placeholder) => {

@@ -631,7 +631,55 @@ impl<'a> Painter<'a> {
                     self.fill(&p, &paint, FillRule::Winding, clip);
                 }
             }
+            ReplacedPaint::Image(handle) => {
+                if let Some(img) = handle.0.downcast_ref::<crate::image_loader::LoadedImage>() {
+                    self.image(b, img, c, clip, alpha);
+                }
+            }
             ReplacedPaint::Bitmap | ReplacedPaint::Empty => {}
+        }
+    }
+
+    /// An image in a content box `c` (device space), fitted per
+    /// `object-fit` and centered
+    fn image(&mut self, b: &BoxFragment, img: &crate::image_loader::LoadedImage, c: Rect, clip: Clip, alpha: f32) {
+        use fos_css::style::ObjectFit;
+        let (nw, nh) = img.natural;
+        if nw <= 0.0 || nh <= 0.0 || c.w <= 0.0 || c.h <= 0.0 {
+            return;
+        }
+        let (sx, sy) = (c.w / nw, c.h / nh);
+        let (dw, dh) = match b.style.box_.object_fit {
+            ObjectFit::Fill => (c.w, c.h),
+            ObjectFit::Contain => {
+                let s = sx.min(sy);
+                (nw * s, nh * s)
+            }
+            ObjectFit::Cover => {
+                let s = sx.max(sy);
+                (nw * s, nh * s)
+            }
+            ObjectFit::None => (nw, nh),
+            ObjectFit::ScaleDown => {
+                let s = sx.min(sy).min(1.0);
+                (nw * s, nh * s)
+            }
+        };
+        let dest = Rect::new(c.x + (c.w - dw) / 2.0, c.y + (c.h - dh) / 2.0, dw, dh);
+        let visible = clip.intersect(c).intersect(dest);
+        if visible.is_empty() {
+            return;
+        }
+        let pm = &img.pixmap;
+        let transform = Transform::from_row(dw / pm.width() as f32, 0.0, 0.0, dh / pm.height() as f32, dest.x, dest.y);
+        let scale = (dw / pm.width() as f32).min(dh / pm.height() as f32);
+        // Smooth when scaling, exact at 1:1
+        let quality = if (scale - 1.0).abs() < 0.01 { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bilinear };
+        let shader = tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, quality, alpha, transform);
+        let mut paint = Paint::default();
+        paint.shader = shader;
+        if let (Some(rect), Some(mut canvas)) = (tiny_skia::Rect::from_ltrb(visible.0[0], visible.0[1], visible.0[2], visible.0[3]), self.canvas.pixmap_mut()) {
+            canvas.fill_rect(rect, &paint, Transform::identity(), None);
         }
     }
 
@@ -660,7 +708,7 @@ impl<'a> Painter<'a> {
             let size = t.font.size;
             let thickness = (size / 14.0).max(1.0);
             let dc = skia_color(t.decoration_color, alpha);
-            let mut line = |y: f32, painter: &mut Self| painter.fill_rect(Rect::new(r.x, y, r.w, thickness), dc, clip);
+            let line = |y: f32, painter: &mut Self| painter.fill_rect(Rect::new(r.x, y, r.w, thickness), dc, clip);
             if t.decoration & decoration::UNDERLINE != 0 {
                 line(baseline + (t.font.descent() * 0.45).max(1.0), self);
             }

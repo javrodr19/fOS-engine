@@ -23,6 +23,21 @@ pub trait Styler {
     fn natural_size(&mut self, _tree: &DomTree, _node: NodeId) -> Option<(f32, f32)> {
         None
     }
+    /// An image element's content: its natural size and what the painter
+    /// draws
+    fn image(&mut self, _tree: &DomTree, _node: NodeId) -> Option<((f32, f32), ImageHandle)> {
+        None
+    }
+}
+
+/// Image content the embedder supplies (layout only passes it to paint)
+#[derive(Clone)]
+pub struct ImageHandle(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for ImageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImageHandle")
+    }
 }
 
 /// A replaced element (or form control drawn as one)
@@ -31,6 +46,8 @@ pub struct Replaced {
     /// Natural width and height (and their ratio, for auto sizes)
     pub natural: Option<(f32, f32)>,
     pub what: ReplacedWhat,
+    /// The image to draw, once loaded
+    pub image: Option<ImageHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -645,12 +662,18 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         let attr_px = |name: &str| self.tree.get_attribute(node, name).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|v| *v >= 0.0);
         let (w_attr, h_attr) = (attr_px("width"), attr_px("height"));
         let tag = self.tag(node).to_string();
+        let mut image = None;
         let (what, natural) = match tag.as_str() {
             "img" => {
-                let natural = self.styler.natural_size(self.tree, node).or(match (w_attr, h_attr) {
-                    (Some(w), Some(h)) => Some((w, h)),
-                    _ => None,
-                });
+                let natural = match self.styler.image(self.tree, node) {
+                    Some((size, handle)) => {
+                        image = Some(handle);
+                        Some(size)
+                    }
+                    // Not (yet) loaded: the size its attributes give, or
+                    // nothing
+                    None => self.styler.natural_size(self.tree, node).or(Some((w_attr.unwrap_or(0.0), h_attr.unwrap_or(0.0)))),
+                };
                 (ReplacedWhat::Image, natural)
             }
             "canvas" => (ReplacedWhat::Canvas, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
@@ -677,7 +700,13 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                         let checked = self.tree.get_attribute(node, "checked").is_some();
                         (ReplacedWhat::Check { radio: ty == "radio", checked }, Some((13.0, 13.0)))
                     }
-                    "image" => (ReplacedWhat::Image, w_attr.zip(h_attr)),
+                    "image" => match self.styler.image(self.tree, node) {
+                        Some((size, handle)) => {
+                            image = Some(handle);
+                            (ReplacedWhat::Image, Some(size))
+                        }
+                        None => (ReplacedWhat::Image, Some((w_attr.unwrap_or(0.0), h_attr.unwrap_or(0.0)))),
+                    },
                     _ => {
                         let value = self.tree.get_attribute(node, "value").unwrap_or("");
                         let (shown, placeholder) = if value.is_empty() {
@@ -692,7 +721,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 }
             }
         };
-        Some(Replaced { natural, what })
+        Some(Replaced { natural, what, image })
     }
 
     fn selected_option(&self, select: NodeId) -> String {

@@ -295,6 +295,23 @@ impl PageRenderer {
         self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)))
     }
 
+    /// The `href` of the link under document point (x, y), seeing box
+    /// scrolling and fixed boxes
+    pub fn link_at(&mut self, document: &Document, x: f32, y: f32) -> Option<String> {
+        let tree = document.tree();
+        let mut node = self.node_at(x, y)?;
+        while node.is_valid() {
+            let n = tree.get(node)?;
+            if n.as_element().is_some_and(|e| tree.resolve(e.name.local) == "a") {
+                if let Some(href) = tree.get_attribute(node, "href") {
+                    return Some(href.to_string());
+                }
+            }
+            node = n.parent;
+        }
+        None
+    }
+
     /// Whether the cached layout reflects `document` as it is now
     pub fn is_layout_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
@@ -965,6 +982,23 @@ mod tests {
         assert_ne!(far.pixels[50 * 200 + 5], 0xffff0000);
         let fixed = renderer.node_at(10.0, 1010.0).unwrap();
         assert_eq!(document.tree().get(fixed).and_then(|n| n.as_element()).map(|e| document.tree().resolve(e.name.local).to_string()).as_deref(), Some("div"));
+    }
+
+    #[test]
+    fn test_links_in_scrolled_boxes_are_hit_where_shown() {
+        let mut html = String::from("<html><body style='margin:0'><div style='height: 40px; width: 100px; overflow: auto'>");
+        for i in 0..20 {
+            html.push_str(&format!("<div style='height: 20px'><a href='/l{i}' style='display:block'>{i}</a></div>"));
+        }
+        html.push_str("</div></body></html>");
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(renderer.link_at(&document, 10.0, 25.0).as_deref(), Some("/l1"));
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 200.0));
+        assert_eq!(renderer.link_at(&document, 10.0, 25.0).as_deref(), Some("/l11"));
+        // Outside the box there is no link
+        assert_eq!(renderer.link_at(&document, 150.0, 25.0), None);
     }
 
     #[test]

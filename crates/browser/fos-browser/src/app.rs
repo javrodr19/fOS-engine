@@ -933,14 +933,16 @@ impl BrowserApp {
             }
         }
 
-        let href = self.rendered_page.as_ref().and_then(|rendered| {
+        // Hit testing follows box scrolling; the link list is the fallback
+        let href = self.current_document().and_then(|doc| self.renderer.link_at(&lock_document(&doc), doc_x, doc_y));
+        let href = href.or_else(|| self.rendered_page.as_ref().and_then(|rendered| {
             rendered.links.iter()
                 .find(|link| {
                     hit_x >= link.x && hit_x <= link.x + link.width &&
                     hit_y >= link.y && hit_y <= link.y + link.height
                 })
                 .map(|link| link.href.clone())
-        });
+        }));
 
         if let Some(href) = href {
             self.follow_link(&href);

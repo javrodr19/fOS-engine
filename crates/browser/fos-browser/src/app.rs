@@ -297,6 +297,7 @@ impl BrowserApp {
     /// Fetch and decode the page's images (after its first render: images
     /// do not block it), then re-render with them
     fn load_images(&mut self) {
+        self.load_web_fonts();
         let width = self.content_width() as f32;
         let Some(page) = self.current_page.as_ref() else { return };
         let previous = self.renderer.images().clone();
@@ -306,6 +307,21 @@ impl BrowserApp {
             self.renderer.set_images(images);
             self.rerender_at(self.render_start_y);
             self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+    }
+
+    /// Fetch the web fonts the page's CSS uses; text is redrawn in them
+    /// once they arrive (like browsers' font-display: swap)
+    fn load_web_fonts(&mut self) {
+        let Some(doc) = self.current_document() else { return };
+        let Some(page_url) = self.current_page.as_ref().map(|p| p.url.clone()) else { return };
+        let wanted = self.renderer.web_font_requests(&lock_document(&doc));
+        let previous = self.renderer.web_fonts().clone();
+        let fonts = crate::font_loader::load(&mut self.network, &page_url, &wanted, &previous);
+        if !Arc::ptr_eq(&fonts, &previous) {
+            self.renderer.set_web_fonts(fonts);
+            self.rerender_at(self.render_start_y);
             self.request_redraw();
         }
     }

@@ -6,7 +6,7 @@
 //! - Table transformation (glyf/loca/hmtx reconstruction)
 //! - OpenType container reconstruction
 
-use super::brotli::{decompress_with_dict, BrotliError, WOFF2_DICTIONARY};
+use super::brotli::BrotliError;
 use super::parser::reader::FontReader;
 use super::woff2_transforms::{
     reconstruct_glyf, reconstruct_hmtx, generate_loca, can_use_short_loca,
@@ -240,9 +240,15 @@ pub fn is_woff2(data: &[u8]) -> bool {
     u32::from_be_bytes([data[0], data[1], data[2], data[3]]) == WOFF2_SIGNATURE
 }
 
-/// Decode WOFF2 to raw OpenType/TrueType data
+/// Decode WOFF2 to raw OpenType/TrueType data (wuff, a port of the
+/// reference decoder, with the workspace's Brotli)
 pub fn decode_woff2(data: &[u8]) -> Option<Vec<u8>> {
-    decode_woff2_inner(data).ok()
+    let mut brotli = |input: &[u8], size: usize| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut out = Vec::with_capacity(size.min(64 << 20));
+        brotli_decompressor::BrotliDecompress(&mut &input[..], &mut out)?;
+        Ok(out)
+    };
+    wuff::decompress_woff2_with_custom_brotli(data, &mut brotli).ok()
 }
 
 /// Internal WOFF2 decoder with detailed error handling
@@ -265,8 +271,9 @@ fn decode_woff2_inner(data: &[u8]) -> Woff2Result<Vec<u8>> {
     
     let compressed_data = &data[compressed_start..compressed_end];
     
-    // Decompress using Brotli
-    let decompressed = decompress_with_dict(compressed_data, WOFF2_DICTIONARY)?;
+    // Brotli (standard dictionary), capped at the declared font size
+    let mut decompressed = Vec::with_capacity((header.total_sfnt_size as usize).min(64 << 20));
+    brotli_decompressor::BrotliDecompress(&mut &compressed_data[..], &mut decompressed).map_err(|_| Woff2Error::InvalidData)?;
     
     // Process tables and apply inverse transforms
     let mut tables = process_tables(&entries, &decompressed, &header)?;

@@ -926,10 +926,13 @@ dependencies = [
 name = "fos-text"
 version = "0.1.0"
 dependencies = [
+ "brotli-decompressor",
+ "flate2",
  "memmap2",
  "rustc-hash",
  "thiserror 2.0.17",
  "tiny-skia",
+ "wuff",
 ]
 
 [[package]]
@@ -3013,6 +3016,15 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
+
+[[package]]
+name = "wuff"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "200a7b806377b65f1ff9a985874332f15357c87e5dd7855f35f06dade95b8b3d"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "x11-dl"

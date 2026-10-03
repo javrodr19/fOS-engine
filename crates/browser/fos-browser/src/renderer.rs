@@ -170,6 +170,8 @@ pub struct PageRenderer {
     images: crate::image_loader::Images,
     /// Inline `<svg>` elements, rasterized
     svgs: crate::image_loader::SvgCache,
+    /// The page's web fonts (in `fonts`' database)
+    web_fonts: crate::font_loader::WebFonts,
     /// What scripts drew on the page's canvas elements
     canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
     /// Scroll positions of the page's scroll containers
@@ -196,6 +198,7 @@ impl PageRenderer {
             images: Default::default(),
             canvases: Default::default(),
             svgs: Default::default(),
+            web_fonts: Default::default(),
             box_scroll: Default::default(),
         }
     }
@@ -463,6 +466,39 @@ impl PageRenderer {
     }
 
     /// Images the current layout's CSS uses (backgrounds, masks)
+    /// The web fonts `document`'s CSS declares and uses
+    pub fn web_font_requests(&self, document: &Document) -> Vec<crate::font_loader::FontRequest> {
+        let css = self.extract_css_from_document(document);
+        let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
+        crate::font_loader::requests(&css, &media, &crate::css_loader::base_url(document))
+    }
+
+    pub fn web_fonts(&self) -> &crate::font_loader::WebFonts {
+        &self.web_fonts
+    }
+
+    /// Use `fonts` as the page's web fonts: they join a font database
+    /// over the system's, and the layout is redone
+    pub fn set_web_fonts(&mut self, fonts: crate::font_loader::WebFonts) {
+        if Arc::ptr_eq(&self.web_fonts, &fonts) {
+            return;
+        }
+        let mut db = fos_text::FontDatabase::overlay(fos_text::FontDatabase::shared());
+        for f in fonts.iter() {
+            let r = &f.request;
+            let style = if r.italic { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
+            if let Err(e) = db.add_web_font(&r.family, fos_text::FontWeight(r.weight), style, f.data.clone()) {
+                log::debug!("Web font {} unusable: {e}", r.url);
+            }
+        }
+        let db = Arc::new(db);
+        self.web_fonts = fonts;
+        self.text_renderer.fonts = db.clone();
+        self.text_renderer.clear_glyph_cache();
+        self.fonts = FontContext::new(db);
+        self.cached = None;
+    }
+
     pub fn css_image_urls(&self) -> Vec<String> {
         self.cached.as_ref().map(|c| c.layout.css_images.clone()).unwrap_or_default()
     }
@@ -1080,6 +1116,34 @@ mod tests {
         let mut renderer = PageRenderer::new(320, 240);
         let page = renderer.render_html("<html><body></body></html>", "about:blank", 0.0).unwrap();
         assert_eq!(page.pixels.len(), 320 * 240);
+    }
+
+    #[test]
+    fn test_web_fonts_are_used_by_family_name() {
+        let Ok(data) = std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf") else { return };
+        let html = r#"<html><head><style>
+            @font-face { font-family: Brand; src: url(brand.ttf) }
+            p { font-family: Brand, sans-serif }</style></head><body><p>web font</p></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(400, 200);
+        let reqs = renderer.web_font_requests(&document);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].url, "https://example.com/brand.ttf");
+        let font = |r: &mut PageRenderer| {
+            r.render_document(&document, 0.0).unwrap();
+            let layout = r.layout_snapshot().unwrap();
+            let mut family = String::new();
+            layout.fragments.for_each(|f| {
+                if let layout_engine::Fragment::Text(t) = f {
+                    family = t.font.id.and_then(|id| r.fonts.database().font(id)).map(|e| e.family.clone()).unwrap_or_default();
+                }
+            });
+            family
+        };
+        assert_ne!(font(&mut renderer), "Brand");
+        let loaded = crate::font_loader::LoadedFont { request: reqs[0].clone(), data };
+        renderer.set_web_fonts(Arc::new(vec![Arc::new(loaded)]));
+        assert_eq!(font(&mut renderer), "Brand");
     }
 
     #[test]

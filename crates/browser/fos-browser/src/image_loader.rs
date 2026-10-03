@@ -334,14 +334,18 @@ pub fn load_for_page(network: &mut crate::network::NetworkManager, page: &crate:
 
 /// `data:` URL images (base64 or percent-encoded)
 fn decode_data_url(rest: &str) -> Option<LoadedImage> {
+    decode(&data_url_bytes(rest)?)
+}
+
+/// The bytes of a `data:` URL (after `data:`)
+pub fn data_url_bytes(rest: &str) -> Option<Vec<u8>> {
     let (meta, payload) = rest.split_once(',')?;
-    let bytes = if meta.ends_with(";base64") {
+    if meta.ends_with(";base64") {
         let clean: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-        crate::script_fetch::base64_decode(clean.as_bytes())?
+        crate::script_fetch::base64_decode(clean.as_bytes())
     } else {
-        percent_decode(payload)
-    };
-    decode(&bytes)
+        Some(percent_decode(payload))
+    }
 }
 
 fn percent_decode(s: &str) -> Vec<u8> {

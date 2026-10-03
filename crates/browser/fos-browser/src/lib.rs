@@ -47,6 +47,7 @@ pub mod script_fetch;
 pub mod page_styles;
 pub mod css_loader;
 pub mod image_loader;
+pub mod font_loader;
 /// Network requests with HTTP cache
 pub mod network;
 /// Character encoding detection and decoding

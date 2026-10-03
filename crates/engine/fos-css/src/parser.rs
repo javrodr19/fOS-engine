@@ -182,6 +182,148 @@ fn skip_ws_and_comments(b: &[u8], mut i: usize) -> usize {
     }
 }
 
+// ---- @font-face ----
+
+/// A web font an `@font-face` rule declares
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontFace {
+    pub family: String,
+    /// Sources in preference order: URL and `format()` hint (lowercase)
+    pub src: Vec<(String, Option<String>)>,
+    /// The weights it covers (a range for variable fonts)
+    pub weight: (u16, u16),
+    pub italic: bool,
+    /// Code point ranges it covers (empty: all)
+    pub unicode_range: Vec<(u32, u32)>,
+}
+
+impl FontFace {
+    /// Whether the face has code point `c` (by its unicode-range)
+    pub fn covers(&self, c: char) -> bool {
+        self.unicode_range.is_empty() || self.unicode_range.iter().any(|&(a, b)| (a..=b).contains(&(c as u32)))
+    }
+}
+
+/// `U+0025-00FF`, `U+4??`, `U+1F600` ranges
+fn unicode_ranges(v: &str) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for part in v.split(',') {
+        let p = part.trim();
+        let Some(r) = p.strip_prefix("U+").or_else(|| p.strip_prefix("u+")) else { continue };
+        let range = if let Some((a, b)) = r.split_once('-') {
+            u32::from_str_radix(a, 16).ok().zip(u32::from_str_radix(b, 16).ok())
+        } else if r.contains('?') {
+            u32::from_str_radix(&r.replace('?', "0"), 16).ok().zip(u32::from_str_radix(&r.replace('?', "F"), 16).ok())
+        } else {
+            u32::from_str_radix(r, 16).ok().map(|a| (a, a))
+        };
+        if let Some(r) = range {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// The `@font-face` rules of a stylesheet (in matching `@media`,
+/// `@supports` and `@layer` blocks too)
+pub fn font_faces(css: &str, media: &MediaContext) -> Vec<FontFace> {
+    let mut out = Vec::new();
+    collect_font_faces(css, media, &mut out);
+    out
+}
+
+fn collect_font_faces(css: &str, media: &MediaContext, out: &mut Vec<FontFace>) {
+    let b = css.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        i = skip_ws_and_comments(b, i);
+        if i >= b.len() {
+            break;
+        }
+        if b[i] != b'@' {
+            // A style rule: skip its block
+            let end = find_top(b, i, b"{;}");
+            i = if end < b.len() && b[end] == b'{' { skip_token(b, end) } else { end + 1 };
+            continue;
+        }
+        let name_end = b[i + 1..].iter().position(|c| !(c.is_ascii_alphanumeric() || *c == b'-')).map_or(b.len(), |p| i + 1 + p);
+        let name = css[i + 1..name_end].to_ascii_lowercase();
+        let end = find_top(b, name_end, b";{}");
+        if end >= b.len() || b[end] != b'{' {
+            i = end + 1;
+            continue;
+        }
+        let prelude = &css[name_end..end];
+        let block_end = skip_token(b, end);
+        let block = &css[end + 1..block_end.saturating_sub(1).max(end + 1)];
+        match name.as_str() {
+            "font-face" => out.extend(font_face(block)),
+            "media" if media_matches(prelude, media) => collect_font_faces(block, media, out),
+            "supports" if supports(prelude) => collect_font_faces(block, media, out),
+            "layer" => collect_font_faces(block, media, out),
+            _ => {}
+        }
+        i = block_end;
+    }
+}
+
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).or_else(|| s.strip_prefix('\'').and_then(|r| r.strip_suffix('\''))).unwrap_or(s)
+}
+
+fn font_face(block: &str) -> Option<FontFace> {
+    let block = strip_comments(block);
+    let (mut family, mut src, mut weight, mut italic) = (None, Vec::new(), (400, 400), false);
+    let mut unicode_range = Vec::new();
+    for decl in split_top(&block, b';') {
+        let Some((name, value)) = decl.split_once(':') else { continue };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "font-family" => family = Some(unquote(value).to_string()),
+            "src" => {
+                for one in split_top(value, b',') {
+                    let one = one.trim();
+                    let lower = one.to_ascii_lowercase();
+                    let Some(start) = lower.find("url(") else { continue };
+                    let rest = &one[start + 4..];
+                    let Some(close) = rest.find(')') else { continue };
+                    let url = unquote(&rest[..close]).to_string();
+                    let format = lower.find("format(").and_then(|f| {
+                        let r = &lower[f + 7..];
+                        r.find(')').map(|c| unquote(&r[..c]).to_string())
+                    });
+                    if !url.is_empty() {
+                        src.push((url, format));
+                    }
+                }
+            }
+            "font-weight" => {
+                let w = |v: &str| match v {
+                    "normal" => Some(400),
+                    "bold" => Some(700),
+                    n => n.parse::<f32>().ok().map(|n| n.clamp(1.0, 1000.0) as u16),
+                };
+                let parts: Vec<&str> = value.split_whitespace().collect();
+                if let [a, rest @ ..] = parts.as_slice() {
+                    if let Some(a) = w(&a.to_ascii_lowercase()) {
+                        let b = rest.first().and_then(|b| w(&b.to_ascii_lowercase())).unwrap_or(a);
+                        weight = (a.min(b), a.max(b));
+                    }
+                }
+            }
+            "font-style" => {
+                let v = value.to_ascii_lowercase();
+                italic = v.starts_with("italic") || v.starts_with("oblique");
+            }
+            "unicode-range" => unicode_range = unicode_ranges(value),
+            _ => {}
+        }
+    }
+    let family = family.filter(|f| !f.is_empty())?;
+    (!src.is_empty()).then_some(FontFace { family, src, weight, italic, unicode_range })
+}
+
 // ---- rules ----
 
 fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
@@ -808,6 +950,23 @@ mod tests {
             PropertyValue::Color(c) => (c.r, c.g, c.b, c.a),
             _ => panic!("not a color"),
         }
+    }
+
+    #[test]
+    fn font_faces_are_collected() {
+        let ctx = MediaContext { width: 800.0, height: 600.0 };
+        let css = r#"a { color: red } @font-face { font-family: "Inter"; src: local(Inter), url(/f/inter.woff2) format("woff2"), url('/f/inter.woff') format('woff'); font-weight: 100 900; font-style: normal }
+            @media (min-width: 100px) { @font-face { font-family: Icons; src: url(i.ttf); font-style: italic; font-weight: bold } }
+            @media (max-width: 10px) { @font-face { font-family: Hidden; src: url(h.ttf) } }
+            @font-face { font-family: NoSrc }"#;
+        let faces = font_faces(css, &ctx);
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0].family, "Inter");
+        assert_eq!(faces[0].src, vec![("/f/inter.woff2".to_string(), Some("woff2".to_string())), ("/f/inter.woff".to_string(), Some("woff".to_string()))]);
+        assert_eq!(faces[0].weight, (100, 900));
+        assert_eq!((faces[1].family.as_str(), faces[1].italic, faces[1].weight), ("Icons", true, (700, 700)));
+        let f = &font_faces("@font-face { font-family: L; src: url(l.woff2); unicode-range: U+0000-00FF, U+0131, U+20?? }", &ctx)[0];
+        assert!(f.covers('a') && f.covers('\u{0131}') && f.covers('\u{20AC}') && !f.covers('\u{0400}'));
     }
 
     #[test]

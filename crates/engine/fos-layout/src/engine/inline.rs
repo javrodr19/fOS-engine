@@ -56,7 +56,7 @@ fn is_cjk(c: char) -> bool {
 fn spaced(word: &ShapedWord, ls: f32) -> Arc<ShapedWord> {
     let glyphs: Box<[Glyph]> = word.glyphs.iter().enumerate().map(|(i, g)| Glyph { x: g.x + ls * i as f32, ..*g }).collect();
     let n = word.glyphs.len().max(1) as f32;
-    Arc::new(ShapedWord { font: word.font, size: word.size, width: word.width + ls * n, glyphs })
+    Arc::new(ShapedWord { font: word.font, size: word.size, width: word.width + ls * n, glyphs, fallback: word.fallback.clone() })
 }
 
 /// Measure the content into pieces; `atomic_widths` are the atomic

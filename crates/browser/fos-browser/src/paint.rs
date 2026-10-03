@@ -773,7 +773,16 @@ impl<'a> Painter<'a> {
                 continue;
             }
             let x = *x;
-            self.text.draw_glyph_run(self.canvas, font, word.size, t.font.synthesis, color, word.glyphs.iter().map(|g| (g.id, x + g.x, baseline - g.y)), pixel_clip);
+            if word.fallback.is_empty() {
+                self.text.draw_glyph_run(self.canvas, font, word.size, t.font.synthesis, color, word.glyphs.iter().map(|g| (g.id, x + g.x, baseline - g.y)), pixel_clip);
+            } else {
+                // Characters drawn from fallback faces, glyph by glyph
+                for (face, g) in word.glyph_fonts() {
+                    if let Some(face) = face {
+                        self.text.draw_glyph_run(self.canvas, face, word.size, t.font.synthesis, color, std::iter::once((g.id, x + g.x, baseline - g.y)), pixel_clip);
+                    }
+                }
+            }
         }
         if t.decoration != 0 {
             let size = t.font.size;

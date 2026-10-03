@@ -486,6 +486,19 @@ impl Default for InheritedStyle {
     }
 }
 
+/// A piece of generated content
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContentItem {
+    Text(Arc<str>),
+    /// The element's attribute (lowercase name)
+    Attr(Arc<str>),
+    OpenQuote,
+    CloseQuote,
+    /// A counter's value, in a list style (the `ListStyleType`
+    /// discriminant; decimal when absent)
+    Counter(Arc<str>, Option<u8>),
+}
+
 /// Box model, positioning, flex and other non-inherited properties
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoxStyle {
@@ -526,6 +539,8 @@ pub struct BoxStyle {
     pub table_layout: TableLayout,
     /// Grid container and item properties
     pub grid: crate::grid::GridStyle,
+    /// What a `::before`/`::after` box shows (`None`: none or normal)
+    pub content: Option<Arc<[ContentItem]>>,
     pub text_decoration_line: u8,
     /// `None` is currentcolor
     pub text_decoration_color: Option<Color>,
@@ -570,6 +585,7 @@ impl Default for BoxStyle {
             text_overflow: TextOverflow::Clip,
             table_layout: TableLayout::Auto,
             grid: Default::default(),
+            content: None,
             text_decoration_line: 0,
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
@@ -1136,6 +1152,11 @@ impl Style {
                     }
                 }
             }
+            PropertyId::Content => {
+                if let PropertyValue::Content(items) = v {
+                    set!(box_, [content], (!items.is_empty()).then(|| items.clone()));
+                }
+            }
             PropertyId::GridTemplateAreas => {
                 if let PropertyValue::Grid(text) = v {
                     if let Some(areas) = crate::grid::parse_areas(text) {
@@ -1454,6 +1475,7 @@ impl Style {
             PropertyId::GridTemplateColumns => copy!(box_, [grid.template_columns]),
             PropertyId::GridTemplateRows => copy!(box_, [grid.template_rows]),
             PropertyId::GridTemplateAreas => copy!(box_, [grid.areas]),
+            PropertyId::Content => copy!(box_, [content]),
             PropertyId::GridAutoColumns => copy!(box_, [grid.auto_columns]),
             PropertyId::GridAutoRows => copy!(box_, [grid.auto_rows]),
             PropertyId::GridAutoFlow => {

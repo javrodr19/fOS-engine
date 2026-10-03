@@ -310,7 +310,7 @@ impl FragmentTree {
     pub fn element_rects(&self) -> Vec<(NodeId, Rect)> {
         let mut out = Vec::new();
         fn walk(b: &BoxFragment, out: &mut Vec<(NodeId, Rect)>) {
-            if b.node.is_valid() {
+            if b.node.is_valid() && !b.node.is_generated() {
                 out.push((b.node, b.border_box));
             }
             for c in &b.children {
@@ -431,7 +431,8 @@ impl FragmentTree {
             }
             (hits(b) && b.border_box.contains(bx, by)).then_some(b.node)
         }
-        walk(self.root.as_ref()?, x, y, scroll, (scroll, self.viewport_height), offsets)
+        // A hit on a `::before`/`::after` box is a hit on its element
+        walk(self.root.as_ref()?, x, y, scroll, (scroll, self.viewport_height), offsets).map(NodeId::originating)
     }
 }
 

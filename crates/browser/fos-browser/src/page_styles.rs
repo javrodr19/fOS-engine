@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 
 use fos_css::style::{Style, StyleContext};
 use fos_css::{Specificity, Stylesheet};
-use fos_dom::{DomTree, ElementData, NodeId, SelectorList, SubjectKey};
+use fos_dom::{DomTree, ElementData, NodeId, PseudoElement, SelectorList, SubjectKey};
 
 struct CompiledSelector {
     selector: SelectorList,
@@ -87,10 +87,9 @@ impl AncestorFilter {
     }
 }
 
-/// Style rules ready for matching
-pub struct PageStyles {
-    stylesheet: Stylesheet,
-    selectors: Vec<CompiledSelector>,
+/// Selectors filed by the most selective key of their subject
+#[derive(Default)]
+struct Buckets {
     by_id: HashMap<String, Vec<u32>>,
     by_class: HashMap<String, Vec<u32>>,
     by_tag: HashMap<String, Vec<u32>>,
@@ -100,93 +99,34 @@ pub struct PageStyles {
     universal: Vec<u32>,
 }
 
-impl PageStyles {
-    pub fn new(mut stylesheet: Stylesheet) -> Self {
-        let mut styles = PageStyles {
-            selectors: Vec::new(),
-            by_id: HashMap::new(),
-            by_class: HashMap::new(),
-            by_tag: HashMap::new(),
-            by_attr: HashMap::new(),
-            universal: Vec::new(),
-            stylesheet: Stylesheet { rules: Vec::new() },
-        };
-        let mut skipped = 0;
-        for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
-            // Matching needs only the compiled selectors from here on
-            let selectors = std::mem::take(&mut rule.selectors);
-            if rule.declarations.is_empty() {
-                continue;
-            }
-            for mut selector in selectors {
-                // Browsers drop selectors they cannot parse
-                let Some(list) = selector.parsed.take().or_else(|| SelectorList::parse(&selector.text)) else {
-                    skipped += 1;
-                    continue;
-                };
-                // A list of several complex selectors keeps no ancestor
-                // requirement (each alternative needs different ancestors)
-                let ancestors = match list.ancestor_hashes().as_slice() {
-                    [one] => one.clone().into_boxed_slice(),
-                    _ => Box::default(),
-                };
-                for key in list.subject_keys() {
-                    let idx = styles.selectors.len() as u32;
-                    match key {
-                        Some(SubjectKey::Id(id)) => styles.by_id.entry(id).or_default().push(idx),
-                        Some(SubjectKey::Class(c)) => styles.by_class.entry(c).or_default().push(idx),
-                        Some(SubjectKey::Tag(t)) => styles.by_tag.entry(t).or_default().push(idx),
-                        Some(SubjectKey::Attr(a)) => styles.by_attr.entry(a).or_default().push(idx),
-                        None => {
-                            log::trace!("universal selector: {}", selector.text);
-                            styles.universal.push(idx)
-                        }
-                    }
-                }
-                styles.selectors.push(CompiledSelector {
-                    selector: list,
-                    specificity: selector.specificity,
-                    rule: rule_index as u32,
-                    ancestors,
-                });
-            }
+impl Buckets {
+    fn add(&mut self, key: Option<SubjectKey>, idx: u32) {
+        match key {
+            Some(SubjectKey::Id(id)) => self.by_id.entry(id).or_default().push(idx),
+            Some(SubjectKey::Class(c)) => self.by_class.entry(c).or_default().push(idx),
+            Some(SubjectKey::Tag(t)) => self.by_tag.entry(t).or_default().push(idx),
+            Some(SubjectKey::Attr(a)) => self.by_attr.entry(a).or_default().push(idx),
+            None => self.universal.push(idx),
         }
-        if skipped > 0 {
-            log::debug!("Skipped {skipped} unsupported selectors");
-        }
-        styles.selectors.shrink_to_fit();
-        styles.universal.shrink_to_fit();
-        for m in [&mut styles.by_id, &mut styles.by_class, &mut styles.by_tag, &mut styles.by_attr] {
+    }
+
+    fn shrink(&mut self) {
+        self.universal.shrink_to_fit();
+        for m in [&mut self.by_id, &mut self.by_class, &mut self.by_tag, &mut self.by_attr] {
             for v in m.values_mut() {
                 v.shrink_to_fit();
             }
             m.shrink_to_fit();
         }
-        styles.stylesheet = stylesheet;
-        styles
     }
 
-    /// Selectors per bucket kind (id, class, tag, universal), for tuning
-    pub fn bucket_sizes(&self) -> (usize, usize, usize, usize) {
-        let sum = |m: &HashMap<String, Vec<u32>>| m.values().map(Vec::len).sum();
-        (sum(&self.by_id), sum(&self.by_class), sum(&self.by_tag) + sum(&self.by_attr), self.universal.len())
+    fn is_empty(&self) -> bool {
+        self.universal.is_empty() && self.by_id.is_empty() && self.by_class.is_empty() && self.by_tag.is_empty() && self.by_attr.is_empty()
     }
 
-    /// Number of rules
-    pub fn rule_count(&self) -> usize {
-        self.stylesheet.rules.len()
-    }
-
-    /// Style element `node` with these rules alone (plus the UA's), as a
-    /// child of `parent`; `filter`, if given, holds the element's ancestors
-    pub fn style(&self, tree: &DomTree, node: NodeId, element: &ElementData, parent: &Style, filter: Option<&AncestorFilter>) -> Style {
-        let mut style = Style::inherit_from(parent);
-        cascade(Some(self), tree, node, element, filter, &[], &mut style, parent, &StyleContext::default(), &mut Default::default());
-        style
-    }
-
-    /// The rules matching element `node`, lowest priority first (each once)
-    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>) -> Vec<u32> {
+    /// Selectors filed under the element's id, classes, tag and attributes
+    /// (sorted, each once)
+    fn candidates(&self, tree: &DomTree, element: &ElementData) -> Vec<u32> {
         let mut candidates: Vec<u32> = Vec::new();
         if let Some(id) = element.id {
             if let Some(list) = self.by_id.get(tree.resolve(id)) {
@@ -214,22 +154,126 @@ impl PageStyles {
                 }
             }
         }
-        if candidates.is_empty() && self.universal.is_empty() {
-            return Vec::new();
-        }
         // A selector list may be filed under several keys, and an element
-        // may repeat a class: each selector is tried once. The universal
-        // list is long and already sorted, so it is merged in unsorted.
+        // may repeat a class: each selector is tried once
         candidates.sort_unstable();
         candidates.dedup();
-        let universal = self.universal.iter().copied().filter(|i| candidates.binary_search(i).is_err());
+        candidates
+    }
+}
+
+/// Style rules ready for matching
+pub struct PageStyles {
+    stylesheet: Stylesheet,
+    selectors: Vec<CompiledSelector>,
+    /// Selectors of elements
+    elements: Buckets,
+    /// Selectors of `::before`/`::after` boxes (filed by their element)
+    generated: Buckets,
+}
+
+impl PageStyles {
+    pub fn new(mut stylesheet: Stylesheet) -> Self {
+        let mut styles = PageStyles { selectors: Vec::new(), elements: Buckets::default(), generated: Buckets::default(), stylesheet: Stylesheet { rules: Vec::new() } };
+        let mut skipped = 0;
+        for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
+            // Matching needs only the compiled selectors from here on
+            let selectors = std::mem::take(&mut rule.selectors);
+            if rule.declarations.is_empty() {
+                continue;
+            }
+            for mut selector in selectors {
+                // Browsers drop selectors they cannot parse
+                let Some(list) = selector.parsed.take().or_else(|| SelectorList::parse(&selector.text)) else {
+                    skipped += 1;
+                    continue;
+                };
+                let (elements, generated) = (list.selects_elements(), list.selects_generated());
+                if !elements && !generated {
+                    // Only pseudo-elements nothing renders
+                    continue;
+                }
+                // A list of several complex selectors keeps no ancestor
+                // requirement (each alternative needs different ancestors)
+                let ancestors = match list.ancestor_hashes().as_slice() {
+                    [one] => one.clone().into_boxed_slice(),
+                    _ => Box::default(),
+                };
+                let idx = styles.selectors.len() as u32;
+                for key in list.subject_keys() {
+                    if elements {
+                        styles.elements.add(key.clone(), idx);
+                    }
+                    if generated {
+                        styles.generated.add(key, idx);
+                    }
+                }
+                styles.selectors.push(CompiledSelector {
+                    selector: list,
+                    specificity: selector.specificity,
+                    rule: rule_index as u32,
+                    ancestors,
+                });
+            }
+        }
+        if skipped > 0 {
+            log::debug!("Skipped {skipped} unsupported selectors");
+        }
+        styles.selectors.shrink_to_fit();
+        styles.elements.shrink();
+        styles.generated.shrink();
+        styles.stylesheet = stylesheet;
+        styles
+    }
+
+    /// Selectors per bucket kind (id, class, tag, universal), for tuning
+    pub fn bucket_sizes(&self) -> (usize, usize, usize, usize) {
+        let sum = |m: &HashMap<String, Vec<u32>>| m.values().map(Vec::len).sum();
+        let b = &self.elements;
+        (sum(&b.by_id), sum(&b.by_class), sum(&b.by_tag) + sum(&b.by_attr), b.universal.len())
+    }
+
+    /// Number of rules
+    pub fn rule_count(&self) -> usize {
+        self.stylesheet.rules.len()
+    }
+
+    /// Style element `node` with these rules alone (plus the UA's), as a
+    /// child of `parent`; `filter`, if given, holds the element's ancestors
+    pub fn style(&self, tree: &DomTree, node: NodeId, element: &ElementData, parent: &Style, filter: Option<&AncestorFilter>) -> Style {
+        let mut style = Style::inherit_from(parent);
+        cascade(Some(self), tree, node, element, filter, &[], &mut style, parent, &StyleContext::default(), &mut Default::default());
+        style
+    }
+
+    /// The rules matching element `node`, lowest priority first (each once)
+    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>) -> Vec<u32> {
+        self.matching(&self.elements, tree, element, filter, |s| s.matches(tree, node))
+    }
+
+    /// The rules matching pseudo-element `pe` of element `node`
+    fn pseudo_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, pe: PseudoElement) -> Vec<u32> {
+        if self.generated.is_empty() {
+            return Vec::new();
+        }
+        self.matching(&self.generated, tree, element, filter, |s| s.matches_pseudo(tree, node, pe))
+    }
+
+    fn matching(&self, buckets: &Buckets, tree: &DomTree, element: &ElementData, filter: Option<&AncestorFilter>, test: impl Fn(&SelectorList) -> bool) -> Vec<u32> {
+        let candidates = buckets.candidates(tree, element);
+        if candidates.is_empty() && buckets.universal.is_empty() {
+            return Vec::new();
+        }
+        // The universal list is long and already sorted, so it is merged in
+        // unsorted
+        let universal = buckets.universal.iter().copied().filter(|i| candidates.binary_search(i).is_err());
         let mut matched: Vec<(Specificity, u32)> = candidates
             .iter()
             .copied()
             .chain(universal)
             .map(|i| &self.selectors[i as usize])
             .filter(|c| filter.is_none_or(|f| c.ancestors.iter().all(|&h| f.may_contain(h))))
-            .filter(|c| c.selector.matches(tree, node))
+            .filter(|c| test(&c.selector))
             .map(|c| (c.specificity, c.rule))
             .collect();
         matched.sort_unstable();
@@ -384,10 +428,53 @@ pub fn cascade(
     ctx: &StyleContext,
     cache: &mut fos_css::ResolveCache,
 ) {
+    cascade_for(styles, tree, node, element, None, filter, inline, style, parent, ctx, cache)
+}
+
+/// The style of pseudo-element `pe` of element `node` (whose style is
+/// `parent`), or `None` when no rule gives it content
+#[allow(clippy::too_many_arguments)]
+pub fn pseudo_style(
+    styles: Option<&PageStyles>,
+    tree: &DomTree,
+    node: NodeId,
+    element: &ElementData,
+    pe: PseudoElement,
+    filter: Option<&AncestorFilter>,
+    parent: &Style,
+    ctx: &StyleContext,
+    cache: &mut fos_css::ResolveCache,
+) -> Option<Style> {
+    let mut style = Style::inherit_from(parent);
+    cascade_for(styles, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
+    style.box_.content.is_some().then_some(style)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cascade_for(
+    styles: Option<&PageStyles>,
+    tree: &DomTree,
+    node: NodeId,
+    element: &ElementData,
+    pe: Option<PseudoElement>,
+    filter: Option<&AncestorFilter>,
+    inline: &[fos_css::Declaration],
+    style: &mut Style,
+    parent: &Style,
+    ctx: &StyleContext,
+    cache: &mut fos_css::ResolveCache,
+) {
     let ua = &*UA;
-    let ua_rules = ua.matching_rules(tree, node, element, filter);
-    let hints = presentational_hints(tree, element);
-    let rules = styles.map_or(Vec::new(), |s| s.matching_rules(tree, node, element, filter));
+    let rules_of = |s: &PageStyles| match pe {
+        Some(pe) => s.pseudo_rules(tree, node, element, filter, pe),
+        None => s.matching_rules(tree, node, element, filter),
+    };
+    let ua_rules = rules_of(ua);
+    let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
+    let rules = styles.map_or(Vec::new(), |s| rules_of(s));
+    if pe.is_some() && ua_rules.is_empty() && rules.is_empty() {
+        return;
+    }
     if ua_rules.is_empty() && hints.is_empty() && rules.is_empty() && inline.is_empty() {
         style.finish();
         return;

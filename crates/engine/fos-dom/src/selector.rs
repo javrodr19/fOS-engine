@@ -52,6 +52,7 @@ impl Compound {
                     c += s.2;
                 }
                 Pseudo::Never if self.pseudo_elements > 0 => {}
+                Pseudo::PseudoElement => {}
                 _ => b += 1,
             }
         }
@@ -78,6 +79,27 @@ struct Compound {
     pseudos: Vec<Pseudo>,
     /// `::before` and friends (count as type selectors for specificity)
     pseudo_elements: u8,
+    /// The pseudo-element the compound selects, if any
+    pseudo_element: Option<PseudoElement>,
+}
+
+/// A pseudo-element generated boxes are styled by
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
+    /// `::first-line`, `::placeholder` and others (never matched)
+    Other,
+}
+
+impl PseudoElement {
+    fn from_name(name: &str) -> PseudoElement {
+        match name.to_ascii_lowercase().as_str() {
+            "before" => PseudoElement::Before,
+            "after" => PseudoElement::After,
+            _ => PseudoElement::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +144,8 @@ enum Pseudo {
     Enabled,
     Link,
     Never,
+    /// Marks a compound selecting a pseudo-element: never an element
+    PseudoElement,
 }
 
 /// Kinds of keys in ancestor filters (see [`key_hash`])
@@ -254,6 +278,23 @@ impl SelectorList {
         self.0.iter().any(|c| match_complex(tree, node, &c.parts))
     }
 
+    /// Whether pseudo-element `pe` of element `node` matches any selector
+    /// of the list
+    pub fn matches_pseudo(&self, tree: &DomTree, node: NodeId, pe: PseudoElement) -> bool {
+        self.0.iter().any(|c| match_complex_as(tree, node, &c.parts, Some(pe)))
+    }
+
+    /// Whether some selector of the list selects a `::before` or `::after`
+    /// box (and which elements' does not matter otherwise)
+    pub fn selects_generated(&self) -> bool {
+        self.0.iter().any(|c| c.parts.first().is_some_and(|(s, _)| matches!(s.pseudo_element, Some(PseudoElement::Before | PseudoElement::After))))
+    }
+
+    /// Whether some selector of the list can match an element itself
+    pub fn selects_elements(&self) -> bool {
+        self.0.iter().any(|c| c.parts.first().is_some_and(|(s, _)| s.pseudo_element.is_none()))
+    }
+
     /// The first element in the subtree of `root` (excluding `root`), in
     /// document order, that matches
     pub fn query_first(&self, tree: &DomTree, root: NodeId) -> Option<NodeId> {
@@ -349,8 +390,17 @@ fn next_element(tree: &DomTree, id: NodeId) -> Option<NodeId> {
 }
 
 fn match_complex(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)]) -> bool {
+    match_complex_as(tree, node, parts, None)
+}
+
+/// Match with the subject compound selecting pseudo-element `pe` of
+/// `node` (when given)
+fn match_complex_as(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], pe: Option<PseudoElement>) -> bool {
     let Some((compound, comb)) = parts.first() else { return false };
-    if !match_compound(tree, node, compound) {
+    if pe.is_some() && compound.pseudo_element != pe {
+        return false;
+    }
+    if !match_compound(tree, node, compound, pe.is_some()) {
         return false;
     }
     let rest = &parts[1..];
@@ -385,7 +435,7 @@ fn attr<'t>(tree: &'t DomTree, e: &'t ElementData, name: &str) -> Option<&'t str
     e.attrs.iter().find(|a| tree.resolve(a.name.local).eq_ignore_ascii_case(name)).map(|a| a.value.as_str())
 }
 
-fn match_compound(tree: &DomTree, node: NodeId, c: &Compound) -> bool {
+fn match_compound(tree: &DomTree, node: NodeId, c: &Compound, pseudo_element: bool) -> bool {
     let Some(e) = element(tree, node) else { return false };
     if let Some(tag) = &c.tag {
         if !tree.resolve(e.name.local).eq_ignore_ascii_case(tag) {
@@ -422,7 +472,7 @@ fn match_compound(tree: &DomTree, node: NodeId, c: &Compound) -> bool {
             return false;
         }
     }
-    c.pseudos.iter().all(|p| match_pseudo(tree, node, e, p))
+    c.pseudos.iter().all(|p| (pseudo_element && matches!(p, Pseudo::PseudoElement)) || match_pseudo(tree, node, e, p))
 }
 
 /// 1-based position among element siblings, optionally of the same type
@@ -470,7 +520,7 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo) -> bo
             let tag = tree.resolve(e.name.local);
             (tag.eq_ignore_ascii_case("a") || tag.eq_ignore_ascii_case("area")) && attr(tree, e, "href").is_some()
         }
-        Pseudo::Never => false,
+        Pseudo::Never | Pseudo::PseudoElement => false,
     }
 }
 
@@ -623,11 +673,27 @@ impl Parser<'_> {
                 }
                 Some(b':') => {
                     self.i += 1;
-                    if self.eat(b':') {
+                    let legacy = {
+                        // `:before`, `:after`, `:first-line`, `:first-letter`
+                        let at = self.i;
+                        let name = self.ident().map(|n| n.to_ascii_lowercase());
+                        let call = self.peek() == Some(b'(');
+                        self.i = at;
+                        !call && name.is_some_and(|n| matches!(n.as_str(), "before" | "after" | "first-line" | "first-letter"))
+                    };
+                    if self.eat(b':') || legacy {
                         // Pseudo-elements are never elements in the tree
-                        self.ident()?;
-                        c.pseudos.push(Pseudo::Never);
+                        let name = self.ident()?;
+                        if self.eat(b'(') {
+                            // ::part(x), ::slotted(x): skip the argument
+                            while self.peek()? != b')' {
+                                self.i += 1;
+                            }
+                            self.i += 1;
+                        }
+                        c.pseudos.push(Pseudo::PseudoElement);
                         c.pseudo_elements += 1;
+                        c.pseudo_element = Some(PseudoElement::from_name(&name));
                     } else {
                         c.pseudos.push(self.pseudo()?);
                     }

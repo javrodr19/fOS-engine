@@ -43,7 +43,7 @@ pub mod selector;
 pub use node::{Node, NodeData, ElementData, TextData, Attribute};
 pub use tree::{DomTree, DomRevision};
 pub use document::Document;
-pub use selector::{SelectorList, SubjectKey, key_hash, KEY_ID, KEY_CLASS, KEY_TAG};
+pub use selector::{SelectorList, SubjectKey, PseudoElement, key_hash, KEY_ID, KEY_CLASS, KEY_TAG};
 pub use interner::{StringInterner, InternedString};
 pub use forms::{
     FormControl, InputElement, InputType, InputValue, 
@@ -102,6 +102,29 @@ impl NodeId {
     #[inline]
     pub fn is_valid(self) -> bool {
         self != Self::NONE
+    }
+
+    /// Ids of `::before`/`::after` boxes start here (layout only; never in
+    /// a tree)
+    const GENERATED: u32 = 0x8000_0000;
+
+    /// The id layout gives this element's `::before` (or `::after`) box
+    pub fn generated(self, after: bool) -> NodeId {
+        NodeId(Self::GENERATED | ((self.0 & 0x3FFF_FFFF) << 1) | after as u32)
+    }
+
+    /// Whether this is a generated box's id
+    pub fn is_generated(self) -> bool {
+        self.is_valid() && self.0 >= Self::GENERATED
+    }
+
+    /// The element a generated box belongs to (itself for other ids)
+    pub fn originating(self) -> NodeId {
+        if self.is_generated() {
+            NodeId((self.0 & !Self::GENERATED) >> 1)
+        } else {
+            self
+        }
     }
     
     /// Get the raw index

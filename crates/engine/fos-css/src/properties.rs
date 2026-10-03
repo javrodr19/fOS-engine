@@ -140,6 +140,7 @@ pub enum PropertyId {
     GridTemplateColumns,
     GridTemplateRows,
     GridTemplateAreas,
+    Content,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,
@@ -299,6 +300,8 @@ pub enum PropertyValue {
     Images(std::sync::Arc<[crate::style::Image]>),
     /// A grid property's (validated) text, parsed when computing styles
     Grid(std::sync::Arc<str>),
+    /// `content`: what a `::before`/`::after` box shows (empty: none)
+    Content(std::sync::Arc<[crate::style::ContentItem]>),
 }
 
 /// CSS keyword values

@@ -28,6 +28,28 @@ pub trait Styler {
     fn image(&mut self, _tree: &DomTree, _node: NodeId) -> Option<((f32, f32), ImageHandle)> {
         None
     }
+    /// The style of the element's `::before` or `::after` box (a child
+    /// of `style`), when it has content
+    fn pseudo(&mut self, _tree: &DomTree, _node: NodeId, _pe: fos_dom::PseudoElement, _style: &Style) -> Option<Style> {
+        None
+    }
+}
+
+/// The text of a generated box's `content`
+pub fn generated_text(tree: &DomTree, node: NodeId, style: &Style) -> String {
+    use fos_css::style::ContentItem;
+    let mut out = String::new();
+    for item in style.box_.content.iter().flat_map(|c| c.iter()) {
+        match item {
+            ContentItem::Text(t) => out.push_str(t),
+            ContentItem::Attr(name) => out.push_str(tree.get_attribute(node, name).unwrap_or("")),
+            ContentItem::OpenQuote => out.push('\u{201C}'),
+            ContentItem::CloseQuote => out.push('\u{201D}'),
+            // Counters are not kept
+            ContentItem::Counter(..) => {}
+        }
+    }
+    out
 }
 
 /// Image content the embedder supplies (layout only passes it to paint)
@@ -463,8 +485,56 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         self.tree.get(node).and_then(|n| n.as_element()).map_or("", |e| self.tree.resolve(e.name.local))
     }
 
+    /// The element's `::before` (or `::after`) box, if it has one: its
+    /// style (display other than none) and text
+    fn pseudo_box(&mut self, node: NodeId, style: &Style, after: bool) -> Option<(Style, String)> {
+        let pe = if after { fos_dom::PseudoElement::After } else { fos_dom::PseudoElement::Before };
+        let ps = self.styler.pseudo(self.tree, node, pe, style)?;
+        if ps.display() == Display::None {
+            return None;
+        }
+        let text = generated_text(self.tree, node, &ps);
+        Some((ps, text))
+    }
+
+    /// A non-inline generated box (block, inline-block, flex item, ...)
+    fn generated_block(&mut self, node: NodeId, ps: Style, text: &str, after: bool) -> LayoutBox {
+        let mut inline = InlineBuilder::new(&ps, if ps.is_out_of_flow() { own_decoration(&ps) } else { self.deco });
+        if !text.is_empty() {
+            inline.push_text(text, node);
+        }
+        let content = inline.take(&ps);
+        LayoutBox { node: node.generated(after), style: ps, kind: BoxKind::Inline(content), marker: None }
+    }
+
+    /// Add element `parent`'s generated box to container `c`
+    fn generated(&mut self, parent: NodeId, parent_style: &Style, c: &mut Container, after: bool) {
+        let Some((ps, text)) = self.pseudo_box(parent, parent_style, after) else { return };
+        let display = ps.display();
+        if display == Display::Inline && !ps.is_out_of_flow() && ps.box_.float == fos_css::style::Float::None {
+            c.inline.open(ps, parent.generated(after));
+            if !text.is_empty() {
+                c.inline.push_text(&text, parent);
+            }
+            c.inline.close();
+        } else if display.is_inline_level() && !ps.is_out_of_flow() && ps.box_.float == fos_css::style::Float::None {
+            let b = self.generated_block(parent, ps, &text, after);
+            c.inline.atomic(b);
+        } else {
+            c.flush_inline();
+            let b = self.generated_block(parent, ps, &text, after);
+            c.blocks.push(b);
+        }
+    }
+
     /// Add element `parent`'s children to container `c`
     fn children(&mut self, parent: NodeId, parent_style: &Style, c: &mut Container) {
+        self.generated(parent, parent_style, c, false);
+        self.element_children(parent, parent_style, c);
+        self.generated(parent, parent_style, c, true);
+    }
+
+    fn element_children(&mut self, parent: NodeId, parent_style: &Style, c: &mut Container) {
         let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
         for child in kids {
             let Some(n) = self.tree.get(child) else { continue };
@@ -614,6 +684,27 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     /// A flex container's children as items: each element is blockified;
     /// runs of text between them become anonymous items
     fn flex_items(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder) {
+        self.generated_item(parent, parent_style, items, text, false);
+        self.flex_children(parent, parent_style, items, text);
+        self.generated_item(parent, parent_style, items, text, true);
+    }
+
+    /// A flex or grid container's generated box, as an item
+    fn generated_item(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder, after: bool) {
+        let Some((mut ps, generated)) = self.pseudo_box(parent, parent_style, after) else { return };
+        let content = text.take(parent_style);
+        if !content.is_blank() {
+            items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
+        }
+        let blockified = ps.display().blockified();
+        if blockified != ps.display() {
+            std::sync::Arc::make_mut(&mut ps.box_).display = blockified;
+        }
+        let b = self.generated_block(parent, ps, &generated, after);
+        items.push(b);
+    }
+
+    fn flex_children(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder) {
         let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
         for child in kids {
             let Some(n) = self.tree.get(child) else { continue };

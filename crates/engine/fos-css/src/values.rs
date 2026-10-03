@@ -581,7 +581,7 @@ pub fn resolve_declaration(name: &str, value: &str, important: bool, ctx: &Resol
     };
     let Some(computed) = evaluate_math_functions(&substituted, &math_ctx, basis) else { return Vec::new() };
     let lower = computed.to_ascii_lowercase();
-    if lower.contains("var(") || lower.contains("env(") || lower.contains("attr(") {
+    if lower.contains("var(") || lower.contains("env(") || (lower.contains("attr(") && name != "content") {
         return Vec::new();
     }
     crate::parser::parse_declarations(&format!("{name}: {computed}{}", if important { " !important" } else { "" }))

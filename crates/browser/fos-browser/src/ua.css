@@ -84,3 +84,5 @@ button, input[type=button], input[type=submit], input[type=reset], select { bord
 select { padding: 0 4px; }
 iframe { border: 2px inset #767676; }
 img, video, canvas, iframe, embed, object, svg { vertical-align: baseline; }
+q::before { content: open-quote }
+q::after { content: close-quote }

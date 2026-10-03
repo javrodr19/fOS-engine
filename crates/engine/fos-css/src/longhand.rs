@@ -228,6 +228,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "grid-template-columns" => GridTemplateColumns,
         "grid-template-rows" => GridTemplateRows,
         "grid-template-areas" => GridTemplateAreas,
+        "content" => Content,
         "grid-auto-columns" => GridAutoColumns,
         "grid-auto-rows" => GridAutoRows,
         "grid-auto-flow" => GridAutoFlow,
@@ -509,6 +510,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
+        P::Content => content(raw).map(|c| PropertyValue::Content(Arc::from(c))),
         P::GridTemplateColumns | P::GridTemplateRows | P::GridTemplateAreas | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridColumnStart | P::GridColumnEnd | P::GridRowStart | P::GridRowEnd => {
             let name = grid_name(id);
             crate::grid::valid(name, raw.trim()).then(|| PropertyValue::Grid(Arc::from(raw.trim())))
@@ -682,6 +684,100 @@ fn overflow(v: &str) -> Option<PropertyValue> {
 /// `safe` / `unsafe` alignment prefixes
 fn strip_safety(v: &str) -> &str {
     v.strip_prefix("safe ").or_else(|| v.strip_prefix("unsafe ")).unwrap_or(v).trim()
+}
+
+/// A `content` value: `none`/`normal` (empty), or strings, `attr()`,
+/// quotes and counters (alternative text after `/` is dropped)
+fn content(raw: &str) -> Option<Vec<ContentItem>> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("normal") {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\n' => i += 1,
+            b'/' => break,
+            q @ (b'"' | b'\'') => {
+                let (text, end) = css_string(raw, i + 1, q)?;
+                out.push(ContentItem::Text(Arc::from(text)));
+                i = end;
+            }
+            _ => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'-' || b[i] == b'_') {
+                    i += 1;
+                }
+                let name = raw[start..i].to_ascii_lowercase();
+                if name.is_empty() {
+                    return None;
+                }
+                if b.get(i) == Some(&b'(') {
+                    let close = raw[i..].find(')')? + i;
+                    let args = raw[i + 1..close].trim();
+                    i = close + 1;
+                    let arg = |n: usize| args.split(',').nth(n).map(|a| a.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+                    match name.as_str() {
+                        "attr" => out.push(ContentItem::Attr(Arc::from(arg(0)?.split_whitespace().next()?.to_ascii_lowercase()))),
+                        "counter" => out.push(ContentItem::Counter(Arc::from(arg(0)?), arg(1).and_then(|s| enum_value::<ListStyleType>(&s.to_ascii_lowercase())).map(|v| match v {
+                            PropertyValue::Enum(e) => e,
+                            _ => 0,
+                        }))),
+                        "counters" => out.push(ContentItem::Counter(Arc::from(arg(0)?), None)),
+                        // Images and other functions show nothing
+                        _ => {}
+                    }
+                } else {
+                    match name.as_str() {
+                        "open-quote" => out.push(ContentItem::OpenQuote),
+                        "close-quote" => out.push(ContentItem::CloseQuote),
+                        "no-open-quote" | "no-close-quote" => {}
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A CSS string from byte `i` (after its opening quote `q`): its text
+/// with escapes resolved, and the index after its closing quote
+pub fn css_string(raw: &str, mut i: usize, q: u8) -> Option<(String, usize)> {
+    let b = raw.as_bytes();
+    let mut out = String::new();
+    while i < b.len() {
+        let c = b[i];
+        if c == q {
+            return Some((out, i + 1));
+        }
+        if c == b'\\' {
+            i += 1;
+            let hex_end = (i..b.len().min(i + 6)).find(|&j| !b[j].is_ascii_hexdigit()).unwrap_or(b.len().min(i + 6));
+            if hex_end > i {
+                let n = u32::from_str_radix(&raw[i..hex_end], 16).ok()?;
+                out.push(char::from_u32(n).filter(|&c| c != '\0').unwrap_or('\u{FFFD}'));
+                i = hex_end;
+                // One white space after a hex escape belongs to it
+                if matches!(b.get(i), Some(b' ' | b'\t' | b'\n')) {
+                    i += 1;
+                }
+            } else if let Some(ch) = raw[i..].chars().next() {
+                if ch != '\n' {
+                    out.push(ch);
+                }
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        let ch = raw[i..].chars().next()?;
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    // An unclosed string ends at the value's end
+    Some((out, i))
 }
 
 fn grid_name(id: PropertyId) -> &'static str {
@@ -1416,6 +1512,23 @@ mod tests {
         let mut s = Style::inherit_from(&parent);
         s.cascade(&refs, &parent, &StyleContext::default(), &mut crate::values::ResolveCache::default());
         s
+    }
+
+    #[test]
+    fn content_values() {
+        let content = |v: &str| match crate::parse_declarations(&format!("content: {v}")).first().map(|d| d.value.clone()) {
+            Some(PropertyValue::Content(items)) => Some(items.to_vec()),
+            _ => None,
+        };
+        assert_eq!(content("none"), Some(vec![]));
+        assert_eq!(content("normal"), Some(vec![]));
+        assert_eq!(content(r#""\201C  x" 'y'"#), Some(vec![ContentItem::Text(Arc::from("\u{201C} x")), ContentItem::Text(Arc::from("y"))]));
+        assert_eq!(content("attr(data-Label) open-quote"), Some(vec![ContentItem::Attr(Arc::from("data-label")), ContentItem::OpenQuote]));
+        assert_eq!(content(r#"counter(item) ". ""#), Some(vec![ContentItem::Counter(Arc::from("item"), None), ContentItem::Text(Arc::from(". "))]));
+        // Alternative text is dropped; images show nothing
+        assert_eq!(content(r#""\2192" / "next""#), Some(vec![ContentItem::Text(Arc::from("\u{2192}"))]));
+        assert_eq!(content("url(a.svg)"), Some(vec![]));
+        assert_eq!(content("bogus"), None);
     }
 
     #[test]

@@ -560,7 +560,8 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
         out.push(decl(id, PropertyValue::Unresolved(Box::new((name.to_string(), value.to_string()))), important));
         return;
     }
-    if lower.contains("env(") || lower.contains("attr(") {
+    // `content` takes attr() itself
+    if lower.contains("env(") || (lower.contains("attr(") && name != "content") {
         return;
     }
     crate::longhand::expand(name, value, important, out);

@@ -678,6 +678,12 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         Some((img.natural, layout_engine::ImageHandle(img.clone())))
     }
 
+    fn pseudo(&mut self, tree: &DomTree, node: NodeId, pe: fos_dom::PseudoElement, style: &Style) -> Option<Style> {
+        let element = tree.get(node)?.as_element()?;
+        let filter = self.stylesheet.is_some().then_some(&self.ancestors);
+        crate::page_styles::pseudo_style(self.stylesheet, tree, node, element, pe, filter, style, &self.ctx, &mut self.resolved)
+    }
+
     fn enter(&mut self, tree: &DomTree, node: NodeId) {
         if self.stylesheet.is_some() {
             self.ancestors.push(tree, node);
@@ -1062,6 +1068,57 @@ mod tests {
         let mut renderer = PageRenderer::new(320, 240);
         let page = renderer.render_html("<html><body></body></html>", "about:blank", 0.0).unwrap();
         assert_eq!(page.pixels.len(), 320 * 240);
+    }
+
+    #[test]
+    fn test_before_and_after_boxes() {
+        let html = r#"<html><head><style>
+            body { margin: 0 }
+            .x::before { content: "\201C AA"; color: #f00 }
+            .x::after { content: attr(data-n); color: #00f }
+            .cf::after { content: ""; display: block; clear: both }
+            .f { float: left; width: 20px; height: 50px }
+            .a { position: relative; height: 30px }
+            .a::before { content: ""; position: absolute; left: 0; top: 0; width: 10px; height: 10px; background: #0f0 }
+            .fl { display: flex }
+            .fl::before { content: "x"; width: 40px; color: #f0f }
+            </style></head><body>
+            <div class="a" id="a"></div>
+            <p class="x" data-n="ZZ">mid</p>
+            <div class="cf" id="cf"><div class="f"></div></div>
+            <div class="fl"><span>item</span></div>
+            <p><q>quoted</q></p>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let mut frags: Vec<(Color, f32, f32)> = Vec::new();
+        layout.fragments.for_each(|f| {
+            if let layout_engine::Fragment::Text(t) = f {
+                frags.push((Color::rgba(t.color.r, t.color.g, t.color.b, t.color.a), t.rect.x, t.rect.w));
+            }
+        });
+        let of = |c: Color| frags.iter().find(|f| f.0 == c).copied();
+        let (red, blue) = (of(Color::rgb(255, 0, 0)).expect("::before text"), of(Color::rgb(0, 0, 255)).expect("::after text"));
+        // Generated text belongs to its element: "mid" sits between
+        assert!(blue.1 > red.1 + red.2 + 10.0, "{red:?} {blue:?}");
+        // Flex containers get generated items, as wide as they say
+        let magenta = of(Color::rgb(255, 0, 255)).expect("flex ::before");
+        let item = texts(&document, &layout, "item")[0].rect;
+        assert!(item.x >= magenta.1 + 40.0 - 0.5, "{magenta:?} {item:?}");
+        // The clearfix contains its float
+        let cf = document.get_element_by_id("cf").unwrap();
+        let cf_rect = layout.fragments.element_rects().into_iter().find(|(n, _)| *n == cf).unwrap().1;
+        assert!(cf_rect.h >= 50.0, "{cf_rect:?}");
+        // Quotes around <q>
+        let quoted = texts(&document, &layout, "quoted");
+        assert!(!quoted.is_empty());
+
+        // An absolutely positioned ::before paints at its element's corner,
+        // and hits there are hits on the element
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[5 * 200 + 5], 0xff00ff00);
+        assert_eq!(renderer.node_at(5.0, 5.0), document.get_element_by_id("a"));
     }
 
     #[test]

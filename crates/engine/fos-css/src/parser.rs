@@ -669,6 +669,14 @@ pub fn parse_color(v: &str) -> Option<Color> {
         };
     }
     let lower = v.to_ascii_lowercase();
+    // Pages are shown in their light scheme
+    if let Some(args) = lower.strip_prefix("light-dark(").and_then(|r| r.strip_suffix(')')) {
+        let parts = split_top(args, b',');
+        return match parts.as_slice() {
+            [light, _] => parse_color(light),
+            _ => None,
+        };
+    }
     if let Some(open) = lower.find('(') {
         let func = &lower[..open];
         let args = lower[open + 1..].strip_suffix(')')?;
@@ -800,6 +808,13 @@ mod tests {
             PropertyValue::Color(c) => (c.r, c.g, c.b, c.a),
             _ => panic!("not a color"),
         }
+    }
+
+    #[test]
+    fn light_dark_picks_the_light_color() {
+        assert_eq!(parse_color("light-dark(#fff, #000)").map(|c| (c.r, c.a)), Some((255, 255)));
+        assert_eq!(parse_color("light-dark(rgb(1, 2, 3), black)").map(|c| c.b), Some(3));
+        assert!(parse_color("light-dark(red)").is_none());
     }
 
     #[test]

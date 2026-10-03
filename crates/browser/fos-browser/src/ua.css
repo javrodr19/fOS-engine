@@ -48,7 +48,7 @@ ul ul ul, ul ol ul, ol ul ul, ol ol ul { list-style-type: square; }
 ul ul, ul ol, ol ul, ol ol, menu ul, ul menu { margin-top: 0; margin-bottom: 0; }
 
 address, cite, dfn, em, i, var { font-style: italic; }
-code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace; font-size: 13px; }
+code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace; }
 pre, listing, xmp, plaintext { white-space: pre; }
 textarea { white-space: pre-wrap; }
 nobr { white-space: nowrap; }

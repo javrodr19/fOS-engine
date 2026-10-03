@@ -502,7 +502,14 @@ fn cascade_for(
     for &rule in &ua_rules {
         ordered.extend(of(ua, rule, true));
     }
+    let sized = ordered.iter().any(|d| d.property == fos_css::properties::PropertyId::FontSize);
     style.cascade(&ordered, parent, ctx, cache);
+    // Browsers' monospace quirk: text switching to the generic monospace
+    // family without a size of its own is drawn at 13/16 of its size
+    let mono = |s: &Style| matches!(&*s.inherited.font_family, [f] if f.eq_ignore_ascii_case("monospace"));
+    if !sized && mono(style) && !mono(parent) {
+        std::sync::Arc::make_mut(&mut style.inherited).font_size = parent.inherited.font_size * 13.0 / 16.0;
+    }
 }
 
 #[cfg(test)]
@@ -539,6 +546,16 @@ mod tests {
     }
 
     const HTML: &str = r#"<html><body><nav><a id="in" class="l">x</a></nav><a id="out" class="l">y</a><p id="p" class="a b">z</p></body></html>"#;
+
+    #[test]
+    fn monospace_text_is_smaller_unless_sized() {
+        let html = r#"<html><body><h1 id="h"><code id="c">x</code><code id="i" class="inherit">y</code></h1><p><code id="s" class="big">z</code></p></body></html>"#;
+        let css = ".inherit { font-family: inherit } .big { font-size: 20px }";
+        let h = style_of(css, html, "h").font_size();
+        assert_eq!(style_of(css, html, "c").font_size(), h * 13.0 / 16.0);
+        assert_eq!(style_of(css, html, "i").font_size(), h);
+        assert_eq!(style_of(css, html, "s").font_size(), 20.0);
+    }
 
     #[test]
     fn combinators_and_pseudo_classes() {

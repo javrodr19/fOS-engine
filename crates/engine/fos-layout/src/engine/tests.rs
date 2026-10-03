@@ -626,3 +626,62 @@ fn webkit_center_centers_block_children() {
     assert_eq!(rect_of(&t, child).x, 8.0 + 292.0);
     assert_eq!(rect_of(&t, child2).x, 8.0);
 }
+
+#[test]
+fn grid_tracks_and_auto_placement() {
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; width: 600px; grid-template-columns: 100px 1fr 2fr; gap: 10px 20px");
+    let items: Vec<NodeId> = (0..5).map(|_| el(&mut tree, g, "div", "height: 30px")).collect();
+    let t = layout(&tree, html, 800.0);
+    let r: Vec<Rect> = items.iter().map(|&n| rect_of(&t, n)).collect();
+    // 600 - 100 - 2*20 = 460 shared 1:2
+    assert_eq!((r[0].x, r[0].w), (8.0, 100.0));
+    assert!((r[1].x - 128.0).abs() < 0.01 && (r[1].w - 460.0 / 3.0).abs() < 0.01, "{:?}", r[1]);
+    assert!((r[2].w - 920.0 / 3.0).abs() < 0.01);
+    // Second row after the gap
+    assert_eq!((r[3].x, r[3].y), (8.0, 8.0 + 30.0 + 10.0));
+    assert_eq!(rect_of(&t, g).h, 70.0);
+}
+
+#[test]
+fn grid_areas_lines_and_spans() {
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; width: 400px; grid-template-columns: 100px 1fr; grid-template-rows: 50px auto 20px; grid-template-areas: 'head head' 'nav main' 'foot foot'");
+    let main = el(&mut tree, g, "div", "grid-area: main; height: 80px");
+    let head = el(&mut tree, g, "div", "grid-area: head");
+    let nav = el(&mut tree, g, "div", "grid-area: nav");
+    let foot = el(&mut tree, g, "div", "grid-column: 1 / -1; grid-row: 3");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, head), Rect::new(8.0, 8.0, 400.0, 50.0));
+    assert_eq!(rect_of(&t, main), Rect::new(108.0, 58.0, 300.0, 80.0));
+    // Stretched to the row that main made 80px tall
+    assert_eq!(rect_of(&t, nav), Rect::new(8.0, 58.0, 100.0, 80.0));
+    assert_eq!(rect_of(&t, foot), Rect::new(8.0, 138.0, 400.0, 20.0));
+}
+
+#[test]
+fn grid_auto_fill_and_alignment() {
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; width: 500px; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); justify-items: center");
+    let items: Vec<NodeId> = (0..5).map(|_| el(&mut tree, g, "div", "width: 50px; height: 10px")).collect();
+    let t = layout(&tree, html, 800.0);
+    // Four 125px columns; the fifth item wraps
+    let r0 = rect_of(&t, items[0]);
+    assert_eq!(r0.x, 8.0 + (125.0 - 50.0) / 2.0);
+    assert_eq!(rect_of(&t, items[4]).y, 18.0);
+    assert_eq!(rect_of(&t, items[3]).x, 8.0 + 375.0 + 37.5);
+}
+
+#[test]
+fn grid_spans_and_dense_flow() {
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; width: 300px; grid-template-columns: repeat(3, 1fr); grid-auto-rows: 10px; grid-auto-flow: row dense");
+    let a = el(&mut tree, g, "div", "grid-column: span 2");
+    let b = el(&mut tree, g, "div", "grid-column: span 2");
+    let c = el(&mut tree, g, "div", "");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, a).x, rect_of(&t, a).w), (8.0, 200.0));
+    assert_eq!(rect_of(&t, b).y, 18.0);
+    // Dense: c fills the hole after a
+    assert_eq!((rect_of(&t, c).x, rect_of(&t, c).y), (208.0, 8.0));
+}

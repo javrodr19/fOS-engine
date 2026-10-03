@@ -57,6 +57,11 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
+        "grid-row" => &[GridRowStart, GridRowEnd],
+        "grid-column" => &[GridColumnStart, GridColumnEnd],
+        "grid-area" => &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
+        "grid-template" => &[GridTemplateRows, GridTemplateColumns, GridTemplateAreas],
+        "grid" => &[GridTemplateRows, GridTemplateColumns, GridTemplateAreas, GridAutoFlow, GridAutoRows, GridAutoColumns],
         "overflow" => &[OverflowX, OverflowY],
         "text-decoration" => &[TextDecorationLine, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition],
@@ -214,6 +219,18 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "border-collapse" => BorderCollapse,
         "border-spacing" => BorderSpacing,
         "pointer-events" => PointerEvents,
+        "grid-template-columns" => GridTemplateColumns,
+        "grid-template-rows" => GridTemplateRows,
+        "grid-template-areas" => GridTemplateAreas,
+        "grid-auto-columns" => GridAutoColumns,
+        "grid-auto-rows" => GridAutoRows,
+        "grid-auto-flow" => GridAutoFlow,
+        "grid-column-start" => GridColumnStart,
+        "grid-column-end" => GridColumnEnd,
+        "grid-row-start" => GridRowStart,
+        "grid-row-end" => GridRowEnd,
+        "justify-items" => JustifyItems,
+        "justify-self" => JustifySelf,
         _ => return None,
     })
 }
@@ -245,6 +262,18 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
         return false;
     }
     let handled = match name {
+        "grid-row" | "grid-column" | "grid-area" | "grid-template" | "grid" => {
+            if let Some(parts) = crate::grid::expand_shorthand(name, value.trim()) {
+                if parts.iter().all(|(n, v)| crate::grid::valid(n, v)) {
+                    for (n, v) in parts {
+                        if let Some(id) = longhand_id(n) {
+                            push(out, id, PropertyValue::Grid(Arc::from(v.as_str())), important);
+                        }
+                    }
+                }
+            }
+            true
+        }
         "margin" | "padding" | "inset" => {
             let ids = longhands_of(name).unwrap();
             let negative = name != "padding";
@@ -449,6 +478,21 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
+        P::GridTemplateColumns | P::GridTemplateRows | P::GridTemplateAreas | P::GridAutoColumns | P::GridAutoRows | P::GridAutoFlow | P::GridColumnStart | P::GridColumnEnd | P::GridRowStart | P::GridRowEnd => {
+            let name = grid_name(id);
+            crate::grid::valid(name, raw.trim()).then(|| PropertyValue::Grid(Arc::from(raw.trim())))
+        }
+        P::JustifyItems => align_items(match v {
+            "left" | "flex-start" | "self-start" => "start",
+            "right" | "flex-end" | "self-end" => "end",
+            "legacy" | "legacy center" | "center legacy" => if v.contains("center") { "center" } else { "normal" },
+            other => other,
+        }),
+        P::JustifySelf => enum_value::<AlignSelf>(match strip_safety(v) {
+            "left" | "flex-start" => "start",
+            "right" | "flex-end" => "end",
+            other => other,
+        }),
         P::TextDecorationLine => {
             let mut bits = 0u8;
             for c in components(v) {
@@ -607,6 +651,22 @@ fn overflow(v: &str) -> Option<PropertyValue> {
 /// `safe` / `unsafe` alignment prefixes
 fn strip_safety(v: &str) -> &str {
     v.strip_prefix("safe ").or_else(|| v.strip_prefix("unsafe ")).unwrap_or(v).trim()
+}
+
+fn grid_name(id: PropertyId) -> &'static str {
+    use PropertyId as P;
+    match id {
+        P::GridTemplateColumns => "grid-template-columns",
+        P::GridTemplateRows => "grid-template-rows",
+        P::GridTemplateAreas => "grid-template-areas",
+        P::GridAutoColumns => "grid-auto-columns",
+        P::GridAutoRows => "grid-auto-rows",
+        P::GridAutoFlow => "grid-auto-flow",
+        P::GridColumnStart => "grid-column-start",
+        P::GridColumnEnd => "grid-column-end",
+        P::GridRowStart => "grid-row-start",
+        _ => "grid-row-end",
+    }
 }
 
 fn justify_content(v: &str) -> Option<PropertyValue> {
@@ -1325,6 +1385,20 @@ mod tests {
         let mut s = Style::inherit_from(&parent);
         s.cascade(&refs, &parent, &StyleContext::default(), &mut crate::values::ResolveCache::default());
         s
+    }
+
+    #[test]
+    fn grid_properties_compute() {
+        use crate::grid::{Breadth, GridLine, TemplateItem};
+        let s = computed("display: grid; grid-template-columns: 10em 1fr; grid-area: Main; justify-items: center; grid-template-areas: 'Main side'");
+        let g = &s.box_.grid;
+        assert!(matches!(g.template_columns[0], TemplateItem::Track(t) if t.min == Breadth::Length(Lp::px(160.0))));
+        assert_eq!(g.row_start, GridLine::Ident(Arc::from("Main")));
+        assert_eq!(g.column_end, GridLine::Ident(Arc::from("Main")));
+        assert_eq!(g.justify_items, AlignItems::Center as u8);
+        assert_eq!(g.areas.as_ref().unwrap().columns, 2);
+        let s = computed("grid-template-columns: repeat(2, calc(50% - 10px))");
+        assert!(matches!(&s.box_.grid.template_columns[0], TemplateItem::Repeat(_, inner) if matches!(inner[0], TemplateItem::Track(t) if t.min == Breadth::Length(Lp { px: -10.0, pct: 50.0 }))));
     }
 
     #[test]

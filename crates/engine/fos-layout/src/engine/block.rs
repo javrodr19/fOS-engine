@@ -367,6 +367,11 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             frag.children = flex.frags;
             flex.height
         }
+        BoxKind::Grid(items) => {
+            let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h);
+            frag.children = grid.frags;
+            grid.height
+        }
         BoxKind::Table(t) => {
             let table = super::table::layout_table(ctx, style, t, width, specified.is_none());
             frag.children = table.frags;
@@ -714,6 +719,7 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
         }
         BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items),
         BoxKind::Table(t) => super::table::intrinsic_table(ctx, &b.style, t),
+        BoxKind::Grid(items) => super::grid::intrinsic_grid(ctx, &b.style, items),
         BoxKind::Replaced(r) => {
             let e = edges(&b.style, 0.0);
             let (w, _) = replaced_content_size(ctx, &b.style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());

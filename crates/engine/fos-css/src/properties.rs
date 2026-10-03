@@ -137,6 +137,18 @@ pub enum PropertyId {
     BorderSpacing,
     TableLayout,
     PointerEvents,
+    GridTemplateColumns,
+    GridTemplateRows,
+    GridTemplateAreas,
+    GridAutoColumns,
+    GridAutoRows,
+    GridAutoFlow,
+    GridColumnStart,
+    GridColumnEnd,
+    GridRowStart,
+    GridRowEnd,
+    JustifyItems,
+    JustifySelf,
 }
 
 impl PropertyId {
@@ -281,6 +293,8 @@ pub enum PropertyValue {
     CurrentColor,
     /// Background image layers
     Images(std::sync::Arc<[crate::style::Image]>),
+    /// A grid property's (validated) text, parsed when computing styles
+    Grid(std::sync::Arc<str>),
 }
 
 /// CSS keyword values

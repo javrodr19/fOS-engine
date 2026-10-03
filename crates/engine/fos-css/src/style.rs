@@ -524,6 +524,8 @@ pub struct BoxStyle {
     pub object_fit: ObjectFit,
     pub text_overflow: TextOverflow,
     pub table_layout: TableLayout,
+    /// Grid container and item properties
+    pub grid: crate::grid::GridStyle,
     pub text_decoration_line: u8,
     /// `None` is currentcolor
     pub text_decoration_color: Option<Color>,
@@ -567,6 +569,7 @@ impl Default for BoxStyle {
             object_fit: ObjectFit::Fill,
             text_overflow: TextOverflow::Clip,
             table_layout: TableLayout::Auto,
+            grid: Default::default(),
             text_decoration_line: 0,
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
@@ -855,6 +858,25 @@ impl Style {
         Lp::px(px)
     }
 
+    /// A length-percentage in text (grid tracks), including resolved
+    /// mixes (`-fos-mix(Xpx Y%)`)
+    fn lp_text(&self, t: &str, ctx: &StyleContext) -> Option<Lp> {
+        if let Some(inner) = t.strip_prefix("-fos-mix(").and_then(|r| r.strip_suffix(')')) {
+            let mut lp = Lp::ZERO;
+            for part in inner.split_whitespace() {
+                let l = crate::parser::parse_length(part)?;
+                let v = self.length(l, ctx);
+                lp.px += v.px;
+                lp.pct += v.pct;
+            }
+            return Some(lp);
+        }
+        if t == "0" {
+            return Some(Lp::ZERO);
+        }
+        crate::parser::parse_length(t).map(|l| self.length(l, ctx))
+    }
+
     /// Pixels only (border widths, spacing); percentages have no meaning
     fn px(&self, v: &PropertyValue, ctx: &StyleContext) -> Option<f32> {
         self.lp(v, ctx).filter(|l| !l.has_percent()).map(|l| l.px)
@@ -1039,6 +1061,52 @@ impl Style {
             PropertyId::ObjectFit => set!(box_, [object_fit], enum_of!(ObjectFit)),
             PropertyId::TextOverflow => set!(box_, [text_overflow], enum_of!(TextOverflow)),
             PropertyId::TableLayout => set!(box_, [table_layout], enum_of!(TableLayout)),
+            PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows | PropertyId::GridAutoColumns | PropertyId::GridAutoRows => {
+                let PropertyValue::Grid(text) = v else { return };
+                let len = |t: &str| self.lp_text(t, ctx);
+                match id {
+                    PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows => {
+                        let Some(list) = crate::grid::parse_track_list(text, &len) else { return };
+                        if id == PropertyId::GridTemplateColumns {
+                            set!(box_, [grid.template_columns], list);
+                        } else {
+                            set!(box_, [grid.template_rows], list);
+                        }
+                    }
+                    _ => {
+                        let Some(list) = crate::grid::parse_auto_tracks(text, &len) else { return };
+                        if id == PropertyId::GridAutoColumns {
+                            set!(box_, [grid.auto_columns], list);
+                        } else {
+                            set!(box_, [grid.auto_rows], list);
+                        }
+                    }
+                }
+            }
+            PropertyId::GridTemplateAreas => {
+                if let PropertyValue::Grid(text) = v {
+                    if let Some(areas) = crate::grid::parse_areas(text) {
+                        set!(box_, [grid.areas], areas);
+                    }
+                }
+            }
+            PropertyId::GridAutoFlow => {
+                if let Some((column, dense)) = match v { PropertyValue::Grid(t) => crate::grid::parse_flow(t), _ => None } {
+                    set!(box_, [grid.flow_column], column);
+                    set!(box_, [grid.flow_dense], dense);
+                }
+            }
+            PropertyId::GridColumnStart | PropertyId::GridColumnEnd | PropertyId::GridRowStart | PropertyId::GridRowEnd => {
+                let Some(line) = (match v { PropertyValue::Grid(t) => crate::grid::parse_line(t), _ => None }) else { return };
+                match id {
+                    PropertyId::GridColumnStart => set!(box_, [grid.column_start], line),
+                    PropertyId::GridColumnEnd => set!(box_, [grid.column_end], line),
+                    PropertyId::GridRowStart => set!(box_, [grid.row_start], line),
+                    _ => set!(box_, [grid.row_end], line),
+                }
+            }
+            PropertyId::JustifyItems => set!(box_, [grid.justify_items], enum_of!(AlignItems) as u8),
+            PropertyId::JustifySelf => set!(box_, [grid.justify_self], enum_of!(AlignSelf) as u8),
             PropertyId::TextDecorationLine => {
                 if let PropertyValue::Integer(n) = v {
                     set!(box_, [text_decoration_line], *n as u8);
@@ -1344,6 +1412,21 @@ impl Style {
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
             PropertyId::TextOverflow => copy!(box_, [text_overflow]),
             PropertyId::TableLayout => copy!(box_, [table_layout]),
+            PropertyId::GridTemplateColumns => copy!(box_, [grid.template_columns]),
+            PropertyId::GridTemplateRows => copy!(box_, [grid.template_rows]),
+            PropertyId::GridTemplateAreas => copy!(box_, [grid.areas]),
+            PropertyId::GridAutoColumns => copy!(box_, [grid.auto_columns]),
+            PropertyId::GridAutoRows => copy!(box_, [grid.auto_rows]),
+            PropertyId::GridAutoFlow => {
+                copy!(box_, [grid.flow_column]);
+                copy!(box_, [grid.flow_dense]);
+            }
+            PropertyId::GridColumnStart => copy!(box_, [grid.column_start]),
+            PropertyId::GridColumnEnd => copy!(box_, [grid.column_end]),
+            PropertyId::GridRowStart => copy!(box_, [grid.row_start]),
+            PropertyId::GridRowEnd => copy!(box_, [grid.row_end]),
+            PropertyId::JustifyItems => copy!(box_, [grid.justify_items]),
+            PropertyId::JustifySelf => copy!(box_, [grid.justify_self]),
             PropertyId::TextDecorationLine => copy!(box_, [text_decoration_line]),
             PropertyId::TextDecorationColor => copy!(box_, [text_decoration_color]),
             PropertyId::TextDecorationStyle => copy!(box_, [text_decoration_style]),

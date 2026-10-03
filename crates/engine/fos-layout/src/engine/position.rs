@@ -32,7 +32,7 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
         map.insert(b.node, b);
     }
     match &b.kind {
-        BoxKind::Block(children) | BoxKind::Flex(children) => {
+        BoxKind::Block(children) | BoxKind::Flex(children) | BoxKind::Grid(children) => {
             for c in children {
                 collect(c, map);
             }

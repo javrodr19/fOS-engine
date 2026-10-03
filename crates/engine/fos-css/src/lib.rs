@@ -52,6 +52,7 @@ pub mod predictive;
 
 pub mod values;
 pub mod style;
+pub mod grid;
 mod longhand;
 pub use values::{ResolveCache, ResolveContext, resolve_declaration, substitute_vars, compute_custom_properties, CustomProperties, VarSource};
 pub use parser::{CssParser, MediaContext, parse_declarations, parse_color, parse_length, media_matches};

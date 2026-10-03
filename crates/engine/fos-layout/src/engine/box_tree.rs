@@ -82,6 +82,8 @@ pub enum BoxKind {
     /// A flex container and its items (blockified; text runs wrapped in
     /// anonymous blocks)
     Flex(Vec<LayoutBox>),
+    /// A grid container and its items (made like flex items)
+    Grid(Vec<LayoutBox>),
     /// A table: captions and rows of cells (row groups flattened, header
     /// rows first and footer rows last)
     Table(Box<TableBox>),
@@ -422,7 +424,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             }
             return LayoutBox { node, style, kind: BoxKind::Table(Box::new(table)), marker: None };
         }
-        if matches!(style.display(), Display::Flex | Display::InlineFlex) {
+        if matches!(style.display(), Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid) {
             let mut items = Vec::new();
             let mut text = InlineBuilder::new(&style, self.deco);
             self.styler.enter(self.tree, node);
@@ -436,7 +438,8 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             if is_ol || matches!(self.tag(node), "ul" | "menu" | "dir") {
                 self.list_counters.pop();
             }
-            return LayoutBox { node, style, kind: BoxKind::Flex(items), marker: None };
+            let kind = if matches!(style.display(), Display::Grid | Display::InlineGrid) { BoxKind::Grid(items) } else { BoxKind::Flex(items) };
+            return LayoutBox { node, style, kind, marker: None };
         }
         let mut c = Container { style: &style, blocks: Vec::new(), inline: InlineBuilder::new(&style, self.deco) };
         // Inside markers lead the content

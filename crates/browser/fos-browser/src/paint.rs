@@ -37,6 +37,8 @@ pub struct Painter<'a> {
     /// ones resolve against
     images: Option<&'a std::collections::HashMap<String, std::sync::Arc<crate::image_loader::LoadedImage>>>,
     base: &'a str,
+    /// Canvas elements' bitmaps
+    canvases: Option<&'a std::collections::HashMap<NodeId, std::sync::Arc<crate::image_loader::LoadedImage>>>,
 }
 
 /// A device-space clip rectangle: x0, y0, x1, y1
@@ -171,13 +173,19 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "" }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None }
     }
 
     /// Images for CSS `url()`s
     pub fn with_images(mut self, images: &'a crate::image_loader::Images, base: &'a str) -> Self {
         self.images = Some(&**images);
         self.base = base;
+        self
+    }
+
+    /// Bitmaps of canvas elements
+    pub fn with_canvases(mut self, canvases: &'a std::collections::HashMap<NodeId, std::sync::Arc<crate::image_loader::LoadedImage>>) -> Self {
+        self.canvases = Some(canvases);
         self
     }
 
@@ -694,7 +702,12 @@ impl<'a> Painter<'a> {
                     self.image(b, img, c, clip, alpha);
                 }
             }
-            ReplacedPaint::Bitmap | ReplacedPaint::Empty => {}
+            ReplacedPaint::Bitmap => {
+                if let Some(img) = self.canvases.and_then(|c| c.get(&b.node)).cloned() {
+                    self.image(b, &img, c, clip, alpha);
+                }
+            }
+            ReplacedPaint::Empty => {}
         }
     }
 

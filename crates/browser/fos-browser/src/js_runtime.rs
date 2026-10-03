@@ -560,6 +560,11 @@ impl PageJsRuntime {
         }
     }
 
+    /// Canvas elements whose bitmaps scripts changed since the last call
+    pub fn take_canvas_updates(&mut self) -> Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)> {
+        self.vm.as_mut().map(crate::canvas_bindings::take_canvas_updates).unwrap_or_default()
+    }
+
     /// A scroll position the page's scripts asked for (taken)
     pub fn take_scroll_request(&mut self) -> Option<f32> {
         self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()).and_then(|h| h.scroll_request.take())
@@ -1850,6 +1855,23 @@ mod tests {
         assert_eq!(rt.eval("ok").unwrap(), "1");
         let msgs = rt.console_messages();
         assert!(msgs.iter().any(|m| format!("{m:?}").contains("undefinedFn")), "{msgs:?}");
+    }
+
+    #[test]
+    fn canvas_drawings_reach_the_page() {
+        let (mut rt, doc) = page("<html><body style='margin:0'><canvas id=c width=20 height=10 style='width: 40px; height: 20px'></canvas></body></html>");
+        rt.eval("const ctx = document.getElementById('c').getContext('2d'); ctx.fillStyle = '#00f'; ctx.fillRect(0, 0, 10, 10);").unwrap();
+        let updates = rt.take_canvas_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1, (20, 10));
+        // Nothing new until it is drawn on again
+        assert!(rt.take_canvas_updates().is_empty());
+        let mut renderer = crate::renderer::PageRenderer::new(100, 50);
+        assert!(renderer.update_canvases(updates));
+        let page = renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        // Scaled 2x: blue on the left half, nothing drawn on the right
+        assert_eq!(page.pixels[5 * 100 + 10], 0xff0000ff);
+        assert_eq!(page.pixels[5 * 100 + 30], 0xffffffff);
     }
 
     #[test]

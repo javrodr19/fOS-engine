@@ -342,6 +342,22 @@ fn element_context(vm: &mut Vm, id: NodeId) -> Option<Value> {
     Some(vm.host_roots[slot])
 }
 
+/// Canvas elements whose bitmaps changed since the last call, with a copy
+/// of each bitmap (`None` once cleared), for painting the page
+pub fn take_canvas_updates(vm: &mut Vm) -> Vec<(NodeId, (u32, u32), Option<sk::Pixmap>)> {
+    let entries: Vec<(u32, usize)> = host(vm).contexts.iter().map(|(k, v)| (*k, *v)).collect();
+    let mut out = Vec::new();
+    for (id, slot) in entries {
+        let ctx = vm.host_roots[slot];
+        if let Some(c) = data::<Context2D>(ctx) {
+            if c.canvas.take_dirty() {
+                out.push((NodeId(id), (c.canvas.width(), c.canvas.height()), c.canvas.pixmap().cloned()));
+            }
+        }
+    }
+    out
+}
+
 /// `width` or `height` of an element changed: a canvas starts over
 pub fn attribute_changed(vm: &mut Vm, id: NodeId, name: &str) {
     if name != "width" && name != "height" {

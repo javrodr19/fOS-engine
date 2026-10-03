@@ -152,6 +152,8 @@ pub struct PageRenderer {
     scroll: f32,
     /// The current page's decoded images
     images: crate::image_loader::Images,
+    /// What scripts drew on the page's canvas elements
+    canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
 }
 
 impl PageRenderer {
@@ -172,6 +174,7 @@ impl PageRenderer {
             compiled_css: None,
             scroll: 0.0,
             images: Default::default(),
+            canvases: Default::default(),
         }
     }
 
@@ -195,6 +198,7 @@ impl PageRenderer {
     pub fn clear_cache(&mut self) {
         self.cached = None;
         self.compiled_css = None;
+        self.canvases.clear();
         self.text_renderer.clear_glyph_cache();
         self.fonts = FontContext::new(self.text_renderer.fonts.clone());
     }
@@ -346,6 +350,27 @@ impl PageRenderer {
         Some(page)
     }
 
+    /// Take new canvas bitmaps (`None`: cleared); true if any changed. A
+    /// repaint shows them (the layout does not change).
+    pub fn update_canvases(&mut self, updates: Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)>) -> bool {
+        let changed = !updates.is_empty();
+        for (node, (w, h), pixmap) in updates {
+            match pixmap {
+                Some(pixmap) => {
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap }));
+                }
+                None => {
+                    self.canvases.remove(&node);
+                }
+            }
+        }
+        if changed {
+            // Painted buffers are stale
+            self.layout_generation += 1;
+        }
+        changed
+    }
+
     /// Images the current layout's CSS uses (backgrounds, masks)
     pub fn css_image_urls(&self) -> Vec<String> {
         self.cached.as_ref().map(|c| c.layout.css_images.clone()).unwrap_or_default()
@@ -464,7 +489,7 @@ impl PageRenderer {
     fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
         let bg = layout.background;
         let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
-        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base);
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base).with_canvases(&self.canvases);
         painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
     }

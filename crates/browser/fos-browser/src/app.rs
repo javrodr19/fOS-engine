@@ -364,6 +364,12 @@ impl BrowserApp {
 
     /// Re-render if the DOM changed since it was laid out (e.g. by a script)
     fn refresh_if_dom_changed(&mut self) {
+        // What scripts drew on canvases
+        let updates = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).map(|r| r.take_canvas_updates()).unwrap_or_default();
+        if self.renderer.update_canvases(updates) {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
         let Some(doc) = self.current_document() else { return };
         let current = self.renderer.is_layout_current(&lock_document(&doc));
         if !current {

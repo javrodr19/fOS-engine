@@ -204,9 +204,11 @@ impl InlineContent {
     }
 }
 
-/// An inline box with borders or padding shows even when empty
+/// An inline box with left/right borders, padding or margins makes its
+/// line even when empty (CSS 2.1 §9.4.2; vertical ones do not)
 fn has_edges(s: &Style) -> bool {
-    s.border.has_border() || s.box_.padding.iter().any(|p| !p.is_zero()) || s.background.is_visible()
+    let b = &s.box_;
+    [1, 3].iter().any(|&i| s.border.width[i] > 0.0 || !b.padding[i].is_zero() || !matches!(b.margin[i], fos_css::style::LpAuto::Lp(l) if l.is_zero()))
 }
 
 /// Builds the inline content of one block container

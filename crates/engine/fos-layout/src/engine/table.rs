@@ -202,7 +202,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
     let mut row_h: Vec<f32> = t.rows.iter().map(|r| r.style.box_.height.resolve(0.0).unwrap_or(0.0)).collect();
     for &(r, c, cell) in &g.cells {
         let w = span_width(c, cell.colspan as usize);
-        let laid = layout_sized(ctx, &cell.b, w, None, Sizing::Shrink, false, Forced { width: Some(w), height: None });
+        let laid = layout_sized(ctx, &cell.b, w, None, Sizing::Shrink, false, Forced { width: Some(w), height: None, root: true });
         let rs = (cell.rowspan as usize).min(t.rows.len() - r);
         if rs == 1 {
             row_h[r] = row_h[r].max(laid.frag.border_box.h);

@@ -707,3 +707,30 @@ fn grid_spans_and_dense_flow() {
     // Dense: c fills the hole after a
     assert_eq!((rect_of(&t, c).x, rect_of(&t, c).y), (208.0, 8.0));
 }
+
+#[test]
+fn floats_in_a_flex_item_sit_side_by_side() {
+    let (mut tree, html, body) = doc();
+    let flex = el(&mut tree, body, "div", "display: flex; justify-content: flex-end; width: 600px");
+    el(&mut tree, flex, "div", "display: block; width: 100px; height: 10px");
+    let item = el(&mut tree, flex, "div", "display: block");
+    let ul = el(&mut tree, item, "ul", "display: inline; margin: 0; padding: 0");
+    let mut lis = Vec::new();
+    for _ in 0..3 {
+        text(&mut tree, ul, " ");
+        let li = el(&mut tree, ul, "li", "display: list-item; float: left; margin-right: 10px");
+        let b = el(&mut tree, li, "a", "display: inline-block; width: 50px; height: 20px");
+        let _ = b;
+        lis.push(li);
+    }
+    let t = layout(&tree, html, 800.0);
+    let r: Vec<Rect> = lis.iter().map(|&l| rect_of(&t, l)).collect();
+    // The item is a formatting context: it holds its floats
+    let u = rect_of(&t, item);
+    assert_eq!(r[0].y, u.y, "{u:?} {r:?}");
+    assert!(u.h >= r[0].h);
+    assert_eq!(r[0].y, r[1].y);
+    assert_eq!(r[1].y, r[2].y);
+    assert!(r[1].x > r[0].x && r[2].x > r[1].x);
+}
+

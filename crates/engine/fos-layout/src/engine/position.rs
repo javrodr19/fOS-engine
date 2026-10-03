@@ -106,7 +106,7 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
         (true, Some(t), Some(bt)) if !replaced => Some(clamp_height(s, (cb.h - t - bt - mt - mb - vbp).max(0.0), Some(cb.h), vbp) + vbp),
         _ => None,
     };
-    let laid = layout_sized(ctx, b, cb.w, Some(cb.h), Sizing::Shrink, false, Forced { width, height });
+    let laid = layout_sized(ctx, b, cb.w, Some(cb.h), Sizing::Shrink, false, Forced { width, height, root: false });
     let mut frag = laid.frag;
     let (w, h) = (frag.border_box.w, frag.border_box.h);
 

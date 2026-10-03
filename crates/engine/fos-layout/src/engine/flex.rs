@@ -113,7 +113,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
             // A column item's height at its cross size
             let cross_w = if stretch_cross { Some((width - margin[1] - margin[3]).max(0.0)) } else { None };
-            layout_sized(ctx, b, width, height, Sizing::Shrink, false, Forced { width: cross_w, height: None })
+            layout_sized(ctx, b, width, height, Sizing::Shrink, false, Forced { width: cross_w, height: None, root: true })
         };
         let base = match (s.box_.flex_basis, definite(s.box_.flex_basis)) {
             (LpAuto::Lp(_), Some(v)) => v,
@@ -246,10 +246,10 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for it in flex.iter_mut() {
         let s = &it.b.style;
         let forced = if row {
-            Forced { width: Some(it.target), height: None }
+            Forced { width: Some(it.target), height: None, root: true }
         } else {
             let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.width.is_auto() && !it.auto_margin[1] && !it.auto_margin[3];
-            Forced { width: stretch.then(|| (width - it.margin[1] - it.margin[3]).max(0.0)), height: Some(it.target) }
+            Forced { width: stretch.then(|| (width - it.margin[1] - it.margin[3]).max(0.0)), height: Some(it.target), root: true }
         };
         let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, forced);
         it.cross = if row { laid.frag.border_box.h } else { laid.frag.border_box.w };
@@ -299,7 +299,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                 let (_, vbp) = bp(s, width);
                 target = super::block::clamp_height(s, (target - vbp).max(0.0), height, vbp) + vbp;
                 if (target - it.cross).abs() > 0.01 {
-                    let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, Forced { width: Some(it.target), height: Some(target) });
+                    let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, Forced { width: Some(it.target), height: Some(target), root: true });
                     it.cross = target;
                     it.laid = Some(laid);
                 }

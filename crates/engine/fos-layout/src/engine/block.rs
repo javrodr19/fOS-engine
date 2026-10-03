@@ -247,6 +247,9 @@ pub fn layout_block_level(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: O
 pub struct Forced {
     pub width: Option<f32>,
     pub height: Option<f32>,
+    /// The box is a flex or grid item or a table cell: it establishes a
+    /// formatting context whatever its own style says
+    pub root: bool,
 }
 
 /// [`layout_block_level`] with sizes imposed by the parent (auto margins
@@ -324,7 +327,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     };
     let inner_cb_h = specified_h.map(|h| if forced.height.is_some() { h } else { clamp_height(style, h, cb_h, vbp) }).or(if is_root { cb_h.map(|h| (h - vbp).max(0.0)) } else { None });
 
-    let bfc = is_root || b.is_bfc_root();
+    let bfc = is_root || forced.root || b.is_bfc_root();
     let collapse_top = !bfc && e.border[0] == 0.0 && e.padding[0] == 0.0;
     let collapse_bottom = !bfc && e.border[2] == 0.0 && e.padding[2] == 0.0 && style.box_.height.is_auto() && style.box_.min_height.resolve(0.0).unwrap_or(0.0) <= 0.0;
 
@@ -709,14 +712,28 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
     match &b.kind {
         BoxKind::Inline(content) => inline::intrinsic_inline(ctx, content),
         BoxKind::Block(children) => {
+            use fos_css::style::{Clear, Float};
             let (mut min, mut max) = (0.0f32, 0.0f32);
+            // Floats in a row sit side by side at max-content
+            let mut float_row = 0.0f32;
             for c in children {
                 if c.style.is_out_of_flow() {
                     continue;
                 }
                 let (cmin, cmax) = intrinsic_outer(ctx, c);
                 min = min.max(cmin);
-                max = max.max(cmax);
+                if c.style.box_.float != Float::None {
+                    if c.style.box_.clear != Clear::None {
+                        float_row = 0.0;
+                    }
+                    float_row += cmax;
+                    max = max.max(float_row);
+                } else if cmax > 0.0 {
+                    // (empty boxes between floats, like the pieces of an
+                    // inline element split around them, end no row)
+                    float_row = 0.0;
+                    max = max.max(cmax);
+                }
             }
             (min, max)
         }

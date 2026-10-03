@@ -586,7 +586,7 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let m = b.style.box_.margin.map(|m| m.resolve(area_w));
         let forced_w = (stretch && b.style.box_.width.is_auto() && m[1].is_some() && m[3].is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)))
             .then(|| (area_w - m[1].unwrap_or(0.0) - m[3].unwrap_or(0.0)).max(0.0));
-        let l = layout_sized(ctx, b, area_w, None, Sizing::Shrink, false, Forced { width: forced_w, height: None });
+        let l = layout_sized(ctx, b, area_w, None, Sizing::Shrink, false, Forced { width: forced_w, height: None, root: true });
         let outer = l.mt.size() + l.frag.border_box.h + l.mb.size();
         row_contrib.push((outer, outer));
         laid.push(l);
@@ -627,7 +627,7 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         if vstretch && b.style.box_.height.is_auto() && mt.is_some() && mb.is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)) {
             let target = (area_h - mt.unwrap_or(0.0) - mb.unwrap_or(0.0)).max(0.0);
             if (target - l.frag.border_box.h).abs() > 0.01 {
-                l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: Some(target) });
+                l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: Some(target), root: true });
             }
         }
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);

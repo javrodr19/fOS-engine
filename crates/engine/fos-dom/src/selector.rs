@@ -547,19 +547,26 @@ impl Parser<'_> {
     }
 
     fn ident(&mut self) -> Option<String> {
-        let mut out = String::new();
+        // The common case, no escapes: one slice of the source
+        let start = self.i;
         while let Some(c) = self.peek() {
             if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80 {
-                // Copy whole UTF-8 sequences
-                let len = match c {
-                    0..0x80 => 1,
-                    0xC0..0xE0 => 2,
-                    0xE0..0xF0 => 3,
-                    _ => 4,
-                };
-                let end = (self.i + len).min(self.s.len());
-                out.push_str(std::str::from_utf8(&self.s[self.i..end]).ok()?);
-                self.i = end;
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if self.peek() != Some(b'\\') {
+            return (self.i > start).then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned());
+        }
+        let mut out = String::from_utf8_lossy(&self.s[start..self.i]).into_owned();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80 {
+                let run = self.i;
+                while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80) {
+                    self.i += 1;
+                }
+                out.push_str(&String::from_utf8_lossy(&self.s[run..self.i]));
             } else if c == b'\\' {
                 self.i += 1;
                 let c = self.peek()?;

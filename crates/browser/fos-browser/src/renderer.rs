@@ -393,7 +393,9 @@ impl PageRenderer {
     /// The page's CSS compiled for matching, reused while its text and
     /// the viewport stay the same
     fn compiled_stylesheet(&mut self, document: &Document) -> Option<Arc<PageStyles>> {
+        let started = std::time::Instant::now();
         let css_text = self.extract_css_from_document(document);
+        log::debug!("css: extracted {} bytes in {:?}", css_text.len(), started.elapsed());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         css_text.hash(&mut hasher);
         (self.viewport_width, self.viewport_height).hash(&mut hasher);

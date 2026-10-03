@@ -63,7 +63,17 @@ impl Default for CssParser {
 
 /// Position just past a comment, string or balanced block starting at `i`
 /// (or `i + 1` for any other byte)
+#[inline]
 fn skip_token(b: &[u8], i: usize) -> usize {
+    // Most bytes start nothing: no call for them
+    if !matches!(b[i], b'/' | b'"' | b'\'' | b'\\' | b'(' | b'[' | b'{') {
+        return i + 1;
+    }
+    skip_special(b, i)
+}
+
+#[inline(never)]
+fn skip_special(b: &[u8], i: usize) -> usize {
     match b[i] {
         b'/' if b.get(i + 1) == Some(&b'*') => {
             let mut j = i + 2;
@@ -223,8 +233,9 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .filter_map(|text| {
-                let (a, b, c) = *fos_dom::SelectorList::parse(text)?.specificities().first()?;
-                Some(Selector { text: text.to_string(), specificity: Specificity(a, b, c), parts: Vec::new() })
+                let parsed = fos_dom::SelectorList::parse(text)?;
+                let (a, b, c) = *parsed.specificities().first()?;
+                Some(Selector { text: text.to_string(), specificity: Specificity(a, b, c), parts: Vec::new(), parsed: Some(parsed) })
             })
             .collect();
         // Rules are kept even when none of their declarations is modeled

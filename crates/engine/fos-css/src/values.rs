@@ -90,16 +90,23 @@ pub struct ResolveContext<'a> {
 
 /// Find `name(` at a token boundary (case-insensitive), from `from`
 fn find_function(s: &str, name: &str, from: usize) -> Option<usize> {
-    let lower = s.to_ascii_lowercase();
-    let pat = format!("{name}(");
-    let mut at = from;
-    while let Some(p) = lower[at..].find(&pat) {
-        let i = at + p;
-        let boundary = i == 0 || !matches!(lower.as_bytes()[i - 1], b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_');
-        if boundary {
-            return Some(i);
+    let b = s.as_bytes();
+    let n = name.as_bytes();
+    if b.len() < n.len() + 1 {
+        return None;
+    }
+    let mut i = from;
+    // Each candidate is an opening parenthesis preceded by the name
+    while let Some(p) = b.get(i..).and_then(|rest| rest.iter().position(|&c| c == b'(')) {
+        let open = i + p;
+        if open >= n.len() {
+            let start = open - n.len();
+            let boundary = start == 0 || !matches!(b[start - 1].to_ascii_lowercase(), b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_');
+            if boundary && b[start..open].eq_ignore_ascii_case(n) && start >= from {
+                return Some(start);
+            }
         }
-        at = i + pat.len();
+        i = open + 1;
     }
     None
 }

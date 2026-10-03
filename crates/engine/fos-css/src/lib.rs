@@ -207,6 +207,9 @@ pub struct Selector {
     pub specificity: Specificity,
     /// Parsed selector parts
     pub parts: Vec<SelectorPart>,
+    /// The selector parsed for matching (taken by whoever compiles the
+    /// sheet, so it is parsed once)
+    pub parsed: Option<fos_dom::SelectorList>,
 }
 
 /// Part of a compound selector

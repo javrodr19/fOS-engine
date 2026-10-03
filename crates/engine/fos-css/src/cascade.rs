@@ -204,6 +204,7 @@ impl StyleResolver {
                             text: "div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, form, header, footer, section, article, nav, aside, main".into(),
                             specificity: Specificity(0, 0, 1),
                             parts: vec![SelectorPart::Type("div".into())],
+                            parsed: None,
                         },
                     ],
                     declarations: vec![
@@ -221,6 +222,7 @@ impl StyleResolver {
                             text: "span, a, strong, em, b, i, u".into(),
                             specificity: Specificity(0, 0, 1),
                             parts: vec![SelectorPart::Type("span".into())],
+                            parsed: None,
                         },
                     ],
                     declarations: vec![
@@ -238,6 +240,7 @@ impl StyleResolver {
                             text: "head, script, style, link, meta, title".into(),
                             specificity: Specificity(0, 0, 1),
                             parts: vec![SelectorPart::Type("head".into())],
+                            parsed: None,
                         },
                     ],
                     declarations: vec![

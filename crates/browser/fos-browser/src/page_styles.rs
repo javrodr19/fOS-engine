@@ -101,7 +101,7 @@ pub struct PageStyles {
 }
 
 impl PageStyles {
-    pub fn new(stylesheet: Stylesheet) -> Self {
+    pub fn new(mut stylesheet: Stylesheet) -> Self {
         let mut styles = PageStyles {
             selectors: Vec::new(),
             by_id: HashMap::new(),
@@ -112,13 +112,13 @@ impl PageStyles {
             stylesheet: Stylesheet { rules: Vec::new() },
         };
         let mut skipped = 0;
-        for (rule_index, rule) in stylesheet.rules.iter().enumerate() {
+        for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
             if rule.declarations.is_empty() {
                 continue;
             }
-            for selector in &rule.selectors {
+            for selector in &mut rule.selectors {
                 // Browsers drop selectors they cannot parse
-                let Some(list) = SelectorList::parse(&selector.text) else {
+                let Some(list) = selector.parsed.take().or_else(|| SelectorList::parse(&selector.text)) else {
                     skipped += 1;
                     continue;
                 };

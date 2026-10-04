@@ -498,6 +498,17 @@ fn evaluate_math(expr: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -
     }
 }
 
+/// A math function of absolute lengths (`calc(1120px - 1px)`) in px, as
+/// media queries use them: `em` and `rem` are the initial 16px
+pub(crate) fn math_length(expr: &str, viewport: (f32, f32)) -> Option<f32> {
+    let ctx = ResolveContext { custom: None, font_size: 16.0, parent_font_size: 16.0, root_font_size: 16.0, viewport };
+    let out = evaluate_math(expr.trim(), &ctx, None)?;
+    match out.strip_suffix("px") {
+        Some(px) => px.parse().ok(),
+        None => out.parse::<f32>().ok().filter(|n| *n == 0.0),
+    }
+}
+
 /// Replace the math functions in `value` with their results
 fn evaluate_math_functions(value: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -> Option<String> {
     let mut out = String::with_capacity(value.len());

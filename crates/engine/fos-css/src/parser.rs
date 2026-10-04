@@ -502,7 +502,9 @@ fn feature(f: &str, ctx: &MediaContext) -> bool {
     };
     let name = name.strip_prefix("-webkit-").unwrap_or(name);
     let (w, h) = (ctx.width, ctx.height);
-    let len = |v: Option<&str>| v.and_then(media_length);
+    let len = |v: Option<&str>| {
+        v.and_then(|v| if v.contains('(') { crate::values::math_length(v, (w, h)) } else { media_length(v) })
+    };
     match (name, value) {
         ("width", Some(v)) => len(Some(v)).is_some_and(|x| (w - x).abs() < 0.5),
         ("min-width", v) => len(v).is_some_and(|x| w >= x),
@@ -586,6 +588,7 @@ fn range_feature(f: &str, ctx: &MediaContext) -> bool {
             "width" => Some(ctx.width),
             "height" => Some(ctx.height),
             "aspect-ratio" => Some(ctx.width / ctx.height),
+            _ if t.contains('(') => crate::values::math_length(t, (ctx.width, ctx.height)),
             _ => media_length(t).or_else(|| ratio(t)),
         }
     };
@@ -1043,6 +1046,11 @@ mod tests {
         assert!(on("screen"));
         assert!(on("all and (min-width: 600px)"));
         assert!(!on("(max-width: 600px)"));
+        // Math functions (Wikipedia's breakpoints)
+        assert!(on("screen and (max-width: calc(1120px - 1px))"));
+        assert!(!on("(max-width: calc(640px - 1px))"));
+        assert!(on("(min-width: calc(40em + 1px))"));
+        assert!(on("(width < calc(1120px - 1px))"));
         assert!(on("print, (orientation: landscape)"));
         assert!(!on("print"));
         assert!(on("not print"));

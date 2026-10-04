@@ -128,6 +128,7 @@ pub enum PropertyId {
     ColumnGap,
     BackgroundImage,
     BackgroundRepeat,
+    BackgroundClip,
     BackgroundPosition,
     BackgroundSize,
     TextDecorationLine,

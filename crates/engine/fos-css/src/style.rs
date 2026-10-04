@@ -360,6 +360,7 @@ css_enum!(OverflowWrap { Normal = "normal", Anywhere = "anywhere", BreakWord = "
 css_enum!(TextOverflow { Clip = "clip", Ellipsis = "ellipsis" });
 css_enum!(ObjectFit { Fill = "fill", Contain = "contain", Cover = "cover", None = "none", ScaleDown = "scale-down" });
 css_enum!(TextDecorationStyle { Solid = "solid", Double = "double", Dotted = "dotted", Dashed = "dashed", Wavy = "wavy" });
+css_enum!(BackgroundClip { BorderBox = "border-box", PaddingBox = "padding-box", ContentBox = "content-box", Text = "text" });
 css_enum!(BackgroundRepeat { Repeat = "repeat", RepeatX = "repeat-x", RepeatY = "repeat-y", NoRepeat = "no-repeat", Space = "space", Round = "round" });
 css_enum!(BorderCollapse { Separate = "separate", Collapse = "collapse" });
 css_enum!(TableLayout { Auto = "auto", Fixed = "fixed" });
@@ -813,6 +814,8 @@ pub struct BackgroundStyle {
     pub mask_size: BackgroundSize,
     pub mask_position: (Lp, Lp),
     pub mask_repeat: (BackgroundRepeat, BackgroundRepeat),
+    /// What the background paints within (`text`: only under glyphs)
+    pub clip: BackgroundClip,
 }
 
 impl Default for BackgroundStyle {
@@ -827,6 +830,7 @@ impl Default for BackgroundStyle {
             mask_size: BackgroundSize::Auto,
             mask_position: (Lp::ZERO, Lp::ZERO),
             mask_repeat: (BackgroundRepeat::Repeat, BackgroundRepeat::Repeat),
+            clip: BackgroundClip::BorderBox,
         }
     }
 }
@@ -1599,6 +1603,7 @@ impl Style {
                     set!(background, [images], images.clone());
                 }
             }
+            PropertyId::BackgroundClip => set!(background, [clip], enum_of!(BackgroundClip)),
             PropertyId::BackgroundRepeat => {
                 if let Some(r) = Self::repeat_layers(v) {
                     set!(background, [repeat], Arc::from(r));
@@ -1858,6 +1863,7 @@ impl Style {
             PropertyId::BackgroundColor => copy!(background, [color]),
             PropertyId::BackgroundImage => copy!(background, [images]),
             PropertyId::BackgroundRepeat => copy!(background, [repeat]),
+            PropertyId::BackgroundClip => copy!(background, [clip]),
             PropertyId::BackgroundPosition => copy!(background, [position]),
             PropertyId::BackgroundSize => copy!(background, [size]),
             PropertyId::MaskImage => copy!(background, [mask]),

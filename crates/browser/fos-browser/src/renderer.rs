@@ -1066,6 +1066,25 @@ mod tests {
     }
 
     #[test]
+    fn test_background_clip() {
+        let html = r#"<html><body style="margin: 0">
+            <div style="font: bold 40px sans-serif; line-height: 40px; height: 40px; background: #f00; background-clip: text; color: transparent">MMMM</div>
+            <div style="width: 20px; height: 20px; border: 5px solid transparent; background: #00f; background-clip: padding-box"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 80);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // The background shows through the glyphs only
+        let red = (0..40).flat_map(|y| (0..120).map(move |x| (x, y))).filter(|&(x, y)| at(x, y) == 0xffff0000).count();
+        assert!(red > 100, "glyphs filled: {red}");
+        assert_ne!(at(195, 20), 0xffff0000, "no background beside the text");
+        // padding-box: none under the (transparent) border
+        assert_ne!(at(2, 42), 0xff0000ff);
+        assert_eq!(at(15, 55), 0xff0000ff);
+    }
+
+    #[test]
     fn test_object_position() {
         // 10×20: red on top, blue below; shown in 10×10 boxes with cover
         let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><rect width='10' height='10' fill='red'/><rect y='10' width='10' height='10' fill='blue'/></svg>";

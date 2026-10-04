@@ -204,6 +204,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "background-color" => BackgroundColor,
         "background-image" => BackgroundImage,
         "background-repeat" => BackgroundRepeat,
+        "background-clip" | "-webkit-background-clip" => BackgroundClip,
         "background-position" => BackgroundPosition,
         "background-size" => BackgroundSize,
         "color" => Color,
@@ -588,6 +589,8 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         }
         P::BackgroundImage | P::MaskImage => background_images(raw).map(|i| PropertyValue::Images(Arc::from(i))),
         P::BackgroundRepeat | P::MaskRepeat => layers(v, background_repeat),
+        // One value for all layers (the first)
+        P::BackgroundClip => enum_value::<BackgroundClip>(split_top(v, b',').first()?.trim()),
         P::BackgroundPosition | P::MaskPosition => layers(v, |l| background_position(&components(l))),
         P::BackgroundSize | P::MaskSize => layers(v, background_size),
         P::FontFamily => font_family(raw),
@@ -654,7 +657,7 @@ macro_rules! css_enum_impl {
 css_enum_impl!(
     Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
-    ObjectFit, TextDecorationStyle, BackgroundRepeat, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
+    ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
 );
 
 fn enum_value<T: CssEnum>(v: &str) -> Option<PropertyValue> {

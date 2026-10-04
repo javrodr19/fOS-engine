@@ -50,6 +50,8 @@ pub struct Painter<'a> {
     untransformed: usize,
     /// The box being painted offscreen for its shape clip (painted plainly)
     shaped: usize,
+    /// Painting only glyphs, opaque (the mask of `background-clip: text`)
+    only_text: bool,
 }
 
 /// Where painting is: origin, dx and view
@@ -191,7 +193,7 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0, shaped: 0 }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0, shaped: 0, only_text: false }
     }
 
     /// Images for CSS `url()`s
@@ -389,6 +391,7 @@ impl<'a> Painter<'a> {
                 view: self.view,
                 untransformed: key,
                 shaped: self.shaped,
+                only_text: self.only_text,
             };
             p.paint_layer(b, Clip([0.0, 0.0, w, h]), alpha);
         }
@@ -482,6 +485,9 @@ impl<'a> Painter<'a> {
 
     /// Overlay scroll thumbs on a box whose content overflows it
     fn scroll_thumbs(&mut self, b: &BoxFragment, clip: Clip) {
+        if self.only_text {
+            return;
+        }
         use fos_css::style::Overflow;
         let Some((ew, eh)) = b.scroll_extent else { return };
         let user = |o: Overflow| matches!(o, Overflow::Auto | Overflow::Scroll);
@@ -510,7 +516,7 @@ impl<'a> Painter<'a> {
 
     /// Background, borders and replaced content of one box
     fn paint_own(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
-        if b.style.inherited.visibility != Visibility::Visible {
+        if b.style.inherited.visibility != Visibility::Visible || self.only_text {
             return;
         }
         if let Some(url) = &b.style.background.mask {
@@ -522,7 +528,9 @@ impl<'a> Painter<'a> {
         if shadows {
             self.shadows(b, clip, alpha, false);
         }
-        if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
+        if b.style.background.clip == fos_css::style::BackgroundClip::Text {
+            self.text_background(b, clip, alpha);
+        } else if b.kind == BoxFragmentKind::InlinePart || self.canvas_background_box != Some(b.node) {
             self.background(b, clip, alpha);
         } else {
             // The color went to the canvas; gradients still paint here
@@ -659,6 +667,7 @@ impl<'a> Painter<'a> {
                 view: self.view,
                 untransformed: self.untransformed,
                 shaped: key,
+                only_text: self.only_text,
             };
             let c = Clip([0.0, 0.0, w, h]);
             if layer {
@@ -754,9 +763,22 @@ impl<'a> Painter<'a> {
         if !bg.is_visible() {
             return;
         }
-        let r = self.dev(b.border_box);
+        let border_box = self.dev(b.border_box);
+        // background-clip: the color paints within the border, padding or
+        // content box (its curve inset accordingly)
+        let (r, rad) = match bg.clip {
+            fos_css::style::BackgroundClip::PaddingBox => {
+                let p = self.dev(b.padding_box());
+                (p, inset_radii(radii(b, border_box), b.border))
+            }
+            fos_css::style::BackgroundClip::ContentBox => {
+                let c = self.dev(b.content_box());
+                let e = [b.border[0] + b.padding[0], b.border[1] + b.padding[1], b.border[2] + b.padding[2], b.border[3] + b.padding[3]];
+                (c, inset_radii(radii(b, border_box), e))
+            }
+            _ => (border_box, radii(b, border_box)),
+        };
         if bg.color.a > 0 {
-            let rad = radii(b, r);
             if rad.iter().all(|c| c.0 == 0.0) {
                 self.fill_rect(r, skia_color(bg.color, alpha), clip);
             } else if let Some(path) = rounded_path(r, rad) {
@@ -766,7 +788,57 @@ impl<'a> Painter<'a> {
                 self.fill(&path, &paint, FillRule::Winding, clip);
             }
         }
+        let clip = if bg.clip == fos_css::style::BackgroundClip::BorderBox { clip } else { clip.intersect(r) };
         self.background_images(b, clip, alpha);
+    }
+
+    /// `background-clip: text`: the background shows only through the
+    /// glyphs of the box's text (painted into a mask offscreen)
+    fn text_background(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        let r = self.dev(b.border_box);
+        let (x0, y0) = (r.x.max(clip.0[0]).floor(), r.y.max(clip.0[1]).floor());
+        let (x1, y1) = (r.right().min(clip.0[2]).ceil(), r.bottom().min(clip.0[3]).ceil());
+        if x1 <= x0 || y1 <= y0 || (x1 - x0) * (y1 - y0) > 16_000_000.0 {
+            return;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let (Some(mut glyphs), Some(mut fill)) = (Canvas::new(w as u32, h as u32), Canvas::new(w as u32, h as u32)) else { return };
+        let local = Clip([0.0, 0.0, w, h]);
+        let mut sub = |canvas: &mut Canvas, only_text: bool, this: &mut Self| {
+            let mut p = Painter {
+                canvas,
+                text: &mut *this.text,
+                origin: this.origin + y0,
+                mask: None,
+                canvas_background_box: None,
+                scroll: this.scroll,
+                find_fixed: this.find_fixed,
+                images: this.images,
+                base: this.base,
+                canvases: this.canvases,
+                box_scroll: this.box_scroll,
+                dx: this.dx - x0,
+                view: this.view,
+                untransformed: this.untransformed,
+                shaped: this.shaped,
+                only_text,
+            };
+            if only_text {
+                p.paint_flow(b, local, 1.0);
+            } else {
+                p.background(b, local, alpha);
+            }
+        };
+        sub(&mut glyphs, true, self);
+        sub(&mut fill, false, self);
+        // Keep the background where glyphs are
+        let paint = tiny_skia::PixmapPaint { blend_mode: tiny_skia::BlendMode::SourceIn, ..Default::default() };
+        if let Some(mut pm) = glyphs.pixmap_mut() {
+            pm.draw_pixmap(0, 0, fill.pixmap(), &paint, Transform::identity(), None);
+        }
+        if let Some(mut pm) = self.canvas.pixmap_mut() {
+            pm.draw_pixmap(x0 as i32, y0 as i32, glyphs.pixmap(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+        }
     }
 
     /// Gradient layers, bottom first (`url()` images come with image
@@ -993,6 +1065,9 @@ impl<'a> Painter<'a> {
     }
 
     fn outline(&mut self, b: &BoxFragment, clip: Clip, alpha: f32) {
+        if self.only_text {
+            return;
+        }
         let bs = &b.style.border;
         let w = bs.outline_width;
         if w <= 0.0 || matches!(bs.outline_style, BorderStyle::None | BorderStyle::Hidden) {
@@ -1133,7 +1208,8 @@ impl<'a> Painter<'a> {
     }
 
     fn text(&mut self, t: &TextFragment, clip: Clip, alpha: f32) {
-        if !t.visible || t.color.a == 0 {
+        // Mask glyphs are drawn whatever their color (often transparent)
+        if !t.visible || (t.color.a == 0 && !self.only_text) {
             return;
         }
         let r = self.dev(t.rect);
@@ -1142,7 +1218,7 @@ impl<'a> Painter<'a> {
         if r.bottom() + slack < clip.0[1] || r.y - slack > clip.0[3] || r.x > clip.0[2] || r.right() < clip.0[0] {
             return;
         }
-        let color = render_color(t.color, alpha);
+        let color = if self.only_text { render_color(fos_css::properties::Color::BLACK, 1.0) } else { render_color(t.color, alpha) };
         let baseline = t.baseline - self.origin;
         let pixel_clip = clip.pixels();
         for (word, x) in &t.words {

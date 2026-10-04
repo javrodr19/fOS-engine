@@ -233,6 +233,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "counter-increment" => CounterIncrement,
         "counter-set" => CounterSet,
         "clip" => Clip,
+        "object-position" => ObjectPosition,
         "clip-path" | "-webkit-clip-path" => ClipPath,
         "transform" | "-webkit-transform" | "-ms-transform" => Transform,
         "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
@@ -527,7 +528,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::CounterReset | P::CounterSet => counters(raw, 0).map(|c| PropertyValue::Counters(Arc::from(c))),
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         // Kept as text and resolved per element (lengths need its font)
-        P::Clip | P::ClipPath => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::Clip | P::ClipPath | P::ObjectPosition => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Transform => crate::transform::valid(raw).then(|| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::TransformOrigin | P::Translate => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Rotate => crate::transform::parse_rotate(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),

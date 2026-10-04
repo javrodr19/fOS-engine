@@ -152,6 +152,7 @@ pub enum PropertyId {
     /// `clip: rect(...)` and `clip-path` (inset shapes)
     Clip,
     ClipPath,
+    ObjectPosition,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,

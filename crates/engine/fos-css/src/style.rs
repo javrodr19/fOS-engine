@@ -606,6 +606,8 @@ pub struct BoxStyle {
     /// `transform` functions (`None`: none)
     pub transform: Option<Arc<[crate::transform::TransformFn]>>,
     pub transform_origin: (Lp, Lp),
+    /// Where a replaced element's content sits in its box
+    pub object_position: (Lp, Lp),
     /// The individual `translate`, `rotate` (radians) and `scale`
     pub translate: Option<(Lp, Lp)>,
     pub rotate: Option<f32>,
@@ -663,6 +665,7 @@ impl Default for BoxStyle {
             box_shadow: None,
             transform: None,
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
+            object_position: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
             translate: None,
             rotate: None,
             scale: None,
@@ -1335,6 +1338,13 @@ impl Style {
                     _ => {}
                 }
             }
+            PropertyId::ObjectPosition => {
+                let PropertyValue::Transform(text) = v else { return };
+                let len = |t: &str| self.lp_text(t, ctx);
+                if let Some(o) = crate::transform::parse_origin(text, &len) {
+                    set!(box_, [object_position], o);
+                }
+            }
             PropertyId::Clip | PropertyId::ClipPath => {
                 let PropertyValue::Transform(text) = v else { return };
                 let lower = text.to_ascii_lowercase();
@@ -1701,6 +1711,7 @@ impl Style {
             PropertyId::Transform => copy!(box_, [transform]),
             PropertyId::BoxShadow => copy!(box_, [box_shadow]),
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),
+            PropertyId::ObjectPosition => copy!(box_, [object_position]),
             PropertyId::Translate => copy!(box_, [translate]),
             PropertyId::Rotate => copy!(box_, [rotate]),
             PropertyId::Scale => copy!(box_, [scale]),

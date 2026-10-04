@@ -1041,6 +1041,26 @@ mod tests {
     }
 
     #[test]
+    fn test_object_position() {
+        // 10×20: red on top, blue below; shown in 10×10 boxes with cover
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><rect width='10' height='10' fill='red'/><rect y='10' width='10' height='10' fill='blue'/></svg>";
+        let html = format!(
+            r#"<html><body style="margin: 0"><img src="{svg}" style="display: block; width: 10px; height: 10px; object-fit: cover; object-position: 100% 0"><img src="{svg}" style="display: block; width: 10px; height: 10px; object-fit: cover; object-position: left bottom"></body></html>"#
+        );
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(50, 30);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 50 + x];
+        // The top of the image in the first, the bottom in the second
+        assert_eq!(at(5, 2), 0xffff0000);
+        assert_eq!(at(5, 8), 0xffff0000);
+        assert_eq!(at(5, 12), 0xff0000ff);
+        assert_eq!(at(5, 18), 0xff0000ff);
+    }
+
+    #[test]
     fn test_generated_content_images() {
         let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='red'/></svg>";
         let html = format!(r#"<html><head><style>body, p {{ margin: 0 }} .i::before {{ content: url("{svg}") " " }}</style></head><body><p class=i>x</p></body></html>"#);

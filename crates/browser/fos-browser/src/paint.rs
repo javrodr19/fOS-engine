@@ -965,7 +965,7 @@ impl<'a> Painter<'a> {
     }
 
     /// An image in a content box `c` (device space), fitted per
-    /// `object-fit` and centered
+    /// `object-fit` and placed per `object-position`
     fn image(&mut self, b: &BoxFragment, img: &crate::image_loader::LoadedImage, c: Rect, clip: Clip, alpha: f32) {
         use fos_css::style::ObjectFit;
         let (nw, nh) = img.natural;
@@ -989,7 +989,9 @@ impl<'a> Painter<'a> {
                 (nw * s, nh * s)
             }
         };
-        let dest = Rect::new(c.x + (c.w - dw) / 2.0, c.y + (c.h - dh) / 2.0, dw, dh);
+        // object-position (50% 50% by default) places it in the box
+        let (px, py) = b.style.box_.object_position;
+        let dest = Rect::new(c.x + px.resolve(c.w - dw), c.y + py.resolve(c.h - dh), dw, dh);
         let visible = clip.intersect(c).intersect(dest);
         if visible.is_empty() {
             return;

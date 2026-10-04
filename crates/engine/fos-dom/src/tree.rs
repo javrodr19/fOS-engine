@@ -43,6 +43,8 @@ pub struct DomTree {
     /// Shadow roots by host, and hosts by shadow root
     shadow_roots: std::collections::HashMap<NodeId, NodeId>,
     shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
+    /// The element `:scope` means while a query runs (none: the root)
+    selector_scope: std::cell::Cell<NodeId>,
 }
 
 impl DomTree {
@@ -56,6 +58,7 @@ impl DomTree {
             custom_defined: Default::default(),
             shadow_roots: Default::default(),
             shadow_hosts: Default::default(),
+            selector_scope: std::cell::Cell::new(NodeId::NONE),
         };
         
         // Create document root at index 0
@@ -74,6 +77,7 @@ impl DomTree {
             custom_defined: Default::default(),
             shadow_roots: Default::default(),
             shadow_hosts: Default::default(),
+            selector_scope: std::cell::Cell::new(NodeId::NONE),
         };
         tree.nodes.push(Node::document());
         tree
@@ -121,6 +125,21 @@ impl DomTree {
             return None;
         }
         self.shadow_hosts.get(&root).copied()
+    }
+
+    /// The element `:scope` matches (`NodeId::NONE`: the root element)
+    pub fn selector_scope(&self) -> NodeId {
+        self.selector_scope.get()
+    }
+
+    /// Set what `:scope` matches, returning the previous scope
+    pub fn set_selector_scope(&self, scope: NodeId) -> NodeId {
+        self.selector_scope.replace(scope)
+    }
+
+    /// Every (host, shadow root) pair
+    pub fn shadow_roots(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        self.shadow_roots.iter().map(|(&h, &r)| (h, r))
     }
 
     /// Whether any shadow root exists

@@ -670,12 +670,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     }
 
     fn element_children(&mut self, parent: NodeId, parent_style: &Style, c: &mut Container) {
-        let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
+        let kids = self.flat_children(parent);
         for child in kids {
             let Some(n) = self.tree.get(child) else { continue };
             if let Some(text) = n.as_text() {
                 if !text.is_empty() {
-                    c.inline.push_text(text, parent);
+                    c.inline.push_text(text, self.text_parent(n.parent, parent));
                 }
                 continue;
             }
@@ -725,10 +725,35 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         }
     }
 
+    /// `parent`'s children in the flattened tree: a shadow host's are its
+    /// shadow root's, a slot's are the nodes assigned to it (or its own,
+    /// as fallback content, when none are)
+    fn flat_children(&self, parent: NodeId) -> Vec<NodeId> {
+        let own = |id: NodeId| self.tree.children(id).map(|(id, _)| id).collect::<Vec<_>>();
+        if self.tree.has_shadow_roots() {
+            if let Some(root) = self.tree.shadow_root(parent) {
+                return own(root);
+            }
+            if self.tag(parent) == "slot" && self.tree.containing_shadow_host(parent).is_some() {
+                let assigned = self.tree.assigned_nodes(parent);
+                if !assigned.is_empty() {
+                    return assigned;
+                }
+            }
+        }
+        own(parent)
+    }
+
+    /// The element a text node's runs belong to: its parent, or for text
+    /// directly in a shadow root, the host
+    fn text_parent(&self, dom_parent: NodeId, flat_parent: NodeId) -> NodeId {
+        if self.tree.shadow_host(dom_parent).is_some() { flat_parent } else { dom_parent }
+    }
+
     /// Element children with their styles, skipping `display: none`
     /// (and text, which tables do not render outside cells)
     fn styled_children(&mut self, parent: NodeId, parent_style: &Style) -> Vec<(NodeId, Style)> {
-        let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
+        let kids = self.flat_children(parent);
         let mut out = Vec::new();
         for child in kids {
             if !self.tree.get(child).is_some_and(|n| n.is_element()) {
@@ -846,12 +871,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     }
 
     fn flex_children(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder) {
-        let kids: Vec<NodeId> = self.tree.children(parent).map(|(id, _)| id).collect();
+        let kids = self.flat_children(parent);
         for child in kids {
             let Some(n) = self.tree.get(child) else { continue };
             if let Some(t) = n.as_text() {
                 if !t.is_empty() {
-                    text.push_text(t, parent);
+                    text.push_text(t, self.text_parent(n.parent, parent));
                 }
                 continue;
             }

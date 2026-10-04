@@ -13,6 +13,7 @@
 //! by the tree's revision, so any DOM mutation (from scripts, for example)
 //! is picked up by the next render.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -177,6 +178,9 @@ pub struct PageRenderer {
     /// The page's compiled CSS, by hash of its text and the viewport
     /// (relayouts after DOM changes rarely change the CSS)
     compiled_css: Option<(u64, Option<Arc<PageStyles>>)>,
+    /// Shadow trees' CSS compiled, by text (and viewport) hash: components
+    /// of one kind share theirs
+    shadow_css: HashMap<u64, Option<Arc<PageStyles>>>,
     /// The scroll position last painted (where fixed boxes are)
     scroll: f32,
     /// The current page's decoded images
@@ -207,6 +211,7 @@ impl PageRenderer {
             layout_generation: 0,
             stylesheets: Default::default(),
             compiled_css: None,
+            shadow_css: HashMap::new(),
             scroll: 0.0,
             images: Default::default(),
             canvases: Default::default(),
@@ -347,8 +352,9 @@ impl PageRenderer {
         let width = self.viewport_width;
         let started = std::time::Instant::now();
         let stylesheet = self.compiled_stylesheet(document);
+        let shadow = self.shadow_stylesheets(document);
         let parsed = started.elapsed();
-        let layout = build_layout(document, stylesheet, &self.images, &mut self.svgs, &mut self.fonts, (width as f32, self.viewport_height as f32));
+        let layout = build_layout(document, stylesheet, &shadow, &self.images, &mut self.svgs, &mut self.fonts, (width as f32, self.viewport_height as f32));
         log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
@@ -550,6 +556,42 @@ impl PageRenderer {
         sheet
     }
 
+    /// The CSS of each connected shadow tree (its `<style>` elements and
+    /// adopted sheets), compiled
+    fn shadow_stylesheets(&mut self, document: &Document) -> HashMap<NodeId, Arc<PageStyles>> {
+        let tree = document.tree();
+        let mut out = HashMap::new();
+        if !tree.has_shadow_roots() {
+            return out;
+        }
+        let roots: Vec<NodeId> = tree.shadow_roots().filter(|&(host, _)| tree.is_connected(host)).map(|(_, root)| root).collect();
+        if self.shadow_css.len() > 512 {
+            self.shadow_css.clear();
+        }
+        for root in roots {
+            let css = self.extract_css(document, root, document.shadow_adopted_css(root));
+            if css.trim().is_empty() {
+                continue;
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            css.hash(&mut hasher);
+            (self.viewport_width, self.viewport_height).hash(&mut hasher);
+            let key = hasher.finish();
+            let sheet = match self.shadow_css.get(&key) {
+                Some(sheet) => sheet.clone(),
+                None => {
+                    let sheet = self.compile(&css).map(Arc::new);
+                    self.shadow_css.insert(key, sheet.clone());
+                    sheet
+                }
+            };
+            if let Some(sheet) = sheet {
+                out.insert(root, sheet);
+            }
+        }
+        out
+    }
+
     /// Parse the page's own CSS (`<style>` elements) and compile it for
     /// matching
     #[cfg(test)]
@@ -585,11 +627,17 @@ impl PageRenderer {
     /// document order (cascade order), skipping those whose `media`
     /// attribute does not match the viewport
     fn extract_css_from_document(&self, document: &Document) -> String {
+        self.extract_css(document, document.tree().root(), document.adopted_css())
+    }
+
+    /// The CSS of the tree under `root` (the document or a shadow root),
+    /// then its adopted sheets' (`adopted`)
+    fn extract_css(&self, document: &Document, root: NodeId, adopted: &str) -> String {
         let tree = document.tree();
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
         let mut base: Option<String> = None;
         let mut css = String::new();
-        fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
+        fos_dom::selector::walk_elements(tree, root, &mut |id| {
             let Some(e) = tree.get(id).and_then(|n| n.as_element()) else { return true };
             let tag = tree.resolve(e.name.local);
             let is_style = tag.eq_ignore_ascii_case("style");
@@ -622,7 +670,7 @@ impl PageRenderer {
             }
             true
         });
-        css.push_str(document.adopted_css());
+        css.push_str(adopted);
         css
     }
 
@@ -667,6 +715,8 @@ fn links_in(layout: &PageLayout, origin: f32, height: f32) -> Vec<LinkRegion> {
 /// attributes. Styles live only as long as layout needs them.
 struct BrowserStyler<'a> {
     stylesheet: Option<&'a PageStyles>,
+    /// Each shadow tree's rules, by shadow root
+    shadow_sheets: &'a HashMap<NodeId, Arc<PageStyles>>,
     /// Ancestors of the elements being styled
     ancestors: AncestorFilter,
     /// `var()` and math resolutions shared across elements
@@ -713,7 +763,8 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             .flat_map(|a| fos_css::parse_declarations(&a.value))
             .collect();
         let filter = self.stylesheet.is_some().then_some(&self.ancestors);
-        crate::page_styles::cascade(self.stylesheet, tree, node, element, filter, &inline, &mut style, parent, &self.ctx, &mut self.resolved);
+        let (own, scoped) = self.sheets_for(tree, node);
+        crate::page_styles::cascade(own, scoped, tree, node, element, filter, &inline, &mut style, parent, &self.ctx, &mut self.resolved);
         if !self.root_styled {
             // The root element's font size is what `rem` means
             self.root_styled = true;
@@ -756,7 +807,8 @@ impl layout_engine::Styler for BrowserStyler<'_> {
     fn pseudo(&mut self, tree: &DomTree, node: NodeId, pe: fos_dom::PseudoElement, style: &Style) -> Option<Style> {
         let element = tree.get(node)?.as_element()?;
         let filter = self.stylesheet.is_some().then_some(&self.ancestors);
-        crate::page_styles::pseudo_style(self.stylesheet, tree, node, element, pe, filter, style, &self.ctx, &mut self.resolved)
+        let (own, scoped) = self.sheets_for(tree, node);
+        crate::page_styles::pseudo_style(own, scoped, tree, node, element, pe, filter, style, &self.ctx, &mut self.resolved)
     }
 
     fn enter(&mut self, tree: &DomTree, node: NodeId) {
@@ -785,7 +837,30 @@ fn svg_paint_decl(style: &Style) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-impl BrowserStyler<'_> {
+impl<'a> BrowserStyler<'a> {
+    /// The rules of `node`'s tree (the page's, or its shadow tree's), and
+    /// those of other trees that reach it
+    fn sheets_for(&self, tree: &DomTree, node: NodeId) -> (Option<&'a PageStyles>, crate::page_styles::Scoped<'a>) {
+        if !tree.has_shadow_roots() {
+            return (self.stylesheet, Default::default());
+        }
+        let shadow_sheets: &'a HashMap<NodeId, Arc<PageStyles>> = self.shadow_sheets;
+        let page = self.stylesheet;
+        let sheet_of = |root: NodeId| -> Option<&'a PageStyles> {
+            if tree.shadow_host(root).is_some() { shadow_sheets.get(&root).map(|s| &**s) } else { page }
+        };
+        let root = tree.tree_root(node);
+        let own = sheet_of(root);
+        let host = tree.shadow_root(node).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
+        let parent = tree.get(node).map_or(NodeId::NONE, |n| n.parent);
+        let slotted = tree.shadow_root(parent).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
+        let part = match tree.shadow_host(root) {
+            Some(h) if tree.get_attribute(node, "part").is_some() => sheet_of(tree.tree_root(h)),
+            _ => None,
+        };
+        (own, crate::page_styles::Scoped { host, slotted, part })
+    }
+
     /// Styles of the elements of an inline SVG: those with fill or stroke
     /// declared (at most `budget` elements are styled)
     fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut std::collections::HashMap<NodeId, String>, budget: &mut u32) {
@@ -808,11 +883,12 @@ impl BrowserStyler<'_> {
 }
 
 /// Lay out `document` in a viewport
-fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images: &crate::image_loader::Images, svgs: &mut crate::image_loader::SvgCache, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow_sheets: &HashMap<NodeId, Arc<PageStyles>>, images: &crate::image_loader::Images, svgs: &mut crate::image_loader::SvgCache, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
     let tree = document.tree();
     let root = document.document_element();
     let mut styler = BrowserStyler {
         stylesheet: stylesheet.as_deref(),
+        shadow_sheets,
         ancestors: AncestorFilter::default(),
         resolved: Default::default(),
         ctx: StyleContext { root_font_size: 16.0, viewport },
@@ -1036,7 +1112,7 @@ mod tests {
     fn layout_of(document: &Document, width: f32) -> PageLayout {
         let renderer = PageRenderer::new(width as u32, 240);
         let sheet = renderer.page_stylesheet(document);
-        build_layout(document, sheet, &Default::default(), &mut Default::default(), &mut FontContext::default(), (width, 240.0))
+        build_layout(document, sheet, &Default::default(), &Default::default(), &mut Default::default(), &mut FontContext::default(), (width, 240.0))
     }
 
     /// The text fragments of the element whose text is `text`
@@ -1126,6 +1202,41 @@ mod tests {
         assert_eq!(at(5, 5), 0xffff0000);
         assert_eq!(at(15, 5), 0xff0000ff);
         assert_eq!(at(25, 5), 0xff00ff00);
+    }
+
+    #[test]
+    fn test_shadow_trees_render_with_scoped_styles() {
+        // The page styles the host and its parts; the shadow tree styles
+        // itself, its host (:host) and slotted light children; light
+        // children without a slot are not rendered
+        let html = r#"<html><head><style>
+            x-card::part(base) { background: #ff0 }
+            .base { background: #f0f !important; height: 50px }
+            </style></head><body style="margin: 0">
+            <x-card id="h"><span slot="nowhere" style="display: block; height: 30px; background: #f00"></span><i style="height: 7px"></i></x-card>
+            <div style="height: 10px; background: #00f"></div></body></html>"#;
+        let mut document = fos_html::parse_with_url(html, "https://example.com/");
+        let host = document.get_element_by_id("h").unwrap();
+        let tree = document.tree_mut();
+        let root = tree.attach_shadow(host);
+        let style = tree.create_element("style");
+        let css = tree.create_text(":host { display: block; padding: 5px; background: #0f0 } .base { height: 20px; background: #f00 } ::slotted(i) { display: block; background: #000 }");
+        tree.append_child(style, css);
+        let base = tree.create_element("div");
+        tree.set_attribute(base, "class", "base");
+        tree.set_attribute(base, "part", "base");
+        let slot = tree.create_element("slot");
+        tree.append_child(root, style);
+        tree.append_child(root, base);
+        tree.append_child(root, slot);
+        let mut renderer = PageRenderer::new(100, 60);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |y: usize| page.pixels[y * 100 + 50] & 0xffffff;
+        assert_eq!(at(2), 0x00ff00, ":host padding");
+        assert_eq!(at(10), 0xffff00, "::part() from the page beats the shadow tree's rule");
+        assert_eq!(at(28), 0x000000, "slotted <i>, styled by ::slotted() and its own style");
+        assert_eq!(at(33), 0x00ff00, "host padding below");
+        assert_eq!(at(40), 0x0000ff, "content after the host");
     }
 
     #[test]

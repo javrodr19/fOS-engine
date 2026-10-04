@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 
 use fos_css::style::{Style, StyleContext};
 use fos_css::{Specificity, Stylesheet};
-use fos_dom::{DomTree, ElementData, NodeId, PseudoElement, SelectorList, SubjectKey};
+use fos_dom::{DomTree, ElementData, MatchScope, NodeId, PseudoElement, SelectorList, SubjectKey};
 
 struct CompiledSelector {
     selector: SelectorList,
@@ -170,11 +170,33 @@ pub struct PageStyles {
     elements: Buckets,
     /// Selectors of `::before`/`::after` boxes (filed by their element)
     generated: Buckets,
+    /// Has `:host`, `::slotted()` and `::part()` selectors
+    has_host: bool,
+    has_slotted: bool,
+    has_part: bool,
+}
+
+/// Rules of other trees that reach an element: the `:host` rules of the
+/// shadow tree it hosts, the `::slotted()` rules of the shadow tree it is
+/// assigned to a slot of, and the `::part()` rules of its host's tree
+#[derive(Default, Clone, Copy)]
+pub struct Scoped<'a> {
+    pub host: Option<&'a PageStyles>,
+    pub slotted: Option<&'a PageStyles>,
+    pub part: Option<&'a PageStyles>,
 }
 
 impl PageStyles {
     pub fn new(mut stylesheet: Stylesheet) -> Self {
-        let mut styles = PageStyles { selectors: Vec::new(), elements: Buckets::default(), generated: Buckets::default(), stylesheet: Stylesheet { rules: Vec::new() } };
+        let mut styles = PageStyles {
+            selectors: Vec::new(),
+            elements: Buckets::default(),
+            generated: Buckets::default(),
+            stylesheet: Stylesheet { rules: Vec::new() },
+            has_host: false,
+            has_slotted: false,
+            has_part: false,
+        };
         let mut skipped = 0;
         for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
             // Matching needs only the compiled selectors from here on
@@ -199,6 +221,9 @@ impl PageStyles {
                     [one] => one.clone().into_boxed_slice(),
                     _ => Box::default(),
                 };
+                styles.has_host |= list.has_scope(MatchScope::Host);
+                styles.has_slotted |= list.has_scope(MatchScope::Slotted);
+                styles.has_part |= list.has_scope(MatchScope::Part);
                 let idx = styles.selectors.len() as u32;
                 for key in list.subject_keys() {
                     if elements {
@@ -242,21 +267,35 @@ impl PageStyles {
     /// child of `parent`; `filter`, if given, holds the element's ancestors
     pub fn style(&self, tree: &DomTree, node: NodeId, element: &ElementData, parent: &Style, filter: Option<&AncestorFilter>) -> Style {
         let mut style = Style::inherit_from(parent);
-        cascade(Some(self), tree, node, element, filter, &[], &mut style, parent, &StyleContext::default(), &mut Default::default());
+        cascade(Some(self), Scoped::default(), tree, node, element, filter, &[], &mut style, parent, &StyleContext::default(), &mut Default::default());
         style
     }
 
-    /// The rules matching element `node`, lowest priority first (each once)
-    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>) -> Vec<u32> {
-        self.matching(&self.elements, tree, element, filter, |s| s.matches(tree, node))
+    /// Whether some selector applies in `scope`
+    fn has(&self, scope: MatchScope) -> bool {
+        match scope {
+            MatchScope::Normal => true,
+            MatchScope::Host => self.has_host,
+            MatchScope::Slotted => self.has_slotted,
+            MatchScope::Part => self.has_part,
+        }
     }
 
-    /// The rules matching pseudo-element `pe` of element `node`
-    fn pseudo_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, pe: PseudoElement) -> Vec<u32> {
-        if self.generated.is_empty() {
+    /// The rules matching element `node` in `scope`, lowest priority first
+    /// (each once)
+    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, scope: MatchScope) -> Vec<u32> {
+        if !self.has(scope) {
             return Vec::new();
         }
-        self.matching(&self.generated, tree, element, filter, |s| s.matches_pseudo(tree, node, pe))
+        self.matching(&self.elements, tree, element, filter, |s| s.matches_in(tree, node, scope))
+    }
+
+    /// The rules matching pseudo-element `pe` of element `node` in `scope`
+    fn pseudo_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, pe: PseudoElement, scope: MatchScope) -> Vec<u32> {
+        if self.generated.is_empty() || !self.has(scope) {
+            return Vec::new();
+        }
+        self.matching(&self.generated, tree, element, filter, |s| s.matches_pseudo_in(tree, node, pe, scope))
     }
 
     fn matching(&self, buckets: &Buckets, tree: &DomTree, element: &ElementData, filter: Option<&AncestorFilter>, test: impl Fn(&SelectorList) -> bool) -> Vec<u32> {
@@ -418,6 +457,7 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
 #[allow(clippy::too_many_arguments)]
 pub fn cascade(
     styles: Option<&PageStyles>,
+    scoped: Scoped,
     tree: &DomTree,
     node: NodeId,
     element: &ElementData,
@@ -428,7 +468,7 @@ pub fn cascade(
     ctx: &StyleContext,
     cache: &mut fos_css::ResolveCache,
 ) {
-    cascade_for(styles, tree, node, element, None, filter, inline, style, parent, ctx, cache);
+    cascade_for(styles, scoped, tree, node, element, None, filter, inline, style, parent, ctx, cache);
 }
 
 /// The style of pseudo-element `pe` of element `node` (whose style is
@@ -436,6 +476,7 @@ pub fn cascade(
 #[allow(clippy::too_many_arguments)]
 pub fn pseudo_style(
     styles: Option<&PageStyles>,
+    scoped: Scoped,
     tree: &DomTree,
     node: NodeId,
     element: &ElementData,
@@ -446,7 +487,7 @@ pub fn pseudo_style(
     cache: &mut fos_css::ResolveCache,
 ) -> Option<Style> {
     let mut style = Style::inherit_from(parent);
-    let matched = cascade_for(styles, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
+    let matched = cascade_for(styles, scoped, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
     // A marker exists without `content`; generated boxes need it
     (if pe == PseudoElement::Marker { matched } else { style.box_.content.as_ref().is_some_and(|c| !c.is_empty()) }).then_some(style)
 }
@@ -454,6 +495,7 @@ pub fn pseudo_style(
 #[allow(clippy::too_many_arguments)]
 fn cascade_for(
     styles: Option<&PageStyles>,
+    scoped: Scoped,
     tree: &DomTree,
     node: NodeId,
     element: &ElementData,
@@ -466,17 +508,24 @@ fn cascade_for(
     cache: &mut fos_css::ResolveCache,
 ) -> bool {
     let ua = &*UA;
-    let rules_of = |s: &PageStyles| match pe {
-        Some(pe) => s.pseudo_rules(tree, node, element, filter, pe),
-        None => s.matching_rules(tree, node, element, filter),
+    let rules_of = |s: &PageStyles, scope: MatchScope| match pe {
+        Some(pe) => s.pseudo_rules(tree, node, element, filter, pe, scope),
+        None => s.matching_rules(tree, node, element, filter, scope),
     };
-    let ua_rules = rules_of(ua);
+    let ua_rules = rules_of(ua, MatchScope::Normal);
     let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
-    let rules = styles.map_or(Vec::new(), |s| rules_of(s));
-    if pe.is_some() && ua_rules.is_empty() && rules.is_empty() {
+    let rules = styles.map_or(Vec::new(), |s| rules_of(s, MatchScope::Normal));
+    // Rules from other trees: a shadow tree's own rules for its host, and
+    // `::slotted()` ones, lose to the element's tree's; `::part()` rules,
+    // from outside, win
+    let host = scoped.host.map(|s| (s, rules_of(s, MatchScope::Host)));
+    let slotted = scoped.slotted.map(|s| (s, rules_of(s, MatchScope::Slotted)));
+    let inner: Vec<(&PageStyles, Vec<u32>)> = [host, slotted].into_iter().flatten().filter(|(_, r)| !r.is_empty()).collect();
+    let outer = scoped.part.map(|s| (s, rules_of(s, MatchScope::Part))).filter(|(_, r)| !r.is_empty());
+    if pe.is_some() && ua_rules.is_empty() && rules.is_empty() && inner.is_empty() && outer.is_none() {
         return false;
     }
-    if ua_rules.is_empty() && hints.is_empty() && rules.is_empty() && inline.is_empty() {
+    if ua_rules.is_empty() && hints.is_empty() && rules.is_empty() && inline.is_empty() && inner.is_empty() && outer.is_none() {
         style.finish();
         return true;
     }
@@ -488,14 +537,35 @@ fn cascade_for(
         ordered.extend(of(ua, rule, false));
     }
     ordered.extend(hints.iter());
+    for (s, rules) in &inner {
+        for &rule in rules {
+            ordered.extend(of(s, rule, false));
+        }
+    }
     if let Some(s) = styles {
         for &rule in &rules {
             ordered.extend(of(s, rule, false));
         }
     }
+    if let Some((s, rules)) = &outer {
+        for &rule in rules {
+            ordered.extend(of(s, rule, false));
+        }
+    }
     ordered.extend(inline.iter().filter(|d| !d.important));
+    // `!important` declarations: inner trees' win
+    if let Some((s, rules)) = &outer {
+        for &rule in rules {
+            ordered.extend(of(s, rule, true));
+        }
+    }
     if let Some(s) = styles {
         for &rule in &rules {
+            ordered.extend(of(s, rule, true));
+        }
+    }
+    for (s, rules) in &inner {
+        for &rule in rules {
             ordered.extend(of(s, rule, true));
         }
     }

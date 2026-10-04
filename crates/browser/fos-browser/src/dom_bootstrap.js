@@ -928,6 +928,17 @@
       writable: true, configurable: true,
     });
   }
+  // Attribute queries the bindings lack (namespaced ones ignore the
+  // namespace: attributes are stored by qualified name)
+  for (const proto of new Set([Element.prototype, E])) {
+    for (const [name, value] of Object.entries({
+      hasAttributes() { return this.getAttributeNames().length > 0; },
+      getAttributeNS(ns, name) { return this.getAttribute(name); },
+      hasAttributeNS(ns, name) { return this.hasAttribute(name); },
+    })) {
+      if (!(name in proto)) Object.defineProperty(proto, name, { value, writable: true, configurable: true });
+    }
+  }
   const shadowState = (root) => {
     const s = shadowInfo.get(root);
     if (!s) throw new TypeError('Illegal invocation');

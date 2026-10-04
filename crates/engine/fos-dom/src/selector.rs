@@ -51,10 +51,22 @@ impl Compound {
                     b += s.1;
                     c += s.2;
                 }
+                Pseudo::Host(arg) => {
+                    let s = arg.as_ref().map_or((0, 0, 0), SelectorList::max_specificity);
+                    a += s.0;
+                    b += s.1 + 1;
+                    c += s.2;
+                }
                 Pseudo::Never if self.pseudo_elements > 0 => {}
                 Pseudo::PseudoElement => {}
                 _ => b += 1,
             }
+        }
+        if let Some(ShadowPart::Slotted(arg)) = self.shadow.as_deref() {
+            let s = arg.max_specificity();
+            a += s.0;
+            b += s.1;
+            c += s.2;
         }
         (a, b, c)
     }
@@ -81,6 +93,34 @@ struct Compound {
     pseudo_elements: u8,
     /// The pseudo-element the compound selects, if any
     pseudo_element: Option<PseudoElement>,
+    /// `::slotted()` or `::part()`: the compound then selects elements of
+    /// another tree (see [`MatchScope`])
+    shadow: Option<Box<ShadowPart>>,
+}
+
+#[derive(Debug, Clone)]
+enum ShadowPart {
+    /// `::slotted(x)`: an element assigned to the slot the rest selects
+    Slotted(SelectorList),
+    /// `::part(a b)`: an element of the shadow tree of the host the rest
+    /// selects, exposed as these parts
+    Part(Vec<String>),
+}
+
+/// Which selectors of a list apply, styling an element
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchScope {
+    /// The rules of the element's own tree
+    Normal,
+    /// The element is the host of the shadow tree whose rules these are
+    /// (`:host` selectors)
+    Host,
+    /// The element is assigned to a slot of the shadow tree whose rules
+    /// these are (`::slotted()` selectors)
+    Slotted,
+    /// The element is in the shadow tree of a host in the tree whose rules
+    /// these are (`::part()` selectors)
+    Part,
 }
 
 /// A pseudo-element generated boxes are styled by
@@ -148,6 +188,10 @@ enum Pseudo {
     Link,
     /// Standard elements, and custom elements once defined
     Defined,
+    /// `:host` or `:host(x)`: the shadow host, matched from its shadow tree
+    Host(Option<SelectorList>),
+    /// The element a query runs from (the root element otherwise)
+    Scope,
     Never,
     /// Marks a compound selecting a pseudo-element: never an element
     PseudoElement,
@@ -190,6 +234,11 @@ pub enum SubjectKey {
 /// its tag or an attribute, or for `:is()`/`:where()` subjects the keys of
 /// every alternative inside
 fn compound_keys(c: &Compound) -> Option<Vec<SubjectKey>> {
+    // `::slotted()` and `::part()` select elements other than the ones the
+    // compound's own selectors describe
+    if c.shadow.is_some() {
+        return None;
+    }
     if let Some(id) = &c.id {
         return Some(vec![SubjectKey::Id(id.clone())]);
     }
@@ -280,13 +329,41 @@ impl SelectorList {
 
     /// Whether the element `node` matches any selector of the list
     pub fn matches(&self, tree: &DomTree, node: NodeId) -> bool {
-        self.0.iter().any(|c| match_complex(tree, node, &c.parts))
+        self.matches_in(tree, node, MatchScope::Normal)
+    }
+
+    /// Whether the element `node` matches any selector of the list that
+    /// applies in `scope`
+    pub fn matches_in(&self, tree: &DomTree, node: NodeId, scope: MatchScope) -> bool {
+        self.0.iter().any(|c| match_scoped(tree, node, &c.parts, None, scope))
     }
 
     /// Whether pseudo-element `pe` of element `node` matches any selector
     /// of the list
     pub fn matches_pseudo(&self, tree: &DomTree, node: NodeId, pe: PseudoElement) -> bool {
-        self.0.iter().any(|c| match_complex_as(tree, node, &c.parts, Some(pe)))
+        self.matches_pseudo_in(tree, node, pe, MatchScope::Normal)
+    }
+
+    pub fn matches_pseudo_in(&self, tree: &DomTree, node: NodeId, pe: PseudoElement, scope: MatchScope) -> bool {
+        self.0.iter().any(|c| match_scoped(tree, node, &c.parts, Some(pe), scope))
+    }
+
+    /// Whether some selector of the list applies in `scope` at all
+    pub fn has_scope(&self, scope: MatchScope) -> bool {
+        self.0.iter().any(|c| {
+            let subject = c.parts.first().map(|p| &p.0);
+            match scope {
+                MatchScope::Normal => subject.is_some_and(|s| s.shadow.is_none()),
+                MatchScope::Host => c.parts.iter().any(|(comp, _)| comp.pseudos.iter().any(|p| matches!(p, Pseudo::Host(_)))),
+                MatchScope::Slotted => subject.is_some_and(|s| matches!(s.shadow.as_deref(), Some(ShadowPart::Slotted(_)))),
+                MatchScope::Part => subject.is_some_and(|s| matches!(s.shadow.as_deref(), Some(ShadowPart::Part(_)))),
+            }
+        })
+    }
+
+    /// Match in the context of a shadow host reached from its shadow tree
+    fn matches_at(&self, tree: &DomTree, node: NodeId, at_host: bool) -> bool {
+        self.0.iter().any(|c| match_complex_as(tree, node, &c.parts, None, at_host))
     }
 
     /// Whether some selector of the list selects a `::before` or `::after`
@@ -303,6 +380,7 @@ impl SelectorList {
     /// The first element in the subtree of `root` (excluding `root`), in
     /// document order, that matches
     pub fn query_first(&self, tree: &DomTree, root: NodeId) -> Option<NodeId> {
+        let _scope = ScopeGuard::new(tree, root);
         let mut found = None;
         walk_elements(tree, root, &mut |id| {
             if self.matches(tree, id) {
@@ -318,6 +396,7 @@ impl SelectorList {
     /// Every element in the subtree of `root` (excluding `root`), in
     /// document order, that matches
     pub fn query_all(&self, tree: &DomTree, root: NodeId) -> Vec<NodeId> {
+        let _scope = ScopeGuard::new(tree, root);
         let mut found = Vec::new();
         walk_elements(tree, root, &mut |id| {
             if self.matches(tree, id) {
@@ -326,6 +405,25 @@ impl SelectorList {
             true
         });
         found
+    }
+}
+
+/// `:scope` is the element a query runs from while this lives
+struct ScopeGuard<'t> {
+    tree: &'t DomTree,
+    previous: NodeId,
+}
+
+impl<'t> ScopeGuard<'t> {
+    fn new(tree: &'t DomTree, root: NodeId) -> Self {
+        let scope = if element(tree, root).is_some() { root } else { NodeId::NONE };
+        ScopeGuard { tree, previous: tree.set_selector_scope(scope) }
+    }
+}
+
+impl Drop for ScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.tree.set_selector_scope(self.previous);
     }
 }
 
@@ -394,39 +492,81 @@ fn next_element(tree: &DomTree, id: NodeId) -> Option<NodeId> {
     None
 }
 
-fn match_complex(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)]) -> bool {
-    match_complex_as(tree, node, parts, None)
+/// Match a complex selector in `scope` (whose subject `::slotted()` or
+/// `::part()` moves matching to the slot or host)
+fn match_scoped(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], pe: Option<PseudoElement>, scope: MatchScope) -> bool {
+    let Some((subject, _)) = parts.first() else { return false };
+    match (subject.shadow.as_deref(), scope) {
+        (None, MatchScope::Normal) => match_complex_as(tree, node, parts, pe, false),
+        (None, MatchScope::Host) => match_complex_as(tree, node, parts, pe, true),
+        (Some(ShadowPart::Slotted(arg)), MatchScope::Slotted) => {
+            if !arg.matches(tree, node) {
+                return false;
+            }
+            tree.assigned_slot(node).is_some_and(|slot| match_complex_as(tree, slot, parts, pe, false))
+        }
+        (Some(ShadowPart::Part(names)), MatchScope::Part) => {
+            let Some(e) = element(tree, node) else { return false };
+            let Some(parts_attr) = attr(tree, e, "part") else { return false };
+            if !names.iter().all(|n| parts_attr.split_ascii_whitespace().any(|p| p == n)) {
+                return false;
+            }
+            tree.containing_shadow_host(node).is_some_and(|host| match_complex_as(tree, host, parts, pe, false))
+        }
+        _ => false,
+    }
+}
+
+fn match_complex(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], at_host: bool) -> bool {
+    match_complex_as(tree, node, parts, None, at_host)
+}
+
+/// The element ancestor matching continues with: a shadow tree's top
+/// elements continue with the host, as a host (`true`: only `:host`
+/// matches it, and nothing above it)
+fn parent_hop(tree: &DomTree, node: NodeId, at_host: bool) -> Option<(NodeId, bool)> {
+    if at_host {
+        return None;
+    }
+    let p = parent_element(tree, node)?;
+    Some(match tree.shadow_host(p) {
+        Some(host) => (host, true),
+        None => (p, false),
+    })
 }
 
 /// Match with the subject compound selecting pseudo-element `pe` of
-/// `node` (when given)
-fn match_complex_as(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], pe: Option<PseudoElement>) -> bool {
+/// `node` (when given); `at_host` when `node` is a shadow host seen from
+/// its shadow tree
+fn match_complex_as(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], pe: Option<PseudoElement>, at_host: bool) -> bool {
     let Some((compound, comb)) = parts.first() else { return false };
     if pe.is_some() && compound.pseudo_element != pe {
         return false;
     }
-    if !match_compound(tree, node, compound, pe.is_some()) {
+    if !match_compound(tree, node, compound, pe.is_some(), at_host) {
         return false;
     }
     let rest = &parts[1..];
     match comb {
         Combinator::None => true,
-        Combinator::Child => parent_element(tree, node).is_some_and(|p| match_complex(tree, p, rest)),
+        Combinator::Child => parent_hop(tree, node, at_host).is_some_and(|(p, h)| match_complex(tree, p, rest, h)),
         Combinator::Descendant => {
-            let mut cur = parent_element(tree, node);
-            while let Some(p) = cur {
-                if match_complex(tree, p, rest) {
+            let mut cur = parent_hop(tree, node, at_host);
+            while let Some((p, h)) = cur {
+                if match_complex(tree, p, rest, h) {
                     return true;
                 }
-                cur = parent_element(tree, p);
+                cur = parent_hop(tree, p, h);
             }
             false
         }
-        Combinator::NextSibling => prev_element(tree, node).is_some_and(|p| match_complex(tree, p, rest)),
+        // A host has no siblings in its shadow tree's view
+        _ if at_host => false,
+        Combinator::NextSibling => prev_element(tree, node).is_some_and(|p| match_complex(tree, p, rest, false)),
         Combinator::SubsequentSibling => {
             let mut cur = prev_element(tree, node);
             while let Some(p) = cur {
-                if match_complex(tree, p, rest) {
+                if match_complex(tree, p, rest, false) {
                     return true;
                 }
                 cur = prev_element(tree, p);
@@ -440,8 +580,12 @@ fn attr<'t>(tree: &'t DomTree, e: &'t ElementData, name: &str) -> Option<&'t str
     e.attrs.iter().find(|a| tree.resolve(a.name.local).eq_ignore_ascii_case(name)).map(|a| a.value.as_str())
 }
 
-fn match_compound(tree: &DomTree, node: NodeId, c: &Compound, pseudo_element: bool) -> bool {
+fn match_compound(tree: &DomTree, node: NodeId, c: &Compound, pseudo_element: bool, at_host: bool) -> bool {
     let Some(e) = element(tree, node) else { return false };
+    // Seen from its shadow tree, a host matches only `:host` compounds
+    if at_host && !c.pseudos.iter().any(|p| matches!(p, Pseudo::Host(_))) {
+        return false;
+    }
     if let Some(tag) = &c.tag {
         if !tree.resolve(e.name.local).eq_ignore_ascii_case(tag) {
             return false;
@@ -477,7 +621,7 @@ fn match_compound(tree: &DomTree, node: NodeId, c: &Compound, pseudo_element: bo
             return false;
         }
     }
-    c.pseudos.iter().all(|p| (pseudo_element && matches!(p, Pseudo::PseudoElement)) || match_pseudo(tree, node, e, p))
+    c.pseudos.iter().all(|p| (pseudo_element && matches!(p, Pseudo::PseudoElement)) || match_pseudo(tree, node, e, p, at_host))
 }
 
 /// 1-based position among element siblings, optionally of the same type
@@ -503,7 +647,7 @@ fn nth(a: i32, b: i32, pos: i32) -> bool {
     d % a == 0 && d / a >= 0
 }
 
-fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo) -> bool {
+fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo, at_host: bool) -> bool {
     match p {
         Pseudo::FirstChild => prev_element(tree, node).is_none(),
         Pseudo::LastChild => next_element(tree, node).is_none(),
@@ -512,11 +656,16 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo) -> bo
         Pseudo::LastOfType => position(tree, node, true, true) == 1,
         Pseudo::OnlyOfType => position(tree, node, false, true) == 1 && position(tree, node, true, true) == 1,
         Pseudo::Nth { a, b, from_end, of_type } => nth(*a, *b, position(tree, node, *from_end, *of_type)),
-        Pseudo::Not(list) => !list.matches(tree, node),
-        Pseudo::Is(list) | Pseudo::Where(list) => list.matches(tree, node),
+        Pseudo::Not(list) => !list.matches_at(tree, node, at_host),
+        Pseudo::Is(list) | Pseudo::Where(list) => list.matches_at(tree, node, at_host),
+        Pseudo::Host(arg) => at_host && arg.as_ref().is_none_or(|l| l.matches(tree, node)),
         Pseudo::Has(list, false) => list.query_first(tree, node).is_some(),
         Pseudo::Has(list, true) => tree.children(node).any(|(c, n)| n.is_element() && list.matches(tree, c)),
         Pseudo::Root => !parent_element(tree, node).is_some(),
+        Pseudo::Scope => match tree.selector_scope() {
+            NodeId::NONE => !parent_element(tree, node).is_some(),
+            scope => scope == node,
+        },
         Pseudo::Empty => tree.children(node).all(|(_, c)| !c.is_element() && c.as_text().is_none_or(str::is_empty)),
         Pseudo::Checked => attr(tree, e, "checked").is_some() || attr(tree, e, "selected").is_some(),
         Pseudo::Disabled => attr(tree, e, "disabled").is_some(),
@@ -692,17 +841,37 @@ impl Parser<'_> {
                     };
                     if self.eat(b':') || legacy {
                         // Pseudo-elements are never elements in the tree
-                        let name = self.ident()?;
+                        let name = self.ident()?.to_ascii_lowercase();
                         if self.eat(b'(') {
-                            // ::part(x), ::slotted(x): skip the argument
-                            while self.peek()? != b')' {
-                                self.i += 1;
+                            self.ws();
+                            let shadow = match name.as_str() {
+                                "slotted" => ShadowPart::Slotted(self.list()?),
+                                "part" => {
+                                    let mut names = Vec::new();
+                                    while let Some(n) = self.ident() {
+                                        names.push(n);
+                                        self.ws();
+                                    }
+                                    if names.is_empty() {
+                                        return None;
+                                    }
+                                    ShadowPart::Part(names)
+                                }
+                                _ => return None,
+                            };
+                            self.ws();
+                            if !self.eat(b')') || c.shadow.is_some() {
+                                return None;
                             }
-                            self.i += 1;
+                            // Selects elements (of another tree), so no
+                            // pseudo-element
+                            c.shadow = Some(Box::new(shadow));
+                            c.pseudo_elements += 1;
+                        } else {
+                            c.pseudos.push(Pseudo::PseudoElement);
+                            c.pseudo_elements += 1;
+                            c.pseudo_element = Some(PseudoElement::from_name(&name));
                         }
-                        c.pseudos.push(Pseudo::PseudoElement);
-                        c.pseudo_elements += 1;
-                        c.pseudo_element = Some(PseudoElement::from_name(&name));
                     } else {
                         c.pseudos.push(self.pseudo()?);
                     }
@@ -765,6 +934,7 @@ impl Parser<'_> {
                     let direct = self.eat(b'>');
                     Pseudo::Has(self.list()?, direct)
                 }
+                "host" => Pseudo::Host(Some(self.list()?)),
                 "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                     let (a, b) = self.an_b()?;
                     Pseudo::Nth { a, b, from_end: name.contains("last"), of_type: name.ends_with("of-type") }
@@ -801,6 +971,8 @@ impl Parser<'_> {
             "enabled" => Pseudo::Enabled,
             "link" | "any-link" => Pseudo::Link,
             "defined" => Pseudo::Defined,
+            "host" => Pseudo::Host(None),
+            "scope" => Pseudo::Scope,
             // Legacy single-colon pseudo-elements, user action and state
             _ => Pseudo::Never,
         })
@@ -880,6 +1052,66 @@ mod tests {
     }
 
     #[test]
+    fn shadow_scopes() {
+        // <x-host class=h part-host><b slot=s>1</b><i>2</i></x-host>, its
+        // shadow tree: <div class=base part="base x"><slot name=s></slot><slot></slot></div>
+        let mut t = DomTree::new();
+        let host = t.create_element("x-host");
+        t.set_attribute(host, "class", "h");
+        let b = t.create_element("b");
+        t.set_attribute(b, "slot", "s");
+        let i = t.create_element("i");
+        let root = t.root();
+        t.append_child(root, host);
+        t.append_child(host, b);
+        t.append_child(host, i);
+        let sr = t.attach_shadow(host);
+        let base = t.create_element("div");
+        t.set_attribute(base, "class", "base");
+        t.set_attribute(base, "part", "base x");
+        let named = t.create_element("slot");
+        t.set_attribute(named, "name", "s");
+        let default = t.create_element("slot");
+        t.append_child(sr, base);
+        t.append_child(base, named);
+        t.append_child(base, default);
+        assert_eq!(t.assigned_nodes(named), vec![b]);
+        assert_eq!(t.assigned_nodes(default), vec![i]);
+        assert_eq!(t.assigned_slot(i), Some(default));
+        let m = |sel: &str, node: NodeId, scope: MatchScope| SelectorList::parse(sel).unwrap_or_else(|| panic!("parse {sel}")).matches_in(&t, node, scope);
+        // :host matches the host only from its shadow tree's rules
+        assert!(m(":host", host, MatchScope::Host));
+        assert!(m(":host(.h)", host, MatchScope::Host));
+        assert!(!m(":host(.other)", host, MatchScope::Host));
+        assert!(!m(":host", host, MatchScope::Normal));
+        assert!(!m("x-host", host, MatchScope::Host));
+        // Inside, ancestors continue at the host (as :host only)
+        assert!(m(":host(.h) .base", base, MatchScope::Normal));
+        assert!(m(":host > .base", base, MatchScope::Normal));
+        assert!(!m("x-host .base", base, MatchScope::Normal));
+        assert!(!m("body .base", base, MatchScope::Normal));
+        assert!(m(".base > slot", named, MatchScope::Normal));
+        // ::slotted() styles assigned light children, by their slot
+        assert!(m("::slotted(b)", b, MatchScope::Slotted));
+        assert!(m("slot[name=s]::slotted(*)", b, MatchScope::Slotted));
+        assert!(!m("slot[name=s]::slotted(*)", i, MatchScope::Slotted));
+        assert!(m(".base ::slotted(i)", i, MatchScope::Slotted));
+        assert!(!m("::slotted(b)", b, MatchScope::Normal));
+        // ::part() from the host's tree
+        assert!(m("x-host::part(base)", base, MatchScope::Part));
+        assert!(m(".h::part(x base)", base, MatchScope::Part));
+        assert!(!m(".h::part(other)", base, MatchScope::Part));
+        assert!(!m("x-host::part(base)", base, MatchScope::Normal));
+        let list = SelectorList::parse("::slotted(b), :host, x-host::part(base)").unwrap();
+        assert_eq!(list.subject_keys(), vec![None, None, None]);
+        assert!(list.has_scope(MatchScope::Slotted) && list.has_scope(MatchScope::Host) && list.has_scope(MatchScope::Part));
+        assert!(!SelectorList::parse("::slotted(b)").unwrap().has_scope(MatchScope::Normal));
+        // Document queries do not reach into shadow trees
+        assert_eq!(all(&t, ".base"), Vec::<NodeId>::new());
+        assert_eq!(SelectorList::parse("slot").unwrap().query_all(&t, sr), vec![named, default]);
+    }
+
+    #[test]
     fn matching() {
         let (t, [div, p1, span, p2]) = tree();
         assert_eq!(all(&t, "p"), vec![p1, p2]);
@@ -899,6 +1131,10 @@ mod tests {
         assert_eq!(all(&t, "div :not(p)"), vec![span]);
         assert_eq!(all(&t, "div:has(> span)"), vec![div]);
         assert_eq!(all(&t, "*:hover"), Vec::<NodeId>::new());
+        // :scope is the element queried from (the root element otherwise)
+        assert_eq!(SelectorList::parse(":scope > p").unwrap().query_all(&t, div), vec![p1, p2]);
+        assert_eq!(SelectorList::parse(":scope > p").unwrap().query_all(&t, span), Vec::<NodeId>::new());
+        assert_eq!(all(&t, ":scope"), vec![div]);
         assert_eq!(
             SelectorList::parse("#a .x, ul > li.y.z, p, *:hover").unwrap().subject_keys(),
             vec![Some(SubjectKey::Class("x".into())), Some(SubjectKey::Class("y".into())), Some(SubjectKey::Tag("p".into())), None]

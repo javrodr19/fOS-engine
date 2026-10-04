@@ -284,9 +284,21 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let (mut ml, mut mr) = (e.margin[3].unwrap_or(0.0), e.margin[1].unwrap_or(0.0));
     // Tables are as wide as their content needs (up to the space there is)
     let is_table = matches!(b.kind, BoxKind::Table(_));
+    // aspect-ratio applies to the box-sizing box: a shrink-to-fit box with
+    // a definite height gets its width from it
+    let ratio = style.box_.aspect_ratio.filter(|_| !is_table);
+    let border_box = style.box_.box_sizing == fos_css::style::BoxSizing::BorderBox;
+    let ratio_width = ratio.filter(|_| specified.is_none() && sizing != Sizing::Stretch).and_then(|r| {
+        let h = match forced.height {
+            Some(h) => (h - vbp).max(0.0),
+            None => style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp))?,
+        };
+        Some(if border_box { ((h + vbp) * r - hbp).max(0.0) } else { h * r })
+    });
     let mut width = match specified {
         Some(w) if forced.width.is_some() => w,
         Some(w) => clamp_width(style, w, cb_w, hbp),
+        None if ratio_width.is_some() => clamp_width(style, ratio_width.unwrap_or(0.0), cb_w, hbp),
         None => {
             let avail = (cb_w - ml - mr - hbp).max(0.0);
             let w = match sizing {
@@ -325,7 +337,11 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     // the content's
     let specified_h = match forced.height {
         Some(h) => Some((h - vbp).max(0.0)),
-        None => style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp)),
+        None => style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp)).or_else(|| {
+            // An automatic height follows the width through aspect-ratio
+            let r = ratio.filter(|_| style.box_.height.is_auto())?;
+            Some(if border_box { ((width + hbp) / r - vbp).max(0.0) } else { width / r })
+        }),
     };
     let inner_cb_h = specified_h.map(|h| if forced.height.is_some() { h } else { clamp_height(style, h, cb_h, vbp) }).or(if is_root { cb_h.map(|h| (h - vbp).max(0.0)) } else { None });
 

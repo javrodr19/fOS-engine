@@ -875,3 +875,25 @@ fn right_to_left_blocks_flex_and_grid_mirror() {
     assert!((rect_of(&t, g1).w - 200.0).abs() < 0.5);
     assert!((right(g2) - rect_of(&t, g1).x).abs() < 0.5);
 }
+
+#[test]
+fn aspect_ratio_sizes_automatic_dimensions() {
+    let (mut tree, html, body) = doc();
+    // Height from width: content box, then border box
+    let a = el(&mut tree, body, "div", "display: block; width: 90px; aspect-ratio: 1.8");
+    let b = el(&mut tree, body, "div", "display: block; width: 100px; padding: 10px; box-sizing: border-box; aspect-ratio: 2 / 1");
+    // A stretched block takes the container's width, then the ratio
+    let wrap = el(&mut tree, body, "div", "display: block; width: 300px");
+    let c = el(&mut tree, wrap, "div", "display: block; aspect-ratio: 16 / 9");
+    // Width from height for shrink-to-fit boxes
+    let d = el(&mut tree, body, "div", "display: inline-block; height: 20px; aspect-ratio: 3");
+    // A specified height wins over the ratio
+    let e = el(&mut tree, body, "div", "display: block; width: 50px; height: 7px; aspect-ratio: 1");
+    let t = layout(&tree, html, 800.0);
+    let size = |n| { let r = rect_of(&t, n); (r.w.round(), r.h.round()) };
+    assert_eq!(size(a), (90.0, 50.0));
+    assert_eq!(size(b), (100.0, 50.0));
+    assert_eq!(size(c), (300.0, 169.0));
+    assert_eq!(size(d), (60.0, 20.0));
+    assert_eq!(size(e), (50.0, 7.0));
+}

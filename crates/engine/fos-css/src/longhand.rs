@@ -234,6 +234,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "counter-set" => CounterSet,
         "clip" => Clip,
         "object-position" => ObjectPosition,
+        "aspect-ratio" => AspectRatio,
         "clip-path" | "-webkit-clip-path" => ClipPath,
         "transform" | "-webkit-transform" | "-ms-transform" => Transform,
         "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
@@ -529,6 +530,17 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         // Kept as text and resolved per element (lengths need its font)
         P::Clip | P::ClipPath | P::ObjectPosition => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        // `auto`, a ratio (`16 / 9`, `1.8`) or both: width over height
+        P::AspectRatio => {
+            let ratio = v.replace("auto", " ");
+            let ratio = ratio.trim();
+            if ratio.is_empty() {
+                return Some(PropertyValue::Keyword(Keyword::Auto));
+            }
+            let (w, h) = ratio.split_once('/').unwrap_or((ratio, "1"));
+            let (w, h): (f32, f32) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+            (w >= 0.0 && h >= 0.0 && w.is_finite() && h.is_finite()).then(|| PropertyValue::Number(if w == 0.0 || h == 0.0 { 0.0 } else { w / h }))
+        }
         P::Transform => crate::transform::valid(raw).then(|| PropertyValue::Transform(Arc::from(raw.trim()))),
         P::TransformOrigin | P::Translate => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         P::Rotate => crate::transform::parse_rotate(raw).map(|_| PropertyValue::Transform(Arc::from(raw.trim()))),

@@ -153,6 +153,7 @@ pub enum PropertyId {
     Clip,
     ClipPath,
     ObjectPosition,
+    AspectRatio,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,

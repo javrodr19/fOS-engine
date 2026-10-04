@@ -339,8 +339,33 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
     out.push('>');
 }
 
+/// The system's fonts, for SVG text (loaded once, when first needed), and
+/// the families generic names map to
+static SVG_FONTS: std::sync::LazyLock<(Arc<resvg::usvg::fontdb::Database>, String)> = std::sync::LazyLock::new(|| {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    let families: std::collections::HashSet<String> = db.faces().flat_map(|f| f.families.iter().map(|(n, _)| n.to_ascii_lowercase())).collect();
+    let pick = |names: &[&str]| names.iter().find(|n| families.contains(&n.to_ascii_lowercase())).map(|n| n.to_string());
+    let sans = pick(&["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans", "Noto Sans"]).unwrap_or_else(|| "DejaVu Sans".into());
+    if let Some(serif) = pick(&["Times New Roman", "Liberation Serif", "DejaVu Serif", "Noto Serif"]) {
+        db.set_serif_family(serif);
+    }
+    if let Some(mono) = pick(&["Courier New", "Liberation Mono", "DejaVu Sans Mono", "Noto Sans Mono"]) {
+        db.set_monospace_family(mono);
+    }
+    db.set_sans_serif_family(sans.clone());
+    (Arc::new(db), sans)
+});
+
 fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
-    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let mut options = resvg::usvg::Options::default();
+    // Only SVGs with text need the fonts
+    if bytes.windows(5).any(|w| w == b"<text") {
+        let (db, sans) = &*SVG_FONTS;
+        options.fontdb = db.clone();
+        options.font_family = sans.clone();
+    }
+    let tree = resvg::usvg::Tree::from_data(bytes, &options).ok()?;
     let size = tree.size();
     let (w, h) = (size.width(), size.height());
     if !(w > 0.0 && h > 0.0) {
@@ -457,6 +482,18 @@ fn percent_decode(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svg_text_is_drawn() {
+        // Badges and charts are SVG text: it needs the system's fonts
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="20"><text x="2" y="15" font-family="Verdana,DejaVu Sans,sans-serif" font-size="14" fill="#000">build</text></svg>"##;
+        let img = decode(svg).expect("decodes");
+        let inked = img.pixmap.pixels().iter().filter(|p| p.alpha() > 128).count();
+        assert!(inked > 20, "{inked} text pixels");
+        // Without text, no fonts are needed (or loaded)
+        let plain = decode(br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>"#).expect("decodes");
+        assert_eq!(plain.natural, (4.0, 4.0));
+    }
 
     #[test]
     fn srcset_candidates() {

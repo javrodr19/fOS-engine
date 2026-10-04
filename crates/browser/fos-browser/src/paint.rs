@@ -408,6 +408,16 @@ impl<'a> Painter<'a> {
         (b.style.is_positioned() || b.style.has_transform()) && b.kind != BoxFragmentKind::Placeholder
     }
 
+    /// A layer among `parent`'s children: positioned or transformed, or a
+    /// flex or grid item with a `z-index` (which such items honor
+    /// unpositioned)
+    fn is_layer_in(parent: &BoxFragment, b: &BoxFragment) -> bool {
+        Self::is_layer(b)
+            || (b.style.box_.z_index.is_some()
+                && b.kind == BoxFragmentKind::Block
+                && matches!(parent.style.display(), fos_css::style::Display::Flex | fos_css::style::Display::InlineFlex | fos_css::style::Display::Grid | fos_css::style::Display::InlineGrid))
+    }
+
     /// Paint `b` through its transform `m` (document coordinates): moved,
     /// when it only translates; otherwise drawn offscreen and mapped
     fn paint_transformed(&mut self, b: &BoxFragment, m: fos_css::transform::Matrix, clip: Clip, alpha: f32) {
@@ -542,7 +552,7 @@ impl<'a> Painter<'a> {
     fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
-            if Self::is_layer(cb) {
+            if Self::is_layer_in(b, cb) {
                 // A sticky box is drawn moved to stay in view
                 let mut at = self.at();
                 at.0 -= cb.sticky_offset(b.content_box(), self.view);
@@ -630,7 +640,7 @@ impl<'a> Painter<'a> {
             match c {
                 Fragment::Text(t) => self.text(t, clip, alpha),
                 Fragment::Box(cb) => {
-                    if Self::is_layer(cb) || self.culled(cb, clip) {
+                    if Self::is_layer_in(b, cb) || self.culled(cb, clip) {
                         continue;
                     }
                     self.paint_in_flow(cb, clip, alpha);

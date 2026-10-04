@@ -184,6 +184,9 @@ pub struct Scoped<'a> {
     pub host: Option<&'a PageStyles>,
     pub slotted: Option<&'a PageStyles>,
     pub part: Option<&'a PageStyles>,
+    /// The element is a part in a shadow tree, so its tree's
+    /// `:host::part()` rules apply too
+    pub own_part: bool,
 }
 
 impl PageStyles {
@@ -277,25 +280,27 @@ impl PageStyles {
             MatchScope::Normal => true,
             MatchScope::Host => self.has_host,
             MatchScope::Slotted => self.has_slotted,
-            MatchScope::Part => self.has_part,
+            MatchScope::Part | MatchScope::HostPart => self.has_part,
         }
     }
 
     /// The rules matching element `node` in `scope`, lowest priority first
     /// (each once)
-    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, scope: MatchScope) -> Vec<u32> {
-        if !self.has(scope) {
+    fn matching_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, scopes: &[MatchScope]) -> Vec<u32> {
+        let scopes: Vec<MatchScope> = scopes.iter().copied().filter(|&s| self.has(s)).collect();
+        if scopes.is_empty() {
             return Vec::new();
         }
-        self.matching(&self.elements, tree, element, filter, |s| s.matches_in(tree, node, scope))
+        self.matching(&self.elements, tree, element, filter, |s| scopes.iter().any(|&scope| s.matches_in(tree, node, scope)))
     }
 
-    /// The rules matching pseudo-element `pe` of element `node` in `scope`
-    fn pseudo_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, pe: PseudoElement, scope: MatchScope) -> Vec<u32> {
-        if self.generated.is_empty() || !self.has(scope) {
+    /// The rules matching pseudo-element `pe` of element `node` in `scopes`
+    fn pseudo_rules(&self, tree: &DomTree, node: NodeId, element: &ElementData, filter: Option<&AncestorFilter>, pe: PseudoElement, scopes: &[MatchScope]) -> Vec<u32> {
+        let scopes: Vec<MatchScope> = scopes.iter().copied().filter(|&s| self.has(s)).collect();
+        if self.generated.is_empty() || scopes.is_empty() {
             return Vec::new();
         }
-        self.matching(&self.generated, tree, element, filter, |s| s.matches_pseudo_in(tree, node, pe, scope))
+        self.matching(&self.generated, tree, element, filter, |s| scopes.iter().any(|&scope| s.matches_pseudo_in(tree, node, pe, scope)))
     }
 
     fn matching(&self, buckets: &Buckets, tree: &DomTree, element: &ElementData, filter: Option<&AncestorFilter>, test: impl Fn(&SelectorList) -> bool) -> Vec<u32> {
@@ -508,13 +513,16 @@ fn cascade_for(
     cache: &mut fos_css::ResolveCache,
 ) -> bool {
     let ua = &*UA;
-    let rules_of = |s: &PageStyles, scope: MatchScope| match pe {
-        Some(pe) => s.pseudo_rules(tree, node, element, filter, pe, scope),
-        None => s.matching_rules(tree, node, element, filter, scope),
+    let rules_in = |s: &PageStyles, scopes: &[MatchScope]| match pe {
+        Some(pe) => s.pseudo_rules(tree, node, element, filter, pe, scopes),
+        None => s.matching_rules(tree, node, element, filter, scopes),
     };
+    let rules_of = |s: &PageStyles, scope: MatchScope| rules_in(s, &[scope]);
     let ua_rules = rules_of(ua, MatchScope::Normal);
     let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
-    let rules = styles.map_or(Vec::new(), |s| rules_of(s, MatchScope::Normal));
+    // A part's own tree's `:host::part()` rules rank with the tree's others
+    let own_scopes: &[MatchScope] = if scoped.own_part { &[MatchScope::Normal, MatchScope::HostPart] } else { &[MatchScope::Normal] };
+    let rules = styles.map_or(Vec::new(), |s| rules_in(s, own_scopes));
     // Rules from other trees: a shadow tree's own rules for its host, and
     // `::slotted()` ones, lose to the element's tree's; `::part()` rules,
     // from outside, win

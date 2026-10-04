@@ -94,6 +94,20 @@ impl PageLayout {
         self.fragments.element_rects()
     }
 
+    /// The first box fragment of element `node` (for inspection)
+    pub fn fragment_of(&self, node: NodeId) -> Option<&BoxFragment> {
+        fn find(b: &BoxFragment, node: NodeId) -> Option<&BoxFragment> {
+            if b.node == node {
+                return Some(b);
+            }
+            b.children.iter().find_map(|c| match c {
+                Fragment::Box(cb) => find(cb, node),
+                Fragment::Text(_) => None,
+            })
+        }
+        find(self.fragments.root.as_ref()?, node)
+    }
+
     /// [`Self::boxes`] where they are painted: transformed, fixed and
     /// sticky boxes placed for page scroll `scroll` in a viewport
     /// `view_h` tall, and scroll containers' content moved by their
@@ -855,11 +869,12 @@ impl<'a> BrowserStyler<'a> {
         let host = tree.shadow_root(node).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
         let parent = tree.get(node).map_or(NodeId::NONE, |n| n.parent);
         let slotted = tree.shadow_root(parent).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
+        let is_part = tree.shadow_host(root).is_some() && tree.get_attribute(node, "part").is_some();
         let part = match tree.shadow_host(root) {
-            Some(h) if tree.get_attribute(node, "part").is_some() => sheet_of(tree.tree_root(h)),
+            Some(h) if is_part => sheet_of(tree.tree_root(h)),
             _ => None,
         };
-        (own, crate::page_styles::Scoped { host, slotted, part })
+        (own, crate::page_styles::Scoped { host, slotted, part, own_part: is_part })
     }
 
     /// Styles of the elements of an inline SVG: those with fill or stroke
@@ -1277,6 +1292,23 @@ mod tests {
         renderer.set_images(Arc::new(images));
         let page = renderer.render_document(&document, 0.0).unwrap();
         assert_eq!(page.pixels[10 * 40 + 10] & 0xffffff, 0xff0000);
+    }
+
+    #[test]
+    fn test_z_index_on_unpositioned_grid_and_flex_items() {
+        // Grid and flex items honor z-index without position: the first
+        // item, raised, paints over the later one sharing its area
+        for container in ["display: grid; grid-template-areas: 'a'", "display: flex"] {
+            let item = if container.contains("grid") { "grid-area: a;" } else { "flex: none; width: 20px;" };
+            let second = if container.contains("grid") { "grid-area: a;" } else { "flex: none; width: 20px; margin-left: -20px;" };
+            let html = format!(r#"<html><body style="margin: 0"><div style="{container}; width: 20px">
+                <div style="{item} height: 20px; background: #f00; z-index: 1"></div>
+                <div style="{second} height: 20px; background: #00f"></div></div></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 10] & 0xffffff, 0xff0000, "{container}");
+        }
     }
 
     #[test]

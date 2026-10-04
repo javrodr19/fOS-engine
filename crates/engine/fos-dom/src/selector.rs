@@ -121,6 +121,9 @@ pub enum MatchScope {
     /// The element is in the shadow tree of a host in the tree whose rules
     /// these are (`::part()` selectors)
     Part,
+    /// The element is in the shadow tree whose rules these are, exposed as
+    /// a part (`:host::part()` selectors)
+    HostPart,
 }
 
 /// A pseudo-element generated boxes are styled by
@@ -356,7 +359,7 @@ impl SelectorList {
                 MatchScope::Normal => subject.is_some_and(|s| s.shadow.is_none()),
                 MatchScope::Host => c.parts.iter().any(|(comp, _)| comp.pseudos.iter().any(|p| matches!(p, Pseudo::Host(_)))),
                 MatchScope::Slotted => subject.is_some_and(|s| matches!(s.shadow.as_deref(), Some(ShadowPart::Slotted(_)))),
-                MatchScope::Part => subject.is_some_and(|s| matches!(s.shadow.as_deref(), Some(ShadowPart::Part(_)))),
+                MatchScope::Part | MatchScope::HostPart => subject.is_some_and(|s| matches!(s.shadow.as_deref(), Some(ShadowPart::Part(_)))),
             }
         })
     }
@@ -505,13 +508,16 @@ fn match_scoped(tree: &DomTree, node: NodeId, parts: &[(Compound, Combinator)], 
             }
             tree.assigned_slot(node).is_some_and(|slot| match_complex_as(tree, slot, parts, pe, false))
         }
-        (Some(ShadowPart::Part(names)), MatchScope::Part) => {
+        (Some(ShadowPart::Part(names)), MatchScope::Part | MatchScope::HostPart) => {
             let Some(e) = element(tree, node) else { return false };
             let Some(parts_attr) = attr(tree, e, "part") else { return false };
             if !names.iter().all(|n| parts_attr.split_ascii_whitespace().any(|p| p == n)) {
                 return false;
             }
-            tree.containing_shadow_host(node).is_some_and(|host| match_complex_as(tree, host, parts, pe, false))
+            // From the host's tree the host is an element; from the part's
+            // own tree, it is `:host`
+            let at_host = scope == MatchScope::HostPart;
+            tree.containing_shadow_host(node).is_some_and(|host| match_complex_as(tree, host, parts, pe, at_host))
         }
         _ => false,
     }
@@ -1102,6 +1108,11 @@ mod tests {
         assert!(m(".h::part(x base)", base, MatchScope::Part));
         assert!(!m(".h::part(other)", base, MatchScope::Part));
         assert!(!m("x-host::part(base)", base, MatchScope::Normal));
+        // A component styling its own parts: :host::part() from inside
+        assert!(m(":host::part(base)", base, MatchScope::HostPart));
+        assert!(m(":host(.h)::part(x)", base, MatchScope::HostPart));
+        assert!(!m(":host::part(base)", base, MatchScope::Part));
+        assert!(!m("x-host::part(base)", base, MatchScope::HostPart));
         let list = SelectorList::parse("::slotted(b), :host, x-host::part(base)").unwrap();
         assert_eq!(list.subject_keys(), vec![None, None, None]);
         assert!(list.has_scope(MatchScope::Slotted) && list.has_scope(MatchScope::Host) && list.has_scope(MatchScope::Part));

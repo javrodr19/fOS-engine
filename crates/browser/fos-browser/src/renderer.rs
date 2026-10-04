@@ -1066,6 +1066,33 @@ mod tests {
     }
 
     #[test]
+    fn test_filters_and_centered_ratio_boxes() {
+        // A blurred circle, centered by auto margins with its height from
+        // aspect-ratio (Tailwind's glow), and a darkened box
+        let html = r#"<html><body style="margin: 0">
+            <div style="position: relative; width: 200px; height: 100px">
+            <div style="position: absolute; inset: 0; width: 40px; aspect-ratio: 1; margin: auto; border-radius: 3.4e38px; background: #f00; filter: blur(4px)"></div></div>
+            <div style="height: 20px; background: #fff; filter: brightness(50%)"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 130);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        let red = |p: u32| (p >> 16) & 0xff;
+        let green = |p: u32| (p >> 8) & 0xff;
+        // Solid red at the center, softened at the circle's edge, and
+        // nothing at the box's corners or far away
+        assert!(red(at(100, 50)) > 0xf0 && green(at(100, 50)) < 0x10, "{:x}", at(100, 50));
+        let edge = at(120, 50);
+        assert!(green(edge) > 0x30 && green(edge) < 0xe0, "edge {edge:x}");
+        assert_eq!(at(70, 20) & 0xffffff, 0xffffff, "beyond the blur, outside the circle");
+        assert_eq!(at(10, 50) & 0xffffff, 0xffffff);
+        // brightness(50%): white becomes mid gray
+        let g = at(50, 110) & 0xff;
+        assert!((0x7c..=0x83).contains(&g), "{:x}", at(50, 110));
+    }
+
+    #[test]
     fn test_background_clip() {
         let html = r#"<html><body style="margin: 0">
             <div style="font: bold 40px sans-serif; line-height: 40px; height: 40px; background: #f00; background-clip: text; color: transparent">MMMM</div>

@@ -238,6 +238,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "clip" => Clip,
         "object-position" => ObjectPosition,
         "aspect-ratio" => AspectRatio,
+        "filter" | "-webkit-filter" => Filter,
         "clip-path" | "-webkit-clip-path" => ClipPath,
         "transform" | "-webkit-transform" | "-ms-transform" => Transform,
         "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
@@ -533,7 +534,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::CounterReset | P::CounterSet => counters(raw, 0).map(|c| PropertyValue::Counters(Arc::from(c))),
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         // Kept as text and resolved per element (lengths need its font)
-        P::Clip | P::ClipPath | P::ObjectPosition => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        P::Clip | P::ClipPath | P::ObjectPosition | P::Filter => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         // `auto`, a ratio (`16 / 9`, `1.8`) or both: width over height
         P::AspectRatio => {
             let ratio = v.replace("auto", " ");

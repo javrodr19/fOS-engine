@@ -702,6 +702,11 @@ pub struct BoxStyle {
     /// `aspect-ratio` (width over height) for boxes whose size is
     /// otherwise automatic
     pub aspect_ratio: Option<f32>,
+    /// `filter`: Gaussian blur radius (standard deviation, px; 0: none)
+    /// and brightness factor (1: unchanged); its opacity() folds into
+    /// `opacity`
+    pub filter_blur: f32,
+    pub filter_brightness: f32,
     /// The individual `translate`, `rotate` (radians) and `scale`
     pub translate: Option<(Lp, Lp)>,
     pub rotate: Option<f32>,
@@ -762,6 +767,8 @@ impl Default for BoxStyle {
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
             object_position: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
             aspect_ratio: None,
+            filter_blur: 0.0,
+            filter_brightness: 1.0,
             translate: None,
             rotate: None,
             scale: None,
@@ -1015,7 +1022,7 @@ impl Style {
 
     /// Establishes a stacking context
     pub fn is_stacking_context(&self) -> bool {
-        (self.is_positioned() && self.box_.z_index.is_some()) || self.box_.opacity < 1.0 || matches!(self.box_.position, Position::Fixed | Position::Sticky) || self.has_transform()
+        (self.is_positioned() && self.box_.z_index.is_some()) || self.box_.opacity < 1.0 || matches!(self.box_.position, Position::Fixed | Position::Sticky) || self.has_transform() || self.box_.filter_blur > 0.0 || self.box_.filter_brightness != 1.0
     }
 
     /// Apply an element's declarations in cascade order (lowest priority
@@ -1437,6 +1444,36 @@ impl Style {
                     _ => {}
                 }
             }
+            PropertyId::Filter => {
+                let PropertyValue::Transform(text) = v else { return };
+                let (mut blur, mut brightness, mut opacity) = (0.0f32, 1.0f32, 1.0f32);
+                let lower = text.to_ascii_lowercase();
+                let mut rest = lower.trim();
+                // A list of functions; unsupported ones are skipped
+                while let Some(open) = rest.find('(') {
+                    let name = rest[..open].trim();
+                    let Some(close) = rest[open..].find(')') else { break };
+                    let arg = rest[open + 1..open + close].trim();
+                    let amount = |a: &str| match a.strip_suffix('%') {
+                        Some(p) => p.trim().parse::<f32>().ok().map(|v| v / 100.0),
+                        None if a.is_empty() => Some(1.0),
+                        None => a.parse::<f32>().ok(),
+                    };
+                    match name {
+                        "blur" => blur = if arg.is_empty() { 0.0 } else { self.lp_text(arg, ctx).map_or(0.0, |l| l.px.max(0.0)) },
+                        "brightness" => brightness *= amount(arg).unwrap_or(1.0).max(0.0),
+                        "opacity" => opacity *= amount(arg).unwrap_or(1.0).clamp(0.0, 1.0),
+                        _ => {}
+                    }
+                    rest = rest[open + close + 1..].trim_start();
+                }
+                set!(box_, [filter_blur], blur);
+                set!(box_, [filter_brightness], brightness);
+                if opacity < 1.0 {
+                    let o = self.box_.opacity * opacity;
+                    set!(box_, [opacity], o);
+                }
+            }
             PropertyId::AspectRatio => match v {
                 PropertyValue::Number(r) => set!(box_, [aspect_ratio], (*r > 0.0).then_some(*r)),
                 PropertyValue::Keyword(Keyword::Auto) => set!(box_, [aspect_ratio], None),
@@ -1822,6 +1859,10 @@ impl Style {
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),
             PropertyId::ObjectPosition => copy!(box_, [object_position]),
             PropertyId::AspectRatio => copy!(box_, [aspect_ratio]),
+            PropertyId::Filter => {
+                copy!(box_, [filter_blur]);
+                copy!(box_, [filter_brightness]);
+            }
             PropertyId::Translate => copy!(box_, [translate]),
             PropertyId::Rotate => copy!(box_, [rotate]),
             PropertyId::Scale => copy!(box_, [scale]),

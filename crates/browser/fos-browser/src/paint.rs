@@ -52,6 +52,8 @@ pub struct Painter<'a> {
     shaped: usize,
     /// Painting only glyphs, opaque (the mask of `background-clip: text`)
     only_text: bool,
+    /// The box being painted offscreen for its filter (painted plainly)
+    filtered: usize,
 }
 
 /// Where painting is: origin, dx and view
@@ -103,7 +105,9 @@ fn radii(b: &BoxFragment, r: Rect) -> [(f32, f32); 4] {
     let mut out = [(0.0, 0.0); 4];
     for i in 0..4 {
         let (h, v): (Lp, Lp) = spec[i];
-        out[i] = (h.resolve(r.w).max(0.0), v.resolve(r.h).max(0.0));
+        // Huge radii (999em, 3.4e38px: "fully round") are capped at the
+        // box so the sums below stay finite
+        out[i] = (h.resolve(r.w).clamp(0.0, r.w.max(0.0)), v.resolve(r.h).clamp(0.0, r.h.max(0.0)));
         if out[i].0 == 0.0 || out[i].1 == 0.0 {
             out[i] = (0.0, 0.0);
         }
@@ -119,6 +123,71 @@ fn radii(b: &BoxFragment, r: Rect) -> [(f32, f32); 4] {
         }
     }
     out
+}
+
+/// Whether a box has a `filter` that changes its pixels
+fn has_filter(b: &BoxFragment) -> bool {
+    b.style.box_.filter_blur > 0.0 || (b.style.box_.filter_brightness - 1.0).abs() > 1e-3
+}
+
+/// Blur premultiplied RGBA pixels (`w`×`h`) with standard deviation
+/// `sigma`, as three box blurs each way (transparent beyond the edges)
+fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
+    // Box sizes whose three passes approximate the Gaussian (Kovesi)
+    let n = 3.0f32;
+    let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut wl = ideal.floor() as i32;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wu = wl + 2;
+    let m = ((12.0 * sigma * sigma - n * (wl * wl) as f32 - 4.0 * n * wl as f32 - 3.0 * n) / (-4.0 * wl as f32 - 4.0)).round() as i32;
+    let mut tmp = vec![0u8; data.len()];
+    for i in 0..3 {
+        let size = if i < m { wl } else { wu };
+        let r = ((size - 1) / 2).max(0) as usize;
+        if r == 0 {
+            continue;
+        }
+        box_blur_pass(data, &mut tmp, w, h, r, true);
+        box_blur_pass(&tmp, data, w, h, r, false);
+    }
+}
+
+/// One box-blur pass of radius `r`, along rows or columns
+fn box_blur_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (lines, len) = if horizontal { (h, w) } else { (w, h) };
+    let at = |line: usize, i: usize| if horizontal { (line * w + i) * 4 } else { (i * w + line) * 4 };
+    let div = (2 * r + 1) as u32;
+    for line in 0..lines {
+        let mut sum = [0u32; 4];
+        // The window around position 0: [-r, r]
+        for i in 0..=r.min(len - 1) {
+            let p = at(line, i);
+            for c in 0..4 {
+                sum[c] += src[p + c] as u32;
+            }
+        }
+        for i in 0..len {
+            let p = at(line, i);
+            for c in 0..4 {
+                dst[p + c] = ((sum[c] + div / 2) / div) as u8;
+            }
+            // Slide: add i + r + 1, drop i - r
+            if i + r + 1 < len {
+                let q = at(line, i + r + 1);
+                for c in 0..4 {
+                    sum[c] += src[q + c] as u32;
+                }
+            }
+            if i >= r {
+                let q = at(line, i - r);
+                for c in 0..4 {
+                    sum[c] -= src[q + c] as u32;
+                }
+            }
+        }
+    }
 }
 
 /// Radii shrunk by edge widths (top, right, bottom, left): the curve of an
@@ -193,7 +262,7 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0, shaped: 0, only_text: false }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0, shaped: 0, only_text: false, filtered: 0 }
     }
 
     /// Images for CSS `url()`s
@@ -392,6 +461,7 @@ impl<'a> Painter<'a> {
                 untransformed: key,
                 shaped: self.shaped,
                 only_text: self.only_text,
+                filtered: self.filtered,
             };
             p.paint_layer(b, Clip([0.0, 0.0, w, h]), alpha);
         }
@@ -431,6 +501,9 @@ impl<'a> Painter<'a> {
         let clip = self.own_clip(b, clip);
         if clip.is_empty() || self.culled(b, clip) {
             return;
+        }
+        if self.filtered != b as *const BoxFragment as usize && has_filter(b) {
+            return self.paint_filtered(b, clip, alpha, true);
         }
         if self.shaped != b as *const BoxFragment as usize {
             if let Some(shape) = self.shape_clip(b) {
@@ -573,6 +646,9 @@ impl<'a> Painter<'a> {
         if a <= 0.0 || clip.is_empty() {
             return;
         }
+        if self.filtered != cb as *const BoxFragment as usize && has_filter(cb) {
+            return self.paint_filtered(cb, clip, alpha, false);
+        }
         if self.shaped != cb as *const BoxFragment as usize {
             if let Some(shape) = self.shape_clip(cb) {
                 return self.paint_shaped(cb, shape, clip, alpha, false);
@@ -668,6 +744,7 @@ impl<'a> Painter<'a> {
                 untransformed: self.untransformed,
                 shaped: key,
                 only_text: self.only_text,
+                filtered: self.filtered,
             };
             let c = Clip([0.0, 0.0, w, h]);
             if layer {
@@ -681,6 +758,88 @@ impl<'a> Painter<'a> {
         mask.fill_path(&shape.0, shape.1, true, Transform::identity());
         if let Some(mut pm) = self.canvas.pixmap_mut() {
             pm.draw_pixmap(x0 as i32, y0 as i32, off.pixmap(), &tiny_skia::PixmapPaint::default(), Transform::identity(), Some(&mask));
+        }
+    }
+
+    /// Paint `b` (a layer, or in flow) offscreen, with room for its blur,
+    /// filter it (blur, brightness) and draw it within `clip`
+    fn paint_filtered(&mut self, b: &BoxFragment, clip: Clip, alpha: f32, layer: bool) {
+        let key = b as *const BoxFragment as usize;
+        let (sigma, brightness) = (b.style.box_.filter_blur, b.style.box_.filter_brightness);
+        let reach = (sigma * 3.0).ceil();
+        let ink = self.dev(b.transformed_ink());
+        // What blurs into the clip comes from up to `reach` outside it
+        let x0 = (ink.x - reach).max(clip.0[0] - reach).floor();
+        let y0 = (ink.y - reach).max(clip.0[1] - reach).floor();
+        let x1 = (ink.right() + reach).min(clip.0[2] + reach).ceil();
+        let y1 = (ink.bottom() + reach).min(clip.0[3] + reach).ceil();
+        let prev = std::mem::replace(&mut self.filtered, key);
+        let paint_plain = |this: &mut Self| {
+            if layer {
+                this.paint_layer(b, clip, alpha);
+            } else {
+                this.paint_in_flow(b, clip, alpha);
+            }
+        };
+        if x1 <= x0 || y1 <= y0 {
+            self.filtered = prev;
+            return;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let off = if w * h > 16_000_000.0 { None } else { Canvas::new(w as u32, h as u32) };
+        let Some(mut off) = off else {
+            paint_plain(self);
+            self.filtered = prev;
+            return;
+        };
+        {
+            let mut p = Painter {
+                canvas: &mut off,
+                text: &mut *self.text,
+                origin: self.origin + y0,
+                mask: None,
+                canvas_background_box: self.canvas_background_box,
+                scroll: self.scroll,
+                find_fixed: self.find_fixed,
+                images: self.images,
+                base: self.base,
+                canvases: self.canvases,
+                box_scroll: self.box_scroll,
+                dx: self.dx - x0,
+                view: self.view,
+                untransformed: self.untransformed,
+                shaped: self.shaped,
+                only_text: self.only_text,
+                filtered: key,
+            };
+            let c = Clip([0.0, 0.0, w, h]);
+            if layer {
+                p.paint_layer(b, c, alpha);
+            } else {
+                p.paint_in_flow(b, c, alpha);
+            }
+        }
+        self.filtered = prev;
+        if let Some(mut pm) = off.pixmap_mut() {
+            let (pw, ph) = (pm.width() as usize, pm.height() as usize);
+            let data = pm.data_mut();
+            if sigma > 0.0 {
+                gaussian_blur(data, pw, ph, sigma);
+            }
+            if (brightness - 1.0).abs() > 1e-3 {
+                // Premultiplied: color channels stay within alpha
+                for px in data.chunks_exact_mut(4) {
+                    let a = px[3] as f32;
+                    for c in &mut px[..3] {
+                        *c = (*c as f32 * brightness).min(a).round() as u8;
+                    }
+                }
+            }
+        }
+        let full = clip.contains(Rect::new(0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32));
+        let mask = if full { None } else { self.mask_for(clip).cloned() };
+        if let Some(mut pm) = self.canvas.pixmap_mut() {
+            pm.draw_pixmap(x0 as i32, y0 as i32, off.pixmap(), &tiny_skia::PixmapPaint::default(), Transform::identity(), mask.as_ref());
         }
     }
 
@@ -822,6 +981,7 @@ impl<'a> Painter<'a> {
                 untransformed: this.untransformed,
                 shaped: this.shaped,
                 only_text,
+                filtered: this.filtered,
             };
             if only_text {
                 p.paint_flow(b, local, 1.0);

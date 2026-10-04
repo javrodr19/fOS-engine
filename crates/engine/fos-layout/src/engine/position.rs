@@ -101,9 +101,11 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
             Some(clamp_width(s, max.min(avail).max(min), cb.w, hbp) + hbp)
         }
     };
-    // Height: stretched between top and bottom when auto
+    // Height: stretched between top and bottom when auto, unless
+    // aspect-ratio gives it from the width
+    let ratio_height = s.box_.aspect_ratio.is_some() && s.box_.height.is_auto() && !replaced;
     let height = match (s.box_.height.is_auto(), top, bottom) {
-        (true, Some(t), Some(bt)) if !replaced => Some(clamp_height(s, (cb.h - t - bt - mt - mb - vbp).max(0.0), Some(cb.h), vbp) + vbp),
+        (true, Some(t), Some(bt)) if !replaced && !ratio_height => Some(clamp_height(s, (cb.h - t - bt - mt - mb - vbp).max(0.0), Some(cb.h), vbp) + vbp),
         _ => None,
     };
     let laid = layout_sized(ctx, b, cb.w, Some(cb.h), Sizing::Shrink, false, Forced { width, height, root: false });
@@ -122,7 +124,7 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
             _ => {}
         }
     }
-    if let (Some(t), Some(bt), false) = (top, bottom, s.box_.height.is_auto()) {
+    if let (Some(t), Some(bt), true) = (top, bottom, !s.box_.height.is_auto() || ratio_height) {
         let free = cb.h - t - bt - h - mt - mb;
         match (e.margin[0].is_none(), e.margin[2].is_none()) {
             (true, true) if free > 0.0 => mt += free / 2.0,

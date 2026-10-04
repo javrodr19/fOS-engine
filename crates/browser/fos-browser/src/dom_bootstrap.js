@@ -811,6 +811,75 @@
   makeInterface('HTMLMediaElement', HTMLElement, '');
   makeInterface('HTMLAudioElement', HTMLMediaElement, 'audio');
   makeInterface('HTMLVideoElement', HTMLMediaElement, 'video');
+  // Media elements: nothing plays (play() is refused, as autoplay often
+  // is), but the API is there and reports an idle element
+  {
+    class TimeRanges {
+      get length() { return 0; }
+      start() { throw new DOMException('The index provided (0) is greater than or equal to the maximum bound (0).', 'IndexSizeError'); }
+      end() { throw new DOMException('The index provided (0) is greater than or equal to the maximum bound (0).', 'IndexSizeError'); }
+    }
+    global.TimeRanges = TimeRanges;
+    const media = new WeakMap();
+    const stateOf = (el) => {
+      let s = media.get(el);
+      if (!s) media.set(el, s = { paused: true, currentTime: 0, volume: 1, playbackRate: 1, defaultPlaybackRate: 1, srcObject: null, preservesPitch: true });
+      return s;
+    };
+    const M = HTMLMediaElement.prototype;
+    for (const [k, v] of Object.entries({ NETWORK_EMPTY: 0, NETWORK_IDLE: 1, NETWORK_LOADING: 2, NETWORK_NO_SOURCE: 3, HAVE_NOTHING: 0, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3, HAVE_ENOUGH_DATA: 4 })) {
+      Object.defineProperty(HTMLMediaElement, k, { value: v });
+      Object.defineProperty(M, k, { value: v });
+    }
+    define(M, {
+      load() { stateOf(this).currentTime = 0; },
+      play() {
+        this.dispatchEvent(new Event('play'));
+        return Promise.reject(new DOMException("play() failed because the user didn't interact with the document first.", 'NotAllowedError'));
+      },
+      pause() {
+        const s = stateOf(this);
+        if (!s.paused) { s.paused = true; this.dispatchEvent(new Event('pause')); }
+      },
+      canPlayType() { return ''; },
+      fastSeek(t) { stateOf(this).currentTime = +t || 0; },
+      addTextTrack() { return { kind: 'subtitles', label: '', language: '', mode: 'disabled', cues: [], addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; },
+      captureStream() { throw new DOMException('Not supported', 'NotSupportedError'); },
+      setSinkId() { return Promise.resolve(); },
+      setMediaKeys() { return Promise.resolve(); },
+      get paused() { return stateOf(this).paused; },
+      get ended() { return false; },
+      get seeking() { return false; },
+      get duration() { return NaN; },
+      get readyState() { return 0; },
+      get networkState() { return 0; },
+      get error() { return null; },
+      get currentSrc() { return ''; },
+      get buffered() { return new TimeRanges(); },
+      get played() { return new TimeRanges(); },
+      get seekable() { return new TimeRanges(); },
+      get textTracks() { const l = []; l.addEventListener = () => {}; l.removeEventListener = () => {}; l.getTrackById = () => null; return l; },
+      get audioTracks() { return []; },
+      get videoTracks() { return []; },
+      get mediaKeys() { return null; },
+      get sinkId() { return ''; },
+    });
+    for (const prop of ['currentTime', 'volume', 'playbackRate', 'defaultPlaybackRate', 'srcObject', 'preservesPitch']) {
+      Object.defineProperty(M, prop, {
+        get() { return stateOf(this)[prop]; },
+        set(v) { stateOf(this)[prop] = prop === 'srcObject' ? v : prop === 'preservesPitch' ? !!v : (+v || 0); },
+        configurable: true,
+      });
+    }
+    define(HTMLVideoElement.prototype, {
+      get videoWidth() { return 0; },
+      get videoHeight() { return 0; },
+      getVideoPlaybackQuality() { return { creationTime: performance.now(), droppedVideoFrames: 0, totalVideoFrames: 0 }; },
+      requestPictureInPicture() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); },
+      requestVideoFrameCallback() { return 0; },
+      cancelVideoFrameCallback() {},
+    });
+  }
   // SVG elements keep HTMLElement's conveniences (style, dataset, events)
   makeInterface('SVGElement', HTMLElement, 'svg:*');
   makeInterface('SVGGraphicsElement', SVGElement, '');
@@ -897,6 +966,7 @@
   reflectOn('HTMLButtonElement HTMLInputElement', props('formNoValidate'), boolAttr);
   reflectOn('HTMLDetailsElement HTMLDialogElement', props('open'), boolAttr);
   reflectOn('HTMLMediaElement', [['controls', 'controls'], ['autoplay', 'autoplay'], ['loop', 'loop'], ['muted', 'muted'], ['defaultMuted', 'muted']], boolAttr);
+  reflectOn('HTMLMediaElement', props('preload'), stringAttr);
   reflectOn('HTMLVideoElement', props('playsInline'), boolAttr);
   reflectOn('HTMLImageElement', props('isMap'), boolAttr);
   reflectOn('HTMLOListElement', props('reversed'), boolAttr);
@@ -2079,6 +2149,21 @@
   }
   for (const k of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'origin']) {
     Object.defineProperty(Location.prototype, k, { get() { return this._url[k]; }, set(v) { const u = new URL(this._url.href); u[k] = v; this.href = u.href; } });
+  }
+  // <a> and <area>: the parts of their URL (HTMLHyperlinkElementUtils)
+  for (const proto of [HTMLAnchorElement.prototype, HTMLAreaElement.prototype]) {
+    const parsed = (el) => {
+      if (!el.hasAttribute('href')) return null;
+      try { return new URL(el.getAttribute('href'), document.baseURI); } catch (e) { return null; }
+    };
+    for (const k of ['protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+      Object.defineProperty(proto, k, {
+        get() { const u = parsed(this); return u ? u[k] : (k === 'protocol' ? ':' : ''); },
+        set(v) { const u = parsed(this); if (!u) return; u[k] = v; this.setAttribute('href', u.href); },
+        configurable: true,
+      });
+    }
+    Object.defineProperty(proto, 'origin', { get() { const u = parsed(this); return u ? u.origin : ''; }, configurable: true });
   }
   const pendingNavigation = [];
   function __fosNavigate(url) { pendingNavigation.push(url); }

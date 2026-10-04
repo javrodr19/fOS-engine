@@ -919,6 +919,46 @@ mod tests {
     }
 
     #[test]
+    fn anchor_url_parts() {
+        let (mut rt, _doc) = page(r#"<html><body><a id="a" href="/watch?v=1#t">x</a><a id="n">y</a></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(
+            rt.eval(
+                "const a = document.getElementById('a');
+                 const parts = [a.protocol, a.host, a.pathname, a.search, a.hash, a.origin];
+                 a.pathname = '/results';
+                 const b = document.createElement('A');
+                 b.href = 'https://m.example.org:8080/p/q';
+                 [...parts, a.getAttribute('href'), b.pathname, b.port, b.hostname, document.getElementById('n').pathname].join(' ')"
+            )
+            .unwrap(),
+            "https: example.com /watch ?v=1 #t https://example.com https://example.com/results?v=1#t /p/q 8080 m.example.org "
+        );
+    }
+
+    #[test]
+    fn media_elements() {
+        let (mut rt, _doc) = page(r#"<html><body><video id="v" preload="none" src="a.mp4"></video></body></html>"#);
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(
+            rt.eval(
+                "const v = document.getElementById('v');
+                 window.out = [];
+                 v.load();
+                 v.pause();
+                 v.currentTime = 3;
+                 v.volume = 0.5;
+                 v.play().catch(e => out.push(e.name));
+                 [v.paused, v.currentTime, v.volume, Number.isNaN(v.duration), v.readyState, v.buffered.length, v.canPlayType('video/mp4'),
+                  v.preload, v.videoWidth, HTMLMediaElement.HAVE_ENOUGH_DATA, v instanceof HTMLVideoElement].join()"
+            )
+            .unwrap(),
+            "true,3,0.5,true,0,0,,none,0,4,true"
+        );
+        assert_eq!(rt.eval("out.join()").unwrap(), "NotAllowedError");
+    }
+
+    #[test]
     fn shadow_dom() {
         let (mut rt, _doc) = page(
             r#"<html><body><x-host id="h"><b slot="title">T</b>light</x-host>

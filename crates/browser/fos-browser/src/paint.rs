@@ -311,6 +311,15 @@ impl<'a> Painter<'a> {
         ink.bottom() < clip.0[1] || ink.y > clip.0[3]
     }
 
+    /// Clip for a box and its contents: `clip` and `clip-path: inset()`
+    fn own_clip(&self, b: &BoxFragment, clip: Clip) -> Clip {
+        let r = b.border_box;
+        match b.style.own_clip((r.x, r.y, r.w, r.h)) {
+            Some((x, y, w, h)) => clip.intersect(self.dev(Rect::new(x, y, w, h))),
+            None => clip,
+        }
+    }
+
     /// Clip for a box's contents
     fn inner_clip(&self, b: &BoxFragment, clip: Clip) -> Clip {
         if b.style.clips() {
@@ -413,7 +422,8 @@ impl<'a> Painter<'a> {
                 return self.paint_transformed(b, m, clip, alpha);
             }
         }
-        if self.culled(b, clip) {
+        let clip = self.own_clip(b, clip);
+        if clip.is_empty() || self.culled(b, clip) {
             return;
         }
         let alpha = alpha * b.style.box_.opacity;
@@ -535,7 +545,8 @@ impl<'a> Painter<'a> {
                         continue;
                     }
                     let a = alpha * cb.style.box_.opacity;
-                    if a <= 0.0 {
+                    let clip = self.own_clip(cb, clip);
+                    if a <= 0.0 || clip.is_empty() {
                         continue;
                     }
                     self.paint_own(cb, clip, a);

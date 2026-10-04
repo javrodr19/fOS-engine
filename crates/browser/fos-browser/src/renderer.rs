@@ -1034,6 +1034,26 @@ mod tests {
     }
 
     #[test]
+    fn test_clip_and_clip_path_inset_hide_boxes() {
+        let html = r#"<html><body style="margin: 0">
+            <div style="position: absolute; top: 0; left: 0; width: 40px; height: 40px; background: #f00; clip: rect(0 0 0 0)"></div>
+            <div style="position: absolute; top: 0; left: 50px; width: 40px; height: 40px; background: #f00; clip: rect(0, 20px, 40px, auto)"></div>
+            <div style="position: absolute; top: 50px; left: 0; width: 40px; height: 40px; background: #f00; clip-path: inset(50%)"></div>
+            <div style="position: absolute; top: 50px; left: 50px; width: 40px; height: 40px; background: #f00; clip-path: inset(0 0 0 20px round 4px)"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 200 + x] == 0xffff0000;
+        // rect(0 0 0 0) and inset(50%) hide everything
+        assert!(!red(20, 20) && !red(20, 70));
+        // rect(0, 20px, 40px, auto): the left half shows
+        assert!(red(55, 20) && !red(80, 20));
+        // inset(0 0 0 20px): the right half shows
+        assert!(!red(55, 70) && red(80, 70));
+    }
+
+    #[test]
     fn test_fixed_boxes_stay_in_the_viewport() {
         let mut html = String::from("<html><body><div style='position: fixed; top: 0; left: 0; width: 50px; height: 20px; background: #f00'></div>");
         for i in 0..100 {

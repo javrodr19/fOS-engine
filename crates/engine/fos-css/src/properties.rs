@@ -149,6 +149,9 @@ pub enum PropertyId {
     CounterReset,
     CounterIncrement,
     CounterSet,
+    /// `clip: rect(...)` and `clip-path` (inset shapes)
+    Clip,
+    ClipPath,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,

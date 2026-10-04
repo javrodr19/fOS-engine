@@ -594,6 +594,11 @@ pub struct BoxStyle {
     pub counter_reset: Option<Arc<[(Arc<str>, i32)]>>,
     pub counter_increment: Option<Arc<[(Arc<str>, i32)]>>,
     pub counter_set: Option<Arc<[(Arc<str>, i32)]>>,
+    /// `clip: rect(top right bottom left)` in px from the border box's
+    /// top left (`None` sides are auto), for absolutely positioned boxes
+    pub clip: Option<[Option<f32>; 4]>,
+    /// `clip-path: inset(...)`: top, right, bottom, left insets
+    pub clip_inset: Option<[Lp; 4]>,
     /// `box-shadow`s, front to back (`None`: none)
     pub box_shadow: Option<Arc<[Shadow]>>,
     /// `transform` functions (`None`: none)
@@ -651,6 +656,8 @@ impl Default for BoxStyle {
             counter_reset: None,
             counter_increment: None,
             counter_set: None,
+            clip: None,
+            clip_inset: None,
             box_shadow: None,
             transform: None,
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
@@ -870,6 +877,31 @@ impl Style {
 
     pub fn is_out_of_flow(&self) -> bool {
         matches!(self.box_.position, Position::Absolute | Position::Fixed)
+    }
+
+    /// The part of its border box `r` that is drawn, when `clip` or
+    /// `clip-path: inset()` cuts it
+    pub fn own_clip(&self, r: (f32, f32, f32, f32)) -> Option<(f32, f32, f32, f32)> {
+        let (x, y, w, h) = r;
+        let mut out = None;
+        if let Some(c) = self.box_.clip.filter(|_| matches!(self.box_.position, Position::Absolute | Position::Fixed)) {
+            let (l, t) = (x + c[3].unwrap_or(0.0), y + c[0].unwrap_or(0.0));
+            let (rr, b) = (c[1].map_or(x + w, |v| x + v), c[2].map_or(y + h, |v| y + v));
+            out = Some((l, t, (rr - l).max(0.0), (b - t).max(0.0)));
+        }
+        if let Some(i) = self.box_.clip_inset {
+            let (t, rr, b, l) = (i[0].resolve(h), i[1].resolve(w), i[2].resolve(h), i[3].resolve(w));
+            let (cx, cy, cw, ch) = (x + l, y + t, (w - l - rr).max(0.0), (h - t - b).max(0.0));
+            out = Some(match out {
+                None => (cx, cy, cw, ch),
+                Some((ox, oy, ow, oh)) => {
+                    let (x0, y0) = (ox.max(cx), oy.max(cy));
+                    let (x1, y1) = ((ox + ow).min(cx + cw), (oy + oh).min(cy + ch));
+                    (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+                }
+            });
+        }
+        out
     }
 
     /// Clips its content (overflow other than visible)
@@ -1301,6 +1333,35 @@ impl Style {
                     _ => {}
                 }
             }
+            PropertyId::Clip | PropertyId::ClipPath => {
+                let PropertyValue::Transform(text) = v else { return };
+                let lower = text.to_ascii_lowercase();
+                let args = |name: &str| lower.strip_prefix(name).and_then(|r| r.trim_start().strip_prefix('(')).and_then(|r| r.split(')').next()).map(|a| a.replace(',', " "));
+                if id == PropertyId::Clip {
+                    let rect = args("rect").and_then(|a| {
+                        // Each side: Some(auto as None) or a length; a bad one fails all
+                        let sides: Vec<Option<f32>> = a
+                            .split_whitespace()
+                            .map(|t| if t == "auto" { Some(None) } else { self.lp_text(t, ctx).map(|l| Some(l.px)) })
+                            .collect::<Option<Vec<_>>>()?;
+                        (sides.len() == 4).then(|| [sides[0], sides[1], sides[2], sides[3]])
+                    });
+                    set!(box_, [clip], rect);
+                } else {
+                    // Other shapes and url() references do not clip
+                    let inset = args("inset").and_then(|a| {
+                        let lps: Vec<Lp> = a.split(" round").next()?.split_whitespace().map(|t| self.lp_text(t, ctx)).collect::<Option<_>>()?;
+                        Some(match lps.as_slice() {
+                            [a] => [*a; 4],
+                            [a, b] => [*a, *b, *a, *b],
+                            [a, b, c] => [*a, *b, *c, *b],
+                            [a, b, c, d] => [*a, *b, *c, *d],
+                            _ => return None,
+                        })
+                    });
+                    set!(box_, [clip_inset], inset);
+                }
+            }
             PropertyId::CounterReset | PropertyId::CounterIncrement | PropertyId::CounterSet => {
                 if let PropertyValue::Counters(list) = v {
                     let list = (!list.is_empty()).then(|| list.clone());
@@ -1633,6 +1694,8 @@ impl Style {
             PropertyId::CounterReset => copy!(box_, [counter_reset]),
             PropertyId::CounterIncrement => copy!(box_, [counter_increment]),
             PropertyId::CounterSet => copy!(box_, [counter_set]),
+            PropertyId::Clip => copy!(box_, [clip]),
+            PropertyId::ClipPath => copy!(box_, [clip_inset]),
             PropertyId::Transform => copy!(box_, [transform]),
             PropertyId::BoxShadow => copy!(box_, [box_shadow]),
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),

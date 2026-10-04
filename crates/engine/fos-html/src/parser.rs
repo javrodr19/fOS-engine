@@ -72,14 +72,11 @@ fn whitespace_is_insignificant(tree: &DomTree, id: NodeId) -> bool {
         Some("pre" | "textarea" | "listing" | "plaintext" | "xmp" | "script" | "style") => return false,
         _ => {}
     }
-    let blockish = |sibling: NodeId| -> bool {
-        if !sibling.is_valid() {
-            return true;
-        }
-        match tree.get(sibling).map(|n| &n.data) {
+    let block_tag = |id: NodeId| -> bool {
+        match tree.get(id).map(|n| &n.data) {
             Some(NodeData::Comment(_)) => true,
             Some(NodeData::Element(_)) => matches!(
-                tag_of(tree, sibling).unwrap_or(""),
+                tag_of(tree, id).unwrap_or(""),
                 "address" | "article" | "aside" | "blockquote" | "body" | "center" | "details" | "dialog" | "dd" | "div" | "dl" | "dt"
                     | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head"
                     | "header" | "hgroup" | "hr" | "li" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "section" | "summary"
@@ -90,6 +87,10 @@ fn whitespace_is_insignificant(tree: &DomTree, id: NodeId) -> bool {
             _ => false,
         }
     };
+    // The edges of an inline element are not block boundaries: its only
+    // space (`<span> </span>`) separates the words around it
+    let parent_is_block = node.parent == tree.root() || block_tag(node.parent) || tag_of(tree, node.parent).is_some_and(|t| matches!(t, "html" | "td" | "th"));
+    let blockish = |sibling: NodeId| if sibling.is_valid() { block_tag(sibling) } else { parent_is_block };
     blockish(node.prev_sibling) && blockish(node.next_sibling)
 }
 
@@ -488,6 +489,10 @@ mod tests {
             parse_outline("<div>\n<p><a>x</a> <span>y</span></p>\n</div>"),
             "<html><head></><body><div><p><a>'x'</>' '<span>'y'</></></></></>"
         );
+        // An inline element's only whitespace is a word space (Pygments'
+        // <span class="w"> </span>), but a block's is not
+        assert_eq!(parse_outline("<p>x<span> </span>y</p>"), "<html><head></><body><p>'x'<span>' '</>'y'</></></>");
+        assert_eq!(parse_outline("<div><div> </div></div>"), "<html><head></><body><div><div></></></></>");
         // Template contents are not part of the document tree
         assert_eq!(
             parse_outline("<template><p>inert</p></template><p>live</p>"),

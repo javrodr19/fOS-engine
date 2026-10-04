@@ -739,7 +739,17 @@ impl layout_engine::Styler for BrowserStyler<'_> {
 
     fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {
         let c = style.color();
-        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], self.svgs)?;
+        // CSS fill and stroke beat presentation attributes: they go into
+        // the elements' style attributes
+        let mut paint = std::collections::HashMap::new();
+        if let Some(d) = svg_paint_decl(style) {
+            paint.insert(node, d);
+        }
+        if self.stylesheet.is_some() {
+            let mut budget = 2000;
+            self.svg_paint(tree, node, style, &mut paint, &mut budget);
+        }
+        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], &paint, self.svgs)?;
         Some((img.natural, layout_engine::ImageHandle(img)))
     }
 
@@ -759,6 +769,41 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         if self.stylesheet.is_some() {
             self.ancestors.pop();
         }
+    }
+}
+
+/// A style's declared SVG `fill`/`stroke`, as CSS text
+fn svg_paint_decl(style: &Style) -> Option<String> {
+    let b = &style.box_;
+    let mut out = String::new();
+    if let Some(f) = &b.svg_fill {
+        out.push_str(&format!("fill:{f};"));
+    }
+    if let Some(s) = &b.svg_stroke {
+        out.push_str(&format!("stroke:{s};"));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+impl BrowserStyler<'_> {
+    /// Styles of the elements of an inline SVG: those with fill or stroke
+    /// declared (at most `budget` elements are styled)
+    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut std::collections::HashMap<NodeId, String>, budget: &mut u32) {
+        use layout_engine::Styler;
+        self.enter(tree, node);
+        let kids: Vec<NodeId> = tree.children(node).filter(|(_, n)| n.is_element()).map(|(id, _)| id).collect();
+        for child in kids {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let cs = self.style(tree, child, style);
+            if let Some(d) = svg_paint_decl(&cs) {
+                out.insert(child, d);
+            }
+            self.svg_paint(tree, child, &cs, out, budget);
+        }
+        self.leave();
     }
 }
 
@@ -1063,6 +1108,24 @@ mod tests {
             assert!(red(x0 + 20, 30), "shape {i} center");
             assert!(!red(x0 + 2, 2) && !red(x0 + 37, 2), "shape {i} corners");
         }
+    }
+
+    #[test]
+    fn test_css_fill_on_inline_svg() {
+        // fill="none" on the root, CSS fill from a class (Tailwind's
+        // fill-[#..]); a child's own fill attribute still wins over the
+        // inherited value, and a CSS rule on a child beats its attribute
+        let html = r##"<html><head><style>.logo { fill: #f00 } .logo .b { fill: #0f0 }</style></head><body style="margin: 0">
+            <svg class="logo" width="30" height="10" viewBox="0 0 30 10" fill="none" style="display: block">
+            <rect x="0" width="10" height="10"/><rect x="10" width="10" height="10" fill="#00f"/><rect class="b" x="20" width="10" height="10" fill="#00f"/></svg>
+            </body></html>"##;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 20);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 40 + x];
+        assert_eq!(at(5, 5), 0xffff0000);
+        assert_eq!(at(15, 5), 0xff0000ff);
+        assert_eq!(at(25, 5), 0xff00ff00);
     }
 
     #[test]

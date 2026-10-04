@@ -707,6 +707,10 @@ pub struct BoxStyle {
     /// `opacity`
     pub filter_blur: f32,
     pub filter_brightness: f32,
+    /// `fill` and `stroke` declared for this (SVG) element, as text
+    /// (inheritance is left to the SVG renderer)
+    pub svg_fill: Option<Arc<str>>,
+    pub svg_stroke: Option<Arc<str>>,
     /// The individual `translate`, `rotate` (radians) and `scale`
     pub translate: Option<(Lp, Lp)>,
     pub rotate: Option<f32>,
@@ -769,6 +773,8 @@ impl Default for BoxStyle {
             aspect_ratio: None,
             filter_blur: 0.0,
             filter_brightness: 1.0,
+            svg_fill: None,
+            svg_stroke: None,
             translate: None,
             rotate: None,
             scale: None,
@@ -1474,6 +1480,14 @@ impl Style {
                     set!(box_, [opacity], o);
                 }
             }
+            PropertyId::Fill | PropertyId::Stroke => {
+                let PropertyValue::Transform(text) = v else { return };
+                if id == PropertyId::Fill {
+                    set!(box_, [svg_fill], Some(text.clone()));
+                } else {
+                    set!(box_, [svg_stroke], Some(text.clone()));
+                }
+            }
             PropertyId::AspectRatio => match v {
                 PropertyValue::Number(r) => set!(box_, [aspect_ratio], (*r > 0.0).then_some(*r)),
                 PropertyValue::Keyword(Keyword::Auto) => set!(box_, [aspect_ratio], None),
@@ -1859,6 +1873,8 @@ impl Style {
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),
             PropertyId::ObjectPosition => copy!(box_, [object_position]),
             PropertyId::AspectRatio => copy!(box_, [aspect_ratio]),
+            PropertyId::Fill => copy!(box_, [svg_fill]),
+            PropertyId::Stroke => copy!(box_, [svg_stroke]),
             PropertyId::Filter => {
                 copy!(box_, [filter_blur]);
                 copy!(box_, [filter_brightness]);

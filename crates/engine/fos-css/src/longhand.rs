@@ -239,6 +239,8 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "object-position" => ObjectPosition,
         "aspect-ratio" => AspectRatio,
         "filter" | "-webkit-filter" => Filter,
+        "fill" => Fill,
+        "stroke" => Stroke,
         "clip-path" | "-webkit-clip-path" => ClipPath,
         "transform" | "-webkit-transform" | "-ms-transform" => Transform,
         "transform-origin" | "-webkit-transform-origin" => TransformOrigin,
@@ -535,6 +537,11 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         // Kept as text and resolved per element (lengths need its font)
         P::Clip | P::ClipPath | P::ObjectPosition | P::Filter => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        // Kept as text for the SVG renderer: none, a color, currentColor
+        P::Fill | P::Stroke => {
+            let t = raw.trim();
+            (t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("currentcolor") || parse_color(t).is_some()).then(|| PropertyValue::Transform(Arc::from(t)))
+        }
         // `auto`, a ratio (`16 / 9`, `1.8`) or both: width over height
         P::AspectRatio => {
             let ratio = v.replace("auto", " ");

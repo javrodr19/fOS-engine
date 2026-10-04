@@ -180,9 +180,9 @@ const MAX_CACHED_SVG_BYTES: usize = 16 << 20;
 
 /// An inline `<svg>` element drawn as an image: its subtree serialized
 /// as SVG markup, `currentColor` being `color` (CSS rgba)
-pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
+pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &HashMap<NodeId, String>, cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
     let mut markup = String::new();
-    serialize_svg(tree, node, true, color, &mut markup);
+    serialize_svg(tree, node, true, color, paint, &mut markup);
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -215,7 +215,9 @@ fn escape_xml(s: &str, out: &mut String) {
     }
 }
 
-fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], out: &mut String) {
+/// `paint`: CSS declarations (fill, stroke) for elements, put before
+/// their own style attribute's
+fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint: &HashMap<NodeId, String>, out: &mut String) {
     let Some(n) = tree.get(node) else { return };
     if let Some(text) = n.as_text() {
         escape_xml(text, out);
@@ -236,7 +238,17 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], out: 
         }
         out.push_str(local);
         out.push_str("=\"");
+        if local == "style" {
+            if let Some(p) = paint.get(&node) {
+                escape_xml(p, out);
+            }
+        }
         escape_xml(&a.value, out);
+        out.push('"');
+    }
+    if let Some(p) = paint.get(&node).filter(|_| !e.attrs.iter().any(|a| tree.resolve(a.name.local) == "style")) {
+        out.push_str(" style=\"");
+        escape_xml(p, out);
         out.push('"');
     }
     if root {
@@ -245,7 +257,7 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], out: 
     }
     out.push('>');
     for (child, _) in tree.children(node) {
-        serialize_svg(tree, child, false, color, out);
+        serialize_svg(tree, child, false, color, paint, out);
     }
     out.push_str("</");
     out.push_str(name);

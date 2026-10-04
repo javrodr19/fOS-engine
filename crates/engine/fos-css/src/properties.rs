@@ -156,6 +156,9 @@ pub enum PropertyId {
     ObjectPosition,
     AspectRatio,
     Filter,
+    /// SVG paint: `fill` and `stroke` (inline SVG)
+    Fill,
+    Stroke,
     GridAutoColumns,
     GridAutoRows,
     GridAutoFlow,

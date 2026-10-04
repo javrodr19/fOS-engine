@@ -1134,6 +1134,14 @@ fn set_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<V
     Ok(Value::UNDEFINED)
 }
 
+/// `__fosDefineElement(name)`: a custom element name is now defined
+/// (for `:defined`)
+fn define_element(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let name = arg_string(vm, args, 0)?;
+    with_tree(vm, |t| t.define_custom_element(&name));
+    Ok(Value::UNDEFINED)
+}
+
 /// `__fosTemplateContent(template)`: the template's contents fragment
 fn template_content(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
@@ -1757,6 +1765,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosResolveURL", 2, resolve_url),
         ("__fosCookie", 0, get_cookie),
         ("__fosSetURL", 1, set_url),
+        ("__fosDefineElement", 1, define_element),
         ("__fosRandomBytes", 1, random_bytes),
         ("__fosTemplateContent", 1, template_content),
         ("__fosSetElementPrototype", 2, set_element_prototype),

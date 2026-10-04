@@ -1598,6 +1598,7 @@
       const def = { name, ctor, extends: ext, callbacks, observed, stack: [] };
       ceDefs.set(name, def);
       ceByCtor.set(ctor, def);
+      __fosDefineElement(name);
       const selector = ext ? `${ext}[is="${name}"]` : CSS.escape(name);
       for (const el of document.querySelectorAll(selector)) ceUpgrade(el);
       const waiting = ceWaiting.get(name);

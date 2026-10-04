@@ -146,6 +146,8 @@ enum Pseudo {
     Disabled,
     Enabled,
     Link,
+    /// Standard elements, and custom elements once defined
+    Defined,
     Never,
     /// Marks a compound selecting a pseudo-element: never an element
     PseudoElement,
@@ -523,6 +525,10 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo) -> bo
             let tag = tree.resolve(e.name.local);
             (tag.eq_ignore_ascii_case("a") || tag.eq_ignore_ascii_case("area")) && attr(tree, e, "href").is_some()
         }
+        Pseudo::Defined => {
+            let tag = tree.resolve(e.name.local);
+            !tag.contains('-') || tree.is_custom_element_defined(tag)
+        }
         Pseudo::Never | Pseudo::PseudoElement => false,
     }
 }
@@ -794,6 +800,7 @@ impl Parser<'_> {
             "disabled" => Pseudo::Disabled,
             "enabled" => Pseudo::Enabled,
             "link" | "any-link" => Pseudo::Link,
+            "defined" => Pseudo::Defined,
             // Legacy single-colon pseudo-elements, user action and state
             _ => Pseudo::Never,
         })
@@ -855,6 +862,21 @@ mod tests {
 
     fn all(t: &DomTree, sel: &str) -> Vec<NodeId> {
         SelectorList::parse(sel).unwrap_or_else(|| panic!("parse {sel}")).query_all(t, t.root())
+    }
+
+    #[test]
+    fn defined_pseudo_class() {
+        let mut t = DomTree::new();
+        let div = t.create_element("div");
+        let el = t.create_element("my-el");
+        let root = t.root();
+        t.append_child(root, div);
+        t.append_child(div, el);
+        assert_eq!(all(&t, ":defined"), vec![div]);
+        assert_eq!(all(&t, ":not(:defined)"), vec![el]);
+        t.define_custom_element("my-el");
+        assert_eq!(all(&t, ":defined"), vec![div, el]);
+        assert_eq!(all(&t, ":not(:defined)"), Vec::<NodeId>::new());
     }
 
     #[test]

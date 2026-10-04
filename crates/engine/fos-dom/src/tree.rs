@@ -35,6 +35,8 @@ pub struct DomTree {
     id: u64,
     /// Mutations made through the tree's API
     mutations: u64,
+    /// Custom element names defined by scripts (`customElements.define`)
+    custom_defined: std::collections::HashSet<Box<str>>,
 }
 
 impl DomTree {
@@ -45,6 +47,7 @@ impl DomTree {
             interner: StringInterner::new(),
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
+            custom_defined: Default::default(),
         };
         
         // Create document root at index 0
@@ -60,6 +63,7 @@ impl DomTree {
             interner: StringInterner::new(),
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
+            custom_defined: Default::default(),
         };
         tree.nodes.push(Node::document());
         tree
@@ -75,6 +79,19 @@ impl DomTree {
     #[inline]
     pub fn mark_mutated(&mut self) {
         self.mutations += 1;
+    }
+
+    /// Record that a custom element name has been defined (it then
+    /// matches `:defined`)
+    pub fn define_custom_element(&mut self, name: &str) {
+        if self.custom_defined.insert(name.into()) {
+            self.mark_mutated();
+        }
+    }
+
+    /// Whether custom element `name` has been defined
+    pub fn is_custom_element_defined(&self, name: &str) -> bool {
+        self.custom_defined.contains(name)
     }
 
     /// Get the document root

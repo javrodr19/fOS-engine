@@ -430,6 +430,18 @@
     set(v) { this.className = v; },
     configurable: true,
   });
+  // `part`, on every element
+  const otherTokenLists = new WeakMap(); // element -> { attr: list }
+  const tokenListProp = (proto, prop, attr) => Object.defineProperty(proto, prop, {
+    get() {
+      let lists = otherTokenLists.get(this);
+      if (!lists) otherTokenLists.set(this, lists = {});
+      return lists[attr] || (lists[attr] = new DOMTokenList(this, attr));
+    },
+    set(v) { this.setAttribute(attr, String(v)); },
+    configurable: true,
+  });
+  for (const proto of new Set([Element.prototype, E])) tokenListProp(proto, 'part', 'part');
 
   // style: a CSSStyleDeclaration over the `style` attribute
   const camelToKebab = s => s.startsWith('--') ? s : s.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, '-$1-');

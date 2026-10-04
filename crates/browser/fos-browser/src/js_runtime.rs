@@ -955,13 +955,15 @@ mod tests {
               sheet.replaceSync(':host { color: red }');
               root.adoptedStyleSheets = [sheet];
               log.push('adopted:' + root.adoptedStyleSheets.length + ':' + document.adoptedStyleSheets.length);
+              base.part.add('base', 'x');
+              log.push('part:' + base.getAttribute('part') + ':' + base.part.contains('x') + ':' + base.hasAttributes() + ':' + document.createElement('p').hasAttributes());
             </script></body></html>"#,
         );
         rt.execute_scripts(&mut |_: &str| None).unwrap();
         assert_eq!(
             rt.eval("log.join(' | ')").unwrap(),
             "inner connected:true | template:0:1:<p>1</p> | true,true,11,true,open,true | true,true,true,,false,true | B;#text;true | \
-             base sees base | host sees x-host at phase 2 | slot sees b | base sees  | host sees b at phase 3 | closed:null | NotSupportedError | adopted:1:0"
+             base sees base | host sees x-host at phase 2 | slot sees b | base sees  | host sees b at phase 3 | closed:null | NotSupportedError | adopted:1:0 | part:base x:true:true:false"
         );
     }
 

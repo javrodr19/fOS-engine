@@ -370,24 +370,93 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
         i = block_end;
 
         let prelude = strip_comments(prelude);
-        let selectors: Vec<Selector> = split_top(&prelude, b',')
-            .into_iter()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|text| {
-                let parsed = fos_dom::SelectorList::parse(text)?;
-                let (a, b, c) = *parsed.specificities().first()?;
-                Some(Selector { text: text.to_string(), specificity: Specificity(a, b, c), parts: Vec::new(), parsed: Some(parsed) })
-            })
-            .collect();
-        // Rules are kept even when none of their declarations is modeled
-        // (the stylesheet mirrors the source); matching skips them
-        if !selectors.is_empty() {
-            let mut declarations = parse_declarations(block);
-            declarations.shrink_to_fit();
-            let mut selectors = selectors;
-            selectors.shrink_to_fit();
-            out.push(Rule { selectors, declarations });
+        let texts: Vec<String> = split_top(&prelude, b',').into_iter().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+        style_rule(&texts, block, media, out, 0);
+    }
+}
+
+/// A style rule's selectors (texts) and block: its declarations become a
+/// rule, and rules nested in it (CSS nesting) follow as rules of their
+/// own, with `&` standing for each parent selector (or the parent as an
+/// ancestor when there is none); nested `@media`/`@supports` blocks apply
+/// to the parent's selectors
+fn style_rule(texts: &[String], block: &str, media: &MediaContext, out: &mut Vec<Rule>, depth: u32) {
+    let selectors: Vec<Selector> = texts
+        .iter()
+        .filter_map(|text| {
+            let parsed = fos_dom::SelectorList::parse(text)?;
+            let (a, b, c) = *parsed.specificities().first()?;
+            Some(Selector { text: text.clone(), specificity: Specificity(a, b, c), parts: Vec::new(), parsed: Some(parsed) })
+        })
+        .collect();
+    if selectors.is_empty() {
+        return;
+    }
+    // Split the block: declarations, nested rules, nested at-rules
+    let b = block.as_bytes();
+    let mut decls = String::new();
+    let mut nested: Vec<(&str, &str)> = Vec::new();
+    let mut nested_at: Vec<(String, &str, &str)> = Vec::new();
+    let mut i = 0;
+    if block.contains('{') {
+        while i < b.len() {
+            i = skip_ws_and_comments(b, i);
+            if i >= b.len() {
+                break;
+            }
+            let end = find_top(b, i, b";{}");
+            if end < b.len() && b[end] == b'{' {
+                let block_end = skip_token(b, end);
+                let inner = &block[end + 1..block_end.saturating_sub(1).max(end + 1)];
+                let prelude = block[i..end].trim();
+                if let Some(at) = prelude.strip_prefix('@') {
+                    let name_end = at.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).unwrap_or(at.len());
+                    nested_at.push((at[..name_end].to_ascii_lowercase(), &at[name_end..], inner));
+                } else {
+                    nested.push((prelude, inner));
+                }
+                i = block_end;
+            } else {
+                decls.push_str(&block[i..end.min(b.len())]);
+                decls.push(';');
+                i = end + 1;
+            }
+        }
+    }
+    // Rules are kept even when none of their declarations is modeled
+    // (the stylesheet mirrors the source); matching skips them
+    let mut declarations = if block.contains('{') { parse_declarations(&decls) } else { parse_declarations(block) };
+    declarations.shrink_to_fit();
+    let mut selectors = selectors;
+    selectors.shrink_to_fit();
+    if !declarations.is_empty() || (nested.is_empty() && nested_at.is_empty()) {
+        out.push(Rule { selectors, declarations });
+    }
+    if depth > 16 {
+        return;
+    }
+    for (prelude, inner) in nested {
+        let mut combined = Vec::new();
+        for n in split_top(&strip_comments(prelude), b',').into_iter().map(str::trim).filter(|s| !s.is_empty()) {
+            for parent in texts {
+                combined.push(if n.contains('&') {
+                    n.replace('&', parent)
+                } else {
+                    format!("{parent} {n}")
+                });
+            }
+        }
+        style_rule(&combined, inner, media, out, depth + 1);
+    }
+    for (name, prelude, inner) in nested_at {
+        let applies = match name.as_str() {
+            "media" => media_matches(prelude, media),
+            "supports" => supports(prelude),
+            "layer" | "container" | "scope" | "starting-style" => true,
+            _ => false,
+        };
+        if applies {
+            style_rule(texts, inner, media, out, depth + 1);
         }
     }
 }
@@ -1121,6 +1190,27 @@ mod tests {
         near("oklch(100% 0 0)", (255, 255, 255, 255));
         // MDN's translucent overlay
         near("oklch(0% 0 0deg/6%)", (0, 0, 0, 15));
+    }
+
+    #[test]
+    fn nested_rules() {
+        let css = "#nav { color: red; #logo { float: left; & a { display: block } } & ul, ol { margin: 0 } &:hover { color: blue } @media (min-width: 10px) { width: 5px } padding: 1px; } a, b { & > i { top: 0 } }";
+        let ss = parse(css);
+        let rules: Vec<(String, usize)> = ss.rules.iter().map(|r| (r.selectors.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(", "), r.declarations.len())).collect();
+        assert_eq!(
+            rules,
+            vec![
+                // The parent keeps declarations after nested rules too
+                // (color, and padding's four longhands)
+                ("#nav".to_string(), 5),
+                ("#nav #logo".to_string(), 1),
+                ("#nav #logo a".to_string(), 1),
+                ("#nav ul, #nav ol".to_string(), 4),
+                ("#nav:hover".to_string(), 1),
+                ("#nav".to_string(), 1),
+                ("a > i, b > i".to_string(), 1),
+            ]
+        );
     }
 
     #[test]

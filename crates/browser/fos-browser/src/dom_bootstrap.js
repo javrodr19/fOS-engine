@@ -30,6 +30,8 @@
   // Shadow roots: host -> root, and root -> { host, mode, ... }
   const shadowOf = new WeakMap();
   const shadowInfo = new WeakMap();
+  // Set up once MutationObserver exists: fires slotchange for `root`'s slots
+  let watchSlots = () => {};
   // `el`'s shadow root, whatever its mode. Roots the parser made
   // (declarative, from <template shadowrootmode>) are taken in when first
   // seen.
@@ -40,6 +42,7 @@
       if (root) {
         shadowInfo.set(root, { host: el, mode: __fosShadowClosed(root) ? 'closed' : 'open', delegatesFocus: false, slotAssignment: 'named', clonable: false, declarative: true });
         shadowOf.set(el, root);
+        watchSlots(root, el);
       }
     }
     return root || null;
@@ -404,6 +407,7 @@
       const root = __fosAttachShadow(this);
       shadowInfo.set(root, { host: this, mode, delegatesFocus: !!(init && init.delegatesFocus), slotAssignment: (init && init.slotAssignment) || 'named', clonable: !!(init && init.clonable) });
       shadowOf.set(this, root);
+      watchSlots(root, this);
       return root;
     },
     get shadowRoot() {
@@ -5222,6 +5226,48 @@
       }
       if (entries.length) { try { this._callback.call(this, entries, this); } catch (e) { reportError(e); } }
     }
+  }
+  // slotchange: an internal observer watches each shadow tree and its
+  // host's children; after changes, slots whose assigned nodes differ
+  // from what they had get the event
+  {
+    const assignedBefore = new WeakMap(); // slot -> nodes
+    const dirtyHosts = new Set();
+    const checkSlots = () => {
+      const hosts = Array.from(dirtyHosts);
+      dirtyHosts.clear();
+      for (const host of hosts) {
+        const root = shadowRootOf(host);
+        if (!root) continue;
+        for (const slot of root.querySelectorAll('slot')) {
+          const now = __fosAssignedNodes(slot);
+          const before = assignedBefore.get(slot) || [];
+          if (now.length === before.length && now.every((n, i) => n === before[i])) continue;
+          assignedBefore.set(slot, now);
+          slot.dispatchEvent(new Event('slotchange', { bubbles: true }));
+        }
+      }
+    };
+    const slotObserver = new MutationObserver((records) => {
+      for (const r of records) {
+        const t = r.target;
+        if (shadowInfo.has(t)) dirtyHosts.add(shadowInfo.get(t).host);
+        else if (shadowRootOf(t)) dirtyHosts.add(t);
+        else if (r.type === 'attributes' && r.attributeName === 'slot' && t.parentNode && shadowRootOf(t.parentNode)) dirtyHosts.add(t.parentNode);
+        else {
+          const info = shadowInfoOf(t.getRootNode());
+          if (info) dirtyHosts.add(info.host);
+        }
+      }
+      checkSlots();
+    });
+    watchSlots = (root, host) => {
+      slotObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['name'] });
+      slotObserver.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['slot'] });
+      // Slots of a tree filled before (declarative roots) report once
+      dirtyHosts.add(host);
+      queueMicrotask(checkSlots);
+    };
   }
   Object.assign(global, { MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
   // dataset belongs to both HTML and SVG elements (HTMLOrSVGElement)

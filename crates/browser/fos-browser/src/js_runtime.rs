@@ -970,6 +970,8 @@ mod tests {
               customElements.define('x-inner', XInner);
               const h = document.getElementById('h');
               const root = h.attachShadow({ mode: 'open' });
+              window.changes = [];
+              root.addEventListener('slotchange', e => changes.push(e.target.name || 'default'));
               root.innerHTML = '<div class="base"><slot name="title"></slot><slot></slot><x-inner></x-inner></div>';
               const tpl = document.createElement('template');
               tpl.innerHTML = '<p>1</p>';
@@ -1006,6 +1008,13 @@ mod tests {
             </script></body></html>"#,
         );
         rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // slotchange: both slots got nodes; then only the title slot changes
+        assert_eq!(rt.eval("changes.sort().join()").unwrap(), "default,title");
+        assert_eq!(
+            rt.eval("changes.length = 0; const b2 = document.createElement('b'); b2.slot = 'title'; document.getElementById('h').append(b2); 'ok'").unwrap(),
+            "ok"
+        );
+        assert_eq!(rt.eval("changes.join()").unwrap(), "title");
         assert_eq!(
             rt.eval("log.join(' | ')").unwrap(),
             "inner connected:true | template:0:1:<p>1</p> | true,true,11,true,open,true | true,true,true,,false,true | B;#text;true | \

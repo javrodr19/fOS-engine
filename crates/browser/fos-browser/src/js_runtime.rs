@@ -919,6 +919,53 @@ mod tests {
     }
 
     #[test]
+    fn shadow_dom() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><x-host id="h"><b slot="title">T</b>light</x-host>
+            <script>
+              window.log = [];
+              class XInner extends HTMLElement { connectedCallback() { log.push('inner connected:' + this.isConnected); } }
+              customElements.define('x-inner', XInner);
+              const h = document.getElementById('h');
+              const root = h.attachShadow({ mode: 'open' });
+              root.innerHTML = '<div class="base"><slot name="title"></slot><slot></slot><x-inner></x-inner></div>';
+              const tpl = document.createElement('template');
+              tpl.innerHTML = '<p>1</p>';
+              log.push('template:' + tpl.childNodes.length + ':' + tpl.content.childNodes.length + ':' + tpl.innerHTML);
+              log.push([root instanceof ShadowRoot, root instanceof DocumentFragment, root.nodeType, root.host === h, root.mode, h.shadowRoot === root].join());
+              const base = root.querySelector('.base');
+              log.push([base.isConnected, base.getRootNode() === root, base.getRootNode({ composed: true }) === document,
+                document.querySelector('.base'), h.contains(base), root.innerHTML.startsWith('<div class="base">')].join());
+              const [titleSlot, defaultSlot] = root.querySelectorAll('slot');
+              log.push(titleSlot.assignedNodes().map(n => n.nodeName).join('+') + ';' + defaultSlot.assignedNodes().map(n => n.nodeName).join('+')
+                + ';' + (h.querySelector('b').assignedSlot === titleSlot));
+              // Events: retargeted to the host outside, composed or not
+              h.addEventListener('click', e => log.push('host sees ' + e.target.localName + ' at phase ' + e.eventPhase));
+              base.addEventListener('click', e => log.push('base sees ' + e.target.className));
+              document.body.addEventListener('ping', () => log.push('ping escaped'));
+              base.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+              base.dispatchEvent(new Event('ping', { bubbles: true }));
+              // Slotted light content: the path goes through its slot
+              titleSlot.addEventListener('click', e => log.push('slot sees ' + e.target.localName));
+              h.querySelector('b').click();
+              const closed = document.createElement('div').attachShadow({ mode: 'closed' });
+              log.push('closed:' + closed.host.shadowRoot);
+              try { h.attachShadow({ mode: 'open' }); } catch (e) { log.push(e.name); }
+              const sheet = new CSSStyleSheet();
+              sheet.replaceSync(':host { color: red }');
+              root.adoptedStyleSheets = [sheet];
+              log.push('adopted:' + root.adoptedStyleSheets.length + ':' + document.adoptedStyleSheets.length);
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(
+            rt.eval("log.join(' | ')").unwrap(),
+            "inner connected:true | template:0:1:<p>1</p> | true,true,11,true,open,true | true,true,true,,false,true | B;#text;true | \
+             base sees base | host sees x-host at phase 2 | slot sees b | base sees  | host sees b at phase 3 | closed:null | NotSupportedError | adopted:1:0"
+        );
+    }
+
+    #[test]
     fn template_content_and_crypto() {
         let (mut rt, _doc) = page(r#"<html><body><template id="t"><li>row</li></template><ul id="list"></ul></body></html>"#);
         rt.execute_scripts(&mut |_: &str| None).unwrap();

@@ -27,6 +27,10 @@
 
   // ---- events ----
 
+  // Shadow roots: host -> root, and root -> { host, mode, ... }
+  const shadowOf = new WeakMap();
+  const shadowInfo = new WeakMap();
+
   class Event {
     constructor(type, init = {}) {
       this.type = String(type);
@@ -117,16 +121,37 @@
       event.target = this;
       event.isTrusted = !!event.isTrusted;
       const path = [];
+      // What `target` reads as at each step: leaving a shadow tree, the
+      // target becomes its host (retargeting)
+      const targets = [];
+      const composed = event.composed || event.isTrusted;
       // A document's parent is the window, except for load events (an
-      // image's or script's load never reaches window listeners)
-      for (let n = this; n; n = n === document ? (event.type === 'load' ? null : global) : n.parentNode) {
+      // image's or script's load never reaches window listeners). A
+      // slotted node's parent is its slot; a shadow root's is its host,
+      // for composed events.
+      let t = this;
+      for (let n = this; n;) {
         path.push(n);
+        targets.push(t);
         if (n === global) break;
+        let next;
+        if (n === document) next = event.type === 'load' ? null : global;
+        else {
+          next = n.parentNode;
+          if (next && shadowOf.has(next)) next = __fosAssignedSlot(n) || next;
+          else if (!next && shadowInfo.has(n)) {
+            if (!composed) break;
+            next = shadowInfo.get(n).host;
+            if (t.getRootNode() === n) t = next;
+          }
+        }
+        n = next;
       }
       event._path = path;
-      const invoke = (target, phase) => {
+      // `phase` filters listeners: 1 capturing, 3 bubbling, 2 both
+      const invoke = (target, phase, shown = phase) => {
         event.currentTarget = target;
-        event.eventPhase = phase;
+        event.eventPhase = shown;
         let list = listeners.get(target)?.get(event.type);
         if (list) {
           for (const l of list.slice()) {
@@ -149,9 +174,19 @@
           }
         }
       };
-      for (let i = path.length - 1; i > 0 && !event._stop; i--) invoke(path[i], 1);
+      for (let i = path.length - 1; i > 0 && !event._stop; i--) {
+        event.target = targets[i];
+        invoke(path[i], 1, targets[i] === path[i] ? 2 : 1);
+      }
+      event.target = this;
       if (!event._stop) invoke(this, 2);
-      if (event.bubbles) for (let i = 1; i < path.length && !event._stop; i++) invoke(path[i], 3);
+      // Hosts the event was retargeted to see it at target, bubbling or not
+      for (let i = 1; i < path.length && !event._stop; i++) {
+        event.target = targets[i];
+        if (targets[i] === path[i]) invoke(path[i], 3, 2);
+        else if (event.bubbles) invoke(path[i], 3);
+      }
+      event.target = this;
       event.currentTarget = null;
       event.eventPhase = 0;
       return !event.defaultPrevented;
@@ -329,10 +364,21 @@
       const o = typeof a === 'object' && a ? a : { left: a, top: b };
       this.scrollTo({ left: this.scrollLeft + (+o.left || 0), top: this.scrollTop + (+o.top || 0) });
     },
-    focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus')); },
-    blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur')); },
-    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); },
-    attachShadow() { return this; },
+    focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus', { composed: true })); },
+    blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur', { composed: true })); },
+    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })); },
+    attachShadow(init) {
+      if (shadowOf.has(this)) throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+      const mode = init && init.mode === 'closed' ? 'closed' : 'open';
+      const root = __fosAttachShadow(this);
+      shadowInfo.set(root, { host: this, mode, delegatesFocus: !!(init && init.delegatesFocus), slotAssignment: (init && init.slotAssignment) || 'named', clonable: !!(init && init.clonable) });
+      shadowOf.set(this, root);
+      return root;
+    },
+    get shadowRoot() {
+      const root = shadowOf.get(this);
+      return root && shadowInfo.get(root).mode === 'open' ? root : null;
+    },
     animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; },
   });
   let activeElement = null;
@@ -863,14 +909,90 @@
     set text(v) { this.textContent = v; },
   });
   // Interfaces scripts test for or patch (polyfills walk them), and
-  // character data the page parser does not produce. Shadow roots are
-  // still a stand-in (attachShadow returns the host), so none is made.
+  // character data the page parser does not produce
   for (const [name, parent] of [['CDATASection', Text], ['ProcessingInstruction', CharacterData], ['ShadowRoot', DocumentFragment],
     ['Attr', Node], ['DocumentType', Node]]) {
     const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
     ctor.prototype = Object.create(parent.prototype, { constructor: { value: ctor, writable: true, configurable: true } });
     Object.setPrototypeOf(ctor, parent);
     global[name] = ctor;
+  }
+  // ParentNode.replaceChildren, through removeChild and append (so
+  // observers and custom element reactions see it)
+  for (const proto of [Element.prototype, Document.prototype, DocumentFragment.prototype]) {
+    Object.defineProperty(proto, 'replaceChildren', {
+      value: function replaceChildren(...nodes) {
+        while (this.lastChild) this.removeChild(this.lastChild);
+        this.append(...nodes);
+      },
+      writable: true, configurable: true,
+    });
+  }
+  const shadowState = (root) => {
+    const s = shadowInfo.get(root);
+    if (!s) throw new TypeError('Illegal invocation');
+    return s;
+  };
+  const escapeShadowText = (t) => t.replace(/&/g, '&amp;').replace(/\u00a0/g, '&nbsp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  Object.defineProperties(ShadowRoot.prototype, {
+    host: { get() { return shadowState(this).host; }, configurable: true },
+    mode: { get() { return shadowState(this).mode; }, configurable: true },
+    delegatesFocus: { get() { return shadowState(this).delegatesFocus; }, configurable: true },
+    slotAssignment: { get() { return shadowState(this).slotAssignment; }, configurable: true },
+    clonable: { get() { return shadowState(this).clonable; }, configurable: true },
+    serializable: { get() { return false; }, configurable: true },
+    activeElement: {
+      // The focused element, or the host in this tree it is under
+      get() {
+        for (let n = document.activeElement; n;) {
+          const root = n.getRootNode();
+          if (root === this) return n;
+          n = shadowInfo.get(root)?.host;
+        }
+        return null;
+      },
+      configurable: true,
+    },
+    innerHTML: {
+      get() {
+        return Array.from(this.childNodes, (n) => n.nodeType === 1 ? n.outerHTML : n.nodeType === 3 ? escapeShadowText(n.data) : n.nodeType === 8 ? `<!--${n.data}-->` : '').join('');
+      },
+      set(v) {
+        const t = document.createElement('template');
+        t.innerHTML = v;
+        this.replaceChildren(t.content);
+      },
+      configurable: true,
+    },
+    styleSheets: { get() { return Array.from(this.querySelectorAll('style, link'), (el) => el.sheet).filter(Boolean); }, configurable: true },
+  });
+  Object.defineProperty(ShadowRoot.prototype, Symbol.toStringTag, { value: 'ShadowRoot', configurable: true });
+  __fosSetElementPrototype('#shadow-root', ShadowRoot.prototype);
+  {
+    const getRootNode = Node.prototype.getRootNode;
+    Object.defineProperty(Node.prototype, 'getRootNode', {
+      value: function getRootNode_(options) { return getRootNode.call(this, !!(options && options.composed)); },
+      writable: true, configurable: true,
+    });
+  }
+  // Slots and what is assigned to them
+  const flatAssigned = (slot, flatten) => {
+    const nodes = __fosAssignedNodes(slot);
+    if (!flatten) return nodes;
+    const out = [];
+    for (const n of (nodes.length ? nodes : Array.from(slot.childNodes))) {
+      if (n.localName === 'slot' && n.getRootNode() instanceof ShadowRoot) out.push(...flatAssigned(n, true));
+      else out.push(n);
+    }
+    return out;
+  };
+  Object.defineProperties(HTMLSlotElement.prototype, {
+    assignedNodes: { value(options) { return flatAssigned(this, !!(options && options.flatten)); }, writable: true, configurable: true },
+    assignedElements: { value(options) { return flatAssigned(this, !!(options && options.flatten)).filter((n) => n.nodeType === 1); }, writable: true, configurable: true },
+    assign: { value() {}, writable: true, configurable: true },
+  });
+  for (const proto of [Element.prototype, Text.prototype]) {
+    Object.defineProperty(proto, 'assignedSlot', { get() { return __fosAssignedSlot(this); }, configurable: true });
   }
   Object.defineProperties(DocumentType.prototype, {
     name: { get() { return this.nodeName; }, enumerable: true, configurable: true },
@@ -1221,7 +1343,7 @@
     _changed() {
       const s = state(this);
       if (s.owner && s.owner.localName === 'style') __fosSetSheetCSS(s.owner, this._css());
-      else if (s.constructed) flushAdopted();
+      else if (s.constructed) flushAdopted(null, this);
     }
   }
   const state = (sheet) => {
@@ -1281,21 +1403,31 @@
     },
     configurable: true,
   });
-  // adoptedStyleSheets, on the document and on (stand-in) shadow roots,
-  // which are their hosts: all apply to the whole page
+  // adoptedStyleSheets, on the document and on shadow roots (each
+  // applies to its own tree). A flush updates `only` (an owner), or the
+  // owners adopting `sheet`, or all.
   const adopters = new Set();
-  const adopted = new WeakMap(); // document or host -> array proxy
-  function flushAdopted() {
-    let css = '';
-    for (const owner of adopters) {
-      for (const s of adopted.get(owner) || []) if (s && !s.disabled) css += s._css() + '\n';
+  const adopted = new WeakMap(); // document or shadow root -> array proxy
+  function flushAdopted(only, sheet) {
+    const memo = new Map();
+    const cssOf = (s) => {
+      let c = memo.get(s);
+      if (c === undefined) memo.set(s, c = s._css());
+      return c;
+    };
+    for (const owner of only ? [only] : adopters) {
+      const list = adopted.get(owner) || [];
+      if (sheet && !list.includes(sheet)) continue;
+      let css = '';
+      for (const s of list) if (s && !s.disabled) css += cssOf(s) + '\n';
+      if (shadowInfo.has(owner)) __fosSetShadowAdoptedCSS(owner, css);
+      else __fosSetAdoptedCSS(css);
     }
-    __fosSetAdoptedCSS(css);
   }
   const adoptedSheets = {
     get() {
       let list = adopted.get(this);
-      if (!list) adopted.set(this, list = observedArray([]));
+      if (!list) adopted.set(this, list = observedArray([], this));
       return list;
     },
     set(v) {
@@ -1303,19 +1435,19 @@
       for (const s of sheets) {
         if (!(s instanceof CSSStyleSheet) || !state(s).constructed) throw new DOMException("Failed to set the 'adoptedStyleSheets' property: Can't adopt non-constructed stylesheets.", 'NotAllowedError');
       }
-      adopted.set(this, observedArray(sheets));
+      adopted.set(this, observedArray(sheets, this));
       adopters.add(this);
-      flushAdopted();
+      flushAdopted(this);
     },
     configurable: true,
   };
   // An array whose changes (push, splice, index stores) re-apply the sheets
-  const observedArray = (arr) => new Proxy(arr, {
-    set(target, key, value) { target[key] = value; flushAdopted(); return true; },
-    deleteProperty(target, key) { delete target[key]; flushAdopted(); return true; },
+  const observedArray = (arr, owner) => new Proxy(arr, {
+    set(target, key, value) { target[key] = value; adopters.add(owner); flushAdopted(owner); return true; },
+    deleteProperty(target, key) { delete target[key]; flushAdopted(owner); return true; },
   });
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedSheets);
-  Object.defineProperty(E, 'adoptedStyleSheets', adoptedSheets);
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedSheets);
   Object.assign(global, {
     CSSStyleDeclaration, CSSRule, CSSStyleRule, CSSPageRule, CSSFontFaceRule, CSSKeyframeRule, CSSKeyframesRule,
     CSSGroupingRule, CSSConditionRule: CSSGroupingRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule,
@@ -1427,11 +1559,21 @@
   }
 
   // Elements of `root`'s subtree (root included), in tree order
+  // (shadow-including: shadow trees follow their hosts)
   function ceSubtree(root) {
     if (!root || (root.nodeType !== 1 && root.nodeType !== 11 && root.nodeType !== 9)) return [];
-    const all = Array.from(root.querySelectorAll('*'));
-    if (root.nodeType === 1) all.unshift(root);
-    return all;
+    const out = [];
+    const visit = (r) => {
+      const all = Array.from(r.querySelectorAll('*'));
+      if (r.nodeType === 1) all.unshift(r);
+      for (const el of all) {
+        out.push(el);
+        const sr = shadowOf.get(el);
+        if (sr) visit(sr);
+      }
+    };
+    visit(root);
+    return out;
   }
 
   // `nodes` were inserted: upgrade what was waiting, connect what is custom
@@ -1491,6 +1633,12 @@
   for (const name of ['append', 'prepend', 'before', 'after']) {
     ceWrap(NodeP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
     ceWrap(ElementP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+  }
+  // Fragments (shadow roots among them) and documents have their own
+  for (const proto of [DocumentFragment.prototype, Document.prototype]) {
+    for (const name of ['append', 'prepend']) {
+      if (Object.prototype.hasOwnProperty.call(proto, name)) ceWrap(proto, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+    }
   }
   for (const proto of [NodeP, ElementP]) {
     ceWrap(proto, 'replaceWith', function (a) { return { added: ceArgNodes(a), removed: [this] }; });
@@ -1625,7 +1773,7 @@
     constructor(el) { Object.defineProperty(this, '_el', { value: el }); this.states = new Set(); this.validity = { valid: true }; this.validationMessage = ''; this.willValidate = false; }
     get form() { return this._el.closest('form'); }
     get labels() { return []; }
-    get shadowRoot() { return null; }
+    get shadowRoot() { return shadowOf.get(this._el) ?? null; }
     setFormValue() {}
     setValidity(flags = {}, message = '') { this.validity = { ...flags, valid: !Object.values(flags).some(Boolean) }; this.validationMessage = String(message); }
     checkValidity() { return this.validity.valid; }

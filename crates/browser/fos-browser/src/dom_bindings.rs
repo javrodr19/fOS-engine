@@ -28,6 +28,7 @@ const NODE_CLASS: u32 = 1;
 
 /// Local name of the detached elements standing in for DocumentFragments
 const FRAGMENT: &str = "#document-fragment";
+use fos_dom::SHADOW_ROOT;
 
 /// Severity of a console message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +170,8 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
     let by_tag = !host(vm).tag_protos.is_empty();
     let (proto, tag) = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
         Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => (protos.fragment, None),
+        // ShadowRoot.prototype comes from the bootstrap, by this name
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == SHADOW_ROOT => (protos.fragment, by_tag.then(|| SHADOW_ROOT.to_string())),
         Some(NodeData::Element(e)) => (protos.element, by_tag.then(|| element_tag(t, e))),
         Some(NodeData::Text(_)) => (protos.text, None),
         Some(NodeData::Comment(_)) => (protos.comment, None),
@@ -286,7 +289,7 @@ fn is_element(t: &DomTree, id: NodeId) -> bool {
 }
 
 fn is_fragment(t: &DomTree, id: NodeId) -> bool {
-    t.get(id).and_then(|n| n.as_element()).is_some_and(|e| t.resolve(e.name.local) == FRAGMENT)
+    t.get(id).and_then(|n| n.as_element()).is_some_and(|e| matches!(t.resolve(e.name.local), FRAGMENT | SHADOW_ROOT))
 }
 
 fn children(t: &DomTree, id: NodeId) -> Vec<NodeId> {
@@ -351,7 +354,7 @@ fn nodes_from_args(vm: &mut Vm, args: &[Value]) -> JsResult<Vec<NodeId>> {
 fn node_type(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
     let n = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
-        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => 11,
+        Some(NodeData::Element(e)) if matches!(t.resolve(e.name.local), FRAGMENT | SHADOW_ROOT) => 11,
         Some(NodeData::Element(_)) => 1,
         Some(NodeData::Text(_)) => 3,
         Some(NodeData::ProcessingInstruction { .. }) => 7,
@@ -366,6 +369,7 @@ fn node_type(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult
 fn node_name(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
     let s = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == SHADOW_ROOT => FRAGMENT.into(),
         Some(NodeData::Element(e)) => t.resolve(e.name.local).to_ascii_uppercase(),
         Some(NodeData::Text(_)) => "#text".into(),
         Some(NodeData::Comment(_)) => "#comment".into(),
@@ -431,7 +435,7 @@ fn owner_document(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsR
 
 fn is_connected(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    Ok(Value::bool(with_tree(vm, |t| t.is_inclusive_descendant(id, NodeId::ROOT))))
+    Ok(Value::bool(with_tree(vm, |t| t.is_connected(id))))
 }
 
 fn text_content(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -569,14 +573,23 @@ fn clone_node(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsRe
     Ok(wrap(vm, copy))
 }
 
-fn get_root_node(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    let mut id = this_node(vm, this)?;
-    with_tree(vm, |t| {
-        while let Some(p) = t.get(id).map(|n| n.parent).filter(|p| p.is_valid()) {
-            id = p;
+/// `getRootNode({ composed })`: the tree's root (a shadow root, unless
+/// `composed`, which continues through hosts)
+fn get_root_node(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let id = this_node(vm, this)?;
+    // The bootstrap passes `options.composed` as a boolean
+    let composed = arg(args, 0).as_bool() == Some(true);
+    let root = with_tree(vm, |t| {
+        let mut root = t.tree_root(id);
+        while composed {
+            match t.shadow_host(root) {
+                Some(host) => root = t.tree_root(host),
+                None => break,
+            }
         }
+        root
     });
-    Ok(wrap(vm, id))
+    Ok(wrap(vm, root))
 }
 
 /// `append`, `prepend`, `before`, `after`, `replaceWith`
@@ -710,14 +723,33 @@ fn set_class_name(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> 
     attr_setter(vm, this, args, "class")
 }
 
+/// The node whose children `innerHTML` reads and replaces: a
+/// `<template>`'s contents fragment, otherwise the node itself
+fn inner_html_target(vm: &mut Vm, id: NodeId) -> NodeId {
+    let is_template = with_tree(vm, |t| t.get(id).and_then(|n| n.as_element()).is_some_and(|e| t.resolve(e.name.local) == "template" && t.resolve(e.name.ns) != SVG_NS));
+    if !is_template {
+        return id;
+    }
+    with_doc(vm, |d| match d.template_content(id) {
+        Some(f) => f,
+        None => {
+            let f = d.tree_mut().create_element(FRAGMENT);
+            d.set_template_content(id, f);
+            f
+        }
+    })
+}
+
 fn inner_html(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
+    let id = inner_html_target(vm, id);
     let s = with_tree(vm, |t| fos_html::get_inner_html(t, id));
     Ok(string(vm, &s))
 }
 
 fn set_inner_html(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
+    let id = inner_html_target(vm, id);
     let v = arg(args, 0);
     let html = if v.is_nullish() { String::new() } else { vm.to_rust_string(v)? };
     with_tree(vm, |t| fos_html::set_inner_html(t, id, &html));
@@ -1166,6 +1198,50 @@ fn set_sheet_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsRe
         let text: String = tree.children(id).filter_map(|(_, c)| c.as_text()).collect();
         d.set_sheet_override(id, text, css);
     });
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosAttachShadow(host)`: a new (or the existing) shadow root of `host`
+fn attach_shadow(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(host) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let root = with_tree(vm, |t| t.attach_shadow(host));
+    Ok(wrap(vm, root))
+}
+
+/// `__fosShadowRoot(host)`: `host`'s shadow root, whatever its mode
+fn shadow_root_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(host) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let root = with_tree(vm, |t| t.shadow_root(host)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, root))
+}
+
+/// `__fosShadowHost(root)`: the host of shadow root `root`
+fn shadow_host_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let host = with_tree(vm, |t| t.shadow_host(root)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, host))
+}
+
+/// `__fosAssignedNodes(slot)`: the nodes assigned to a `<slot>`
+fn assigned_nodes(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(slot) = node_id(arg(args, 0)) else { return Ok(wrap_all(vm, Vec::new())) };
+    let ids = with_tree(vm, |t| t.assigned_nodes(slot));
+    Ok(wrap_all(vm, ids))
+}
+
+/// `__fosAssignedSlot(node)`: the slot a host's child is assigned to
+fn assigned_slot(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(node) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let slot = with_tree(vm, |t| t.assigned_slot(node)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, slot))
+}
+
+/// `__fosSetShadowAdoptedCSS(root, css)`: the CSS of a shadow root's
+/// `adoptedStyleSheets`
+fn set_shadow_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let css = arg_string(vm, args, 1)?;
+    with_doc(vm, |d| d.set_shadow_adopted_css(root, css));
     Ok(Value::UNDEFINED)
 }
 
@@ -1771,6 +1847,12 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetElementPrototype", 2, set_element_prototype),
         ("__fosSetSheetCSS", 2, set_sheet_css),
         ("__fosSetAdoptedCSS", 1, set_adopted_css),
+        ("__fosSetShadowAdoptedCSS", 2, set_shadow_adopted_css),
+        ("__fosAttachShadow", 1, attach_shadow),
+        ("__fosShadowRoot", 1, shadow_root_of),
+        ("__fosShadowHost", 1, shadow_host_of),
+        ("__fosAssignedNodes", 1, assigned_nodes),
+        ("__fosAssignedSlot", 1, assigned_slot),
         ("__fosParseDocument", 1, parse_document),
         ("__fosMatchMedia", 1, match_media),
         ("__fosDigest", 2, crate::web_crypto::digest_native),

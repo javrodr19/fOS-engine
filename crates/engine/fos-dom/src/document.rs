@@ -22,6 +22,8 @@ pub struct Document {
     sheet_overrides: std::collections::HashMap<NodeId, (String, String)>,
     /// CSS of the document's adopted (constructed) style sheets
     adopted_css: String,
+    /// CSS of each shadow root's adopted style sheets
+    shadow_adopted_css: std::collections::HashMap<NodeId, String>,
     /// Parsed in quirks mode (no or a legacy doctype)
     quirks: bool,
 }
@@ -49,6 +51,7 @@ impl Document {
             template_contents: Default::default(),
             sheet_overrides: Default::default(),
             adopted_css: String::new(),
+            shadow_adopted_css: Default::default(),
             quirks: false,
         }
     }
@@ -64,6 +67,7 @@ impl Document {
             template_contents: Default::default(),
             sheet_overrides: Default::default(),
             adopted_css: String::new(),
+            shadow_adopted_css: Default::default(),
             quirks: false,
         }
     }
@@ -111,6 +115,18 @@ impl Document {
 
     pub fn set_quirks(&mut self, quirks: bool) {
         self.quirks = quirks;
+    }
+
+    /// CSS of shadow root `root`'s adopted style sheets
+    pub fn shadow_adopted_css(&self, root: NodeId) -> &str {
+        self.shadow_adopted_css.get(&root).map_or("", |s| s.as_str())
+    }
+
+    pub fn set_shadow_adopted_css(&mut self, root: NodeId, css: String) {
+        if css != self.shadow_adopted_css(root) {
+            self.shadow_adopted_css.insert(root, css);
+            self.tree.mark_mutated();
+        }
     }
 
     pub fn set_adopted_css(&mut self, css: String) {

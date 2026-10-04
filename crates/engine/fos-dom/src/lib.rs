@@ -41,7 +41,7 @@ pub mod query_index;
 pub mod selector;
 
 pub use node::{Node, NodeData, ElementData, TextData, Attribute};
-pub use tree::{DomTree, DomRevision};
+pub use tree::{DomTree, DomRevision, SHADOW_ROOT};
 pub use document::Document;
 pub use selector::{SelectorList, SubjectKey, PseudoElement, key_hash, KEY_ID, KEY_CLASS, KEY_TAG};
 pub use interner::{StringInterner, InternedString};

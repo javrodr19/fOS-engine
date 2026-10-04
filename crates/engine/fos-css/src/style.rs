@@ -531,6 +531,94 @@ pub fn parse_shadows(text: &str, len: &dyn Fn(&str) -> Option<f32>) -> Option<Ve
     Some(out)
 }
 
+/// A radius of a `circle()` or `ellipse()` clip
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapeRadius {
+    Lp(Lp),
+    ClosestSide,
+    FarthestSide,
+}
+
+/// A `clip-path` basic shape other than `inset()`, in its border box
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipShape {
+    /// Radii (equal for a circle) and center
+    Ellipse { rx: ShapeRadius, ry: ShapeRadius, circle: bool, at: (Lp, Lp) },
+    /// Vertices, and whether the fill rule is evenodd
+    Polygon(Vec<(Lp, Lp)>, bool),
+}
+
+impl ClipShape {
+    /// Parse `circle(...)`, `ellipse(...)` or `polygon(...)` (lowercase);
+    /// `len` resolves a length-percentage
+    pub fn parse(text: &str, len: &dyn Fn(&str) -> Option<Lp>) -> Option<ClipShape> {
+        let text = text.trim();
+        let (name, rest) = text.split_once('(')?;
+        let inner = rest.rsplit_once(')')?.0.trim();
+        let radius = |t: &str| match t {
+            "closest-side" => Some(ShapeRadius::ClosestSide),
+            "farthest-side" => Some(ShapeRadius::FarthestSide),
+            _ => len(t).map(ShapeRadius::Lp),
+        };
+        let center = Lp { px: 0.0, pct: 50.0 };
+        match name.trim() {
+            "circle" | "ellipse" => {
+                let circle = name.trim() == "circle";
+                let (radii, at) = match inner.split_once("at") {
+                    Some((r, a)) if r.is_empty() || r.ends_with(' ') => (r.trim(), Some(a.trim())),
+                    _ => (inner, None),
+                };
+                let at = match at {
+                    Some(a) => crate::transform::parse_origin(a, len)?,
+                    None => (center, center),
+                };
+                let parts: Vec<&str> = radii.split_whitespace().collect();
+                let (rx, ry) = match (circle, parts.as_slice()) {
+                    (_, []) => (ShapeRadius::ClosestSide, ShapeRadius::ClosestSide),
+                    (true, [r]) => (radius(r)?, radius(r)?),
+                    (false, [x, y]) => (radius(x)?, radius(y)?),
+                    _ => return None,
+                };
+                Some(ClipShape::Ellipse { rx, ry, circle, at })
+            }
+            "polygon" => {
+                let mut evenodd = false;
+                let mut points = Vec::new();
+                for (i, part) in inner.split(',').enumerate() {
+                    let part = part.trim();
+                    if i == 0 && (part == "evenodd" || part == "nonzero") {
+                        evenodd = part == "evenodd";
+                        continue;
+                    }
+                    let mut xy = part.split_whitespace();
+                    let (x, y) = (len(xy.next()?)?, len(xy.next()?)?);
+                    points.push((x, y));
+                }
+                (points.len() >= 3).then_some(ClipShape::Polygon(points, evenodd))
+            }
+            _ => None,
+        }
+    }
+
+    /// An ellipse's center and radii in a `w`×`h` box (from its top left)
+    pub fn ellipse_in(&self, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+        let ClipShape::Ellipse { rx, ry, circle, at } = self else { return None };
+        let (cx, cy) = (at.0.resolve(w), at.1.resolve(h));
+        let (sx, sy) = ((cx.min(w - cx)).abs(), (cy.min(h - cy)).abs());
+        let (fx, fy) = (cx.max(w - cx), cy.max(h - cy));
+        // A circle's percentages are of the box's normalized diagonal
+        let basis = |horizontal: bool| if *circle { (w * w + h * h).sqrt() / std::f32::consts::SQRT_2 } else if horizontal { w } else { h };
+        let r = |v: &ShapeRadius, horizontal: bool| match v {
+            ShapeRadius::Lp(l) => l.resolve(basis(horizontal)).max(0.0),
+            ShapeRadius::ClosestSide if *circle => sx.min(sy),
+            ShapeRadius::FarthestSide if *circle => fx.max(fy),
+            ShapeRadius::ClosestSide => if horizontal { sx } else { sy },
+            ShapeRadius::FarthestSide => if horizontal { fx } else { fy },
+        };
+        Some((cx, cy, r(rx, true), r(ry, false)))
+    }
+}
+
 /// A piece of generated content
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContentItem {
@@ -601,6 +689,8 @@ pub struct BoxStyle {
     pub clip: Option<[Option<f32>; 4]>,
     /// `clip-path: inset(...)`: top, right, bottom, left insets
     pub clip_inset: Option<[Lp; 4]>,
+    /// `clip-path: circle()`, `ellipse()` or `polygon()`
+    pub clip_shape: Option<Arc<ClipShape>>,
     /// `box-shadow`s, front to back (`None`: none)
     pub box_shadow: Option<Arc<[Shadow]>>,
     /// `transform` functions (`None`: none)
@@ -665,6 +755,7 @@ impl Default for BoxStyle {
             counter_set: None,
             clip: None,
             clip_inset: None,
+            clip_shape: None,
             box_shadow: None,
             transform: None,
             transform_origin: (Lp { px: 0.0, pct: 50.0 }, Lp { px: 0.0, pct: 50.0 }),
@@ -1381,6 +1472,7 @@ impl Style {
                         })
                     });
                     set!(box_, [clip_inset], inset);
+                    set!(box_, [clip_shape], ClipShape::parse(&lower, &|t| self.lp_text(t, ctx)).map(Arc::new));
                 }
             }
             PropertyId::CounterReset | PropertyId::CounterIncrement | PropertyId::CounterSet => {
@@ -1716,7 +1808,10 @@ impl Style {
             PropertyId::CounterIncrement => copy!(box_, [counter_increment]),
             PropertyId::CounterSet => copy!(box_, [counter_set]),
             PropertyId::Clip => copy!(box_, [clip]),
-            PropertyId::ClipPath => copy!(box_, [clip_inset]),
+            PropertyId::ClipPath => {
+                copy!(box_, [clip_inset]);
+                copy!(box_, [clip_shape]);
+            }
             PropertyId::Transform => copy!(box_, [transform]),
             PropertyId::BoxShadow => copy!(box_, [box_shadow]),
             PropertyId::TransformOrigin => copy!(box_, [transform_origin]),

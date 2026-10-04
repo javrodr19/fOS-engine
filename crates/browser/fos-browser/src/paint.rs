@@ -48,6 +48,8 @@ pub struct Painter<'a> {
     view: (f32, f32),
     /// The box whose transform is being applied (painted plainly)
     untransformed: usize,
+    /// The box being painted offscreen for its shape clip (painted plainly)
+    shaped: usize,
 }
 
 /// Where painting is: origin, dx and view
@@ -189,7 +191,7 @@ impl<'a> Painter<'a> {
     /// `origin` is the document y of the canvas's first row; `scroll` the
     /// page's scroll position (the canvas may be a band below its top)
     pub fn new(canvas: &'a mut Canvas, text: &'a mut TextRenderer, origin: f32, scroll: f32, canvas_background_box: Option<NodeId>) -> Self {
-        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0 }
+        Painter { canvas, text, origin, mask: None, canvas_background_box, scroll, find_fixed: false, images: None, base: "", canvases: None, box_scroll: None, dx: 0.0, view: (scroll, 0.0), untransformed: 0, shaped: 0 }
     }
 
     /// Images for CSS `url()`s
@@ -386,6 +388,7 @@ impl<'a> Painter<'a> {
                 dx: -b.ink.x,
                 view: self.view,
                 untransformed: key,
+                shaped: self.shaped,
             };
             p.paint_layer(b, Clip([0.0, 0.0, w, h]), alpha);
         }
@@ -425,6 +428,11 @@ impl<'a> Painter<'a> {
         let clip = self.own_clip(b, clip);
         if clip.is_empty() || self.culled(b, clip) {
             return;
+        }
+        if self.shaped != b as *const BoxFragment as usize {
+            if let Some(shape) = self.shape_clip(b) {
+                return self.paint_shaped(b, shape, clip, alpha, true);
+            }
         }
         let alpha = alpha * b.style.box_.opacity;
         if alpha <= 0.0 {
@@ -544,22 +552,126 @@ impl<'a> Painter<'a> {
                     if Self::is_layer(cb) || self.culled(cb, clip) {
                         continue;
                     }
-                    let a = alpha * cb.style.box_.opacity;
-                    let clip = self.own_clip(cb, clip);
-                    if a <= 0.0 || clip.is_empty() {
-                        continue;
-                    }
-                    self.paint_own(cb, clip, a);
-                    let inner = self.inner_clip(cb, clip);
-                    let saved = self.enter_scroll(cb);
-                    self.paint_flow(cb, inner, a);
-                    self.go(saved);
-                    self.scroll_thumbs(cb, clip);
-                    if cb.style.inherited.visibility == Visibility::Visible {
-                        self.outline(cb, clip, a);
-                    }
+                    self.paint_in_flow(cb, clip, alpha);
                 }
             }
+        }
+    }
+
+    /// An in-flow (not layered) box and its contents
+    fn paint_in_flow(&mut self, cb: &BoxFragment, clip: Clip, alpha: f32) {
+        let a = alpha * cb.style.box_.opacity;
+        let clip = self.own_clip(cb, clip);
+        if a <= 0.0 || clip.is_empty() {
+            return;
+        }
+        if self.shaped != cb as *const BoxFragment as usize {
+            if let Some(shape) = self.shape_clip(cb) {
+                return self.paint_shaped(cb, shape, clip, alpha, false);
+            }
+        }
+        self.paint_own(cb, clip, a);
+        let inner = self.inner_clip(cb, clip);
+        let saved = self.enter_scroll(cb);
+        self.paint_flow(cb, inner, a);
+        self.go(saved);
+        self.scroll_thumbs(cb, clip);
+        if cb.style.inherited.visibility == Visibility::Visible {
+            self.outline(cb, clip, a);
+        }
+    }
+
+    /// The shape (device space) a box and its contents are cut to when it
+    /// is not a rectangle: a `clip-path` circle, ellipse or polygon, or
+    /// the rounded border box of a box that clips its overflow
+    fn shape_clip(&self, b: &BoxFragment) -> Option<(Path, FillRule)> {
+        use fos_css::style::ClipShape;
+        let r = self.dev(b.border_box);
+        if let Some(shape) = &b.style.box_.clip_shape {
+            return match &**shape {
+                ClipShape::Ellipse { .. } => {
+                    let (cx, cy, rx, ry) = shape.ellipse_in(r.w, r.h)?;
+                    // An empty shape hides everything
+                    let oval = tiny_skia::Rect::from_xywh(r.x + cx - rx, r.y + cy - ry, (2.0 * rx).max(0.01), (2.0 * ry).max(0.01))?;
+                    Some((PathBuilder::from_oval(oval)?, FillRule::Winding))
+                }
+                ClipShape::Polygon(points, evenodd) => {
+                    let mut pb = PathBuilder::new();
+                    for (i, (x, y)) in points.iter().enumerate() {
+                        let (px, py) = (r.x + x.resolve(r.w), r.y + y.resolve(r.h));
+                        if i == 0 {
+                            pb.move_to(px, py);
+                        } else {
+                            pb.line_to(px, py);
+                        }
+                    }
+                    pb.close();
+                    Some((pb.finish()?, if *evenodd { FillRule::EvenOdd } else { FillRule::Winding }))
+                }
+            };
+        }
+        if b.style.clips() && b.kind != BoxFragmentKind::InlinePart {
+            let rad = radii(b, r);
+            if rad.iter().any(|c| c.0 > 0.0) {
+                return Some((rounded_path(r, rad)?, FillRule::Winding));
+            }
+        }
+        None
+    }
+
+    /// Paint `b` (a layer, or in flow) offscreen, then onto the canvas
+    /// through its shape
+    fn paint_shaped(&mut self, b: &BoxFragment, shape: (Path, FillRule), clip: Clip, alpha: f32, layer: bool) {
+        let key = b as *const BoxFragment as usize;
+        let sb = shape.0.bounds();
+        let (x0, y0) = (sb.left().max(clip.0[0]).floor(), sb.top().max(clip.0[1]).floor());
+        let (x1, y1) = (sb.right().min(clip.0[2]).ceil(), sb.bottom().min(clip.0[3]).ceil());
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let prev = std::mem::replace(&mut self.shaped, key);
+        // Huge areas are painted unshaped
+        let off = if w * h > 16_000_000.0 { None } else { Canvas::new(w as u32, h as u32) };
+        let Some(mut off) = off else {
+            if layer {
+                self.paint_layer(b, clip, alpha);
+            } else {
+                self.paint_in_flow(b, clip, alpha);
+            }
+            self.shaped = prev;
+            return;
+        };
+        {
+            let mut p = Painter {
+                canvas: &mut off,
+                text: &mut *self.text,
+                origin: self.origin + y0,
+                mask: None,
+                canvas_background_box: self.canvas_background_box,
+                scroll: self.scroll,
+                find_fixed: self.find_fixed,
+                images: self.images,
+                base: self.base,
+                canvases: self.canvases,
+                box_scroll: self.box_scroll,
+                dx: self.dx - x0,
+                view: self.view,
+                untransformed: self.untransformed,
+                shaped: key,
+            };
+            let c = Clip([0.0, 0.0, w, h]);
+            if layer {
+                p.paint_layer(b, c, alpha);
+            } else {
+                p.paint_in_flow(b, c, alpha);
+            }
+        }
+        self.shaped = prev;
+        let Some(mut mask) = Mask::new(self.canvas.width(), self.canvas.height()) else { return };
+        mask.fill_path(&shape.0, shape.1, true, Transform::identity());
+        if let Some(mut pm) = self.canvas.pixmap_mut() {
+            pm.draw_pixmap(x0 as i32, y0 as i32, off.pixmap(), &tiny_skia::PixmapPaint::default(), Transform::identity(), Some(&mask));
         }
     }
 
@@ -1004,6 +1116,17 @@ impl<'a> Painter<'a> {
         let shader = tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, quality, alpha, transform);
         let mut paint = Paint::default();
         paint.shader = shader;
+        // Rounded corners cut the image when it fills its box
+        let border = self.dev(b.border_box);
+        let rad = radii(b, border);
+        let covers = dest.x <= c.x + 0.5 && dest.y <= c.y + 0.5 && dest.right() >= c.right() - 0.5 && dest.bottom() >= c.bottom() - 0.5;
+        if covers && rad.iter().any(|r| r.0 > 0.0) {
+            let inner = inset_radii(rad, [c.y - border.y, border.right() - c.right(), border.bottom() - c.bottom(), c.x - border.x]);
+            if let Some(path) = rounded_path(c, inner) {
+                self.fill(&path, &paint, FillRule::Winding, clip);
+                return;
+            }
+        }
         if let (Some(rect), Some(mut canvas)) = (tiny_skia::Rect::from_ltrb(visible.0[0], visible.0[1], visible.0[2], visible.0[3]), self.canvas.pixmap_mut()) {
             canvas.fill_rect(rect, &paint, Transform::identity(), None);
         }

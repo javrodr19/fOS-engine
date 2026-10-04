@@ -1041,6 +1041,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rounded_and_shaped_clips() {
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'><rect width='40' height='40' fill='red'/></svg>";
+        let html = format!(
+            r#"<html><body style="margin: 0"><div style="display: flex">
+            <img src="{svg}" style="width: 40px; height: 40px; border-radius: 50%">
+            <div style="width: 40px; height: 40px; border-radius: 50%; overflow: hidden"><div style="height: 40px; background: #f00"></div></div>
+            <div style="width: 40px; height: 40px; background: #f00; clip-path: circle(50%)"></div>
+            <div style="width: 40px; height: 40px; background: #f00; clip-path: polygon(50% 0, 100% 100%, 0 100%)"></div>
+            </div></body></html>"#
+        );
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 50);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 200 + x] == 0xffff0000;
+        for i in 0..4 {
+            let x0 = i * 40;
+            // Filled in the middle, cut at the top corners
+            assert!(red(x0 + 20, 30), "shape {i} center");
+            assert!(!red(x0 + 2, 2) && !red(x0 + 37, 2), "shape {i} corners");
+        }
+    }
+
+    #[test]
     fn test_object_position() {
         // 10×20: red on top, blue below; shown in 10×10 boxes with cover
         let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><rect width='10' height='10' fill='red'/><rect y='10' width='10' height='10' fill='blue'/></svg>";

@@ -1228,7 +1228,8 @@ mod tests {
         let html = r#"<html><head><style>
             ol li::marker { color: #f00 }
             ul li::marker { content: "-> "; color: #00f }
-            </style></head><body><ol><li>one</li></ol><ul><li>two</li></ul><ol><li id="plain">x</li></ol></body></html>"#;
+            .none::marker { content: none }
+            </style></head><body><ol><li>one</li></ol><ul><li>two</li><li class="none">hidden</li></ul><ol><li id="plain">x</li></ol></body></html>"#;
         let document = fos_html::parse_with_url(html, "https://example.com/");
         let layout = layout_of(&document, 640.0);
         let mut markers: Vec<(Color, f32)> = Vec::new();

@@ -586,7 +586,8 @@ pub struct BoxStyle {
     pub table_layout: TableLayout,
     /// Grid container and item properties
     pub grid: crate::grid::GridStyle,
-    /// What a `::before`/`::after` box shows (`None`: none or normal)
+    /// What a `::before`/`::after` box or marker shows (`None`: normal;
+    /// empty: none)
     pub content: Option<Arc<[ContentItem]>>,
     /// `counter-reset`, `counter-increment` and `counter-set` (`None`:
     /// none)
@@ -1294,8 +1295,10 @@ impl Style {
                 }
             }
             PropertyId::Content => {
-                if let PropertyValue::Content(items) = v {
-                    set!(box_, [content], (!items.is_empty()).then(|| items.clone()));
+                match v {
+                    PropertyValue::Content(items) => set!(box_, [content], (!items.is_empty()).then(|| items.clone())),
+                    PropertyValue::Keyword(Keyword::None) => set!(box_, [content], Some(Arc::from(Vec::new()))),
+                    _ => {}
                 }
             }
             PropertyId::CounterReset | PropertyId::CounterIncrement | PropertyId::CounterSet => {

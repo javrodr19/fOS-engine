@@ -931,8 +931,9 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     fn marker(&mut self, node: NodeId, style: &Style) -> Option<Marker> {
         // `::marker` styles it, and its `content` replaces the text
         let styled = self.styler.pseudo(self.tree, node, fos_dom::PseudoElement::Marker, style);
-        let text = match styled.as_ref().filter(|s| s.box_.content.is_some()) {
-            Some(ms) => generated_text(self.tree, node, ms, &self.counters),
+        let text = match styled.as_ref().and_then(|s| s.box_.content.as_ref().map(|c| (s, c.is_empty()))) {
+            Some((_, true)) => return None,
+            Some((ms, false)) => generated_text(self.tree, node, ms, &self.counters),
             None => {
                 let ordinal = self.counters.iter().rev().find(|c| &*c.0 == "list-item").map_or(1, |c| c.1);
                 marker_text(style.inherited.list_style_type, ordinal)?

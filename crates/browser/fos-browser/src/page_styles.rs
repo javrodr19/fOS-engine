@@ -448,7 +448,7 @@ pub fn pseudo_style(
     let mut style = Style::inherit_from(parent);
     let matched = cascade_for(styles, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
     // A marker exists without `content`; generated boxes need it
-    (if pe == PseudoElement::Marker { matched } else { style.box_.content.is_some() }).then_some(style)
+    (if pe == PseudoElement::Marker { matched } else { style.box_.content.as_ref().is_some_and(|c| !c.is_empty()) }).then_some(style)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -519,6 +519,8 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
+        // `none` (no box, no marker) differs from `normal` for markers
+        P::Content if v == "none" => Some(PropertyValue::Keyword(Keyword::None)),
         P::Content => content(raw).map(|c| PropertyValue::Content(Arc::from(c))),
         P::CounterReset | P::CounterSet => counters(raw, 0).map(|c| PropertyValue::Counters(Arc::from(c))),
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
@@ -1610,7 +1612,8 @@ mod tests {
             Some(PropertyValue::Content(items)) => Some(items.to_vec()),
             _ => None,
         };
-        assert_eq!(content("none"), Some(vec![]));
+        // none is a keyword, kept apart from normal
+        assert_eq!(content("none"), None);
         assert_eq!(content("normal"), Some(vec![]));
         assert_eq!(content(r#""\201C  x" 'y'"#), Some(vec![ContentItem::Text(Arc::from("\u{201C} x")), ContentItem::Text(Arc::from("y"))]));
         assert_eq!(content("attr(data-Label) open-quote"), Some(vec![ContentItem::Attr(Arc::from("data-label")), ContentItem::OpenQuote]));

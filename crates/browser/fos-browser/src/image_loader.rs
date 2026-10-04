@@ -333,7 +333,7 @@ pub fn load_for_page(network: &mut crate::network::NetworkManager, page: &crate:
 }
 
 /// `data:` URL images (base64 or percent-encoded)
-fn decode_data_url(rest: &str) -> Option<LoadedImage> {
+pub(crate) fn decode_data_url(rest: &str) -> Option<LoadedImage> {
     decode(&data_url_bytes(rest)?)
 }
 

@@ -544,6 +544,8 @@ pub enum ContentItem {
     Counter(Arc<str>, Option<u8>),
     /// All of a counter's nested values joined by a string
     Counters(Arc<str>, Arc<str>, Option<u8>),
+    /// An image (`url(...)`)
+    Image(Arc<str>),
 }
 
 /// Box model, positioning, flex and other non-inherited properties

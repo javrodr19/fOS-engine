@@ -754,7 +754,17 @@ fn content(raw: &str) -> Option<Vec<ContentItem>> {
                         "attr" => out.push(ContentItem::Attr(Arc::from(arg(0)?.split_whitespace().next()?.to_ascii_lowercase()))),
                         "counter" => out.push(ContentItem::Counter(ident(arg(0))?, style(arg(1)))),
                         "counters" => out.push(ContentItem::Counters(ident(arg(0))?, Arc::from(string(arg(1))?), style(arg(2)))),
-                        // Images and other functions show nothing
+                        // Commas belong to the URL (data: URLs)
+                        "url" => {
+                            let raw = args.join(",");
+                            let raw = raw.trim();
+                            let url = match raw.as_bytes().first() {
+                                Some(&q @ (b'"' | b'\'')) => css_string(raw, 1, q)?.0,
+                                _ => raw.to_string(),
+                            };
+                            out.push(ContentItem::Image(Arc::from(url)));
+                        }
+                        // Gradients and other functions show nothing
                         _ => {}
                     }
                 } else {
@@ -1626,7 +1636,10 @@ mod tests {
         assert_eq!(content("counter(x, lower-alpha)"), Some(vec![ContentItem::Counter(Arc::from("x"), Some(ListStyleType::LowerAlpha as u8))]));
         // Alternative text is dropped; images show nothing
         assert_eq!(content(r#""\2192" / "next""#), Some(vec![ContentItem::Text(Arc::from("\u{2192}"))]));
-        assert_eq!(content("url(a.svg)"), Some(vec![]));
+        assert_eq!(content("url(a.svg)"), Some(vec![ContentItem::Image(Arc::from("a.svg"))]));
+        assert_eq!(content(r#"url('data:image/svg+xml,<svg a="1,2"/>') "x""#), Some(vec![ContentItem::Image(Arc::from(r#"data:image/svg+xml,<svg a="1,2"/>"#)), ContentItem::Text(Arc::from("x"))]));
+        // Other image functions show nothing
+        assert_eq!(content("linear-gradient(red, blue)"), Some(vec![]));
         assert_eq!(content("bogus"), None);
     }
 

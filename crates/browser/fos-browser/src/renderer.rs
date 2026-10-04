@@ -732,6 +732,11 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         Some((img.natural, layout_engine::ImageHandle(img.clone())))
     }
 
+    fn content_image(&mut self, url: &str) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        let img = self.images.get(url).or_else(|| self.images.get(&fos_net::url_util::resolve(&self.base, url)))?;
+        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+    }
+
     fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {
         let c = style.color();
         let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], self.svgs)?;
@@ -824,7 +829,9 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, images
             // Sticky boxes move with scrolling too: no scroll blitting
             has_fixed |= matches!(b.style.box_.position, fos_css::style::Position::Fixed | fos_css::style::Position::Sticky);
             let bg = &b.style.background;
-            let urls = bg.images.iter().filter_map(|i| if let fos_css::style::Image::Url(u) = i { Some(u) } else { None }).chain(bg.mask.iter());
+            // Background and mask images, and generated content's
+            let content = b.style.box_.content.iter().flat_map(|c| c.iter()).filter_map(|i| if let fos_css::style::ContentItem::Image(u) = i { Some(u) } else { None });
+            let urls = bg.images.iter().filter_map(|i| if let fos_css::style::Image::Url(u) = i { Some(u) } else { None }).chain(bg.mask.iter()).chain(content);
             for u in urls {
                 let abs = fos_net::url_util::resolve(&base, u);
                 if !css_images.contains(&abs) && css_images.len() < 400 {
@@ -1031,6 +1038,26 @@ mod tests {
         assert!(hr.1.w > 250.0 && hr.1.h >= 2.0, "{:?}", hr.1);
         assert!(layout.content_height() >= tops[tops.len() - 1]);
         assert!(layout.anchors.iter().any(|a| a.id == "end"));
+    }
+
+    #[test]
+    fn test_generated_content_images() {
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='red'/></svg>";
+        let html = format!(r#"<html><head><style>body, p {{ margin: 0 }} .i::before {{ content: url("{svg}") " " }}</style></head><body><p class=i>x</p></body></html>"#);
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 50);
+        let first = renderer.render_document(&document, 0.0).unwrap();
+        // Nothing drawn (and no room taken) before the image loads; its URL
+        // is among those to fetch
+        assert_ne!(first.pixels[5 * 200 + 5], 0xffff0000);
+        let urls = renderer.css_image_urls();
+        assert_eq!(urls, vec![svg.to_string()]);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        // Red somewhere in the image's column (it sits on the baseline)
+        let reddish = |p: u32| (p >> 16) & 0xff > 0xe0 && (p >> 8) & 0xff < 0x60;
+        assert!((0..20).any(|y| reddish(page.pixels[y * 200 + 5])));
     }
 
     #[test]

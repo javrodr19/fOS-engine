@@ -738,8 +738,11 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                     pending = 0.0;
                     content = false;
                 }
+                // Spaces count unless a line can break right after them
+                // (the next piece's break opportunity drops them): in
+                // nowrap text they are part of the min-content width
                 PieceKind::Space { collapsible } => {
-                    if whole_lines && (content || !collapsible) {
+                    if content || !collapsible {
                         pending += p.width;
                     }
                 }

@@ -897,3 +897,20 @@ fn aspect_ratio_sizes_automatic_dimensions() {
     assert_eq!(size(d), (60.0, 20.0));
     assert_eq!(size(e), (50.0, 7.0));
 }
+
+#[test]
+fn nowrap_flex_items_keep_their_text_width() {
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 100px");
+    let a = el(&mut tree, row, "span", "white-space: nowrap");
+    text(&mut tree, a, "one two three four");
+    let b = el(&mut tree, row, "span", "white-space: nowrap");
+    text(&mut tree, b, "five six");
+    let t = layout(&tree, html, 800.0);
+    // min-content of nowrap text includes its spaces: the items overflow
+    // the row rather than overlapping
+    let (ra, rb) = (rect_of(&t, a), rect_of(&t, b));
+    let texts: Vec<Rect> = t.element_rects().into_iter().filter(|(n, r)| *n == a && r.w > 0.0).map(|(_, r)| r).collect();
+    let text_right = texts.iter().map(|r| r.right()).fold(0.0f32, f32::max);
+    assert!(rb.x >= text_right - 0.5, "{ra:?} {rb:?} text ends at {text_right}");
+}

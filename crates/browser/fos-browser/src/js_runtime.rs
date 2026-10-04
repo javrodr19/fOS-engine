@@ -922,6 +922,8 @@ mod tests {
     fn shadow_dom() {
         let (mut rt, _doc) = page(
             r#"<html><body><x-host id="h"><b slot="title">T</b>light</x-host>
+            <x-decl id="d"><template shadowrootmode="open"><i>server</i></template></x-decl>
+            <x-decl id="c"><template shadowrootmode="closed"><i>closed</i></template></x-decl>
             <script>
               window.log = [];
               class XInner extends HTMLElement { connectedCallback() { log.push('inner connected:' + this.isConnected); } }
@@ -955,6 +957,10 @@ mod tests {
               sheet.replaceSync(':host { color: red }');
               root.adoptedStyleSheets = [sheet];
               log.push('adopted:' + root.adoptedStyleSheets.length + ':' + document.adoptedStyleSheets.length);
+              const d = document.getElementById('d');
+              log.push('declarative:' + d.shadowRoot.innerHTML + ':' + (document.getElementById('c').shadowRoot === null) + ':' + d.shadowRoot.host.id);
+              const again = d.attachShadow({ mode: 'open' });
+              log.push('claimed:' + (again === d.shadowRoot) + ':' + again.childNodes.length);
               base.part.add('base', 'x');
               log.push('part:' + base.getAttribute('part') + ':' + base.part.contains('x') + ':' + base.hasAttributes() + ':' + document.createElement('p').hasAttributes());
             </script></body></html>"#,
@@ -963,7 +969,7 @@ mod tests {
         assert_eq!(
             rt.eval("log.join(' | ')").unwrap(),
             "inner connected:true | template:0:1:<p>1</p> | true,true,11,true,open,true | true,true,true,,false,true | B;#text;true | \
-             base sees base | host sees x-host at phase 2 | slot sees b | base sees  | host sees b at phase 3 | closed:null | NotSupportedError | adopted:1:0 | part:base x:true:true:false"
+             base sees base | host sees x-host at phase 2 | slot sees b | base sees  | host sees b at phase 3 | closed:null | NotSupportedError | adopted:1:0 | declarative:<i>server</i>:true:d | claimed:true:0 | part:base x:true:true:false"
         );
     }
 

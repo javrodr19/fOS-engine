@@ -1215,6 +1215,12 @@ fn shadow_root_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsR
     Ok(wrap(vm, root))
 }
 
+/// `__fosShadowClosed(root)`: whether a declarative shadow root is closed
+fn shadow_closed(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::FALSE) };
+    Ok(Value::bool(with_tree(vm, |t| t.get_attribute(root, "mode") == Some("closed"))))
+}
+
 /// `__fosShadowHost(root)`: the host of shadow root `root`
 fn shadow_host_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
@@ -1851,6 +1857,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosAttachShadow", 1, attach_shadow),
         ("__fosShadowRoot", 1, shadow_root_of),
         ("__fosShadowHost", 1, shadow_host_of),
+        ("__fosShadowClosed", 1, shadow_closed),
         ("__fosAssignedNodes", 1, assigned_nodes),
         ("__fosAssignedSlot", 1, assigned_slot),
         ("__fosParseDocument", 1, parse_document),

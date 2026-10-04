@@ -30,6 +30,29 @@
   // Shadow roots: host -> root, and root -> { host, mode, ... }
   const shadowOf = new WeakMap();
   const shadowInfo = new WeakMap();
+  // `el`'s shadow root, whatever its mode. Roots the parser made
+  // (declarative, from <template shadowrootmode>) are taken in when first
+  // seen.
+  function shadowRootOf(el) {
+    let root = shadowOf.get(el);
+    if (root === undefined && el && el.nodeType === 1) {
+      root = __fosShadowRoot(el);
+      if (root) {
+        shadowInfo.set(root, { host: el, mode: __fosShadowClosed(root) ? 'closed' : 'open', delegatesFocus: false, slotAssignment: 'named', clonable: false, declarative: true });
+        shadowOf.set(el, root);
+      }
+    }
+    return root || null;
+  }
+  // What is known of shadow root `root` (null for other nodes)
+  function shadowInfoOf(root) {
+    let info = shadowInfo.get(root);
+    if (!info && root && root.nodeType === 11) {
+      const host = __fosShadowHost(root);
+      if (host && shadowRootOf(host)) info = shadowInfo.get(root);
+    }
+    return info || null;
+  }
 
   class Event {
     constructor(type, init = {}) {
@@ -138,10 +161,10 @@
         if (n === document) next = event.type === 'load' ? null : global;
         else {
           next = n.parentNode;
-          if (next && shadowOf.has(next)) next = __fosAssignedSlot(n) || next;
-          else if (!next && shadowInfo.has(n)) {
+          if (next && shadowRootOf(next)) next = __fosAssignedSlot(n) || next;
+          else if (!next && shadowInfoOf(n)) {
             if (!composed) break;
-            next = shadowInfo.get(n).host;
+            next = shadowInfoOf(n).host;
             if (t.getRootNode() === n) t = next;
           }
         }
@@ -368,15 +391,23 @@
     blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur', { composed: true })); },
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })); },
     attachShadow(init) {
-      if (shadowOf.has(this)) throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
       const mode = init && init.mode === 'closed' ? 'closed' : 'open';
+      const existing = shadowRootOf(this);
+      if (existing) {
+        const info = shadowInfo.get(existing);
+        if (!info.declarative) throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+        // A declarative root is emptied and handed over once
+        existing.replaceChildren();
+        Object.assign(info, { mode, delegatesFocus: !!(init && init.delegatesFocus), declarative: false });
+        return existing;
+      }
       const root = __fosAttachShadow(this);
       shadowInfo.set(root, { host: this, mode, delegatesFocus: !!(init && init.delegatesFocus), slotAssignment: (init && init.slotAssignment) || 'named', clonable: !!(init && init.clonable) });
       shadowOf.set(this, root);
       return root;
     },
     get shadowRoot() {
-      const root = shadowOf.get(this);
+      const root = shadowRootOf(this);
       return root && shadowInfo.get(root).mode === 'open' ? root : null;
     },
     animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; },
@@ -952,7 +983,7 @@
     }
   }
   const shadowState = (root) => {
-    const s = shadowInfo.get(root);
+    const s = shadowInfoOf(root);
     if (!s) throw new TypeError('Illegal invocation');
     return s;
   };
@@ -970,7 +1001,7 @@
         for (let n = document.activeElement; n;) {
           const root = n.getRootNode();
           if (root === this) return n;
-          n = shadowInfo.get(root)?.host;
+          n = shadowInfoOf(root)?.host;
         }
         return null;
       },
@@ -1443,7 +1474,7 @@
       if (sheet && !list.includes(sheet)) continue;
       let css = '';
       for (const s of list) if (s && !s.disabled) css += cssOf(s) + '\n';
-      if (shadowInfo.has(owner)) __fosSetShadowAdoptedCSS(owner, css);
+      if (shadowInfoOf(owner)) __fosSetShadowAdoptedCSS(owner, css);
       else __fosSetAdoptedCSS(css);
     }
   }
@@ -1591,7 +1622,7 @@
       if (r.nodeType === 1) all.unshift(r);
       for (const el of all) {
         out.push(el);
-        const sr = shadowOf.get(el);
+        const sr = shadowRootOf(el);
         if (sr) visit(sr);
       }
     };
@@ -1796,7 +1827,7 @@
     constructor(el) { Object.defineProperty(this, '_el', { value: el }); this.states = new Set(); this.validity = { valid: true }; this.validationMessage = ''; this.willValidate = false; }
     get form() { return this._el.closest('form'); }
     get labels() { return []; }
-    get shadowRoot() { return shadowOf.get(this._el) ?? null; }
+    get shadowRoot() { return shadowRootOf(this._el); }
     setFormValue() {}
     setValidity(flags = {}, message = '') { this.validity = { ...flags, valid: !Object.values(flags).some(Boolean) }; this.validationMessage = String(message); }
     checkValidity() { return this.validity.valid; }

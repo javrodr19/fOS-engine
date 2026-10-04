@@ -1240,6 +1240,26 @@ mod tests {
     }
 
     #[test]
+    fn test_declarative_shadow_roots_render_without_scripts() {
+        let html = r#"<html><body style="margin: 0">
+            <x-box><template shadowrootmode="open"><style>:host { display: block; background: #0f0 } div { height: 10px }</style><div></div><slot></slot></template><p style="margin: 0; height: 10px; background: #00f"></p></x-box>
+            <template id="t"><div style="height: 50px; background: #f00"></div></template>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let tree = document.tree();
+        let host = tree.children(document.body()).map(|(c, _)| c).find(|&c| tree.get(c).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "x-box")).unwrap();
+        assert!(tree.shadow_root(host).is_some());
+        // The declarative template is gone; others keep their contents
+        assert_eq!(tree.children(host).filter(|(_, n)| n.is_element()).count(), 1);
+        let mut renderer = PageRenderer::new(100, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |y: usize| page.pixels[y * 100 + 50] & 0xffffff;
+        assert_eq!(at(5), 0x00ff00, "the shadow tree's div on the :host background");
+        assert_eq!(at(15), 0x0000ff, "the slotted <p>");
+        assert_eq!(at(25), 0xffffff, "nothing below");
+    }
+
+    #[test]
     fn test_inline_opacity_covers_its_contents() {
         // Opacity on an inline element fades the inline-blocks and blocks
         // inside it (an undefined custom element under :not(:defined))

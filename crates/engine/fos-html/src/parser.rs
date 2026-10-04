@@ -229,6 +229,30 @@ impl TreeSink for DomSink {
         for &(_, fragment) in &contents {
             tree.remove(fragment);
         }
+        // Declarative shadow roots: a <template shadowrootmode> becomes
+        // the shadow root of its parent element (the first one does), its
+        // contents moving in
+        let mut kept = Vec::with_capacity(contents.len());
+        for (template, fragment) in contents {
+            let mode = tree.get_attribute(template, "shadowrootmode").map(|m| m.trim().to_ascii_lowercase());
+            let parent = tree.get(template).map_or(NodeId::NONE, |n| n.parent);
+            let host_ok = tree.get(parent).is_some_and(|n| n.is_element()) && tree.shadow_root(parent).is_none();
+            match mode.as_deref() {
+                Some(mode @ ("open" | "closed")) if host_ok => {
+                    let root = tree.attach_shadow(parent);
+                    if mode == "closed" {
+                        tree.set_attribute(root, "mode", "closed");
+                    }
+                    let kids: Vec<NodeId> = tree.children(fragment).map(|(c, _)| c).collect();
+                    for kid in kids {
+                        tree.append_child(root, kid);
+                    }
+                    tree.remove(template);
+                }
+                _ => kept.push((template, fragment)),
+            }
+        }
+        let contents = kept;
 
         let mut document = Document::empty(&self.url);
         document.tree = tree;

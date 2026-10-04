@@ -12,3 +12,7 @@ fos-css = { path = "../fos-css" }
 fos-text = { path = "../fos-text" }
 tracing.workspace = true
 thiserror.workspace = true
+# Complex scripts (Arabic joining, Indic reordering, right-to-left
+# glyph order) and the Unicode bidirectional algorithm
+rustybuzz = "0.20"
+unicode-bidi = "0.3"

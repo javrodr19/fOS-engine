@@ -47,6 +47,10 @@ ul ul, ol ul, menu ul, ul menu { list-style-type: circle; }
 ul ul ul, ul ol ul, ol ul ul, ol ol ul { list-style-type: square; }
 ul ul, ul ol, ol ul, ol ol, menu ul, ul menu { margin-top: 0; margin-bottom: 0; }
 
+[dir=rtl], [dir=RTL] { direction: rtl; }
+[dir=ltr], [dir=LTR] { direction: ltr; }
+[dir=rtl] ul, [dir=rtl] ol, [dir=rtl] menu, ul[dir=rtl], ol[dir=rtl] { padding-left: 0; padding-right: 40px; }
+
 address, cite, dfn, em, i, var { font-style: italic; }
 code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace; }
 pre, listing, xmp, plaintext { white-space: pre; }

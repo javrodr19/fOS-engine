@@ -38,6 +38,8 @@ struct Piece {
     width: f32,
     /// A soft wrap opportunity right before this piece
     break_before: bool,
+    /// Where a word or space starts in the content's text
+    at: usize,
 }
 
 /// Horizontal margin + border + padding at an inline box's start and end
@@ -61,7 +63,7 @@ fn spaced(word: &ShapedWord, ls: f32) -> Arc<ShapedWord> {
 
 /// Measure the content into pieces; `atomic_widths` are the atomic
 /// inlines' margin-box widths
-fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont], cb_w: f32, atomic_widths: &[f32]) -> Vec<Piece> {
+fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont], cb_w: f32, atomic_widths: &[f32], levels: Option<&[u8]>) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::with_capacity(ic.items.len() * 4);
     let mut opportunity = false;
     let mut stack: Vec<u32> = Vec::new();
@@ -78,11 +80,12 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                 let text = &ic.text[*start..*end];
                 let mut rest = text;
                 while !rest.is_empty() {
+                    let at = *start + text.len() - rest.len();
                     let spaces = rest.len() - rest.trim_start_matches(' ').len();
                     if spaces > 0 {
                         let n = spaces as f32;
                         let w = ctx.fonts.shape(font, " ").width * n + (inh.word_spacing + inh.letter_spacing) * n;
-                        out.push(Piece { kind: PieceKind::Space { collapsible }, width: w, break_before: false });
+                        out.push(Piece { kind: PieceKind::Space { collapsible }, width: w, break_before: false, at });
                         opportunity = wraps;
                         rest = &rest[spaces..];
                         continue;
@@ -93,47 +96,56 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                     // Break opportunities inside the word
                     let mut chunk_start = 0;
                     let mut prev: Option<char> = None;
-                    let mut chunks: Vec<&str> = Vec::new();
+                    // (text, whether a line may break before it)
+                    let mut chunks: Vec<(&str, bool)> = Vec::new();
+                    let mut chunk_at = at;
+                    let mut chunk_breaks = opportunity;
+                    let level = |i: usize| levels.and_then(|l| l.get(at + i).copied());
                     for (i, c) in word.char_indices() {
                         if let Some(p) = prev {
-                            let split = wraps && (break_all || is_cjk(c) || is_cjk(p) || (p == '-' && c.is_alphanumeric() && i - chunk_start > 2));
-                            if split {
-                                chunks.push(&word[chunk_start..i]);
+                            let breaks = wraps && (break_all || is_cjk(c) || is_cjk(p) || (p == '-' && c.is_alphanumeric() && i - chunk_start > 2));
+                            // Runs of another direction are shaped and
+                            // placed apart (no break opportunity there)
+                            if breaks || level(i) != level(chunk_start) {
+                                chunks.push((&word[chunk_start..i], chunk_breaks));
                                 chunk_start = i;
+                                chunk_breaks = breaks;
                             }
                         }
                         prev = Some(c);
                     }
-                    chunks.push(&word[chunk_start..]);
-                    for (ci, chunk) in chunks.into_iter().enumerate() {
+                    chunks.push((&word[chunk_start..], chunk_breaks));
+                    for (chunk, breaks) in chunks {
+                        let at = chunk_at;
+                        chunk_at += chunk.len();
                         let mut shaped = ctx.fonts.shape(font, chunk);
                         if inh.letter_spacing != 0.0 {
                             shaped = spaced(&shaped, inh.letter_spacing);
                         }
                         let width = shaped.width;
-                        out.push(Piece { kind: PieceKind::Word { style: *style, node: *node, word: shaped }, width, break_before: if ci == 0 { opportunity } else { true } });
+                        out.push(Piece { kind: PieceKind::Word { style: *style, node: *node, word: shaped }, width, break_before: breaks, at });
                         opportunity = false;
                     }
                 }
             }
             InlineItem::Open { style, node } => {
                 let (left, _) = inline_edges(&ic.styles[*style as usize], cb_w);
-                out.push(Piece { kind: PieceKind::Open { style: *style, node: *node }, width: left, break_before: opportunity });
+                out.push(Piece { kind: PieceKind::Open { style: *style, node: *node }, width: left, break_before: opportunity, at: 0 });
                 opportunity = false;
                 stack.push(*style);
             }
             InlineItem::Close => {
                 let right = stack.pop().map_or(0.0, |s| inline_edges(&ic.styles[s as usize], cb_w).1);
-                out.push(Piece { kind: PieceKind::Close, width: right, break_before: false });
+                out.push(Piece { kind: PieceKind::Close, width: right, break_before: false, at: 0 });
             }
             InlineItem::Atomic(_) => {
                 let wraps = ic.styles[stack.last().copied().unwrap_or(0) as usize].inherited.white_space.wraps();
-                out.push(Piece { kind: PieceKind::Atomic(atomic), width: atomic_widths.get(atomic).copied().unwrap_or(0.0), break_before: wraps });
+                out.push(Piece { kind: PieceKind::Atomic(atomic), width: atomic_widths.get(atomic).copied().unwrap_or(0.0), break_before: wraps, at: 0 });
                 atomic += 1;
                 opportunity = wraps;
             }
             InlineItem::Break => {
-                out.push(Piece { kind: PieceKind::Break, width: 0.0, break_before: false });
+                out.push(Piece { kind: PieceKind::Break, width: 0.0, break_before: false, at: 0 });
                 opportunity = false;
             }
         }
@@ -267,13 +279,14 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     }
     let atomic_styles: Vec<&Style> = ic.items.iter().filter_map(|i| if let InlineItem::Atomic(b) = i { Some(&b.style) } else { None }).collect();
     let widths: Vec<f32> = atomics.iter().map(|a| a.as_ref().map_or(0.0, |a| a.margin_box_width())).collect();
-    let pieces = build_pieces(ctx, ic, &fonts, avail, &widths);
+    let rtl = ic.styles[0].inherited.direction == Direction::Rtl;
+    let levels = bidi_levels(&ic.text, rtl);
+    let pieces = build_pieces(ctx, ic, &fonts, avail, &widths, levels.as_deref());
 
     let container = &ic.styles[0];
     let indent = container.inherited.text_indent.resolve(avail);
     let root_font = fonts[0];
     let root_lh = container.inherited.line_height.resolve(root_font.size);
-    let rtl = container.inherited.direction == Direction::Rtl;
     let align = container.inherited.text_align;
 
     let mut frags: Vec<Fragment> = Vec::new();
@@ -389,13 +402,38 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // Atomic inlines placed on this line: (index, x, baseline shift)
         let mut placed_atomics: Vec<(usize, f32, f32)> = Vec::new();
         let mut x = start_x + offset;
-        for &(style, node) in &carried {
-            open_box(&mut stack, ic, &fonts, style, node, x, false, &mut top, &mut bottom);
-        }
+        let order = visual_order(line, &carried, levels.as_deref(), rtl);
+        // Boxes still open at the line's end continue on the next
+        carried = {
+            let mut open = carried.clone();
+            for p in line {
+                match p.kind {
+                    PieceKind::Open { style, node } => open.push((style, node)),
+                    PieceKind::Close => {
+                        open.pop();
+                    }
+                    _ => {}
+                }
+            }
+            open
+        };
         let mut content = false;
         let mut pending = 0.0f32;
         let mut pending_n = 0usize;
-        for p in line {
+        for v in order {
+            let p = match v {
+                Visual::Piece(i) => &line[i],
+                Visual::OpenCarried(style, node) => {
+                    open_box(&mut stack, ic, &fonts, style, node, x, false, &mut top, &mut bottom);
+                    continue;
+                }
+                Visual::CloseOpen => {
+                    if stack.len() > 1 {
+                        close_box(&mut stack, ic, &fonts, x, false, avail);
+                    }
+                    continue;
+                }
+            };
             match &p.kind {
                 PieceKind::Space { collapsible } => {
                     if content || !collapsible {
@@ -467,8 +505,6 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                 PieceKind::Break => {}
             }
         }
-        // Boxes still open continue on the next line
-        carried = stack[1..].iter().map(|o| (o.style, o.node)).collect();
         while stack.len() > 1 {
             close_box(&mut stack, ic, &fonts, x, false, avail);
         }
@@ -495,6 +531,133 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         y += bottom - top;
     }
     InlineLayout { frags, height: y }
+}
+
+/// Bidi embedding levels of each byte of `text` (paragraph direction
+/// `rtl`), or `None` when everything is left to right
+fn bidi_levels(text: &str, rtl: bool) -> Option<Vec<u8>> {
+    let mixed = text.chars().any(|c| matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF | 0x202A..=0x202E | 0x2066..=0x2069 | 0x200F));
+    if !rtl && !mixed {
+        return None;
+    }
+    let base = if rtl { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() };
+    let info = unicode_bidi::BidiInfo::new(text, Some(base));
+    Some(info.levels.iter().map(|l| l.number()).collect())
+}
+
+/// What the line draws, left to right
+enum Visual {
+    Piece(usize),
+    /// An inline box continued from the previous line starts
+    OpenCarried(u32, NodeId),
+    /// The innermost box, continued on the next line, ends
+    CloseOpen,
+}
+
+/// The line's pieces in visual order (Unicode bidi rule L2): runs at
+/// odd levels are reversed. Inline boxes stay whole, ordered as units
+/// among their siblings at the lowest level of their content
+fn visual_order(line: &[Piece], carried: &[(u32, NodeId)], levels: Option<&[u8]>, rtl: bool) -> Vec<Visual> {
+    let Some(levels) = levels else {
+        let mut out: Vec<Visual> = carried.iter().map(|&(s, n)| Visual::OpenCarried(s, n)).collect();
+        out.extend((0..line.len()).map(Visual::Piece));
+        return out;
+    };
+    enum Node {
+        Leaf(usize),
+        Group { open: Result<usize, (u32, NodeId)>, children: Vec<Node>, close: bool, close_at: Option<usize> },
+    }
+    // The line as a tree of inline boxes
+    let mut stack: Vec<(Result<usize, (u32, NodeId)>, Vec<Node>)> = vec![(Err((0, NodeId::NONE)), Vec::new())];
+    for &(s, n) in carried {
+        stack.push((Err((s, n)), Vec::new()));
+    }
+    for (i, p) in line.iter().enumerate() {
+        match p.kind {
+            PieceKind::Open { .. } => stack.push((Ok(i), Vec::new())),
+            PieceKind::Close if stack.len() > 1 => {
+                let (open, children) = stack.pop().expect("group");
+                stack.last_mut().expect("root").1.push(Node::Group { open, children, close: true, close_at: Some(i) });
+            }
+            _ => stack.last_mut().expect("root").1.push(Node::Leaf(i)),
+        }
+    }
+    while stack.len() > 1 {
+        let (open, children) = stack.pop().expect("group");
+        stack.last_mut().expect("root").1.push(Node::Group { open, children, close: false, close_at: None });
+    }
+    let root = stack.pop().expect("root").1;
+    let base = if rtl { 1 } else { 0 };
+    let level_of = |i: usize| -> Option<u8> {
+        match line[i].kind {
+            PieceKind::Word { .. } | PieceKind::Space { .. } => levels.get(line[i].at).copied(),
+            _ => None,
+        }
+    };
+    fn min_level(n: &Node, level_of: &dyn Fn(usize) -> Option<u8>) -> Option<u8> {
+        match n {
+            Node::Leaf(i) => level_of(*i),
+            Node::Group { children, .. } => children.iter().filter_map(|c| min_level(c, level_of)).min(),
+        }
+    }
+    let all: Vec<u8> = (0..line.len()).filter_map(level_of).collect();
+    let hi = all.iter().copied().max().unwrap_or(base).max(base);
+    let lo_odd = all.iter().copied().chain([base]).filter(|l| l % 2 == 1).min();
+    fn order(nodes: Vec<Node>, context: u8, hi: u8, lo_odd: Option<u8>, level_of: &dyn Fn(usize) -> Option<u8>, line: &[Piece], out: &mut Vec<Visual>) {
+        let own: Vec<Option<u8>> = nodes.iter().map(|n| min_level(n, level_of)).collect();
+        // Neutral pieces (boxes without text, atomics) take the lower of
+        // their neighbours' levels
+        let resolved: Vec<u8> = (0..nodes.len())
+            .map(|i| {
+                own[i].unwrap_or_else(|| {
+                    let prev = own[..i].iter().rev().find_map(|l| *l);
+                    let next = own[i + 1..].iter().find_map(|l| *l);
+                    match (prev, next) {
+                        (Some(a), Some(b)) => a.min(b),
+                        (Some(a), None) | (None, Some(a)) => a,
+                        (None, None) => context,
+                    }
+                })
+            })
+            .collect();
+        let mut idx: Vec<usize> = (0..nodes.len()).collect();
+        if let Some(lo) = lo_odd {
+            for k in (lo..=hi).rev() {
+                let mut i = 0;
+                while i < idx.len() {
+                    if resolved[idx[i]] >= k {
+                        let start = i;
+                        while i < idx.len() && resolved[idx[i]] >= k {
+                            i += 1;
+                        }
+                        idx[start..i].reverse();
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        let mut nodes: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
+        for i in idx {
+            match nodes[i].take().expect("node") {
+                Node::Leaf(p) => out.push(Visual::Piece(p)),
+                Node::Group { open, children, close, close_at } => {
+                    out.push(match open {
+                        Ok(p) => Visual::Piece(p),
+                        Err((s, n)) => Visual::OpenCarried(s, n),
+                    });
+                    order(children, resolved[i], hi, lo_odd, level_of, line, out);
+                    match (close, close_at) {
+                        (true, Some(p)) => out.push(Visual::Piece(p)),
+                        _ => out.push(Visual::CloseOpen),
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(line.len() + carried.len() * 2);
+    order(root, base, hi, lo_odd, &level_of, line, &mut out);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,9 +753,9 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
         }
         best
     };
-    let min_pieces = build_pieces(ctx, ic, &fonts, 0.0, &mins);
+    let min_pieces = build_pieces(ctx, ic, &fonts, 0.0, &mins, None);
     let min = measure(&min_pieces, false);
-    let max_pieces = build_pieces(ctx, ic, &fonts, 0.0, &maxs);
+    let max_pieces = build_pieces(ctx, ic, &fonts, 0.0, &maxs, None);
     let max = measure(&max_pieces, true);
     (min, max.max(min))
 }

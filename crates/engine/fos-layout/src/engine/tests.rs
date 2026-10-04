@@ -791,3 +791,62 @@ fn counters_number_generated_content() {
     // the outer list's counter stays in scope for the following sibling
     assert_eq!(texts, ["1 a", "1.1 a", "1.2 b", "2 b", "[2]", "5/2", "6/2"]);
 }
+
+/// The glyph counts of the laid-out words, left to right, and the
+/// leftmost word's x
+fn visual_words(t: &FragmentTree) -> (Vec<usize>, f32) {
+    let mut words: Vec<(f32, usize)> = Vec::new();
+    t.for_each(|f| {
+        if let Fragment::Text(tf) = f {
+            words.extend(tf.words.iter().map(|(w, x)| (*x, w.glyphs.len())));
+        }
+    });
+    words.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (words.iter().map(|w| w.1).collect(), words.first().map_or(0.0, |w| w.0))
+}
+
+/// Whether the system has faces for Hebrew and Arabic (the bidi tests
+/// count glyphs)
+fn has_rtl_fonts() -> bool {
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "p", "display: block");
+    text(&mut tree, p, "\u{5D0} \u{627}");
+    visual_words(&layout(&tree, html, 600.0)).0.iter().all(|&g| g > 0)
+}
+
+#[test]
+fn right_to_left_text_is_reordered() {
+    if !has_rtl_fonts() {
+        return;
+    }
+    // A right-to-left paragraph (2-, 4- and 5-glyph words): the first
+    // word is rightmost; the number stays left to right
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "p", "direction: rtl; display: block");
+    text(&mut tree, p, "\u{5D0}\u{5D1} \u{5D3}\u{5D4}\u{5D5}\u{5D6} 12345");
+    let (glyphs, left) = visual_words(&layout(&tree, html, 600.0));
+    assert_eq!(glyphs, [5, 4, 2]);
+    // Right-aligned (text-align: start)
+    assert!(left > 300.0, "{left}");
+
+    // Hebrew inside English: only the Hebrew run is reversed
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "p", "display: block");
+    text(&mut tree, p, "abc \u{5D0}\u{5D1} \u{5D3}\u{5D4}\u{5D5}\u{5D6}\u{5D7} xyzwvu");
+    let (glyphs, left) = visual_words(&layout(&tree, html, 600.0));
+    assert_eq!(glyphs, [3, 5, 2, 6]);
+    assert!(left < 20.0, "{left}");
+}
+
+#[test]
+fn numbers_and_punctuation_split_from_right_to_left_words() {
+    if !has_rtl_fonts() {
+        return;
+    }
+    // "2026." ending Arabic text: the period goes to the number's left
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "p", "direction: rtl; display: block");
+    text(&mut tree, p, "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64A} 2026.");
+    let (glyphs, _) = visual_words(&layout(&tree, html, 600.0));
+    assert_eq!(glyphs, [1, 4, 6]);
+}

@@ -194,6 +194,11 @@ impl FontContext {
     }
 
     fn shape_uncached(&mut self, font: &ResolvedFont, text: &str) -> ShapedWord {
+        if text.chars().any(is_complex) {
+            if let Some(w) = self.shape_complex(font, text) {
+                return w;
+            }
+        }
         let size = font.size;
         let shaped = font.id.and_then(|id| self.shaper.shape(&self.db, id, text, size).ok());
         match shaped {
@@ -208,6 +213,45 @@ impl FontContext {
                 ShapedWord { font: None, size, width, glyphs: Box::new([]), fallback: Box::new([]) }
             }
         }
+    }
+
+    /// Shape a word in a complex script (joining, reordering, right to
+    /// left) with HarfBuzz's algorithm, in the font when it has the
+    /// script's characters or else a fallback face; glyphs come out in
+    /// visual order
+    fn shape_complex(&mut self, font: &ResolvedFont, text: &str) -> Option<ShapedWord> {
+        let first = text.chars().find(|&c| is_complex(c))?;
+        let covers = |db: &FontDatabase, id: FontId| {
+            db.with_face_data(id, |data, index| rustybuzz::Face::from_slice(data, index).is_some_and(|f| text.chars().filter(|&c| is_complex(c)).all(|c| f.glyph_index(c).is_some())))
+                .unwrap_or(false)
+        };
+        let face_id = match font.id {
+            Some(id) if covers(&self.db, id) => id,
+            _ => self.fallback_face(first)?,
+        };
+        let size = font.size;
+        let (glyphs, width) = self.db.with_face_data(face_id, |data, index| {
+            let face = rustybuzz::Face::from_slice(data, index)?;
+            let mut buf = rustybuzz::UnicodeBuffer::new();
+            buf.push_str(text);
+            buf.guess_segment_properties();
+            let out = rustybuzz::shape(&face, &[], buf);
+            let scale = size / face.units_per_em() as f32;
+            let mut x = 0.0;
+            let glyphs: Vec<Glyph> = out
+                .glyph_infos()
+                .iter()
+                .zip(out.glyph_positions())
+                .map(|(info, pos)| {
+                    let g = Glyph { id: info.glyph_id as u16, x: x + pos.x_offset as f32 * scale, y: pos.y_offset as f32 * scale, advance: pos.x_advance as f32 * scale };
+                    x += pos.x_advance as f32 * scale;
+                    g
+                })
+                .collect();
+            Some((glyphs, x))
+        })??;
+        let fallback: Box<[(u32, Option<FontId>)]> = if Some(face_id) == font.id { Box::new([]) } else { Box::new([(0, Some(face_id))]) };
+        Some(ShapedWord { font: font.id, size, width, glyphs: glyphs.into(), fallback })
     }
 
     /// Shape `text` in runs: characters the face lacks in a fallback face
@@ -275,6 +319,13 @@ impl FontContext {
 }
 
 /// A run's glyphs positioned from `x0`, and the pen position after them
+/// Characters of scripts that need complex shaping: Hebrew, Arabic and
+/// the other right-to-left scripts, Indic scripts, Thai, Lao, Tibetan,
+/// Myanmar and Khmer
+pub fn is_complex(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
+}
+
 fn positioned(run: &fos_text::ShapedRun, x0: f32) -> (Vec<Glyph>, f32) {
     let scale = run.scale();
     let mut x = x0;

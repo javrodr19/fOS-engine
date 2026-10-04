@@ -301,7 +301,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     };
     if sizing == Sizing::Stretch {
         // Auto margins take the free space; overconstrained, the right
-        // margin gives (ltr)
+        // margin gives (the left one in right-to-left content)
         let free = cb_w - width - hbp - ml - mr;
         match (ml_auto, mr_auto) {
             (true, true) => {
@@ -315,6 +315,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
                 ml += free / 2.0;
                 mr += free / 2.0;
             }
+            // (its own direction stands in for the containing block's)
+            (false, false) if style.inherited.direction == fos_css::style::Direction::Rtl => ml += free,
             (false, false) => mr += free,
         }
     }

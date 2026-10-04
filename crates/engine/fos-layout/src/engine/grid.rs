@@ -641,7 +641,11 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let hoff = if ml_auto && mr_auto { hfree / 2.0 } else if ml_auto { hfree } else if mr_auto { 0.0 } else { hfree * hfrac };
         let (mt_auto, mb_auto) = (m[0].is_auto(), m[2].is_auto());
         let voff = if mt_auto && mb_auto { vfree / 2.0 } else if mt_auto { vfree } else if mb_auto { 0.0 } else { vfree * vfrac };
-        let x = col_x.get(a.c0).copied().unwrap_or(0.0) + hoff + l.ml;
+        let mut x = col_x.get(a.c0).copied().unwrap_or(0.0) + hoff + l.ml;
+        // Columns run from the right in right-to-left containers
+        if style.inherited.direction == fos_css::style::Direction::Rtl {
+            x = width - x - l.frag.border_box.w;
+        }
         let y = row_y.get(a.r0).copied().unwrap_or(0.0) + voff + l.mt.size();
         let rel = relative_offset(&b.style, width, height);
         let (dx, dy) = (x - l.frag.border_box.x + rel.0, y - l.frag.border_box.y + rel.1);

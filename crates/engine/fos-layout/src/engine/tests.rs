@@ -850,3 +850,28 @@ fn numbers_and_punctuation_split_from_right_to_left_words() {
     let (glyphs, _) = visual_words(&layout(&tree, html, 600.0));
     assert_eq!(glyphs, [1, 4, 6]);
 }
+
+#[test]
+fn right_to_left_blocks_flex_and_grid_mirror() {
+    let (mut tree, html, body) = doc();
+    let rtl = el(&mut tree, body, "div", "direction: rtl; display: block; width: 600px");
+    let fixed = el(&mut tree, rtl, "div", "display: block; width: 100px; height: 10px");
+    let flex = el(&mut tree, rtl, "div", "display: flex");
+    let f1 = el(&mut tree, flex, "div", "width: 100px; height: 10px");
+    let f2 = el(&mut tree, flex, "div", "width: 50px; height: 10px");
+    let grid = el(&mut tree, rtl, "div", "display: grid; grid-template-columns: 200px 1fr");
+    let g1 = el(&mut tree, grid, "div", "height: 10px");
+    let g2 = el(&mut tree, grid, "div", "height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let right = |n| { let r = rect_of(&t, n); r.x + r.w };
+    let x0 = rect_of(&t, rtl).x;
+    // A fixed-width block sits at the right
+    assert!((right(fixed) - (x0 + 600.0)).abs() < 0.5, "{:?}", rect_of(&t, fixed));
+    // Flex items start from the right: f1 rightmost, f2 to its left
+    assert!((right(f1) - (x0 + 600.0)).abs() < 0.5);
+    assert!((right(f2) - rect_of(&t, f1).x).abs() < 0.5);
+    // The first grid column is the rightmost
+    assert!((right(g1) - (x0 + 600.0)).abs() < 0.5);
+    assert!((rect_of(&t, g1).w - 200.0).abs() < 0.5);
+    assert!((right(g2) - rect_of(&t, g1).x).abs() < 0.5);
+}

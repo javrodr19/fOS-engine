@@ -78,7 +78,9 @@ fn align_of(item: &Style, container: &Style) -> AlignItems {
 pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, _cb_w: f32) -> FlexLayout {
     let bx = &style.box_;
     let row = bx.flex_direction.is_row();
-    let reverse = bx.flex_direction.is_reverse();
+    // Rows run from the right in right-to-left containers
+    let rtl = style.inherited.direction == fos_css::style::Direction::Rtl;
+    let reverse = bx.flex_direction.is_reverse() != (row && rtl);
     let wrap = bx.flex_wrap != FlexWrap::Nowrap;
     let main_size = if row { Some(width) } else { height };
     let cross_size = if row { height } else { Some(width) };

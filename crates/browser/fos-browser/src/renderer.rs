@@ -420,7 +420,7 @@ impl PageRenderer {
         for (node, (w, h), pixmap) in updates {
             match pixmap {
                 Some(pixmap) => {
-                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap }));
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
                 }
                 None => {
                     self.canvases.remove(&node);
@@ -800,7 +800,8 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             let mut budget = 2000;
             self.svg_paint(tree, node, style, &mut paint, &mut budget);
         }
-        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], &paint, self.svgs)?;
+        let refs = (!self.images.is_empty()).then_some(crate::image_loader::SvgRefs { images: self.images, base: &self.base });
+        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], &paint, refs, self.svgs)?;
         Some((img.natural, layout_engine::ImageHandle(img)))
     }
 
@@ -1257,6 +1258,25 @@ mod tests {
         assert_eq!(at(5), 0x00ff00, "the shadow tree's div on the :host background");
         assert_eq!(at(15), 0x0000ff, "the slotted <p>");
         assert_eq!(at(25), 0xffffff, "nothing below");
+    }
+
+    #[test]
+    fn test_svg_use_of_external_sprite() {
+        // <use href="sprites.svg#id"> draws the symbol from the loaded
+        // sprite sheet, which the page's image URLs include
+        let html = r#"<html><body style="margin: 0"><svg width="20" height="20"><use href="/img/sprites.svg#sq" width="20" height="20"></use></svg></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/page");
+        assert_eq!(crate::image_loader::image_urls(&document, 100.0), vec!["https://example.com/img/sprites.svg".to_string()]);
+        let sprite = br##"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="sq" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f00"/></symbol></svg>"##;
+        let img = crate::image_loader::decode(sprite);
+        let mut images = HashMap::new();
+        if let Some(img) = img {
+            images.insert("https://example.com/img/sprites.svg".to_string(), Arc::new(img));
+        }
+        let mut renderer = PageRenderer::new(40, 40);
+        renderer.set_images(Arc::new(images));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[10 * 40 + 10] & 0xffffff, 0xff0000);
     }
 
     #[test]

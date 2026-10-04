@@ -26,7 +26,13 @@ pub struct LoadedImage {
     pub natural: (f32, f32),
     /// Premultiplied pixels (possibly smaller or larger than natural)
     pub pixmap: Pixmap,
+    /// An SVG image's markup, for inline `<svg>`s whose `<use>` refers to
+    /// its elements (sprite sheets)
+    pub svg_source: Option<Arc<str>>,
 }
+
+/// Largest SVG kept as markup for `<use>` references
+const MAX_SVG_SOURCE: usize = 1 << 20;
 
 impl std::fmt::Debug for LoadedImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,23 +114,61 @@ pub fn image_urls(document: &Document, viewport_w: f32) -> Vec<String> {
     let tree = document.tree();
     let base = crate::css_loader::base_url(document);
     let mut urls = Vec::new();
-    fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
-        let Some(e) = tree.get(id).and_then(|n| n.as_element()) else { return true };
-        let tag = tree.resolve(e.name.local);
-        let src = match tag {
-            "img" => image_source(tree, id, viewport_w),
-            "input" if tree.get_attribute(id, "type").is_some_and(|t| t.eq_ignore_ascii_case("image")) => tree.get_attribute(id, "src").map(str::to_string),
-            _ => None,
-        };
-        if let Some(src) = src {
-            let url = fos_net::url_util::resolve(&base, &src);
-            if !urls.contains(&url) {
-                urls.push(url);
+    // The document's tree and the connected shadow trees
+    let mut roots = vec![tree.root()];
+    roots.extend(tree.shadow_roots().filter(|&(host, _)| tree.is_connected(host)).map(|(_, root)| root));
+    for root in roots {
+        fos_dom::selector::walk_elements(tree, root, &mut |id| {
+            let Some(e) = tree.get(id).and_then(|n| n.as_element()) else { return true };
+            let tag = tree.resolve(e.name.local);
+            let src = match tag {
+                "img" => image_source(tree, id, viewport_w),
+                "input" if tree.get_attribute(id, "type").is_some_and(|t| t.eq_ignore_ascii_case("image")) => tree.get_attribute(id, "src").map(str::to_string),
+                // An SVG sprite sheet an inline <svg> uses
+                "use" => use_href(tree, id).and_then(|h| external_ref(h)).map(|(doc, _)| doc.to_string()),
+                _ => None,
+            };
+            if let Some(src) = src {
+                let url = fos_net::url_util::resolve(&base, &src);
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
             }
-        }
-        urls.len() < MAX_IMAGES
-    });
+            urls.len() < MAX_IMAGES
+        });
+    }
     urls
+}
+
+/// A `<use>` element's reference (`href`, or the older `xlink:href`)
+fn use_href(tree: &DomTree, node: NodeId) -> Option<&str> {
+    tree.get_attribute(node, "href").or_else(|| tree.get_attribute(node, "xlink:href"))
+}
+
+/// An external reference's document and element id (`sprites.svg#icon`)
+fn external_ref(href: &str) -> Option<(&str, &str)> {
+    let href = href.trim();
+    let (doc, id) = href.split_once('#')?;
+    (!doc.is_empty() && !id.is_empty()).then_some((doc, id))
+}
+
+/// What inline SVGs refer to outside themselves: loaded SVG images (by
+/// absolute URL) and the URL references resolve against
+#[derive(Clone, Copy)]
+pub struct SvgRefs<'a> {
+    pub images: &'a Images,
+    pub base: &'a str,
+}
+
+/// The markup inside an SVG document's root element
+fn svg_contents(src: &str) -> Option<&str> {
+    let start = src.find("<svg")?;
+    let open_end = start + src[start..].find('>')? + 1;
+    if src[..open_end].ends_with("/>") {
+        return None;
+    }
+    let close = src.rfind("</svg")?;
+    (close >= open_end).then(|| &src[open_end..close])
 }
 
 /// Decode image bytes (raster formats, or SVG)
@@ -149,7 +193,7 @@ pub fn decode(bytes: &[u8]) -> Option<LoadedImage> {
         }
     }
     let pixmap = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)?;
-    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap) })
+    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap), svg_source: None })
 }
 
 /// Downscale a bitmap over the pixel budget
@@ -180,9 +224,10 @@ const MAX_CACHED_SVG_BYTES: usize = 16 << 20;
 
 /// An inline `<svg>` element drawn as an image: its subtree serialized
 /// as SVG markup, `currentColor` being `color` (CSS rgba)
-pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &HashMap<NodeId, String>, cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
+pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &HashMap<NodeId, String>, refs: Option<SvgRefs>, cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
     let mut markup = String::new();
-    serialize_svg(tree, node, true, color, paint, &mut markup);
+    let mut defs = Vec::new();
+    serialize_svg(tree, node, true, color, paint, refs, &mut defs, &mut markup);
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -216,8 +261,11 @@ fn escape_xml(s: &str, out: &mut String) {
 }
 
 /// `paint`: CSS declarations (fill, stroke) for elements, put before
-/// their own style attribute's
-fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint: &HashMap<NodeId, String>, out: &mut String) {
+/// their own style attribute's. `<use>` references to other SVG
+/// documents point into the document's contents, which `defs` gathers
+/// (by URL) and the root gets as `<defs>`.
+#[allow(clippy::too_many_arguments)]
+fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint: &HashMap<NodeId, String>, refs: Option<SvgRefs>, defs: &mut Vec<(String, Arc<str>)>, out: &mut String) {
     let Some(n) = tree.get(node) else { return };
     if let Some(text) = n.as_text() {
         escape_xml(text, out);
@@ -243,7 +291,25 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
                 escape_xml(p, out);
             }
         }
-        escape_xml(&a.value, out);
+        let external = (name == "use" && (local == "href" || local == "xlink:href"))
+            .then(|| external_ref(&a.value))
+            .flatten()
+            .and_then(|(doc, id)| {
+                let refs = refs?;
+                let url = fos_net::url_util::resolve(refs.base, doc);
+                let src = refs.images.get(&url)?.svg_source.clone()?;
+                Some((url, src, id))
+            });
+        match external {
+            Some((url, src, id)) => {
+                out.push('#');
+                escape_xml(id, out);
+                if !defs.iter().any(|(u, _)| *u == url) {
+                    defs.push((url, src));
+                }
+            }
+            None => escape_xml(&a.value, out),
+        }
         out.push('"');
     }
     if let Some(p) = paint.get(&node).filter(|_| !e.attrs.iter().any(|a| tree.resolve(a.name.local) == "style")) {
@@ -257,7 +323,16 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
     }
     out.push('>');
     for (child, _) in tree.children(node) {
-        serialize_svg(tree, child, false, color, paint, out);
+        serialize_svg(tree, child, false, color, paint, refs, defs, out);
+    }
+    if root && !defs.is_empty() {
+        out.push_str("<defs>");
+        for (_, src) in defs.iter() {
+            if let Some(inner) = svg_contents(src) {
+                out.push_str(inner);
+            }
+        }
+        out.push_str("</defs>");
     }
     out.push_str("</");
     out.push_str(name);
@@ -278,7 +353,8 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
     let (pw, ph) = ((w * scale).ceil().max(1.0) as u32, (h * scale).ceil().max(1.0) as u32);
     let mut pixmap = Pixmap::new(pw, ph)?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h), &mut pixmap.as_mut());
-    Some(LoadedImage { natural: (w, h), pixmap })
+    let svg_source = (bytes.len() <= MAX_SVG_SOURCE).then(|| String::from_utf8_lossy(bytes).into());
+    Some(LoadedImage { natural: (w, h), pixmap, svg_source })
 }
 
 /// Fetch and decode the images of `page` (in parallel, through the HTTP

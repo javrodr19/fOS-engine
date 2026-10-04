@@ -767,6 +767,8 @@ pub(crate) fn font_size(v: &str) -> Option<PropertyValue> {
         "xxx-large" => px(48.0),
         "smaller" => Some(PropertyValue::Length(Length { value: 0.833, unit: LengthUnit::Em })),
         "larger" => Some(PropertyValue::Length(Length { value: 1.2, unit: LengthUnit::Em })),
+        // A unitless zero is a length (font-size: 0 hides icon buttons' text)
+        other if other.parse::<f32>() == Ok(0.0) => px(0.0),
         other => parse_length(other).map(PropertyValue::Length),
     }
 }

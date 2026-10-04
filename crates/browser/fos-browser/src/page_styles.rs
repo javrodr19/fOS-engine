@@ -517,6 +517,15 @@ fn cascade_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unitless_zero_font_size() {
+        // Over the UA's form control size, too
+        let html = r#"<html><body><button id=b class=z>x</button><div id=d class=z>y</div></body></html>"#;
+        assert_eq!(style_of(".z { font-size: 0 }", html, "b").font_size(), 0.0);
+        assert_eq!(style_of(".z { font-size: 0 }", html, "d").font_size(), 0.0);
+    }
+
     use fos_css::parse_stylesheet;
     use fos_css::style::{Display, Lp, LpAuto};
 

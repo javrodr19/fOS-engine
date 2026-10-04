@@ -1224,6 +1224,29 @@ mod tests {
     }
 
     #[test]
+    fn test_marker_pseudo_element() {
+        let html = r#"<html><head><style>
+            ol li::marker { color: #f00 }
+            ul li::marker { content: "-> "; color: #00f }
+            </style></head><body><ol><li>one</li></ol><ul><li>two</li></ul><ol><li id="plain">x</li></ol></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let mut markers: Vec<(Color, f32)> = Vec::new();
+        layout.fragments.for_each(|f| {
+            if let layout_engine::Fragment::Box(b) = f {
+                if let Some(m) = &b.marker {
+                    markers.push((Color::rgba(m.color.r, m.color.g, m.color.b, m.color.a), m.rect.w));
+                }
+            }
+        });
+        assert_eq!(markers.len(), 3, "{markers:?}");
+        assert_eq!(markers[0].0, Color::rgb(255, 0, 0));
+        // content replaces the marker text: "-> " is wider than "1. "
+        assert_eq!(markers[1].0, Color::rgb(0, 0, 255));
+        assert!(markers[1].1 > markers[0].1, "{markers:?}");
+    }
+
+    #[test]
     fn test_before_and_after_boxes() {
         let html = r#"<html><head><style>
             body { margin: 0 }

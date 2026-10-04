@@ -88,6 +88,8 @@ struct Compound {
 pub enum PseudoElement {
     Before,
     After,
+    /// A list item's marker
+    Marker,
     /// `::first-line`, `::placeholder` and others (never matched)
     Other,
 }
@@ -97,6 +99,7 @@ impl PseudoElement {
         match name.to_ascii_lowercase().as_str() {
             "before" => PseudoElement::Before,
             "after" => PseudoElement::After,
+            "marker" => PseudoElement::Marker,
             _ => PseudoElement::Other,
         }
     }
@@ -287,7 +290,7 @@ impl SelectorList {
     /// Whether some selector of the list selects a `::before` or `::after`
     /// box (and which elements' does not matter otherwise)
     pub fn selects_generated(&self) -> bool {
-        self.0.iter().any(|c| c.parts.first().is_some_and(|(s, _)| matches!(s.pseudo_element, Some(PseudoElement::Before | PseudoElement::After))))
+        self.0.iter().any(|c| c.parts.first().is_some_and(|(s, _)| matches!(s.pseudo_element, Some(PseudoElement::Before | PseudoElement::After | PseudoElement::Marker))))
     }
 
     /// Whether some selector of the list can match an element itself

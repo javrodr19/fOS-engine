@@ -428,7 +428,7 @@ pub fn cascade(
     ctx: &StyleContext,
     cache: &mut fos_css::ResolveCache,
 ) {
-    cascade_for(styles, tree, node, element, None, filter, inline, style, parent, ctx, cache)
+    cascade_for(styles, tree, node, element, None, filter, inline, style, parent, ctx, cache);
 }
 
 /// The style of pseudo-element `pe` of element `node` (whose style is
@@ -446,8 +446,9 @@ pub fn pseudo_style(
     cache: &mut fos_css::ResolveCache,
 ) -> Option<Style> {
     let mut style = Style::inherit_from(parent);
-    cascade_for(styles, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
-    style.box_.content.is_some().then_some(style)
+    let matched = cascade_for(styles, tree, node, element, Some(pe), filter, &[], &mut style, parent, ctx, cache);
+    // A marker exists without `content`; generated boxes need it
+    (if pe == PseudoElement::Marker { matched } else { style.box_.content.is_some() }).then_some(style)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -463,7 +464,7 @@ fn cascade_for(
     parent: &Style,
     ctx: &StyleContext,
     cache: &mut fos_css::ResolveCache,
-) {
+) -> bool {
     let ua = &*UA;
     let rules_of = |s: &PageStyles| match pe {
         Some(pe) => s.pseudo_rules(tree, node, element, filter, pe),
@@ -473,11 +474,11 @@ fn cascade_for(
     let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
     let rules = styles.map_or(Vec::new(), |s| rules_of(s));
     if pe.is_some() && ua_rules.is_empty() && rules.is_empty() {
-        return;
+        return false;
     }
     if ua_rules.is_empty() && hints.is_empty() && rules.is_empty() && inline.is_empty() {
         style.finish();
-        return;
+        return true;
     }
     let mut ordered: Vec<&fos_css::Declaration> = Vec::new();
     fn of(s: &PageStyles, rule: u32, important: bool) -> impl Iterator<Item = &fos_css::Declaration> {
@@ -510,6 +511,7 @@ fn cascade_for(
     if !sized && mono(style) && !mono(parent) {
         std::sync::Arc::make_mut(&mut style.inherited).font_size = parent.inherited.font_size * 13.0 / 16.0;
     }
+    true
 }
 
 #[cfg(test)]

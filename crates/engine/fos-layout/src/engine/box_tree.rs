@@ -452,7 +452,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else {
             own
         };
-        let marker = (style.display() == Display::ListItem).then(|| self.marker(&style)).flatten();
+        let marker = (style.display() == Display::ListItem).then(|| self.marker(node, &style)).flatten();
         if matches!(style.display(), Display::Table | Display::InlineTable) {
             self.enter(node);
             let table = self.table(node, &style);
@@ -928,10 +928,17 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         first.unwrap_or_default()
     }
 
-    fn marker(&mut self, style: &Style) -> Option<Marker> {
-        let ordinal = self.counters.iter().rev().find(|c| &*c.0 == "list-item").map_or(1, |c| c.1);
-        let text = marker_text(style.inherited.list_style_type, ordinal)?;
-        let mut mstyle = Style::inherit_from(style);
+    fn marker(&mut self, node: NodeId, style: &Style) -> Option<Marker> {
+        // `::marker` styles it, and its `content` replaces the text
+        let styled = self.styler.pseudo(self.tree, node, fos_dom::PseudoElement::Marker, style);
+        let text = match styled.as_ref().filter(|s| s.box_.content.is_some()) {
+            Some(ms) => generated_text(self.tree, node, ms, &self.counters),
+            None => {
+                let ordinal = self.counters.iter().rev().find(|c| &*c.0 == "list-item").map_or(1, |c| c.1);
+                marker_text(style.inherited.list_style_type, ordinal)?
+            }
+        };
+        let mut mstyle = styled.unwrap_or_else(|| Style::inherit_from(style));
         // Markers keep the list item's font but not its decorations
         std::sync::Arc::make_mut(&mut mstyle.inherited).white_space = WhiteSpace::Pre;
         Some(Marker { text, style: mstyle, outside: style.inherited.list_style_position == ListStylePosition::Outside })

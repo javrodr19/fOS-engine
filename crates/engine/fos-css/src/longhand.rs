@@ -36,6 +36,8 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
         "margin-block" => &[MarginTop, MarginBottom],
+        "inset-block" => &[Top, Bottom],
+        "inset-inline" => &[Left, Right],
         "margin-inline" => &[MarginLeft, MarginRight],
         "padding-block" => &[PaddingTop, PaddingBottom],
         "padding-inline" => &[PaddingLeft, PaddingRight],
@@ -264,7 +266,7 @@ pub(crate) fn is_known(name: &str) -> bool {
     let name = physical(name);
     longhands_of(name).is_some()
         || longhand_id(name).is_some()
-        || matches!(name, "margin-block" | "margin-inline" | "padding-block" | "padding-inline")
+        || matches!(name, "margin-block" | "margin-inline" | "padding-block" | "padding-inline" | "inset-block" | "inset-inline")
 }
 
 /// Parse `name: value` into longhands; false if the property is unknown
@@ -309,9 +311,10 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
-        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" => {
+        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" | "inset-block" | "inset-inline" => {
             let ids = longhands_of(name).unwrap();
-            let auto = name.starts_with("margin");
+            // Margins and insets take auto and negative values
+            let auto = !name.starts_with("padding");
             let parts: Option<Vec<PropertyValue>> = components(&lower).into_iter().map(|c| length(c, auto, false, auto)).collect();
             if let Some(parts) = parts.filter(|p| (1..=2).contains(&p.len())) {
                 push(out, ids[0], parts[0].clone(), important);

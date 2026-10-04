@@ -1135,6 +1135,13 @@ mod tests {
         assert!(d.iter().any(|d| d.property == PropertyId::MarginRight && matches!(d.value, PropertyValue::Keyword(Keyword::Auto))));
         assert_eq!(d.iter().filter(|d| d.property == PropertyId::PaddingLeft && d.important).count(), 1);
         assert!(d.iter().any(|d| d.property == PropertyId::BackgroundColor && matches!(d.value, PropertyValue::Color(c) if c.r == 255)));
+        // Logical inset shorthands (the full-bleed trick: inset-inline: 50%)
+        let ss = parse("p { inset-inline: 50%; inset-block: auto -3px }");
+        let d = &ss.rules[0].declarations;
+        let pct = |id: PropertyId| d.iter().any(|d| d.property == id && matches!(d.value, PropertyValue::Length(Length { value, unit: LengthUnit::Percent }) if value == 50.0));
+        assert!(pct(PropertyId::Left) && pct(PropertyId::Right));
+        assert!(d.iter().any(|d| d.property == PropertyId::Top && matches!(d.value, PropertyValue::Keyword(Keyword::Auto))));
+        assert!(d.iter().any(|d| d.property == PropertyId::Bottom && matches!(d.value, PropertyValue::Length(Length { value, .. }) if value == -3.0)));
     }
 
     #[test]

@@ -1297,6 +1297,9 @@ impl Vm {
     }
 
     fn template_object(&mut self, site: &TemplateSite) -> Value {
+        if let Some(o) = site.object.get() {
+            return Value::object(o);
+        }
         let cooked: Vec<Value> = site
             .cooked
             .iter()
@@ -1309,6 +1312,9 @@ impl Vm {
         let strings = self.new_array(cooked);
         let raw = self.new_array(raw);
         self.define_value(strings, PropertyKey::Atom(atoms::raw), Value::object(raw), PropFlags::FROZEN);
+        crate::builtins::object::set_integrity(self, raw, true);
+        crate::builtins::object::set_integrity(self, strings, true);
+        site.object.set(Some(strings));
         Value::object(strings)
     }
 }

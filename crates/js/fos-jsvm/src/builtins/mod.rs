@@ -13,7 +13,7 @@ pub(crate) mod promise;
 pub(crate) mod json;
 mod math;
 mod number;
-mod object;
+pub(crate) mod object;
 pub(crate) mod proxy;
 mod reflect;
 pub(crate) mod regexp;

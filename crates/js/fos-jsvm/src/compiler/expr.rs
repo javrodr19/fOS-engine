@@ -936,6 +936,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
         let site = TemplateSite {
             cooked: template.cooked.iter().map(|c| c.as_ref().map(|u| u.clone())).collect(),
             raw: template.raw.iter().map(|r| r.encode_utf16().collect::<Vec<u16>>().into_boxed_slice()).collect(),
+            object: Default::default(),
         };
         self.f().templates.push(site);
         let strings = self.alloc()?;

@@ -305,6 +305,10 @@ pub enum IcState {
 pub struct TemplateSite {
     pub cooked: Vec<Option<Box<[u16]>>>,
     pub raw: Vec<Box<[u16]>>,
+    /// The site's template object, made on first evaluation: every
+    /// evaluation passes the same (frozen) strings array, which libraries
+    /// use as a cache key
+    pub object: Cell<Option<Gc<JsObject>>>,
 }
 
 /// A regular expression literal (compiled on first evaluation)
@@ -497,6 +501,11 @@ impl FunctionProto {
                 }
                 IcState::Add { proto: Some(p), .. } => tracer.mark(p),
                 _ => {}
+            }
+        }
+        for t in code.templates.iter() {
+            if let Some(o) = t.object.get() {
+                tracer.mark(o);
             }
         }
         for f in code.funcs.iter() {

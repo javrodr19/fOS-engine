@@ -523,6 +523,8 @@ fn strings() {
         ("`a${1 + 1}b${'c'}`", "'a2bc'"),
         ("function tag(s, ...v) { return s.raw.join('|') + v.join(','); } tag`x${1}y${2}z`", "'x|y|z1,2'"),
         ("String.raw`a\\nb`", "'a\\nb'"),
+        // One frozen template object per call site, whatever the evaluation
+        ("function tag(s) { return s; } const f = () => tag`a${1}b`; const a = f(); [a === f(), a !== tag`a${1}b`, Object.isFrozen(a), Object.isFrozen(a.raw)].join()", "'true,true,true,true'"),
         ("'abc'.localeCompare('abc')", "0"),
         ("new String('ab').length", "2"),
         ("typeof new String('ab')", "'object'"),

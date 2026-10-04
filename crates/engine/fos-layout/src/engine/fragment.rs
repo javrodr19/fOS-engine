@@ -357,6 +357,67 @@ impl FragmentTree {
         out
     }
 
+    /// [`Self::element_rects`] where they are painted: through CSS
+    /// transforms (their bounds), with fixed boxes following the page
+    /// scroll `scroll` and sticky ones held in the viewport (`view_h`
+    /// tall), and content inside scroll containers moved by `offsets`
+    pub fn painted_element_rects(&self, scroll: f32, view_h: f32, offsets: &dyn Fn(NodeId) -> (f32, f32)) -> Vec<(NodeId, Rect)> {
+        use fos_css::transform::{apply, multiply, Matrix, IDENTITY};
+        fn map(m: &Matrix, r: Rect) -> Rect {
+            if *m == IDENTITY {
+                return r;
+            }
+            let pts = [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())].map(|p| apply(*m, p));
+            let (x0, x1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
+            let (y0, y1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.1), b.max(p.1)));
+            Rect::new(x0, y0, x1 - x0, y1 - y0)
+        }
+        struct Walk<'a> {
+            scroll: f32,
+            offsets: &'a dyn Fn(NodeId) -> (f32, f32),
+            out: Vec<(NodeId, Rect)>,
+        }
+        // `view`: the visible part (top, height) of the scroll container
+        // in `b`'s layout coordinates; `container`: its parent's content box
+        fn walk(w: &mut Walk, b: &BoxFragment, mut m: Matrix, view: (f32, f32), container: Rect) {
+            if b.style.box_.position == fos_css::style::Position::Fixed {
+                m = [1.0, 0.0, 0.0, 1.0, 0.0, w.scroll];
+            }
+            let stuck = b.sticky_offset(container, view);
+            if stuck != 0.0 {
+                m = multiply(m, [1.0, 0.0, 0.0, 1.0, 0.0, stuck]);
+            }
+            if let Some(t) = b.transform() {
+                m = multiply(m, t);
+            }
+            if b.node.is_valid() && !b.node.is_generated() {
+                w.out.push((b.node, map(&m, b.border_box)));
+            }
+            let mut inner_view = view;
+            if b.scroll_extent.is_some() {
+                let (ox, oy) = (w.offsets)(b.node);
+                if ox != 0.0 || oy != 0.0 {
+                    m = multiply(m, [1.0, 0.0, 0.0, 1.0, -ox, -oy]);
+                }
+                let pad = b.padding_box();
+                inner_view = (pad.y + oy, pad.h);
+            }
+            let content = b.content_box();
+            for c in &b.children {
+                match c {
+                    Fragment::Box(cb) => walk(w, cb, m, inner_view, content),
+                    Fragment::Text(t) if t.node.is_valid() => w.out.push((t.node, map(&m, t.rect))),
+                    Fragment::Text(_) => {}
+                }
+            }
+        }
+        let mut w = Walk { scroll, offsets, out: Vec::new() };
+        if let Some(root) = &self.root {
+            walk(&mut w, root, IDENTITY, (scroll, view_h), root.border_box);
+        }
+        w.out
+    }
+
     /// The deepest element at document point (x, y), topmost first:
     /// positioned boxes by z-index, then in-flow content (later siblings
     /// paint over earlier ones); boxes with `pointer-events: none` are

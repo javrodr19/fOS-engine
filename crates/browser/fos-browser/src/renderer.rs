@@ -93,6 +93,19 @@ impl PageLayout {
         self.fragments.element_rects()
     }
 
+    /// [`Self::boxes`] where they are painted: transformed, fixed and
+    /// sticky boxes placed for page scroll `scroll` in a viewport
+    /// `view_h` tall, and scroll containers' content moved by their
+    /// offsets
+    pub fn painted_boxes(&self, scroll: f32, view_h: f32, offsets: &std::collections::HashMap<u32, (f32, f32)>) -> Vec<(NodeId, Rect)> {
+        self.fragments.painted_element_rects(scroll, view_h, &|n| offsets.get(&n.0).copied().unwrap_or((0.0, 0.0)))
+    }
+
+    /// Whether some box moves with the page scroll (fixed or sticky)
+    pub fn has_fixed(&self) -> bool {
+        self.has_fixed
+    }
+
     /// Height of the laid-out document
     pub fn content_height(&self) -> f32 {
         self.fragments.document_height

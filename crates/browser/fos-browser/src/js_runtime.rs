@@ -568,6 +568,9 @@ impl PageJsRuntime {
     /// Scroll containers' positions, for scripts to read
     pub fn set_box_scrolls(&mut self, scrolls: std::collections::HashMap<u32, (f32, f32)>) {
         if let Some(h) = self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()) {
+            if h.box_scroll != scrolls {
+                h.boxes = None;
+            }
             h.box_scroll = scrolls;
         }
     }
@@ -1858,6 +1861,38 @@ mod tests {
         rt.eval("window.scrollTo(0, 123)").unwrap();
         assert_eq!(rt.take_scroll_request(), Some(123.0));
         assert_eq!(rt.take_scroll_request(), None);
+    }
+
+    #[test]
+    fn client_rects_are_where_boxes_are_painted() {
+        let (mut rt, doc) = page(
+            r#"<html><body style="margin: 0">
+            <div id=t style="width: 100px; height: 50px; margin-left: 100px; transform: translateX(30px) scale(2)"></div>
+            <div id=f style="position: fixed; top: 10px; left: 0; width: 20px; height: 20px"></div>
+            <div style="height: 300px"><div id=s style="position: sticky; top: 0; height: 20px"></div></div>
+            <div id=c style="overflow: auto; height: 100px"><div style="height: 50px"></div><div id=in style="height: 20px"></div><div style="height: 500px"></div></div>
+            <div style="height: 2000px"></div></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+        let cases = [
+            // Scaled about its center and moved: 200 wide from x 80
+            ("const g = id => document.getElementById(id), r = id => { const b = g(id).getBoundingClientRect(); return [b.left, b.top, b.width, b.height].map(Math.round) }; r('t')", "[ 80, -25, 200, 100 ]"),
+            // offsetWidth ignores transforms
+            ("[g('t').offsetWidth, g('t').offsetLeft]", "[ 100, 100 ]"),
+            ("r('s')[1]", "50"),
+            ("r('in')[1]", "400"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
+        // After scrolling: the fixed box stays put, the sticky one sticks
+        // to the top, and scrolled content inside the box moves up
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 120.0));
+        rt.eval("g('c').scrollTop = 30").unwrap();
+        assert_eq!(rt.eval("[r('f')[1], r('s')[1], r('in')[1], r('t')[1]]").unwrap(), "[ 10, 0, 250, -145 ]");
     }
 
     #[test]

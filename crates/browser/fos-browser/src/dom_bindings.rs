@@ -82,7 +82,9 @@ pub struct DomHost {
     viewport: (f32, f32),
     scroll: (f32, f32),
     /// Element boxes from `layout` (built on the first query after a layout)
-    boxes: Option<HashMap<u32, [f32; 4]>>,
+    /// Element boxes where painted (scroll-dependent), and as laid out
+    pub(crate) boxes: Option<HashMap<u32, [f32; 4]>>,
+    layout_boxes: Option<HashMap<u32, [f32; 4]>>,
     /// A scroll position a script asked for
     pub scroll_request: Option<f32>,
     /// Scroll containers' positions (mirrored from the renderer, updated
@@ -122,6 +124,7 @@ impl DomHost {
             tag_protos: HashMap::new(),
             scroll: (0.0, 0.0),
             boxes: None,
+            layout_boxes: None,
             scroll_request: None,
             box_scroll: HashMap::new(),
             box_scroll_requests: Vec::new(),
@@ -1453,10 +1456,15 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
         (None, None) => true,
         _ => false,
     };
+    // Fixed and sticky boxes move with the page scroll
+    let moved = h.scroll.1 != scroll.1 && h.layout.as_ref().is_some_and(|l| l.has_fixed());
     if !same {
         h.layout = layout;
         h.boxes = None;
+        h.layout_boxes = None;
         h.metrics = None;
+    } else if moved || h.viewport != viewport {
+        h.boxes = None;
     }
     h.viewport = viewport;
     h.scroll = scroll;
@@ -1465,7 +1473,7 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
 /// Boxes of all rendered elements: the union of each element's own
 /// fragments (its border boxes and text), and for elements that generate
 /// none (`display: contents`) the union of their descendants'
-fn element_boxes(tree: &DomTree, layout: &crate::renderer::PageLayout) -> HashMap<u32, [f32; 4]> {
+fn element_boxes(tree: &DomTree, rects: Vec<(NodeId, fos_layout::engine::Rect)>) -> HashMap<u32, [f32; 4]> {
     fn union(boxes: &mut HashMap<u32, [f32; 4]>, n: u32, r: [f32; 4]) {
         match boxes.get_mut(&n) {
             Some(b) => {
@@ -1478,7 +1486,6 @@ fn element_boxes(tree: &DomTree, layout: &crate::renderer::PageLayout) -> HashMa
             }
         }
     }
-    let rects = layout.boxes();
     let mut boxes: HashMap<u32, [f32; 4]> = HashMap::with_capacity(rects.len());
     for (node, r) in &rects {
         union(&mut boxes, node.0, [r.x, r.y, r.w, r.h]);
@@ -1495,20 +1502,27 @@ fn element_boxes(tree: &DomTree, layout: &crate::renderer::PageLayout) -> HashMa
     boxes
 }
 
-/// `__fosGeometry(node)`: `[x, y, width, height]` in document coordinates,
-/// or null when the element is not rendered
+/// `__fosGeometry(node, painted)`: `[x, y, width, height]` in document
+/// coordinates, or null when the element is not rendered; `painted`
+/// boxes are where they are drawn (transformed, stuck, scrolled), others
+/// as laid out
 fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
-    if host(vm).layout.is_none() {
-        return Ok(Value::NULL);
-    }
-    if host(vm).boxes.is_none() {
-        let layout = host(vm).layout.clone().unwrap();
-        let boxes = with_tree(vm, |t| element_boxes(t, &layout));
+    let painted = fos_jsvm::vm::truthy(arg(args, 1));
+    let Some(layout) = host(vm).layout.clone() else { return Ok(Value::NULL) };
+    if painted && host(vm).boxes.is_none() {
+        let (scroll, view_h, box_scroll) = (host(vm).scroll.1, host(vm).viewport.1, host(vm).box_scroll.clone());
+        let rects = layout.painted_boxes(scroll, view_h, &box_scroll);
+        let boxes = with_tree(vm, |t| element_boxes(t, rects));
         host(vm).boxes = Some(boxes);
+    } else if !painted && host(vm).layout_boxes.is_none() {
+        let boxes = with_tree(vm, |t| element_boxes(t, layout.boxes()));
+        host(vm).layout_boxes = Some(boxes);
     }
-    let Some(b) = host(vm).boxes.as_ref().unwrap().get(&id.0).copied() else { return Ok(Value::NULL) };
-    let vals: Vec<Value> = b.iter().map(|&v| Value::number(v as f64)).collect();
+    let h = host(vm);
+    let cache = if painted { &h.boxes } else { &h.layout_boxes };
+    let Some(b) = cache.as_ref().unwrap().get(&id.0).copied() else { return Ok(Value::NULL) };
+    let vals: Vec<Value> = b.iter().map(|&v: &f32| Value::number(v as f64)).collect();
     Ok(Value::object(vm.new_array(vals)))
 }
 
@@ -1543,6 +1557,7 @@ fn set_box_scroll(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsR
     let y = if y.is_finite() { y.clamp(0.0, (m[3] - m[1]).max(0.0)).round() } else { cy };
     let h = host(vm);
     h.box_scroll.insert(id.0, (x, y));
+    h.boxes = None;
     h.box_scroll_requests.push((id, x, y));
     Ok(Value::UNDEFINED)
 }

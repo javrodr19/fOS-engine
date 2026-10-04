@@ -279,11 +279,11 @@
     // Geometry from the browser's layout: [x, y, width, height] in
     // document coordinates, or null when the element is not rendered
     getBoundingClientRect() {
-      const g = __fosGeometry(this);
+      const g = __fosGeometry(this, true);
       const v = __fosViewport();
       return g ? domRect(g[0] - v[2], g[1] - v[3], g[2], g[3]) : domRect(0, 0, 0, 0);
     },
-    getClientRects() { return __fosGeometry(this) ? [this.getBoundingClientRect()] : []; },
+    getClientRects() { return __fosGeometry(this, true) ? [this.getBoundingClientRect()] : []; },
     get offsetWidth() { const g = __fosGeometry(this); return g ? Math.round(g[2]) : 0; },
     get offsetHeight() { const g = __fosGeometry(this); return g ? Math.round(g[3]) : 0; },
     get offsetTop() { const g = __fosGeometry(this); return g ? Math.round(g[1]) : 0; },

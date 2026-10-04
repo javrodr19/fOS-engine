@@ -357,6 +357,12 @@ impl InlineBuilder {
         self.after_space = true;
     }
 
+    /// The combined opacity of the open inline boxes, which a block inside
+    /// them (with no fragment of theirs around it) takes on
+    fn open_opacity(&self) -> f32 {
+        self.open.iter().map(|(si, _)| self.content.styles[*si as usize].box_.opacity).product()
+    }
+
     /// Take the content so far (closing open inline boxes; they reopen in
     /// what follows), for an anonymous block before a block-level child
     fn take(&mut self, container: &Style) -> InlineContent {
@@ -373,6 +379,13 @@ impl InlineBuilder {
         }
         self.after_space = true;
         taken
+    }
+}
+
+/// Multiply `opacity` into a box's own
+fn fade(style: &mut Style, opacity: f32) {
+    if opacity < 1.0 {
+        std::sync::Arc::make_mut(&mut style.box_).opacity *= opacity;
     }
 }
 
@@ -642,6 +655,8 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             c.inline.atomic(b);
         } else {
             c.flush_inline();
+            let mut ps = ps;
+            fade(&mut ps, c.inline.open_opacity());
             let b = self.generated_block(parent, ps, content, after);
             c.blocks.push(b);
         }
@@ -702,6 +717,8 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 // Block-level (tables, grids and out-of-flow boxes are laid
                 // out as blocks for now)
                 c.flush_inline();
+                let mut style = style;
+                fade(&mut style, c.inline.open_opacity());
                 let b = self.element_box(child, style, true);
                 c.blocks.push(b);
             }

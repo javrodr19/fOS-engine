@@ -399,8 +399,6 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }];
         let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
         let (mut top, mut bottom) = (root_top, root_bottom);
-        // Atomic inlines placed on this line: (index, x, baseline shift)
-        let mut placed_atomics: Vec<(usize, f32, f32)> = Vec::new();
         let mut x = start_x + offset;
         let order = visual_order(line, &carried, levels.as_deref(), rtl);
         // Boxes still open at the line's end continue on the next
@@ -474,17 +472,21 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     x += pending + extra * pending_n as f32;
                     pending = 0.0;
                     pending_n = 0;
-                    if let Some(laid) = &atomics[*i] {
-                        let parent = stack.last().expect("root box");
+                    if let Some(mut laid) = atomics[*i].take() {
+                        let parent = stack.last_mut().expect("root box");
                         let pfont = fonts[parent.style as usize];
                         let st = atomic_styles[*i];
                         let h = laid.mt.size() + laid.frag.border_box.h + laid.mb.size();
-                        let bl = atomic_baseline(laid);
+                        let bl = atomic_baseline(&laid);
                         let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, st.inherited.line_height.resolve(st.font_size()));
                         top = top.min(shift - bl);
                         bottom = bottom.max(shift - bl + h);
-                        placed_atomics.push((*i, x, shift));
-                        stack.last_mut().expect("root box").last_text = None;
+                        // Inside its inline box (whose opacity, filter...
+                        // cover it); moved down to the baseline with the line
+                        let rel = relative_offset(st, avail, cb_h);
+                        laid.frag.translate(x + rel.0, shift - bl + laid.mt.size() + rel.1);
+                        parent.children.push(Fragment::Box(laid.frag));
+                        parent.last_text = None;
                     }
                     x += p.width;
                     content = true;
@@ -516,16 +518,6 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         let mut line_frags = root.children;
         for f in &mut line_frags {
             f.translate(0.0, baseline);
-        }
-        for (i, ax, shift) in placed_atomics {
-            if let Some(mut laid) = atomics[i].take() {
-                let bl = atomic_baseline(&laid);
-                let st = atomic_styles[i];
-                let rel = relative_offset(st, avail, cb_h);
-                // The fragment's border box is at (margin-left, 0)
-                laid.frag.translate(ax + rel.0, baseline + shift - bl + laid.mt.size() + rel.1);
-                line_frags.push(Fragment::Box(laid.frag));
-            }
         }
         frags.extend(line_frags);
         y += bottom - top;

@@ -1129,6 +1129,27 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_opacity_covers_its_contents() {
+        // Opacity on an inline element fades the inline-blocks and blocks
+        // inside it (an undefined custom element under :not(:defined))
+        let cases = [
+            (r#"<x-a style="opacity: 0"><div style="height: 20px; background: #f00"></div></x-a>"#, 0xffffff),
+            (r#"<span style="opacity: 0"><span style="display: inline-block; width: 20px; height: 20px; background: #f00"></span></span>"#, 0xffffff),
+            (r#"<x-a style="opacity: 0.5"><div style="height: 20px; background: #000"></div></x-a>"#, 0x808080),
+            (r#"<span><span style="display: inline-block; width: 20px; height: 20px; background: #f00"></span></span>"#, 0xff0000),
+        ];
+        for (body, want) in cases {
+            let html = format!(r#"<html><body style="margin: 0">{body}</body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(100, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            let p = page.pixels[10 * 100 + 5] & 0xffffff;
+            let near = |a: u32, b: u32, sh: u32| ((a >> sh) & 0xff).abs_diff((b >> sh) & 0xff) <= 2;
+            assert!(near(p, want, 0) && near(p, want, 8) && near(p, want, 16), "{body}: {p:x}");
+        }
+    }
+
+    #[test]
     fn test_filters_and_centered_ratio_boxes() {
         // A blurred circle, centered by auto margins with its height from
         // aspect-ratio (Tailwind's glow), and a darkened box
@@ -1553,3 +1574,4 @@ mod tests {
         assert_eq!(seg("inline").1, 20.0);
     }
 }
+

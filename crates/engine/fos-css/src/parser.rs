@@ -855,16 +855,104 @@ pub fn parse_color(v: &str) -> Option<Color> {
                 Some(Color::rgba(ch(nums[0])?, ch(nums[1])?, ch(nums[2])?, alpha))
             }
             "hsl" | "hsla" => {
-                let h = nums[0].trim_end_matches("deg").parse::<f32>().ok()?;
+                let h = hue(nums[0])?;
                 let pct = |s: &str| s.trim_end_matches('%').parse::<f32>().ok().map(|x| (x / 100.0).clamp(0.0, 1.0));
                 let (s, l) = (pct(nums[1])?, pct(nums[2])?);
                 let (r, g, b) = hsl_to_rgb(h, s, l);
                 Some(Color::rgba(r, g, b, alpha))
             }
+            "hwb" => {
+                let h = hue(nums[0])?;
+                let (w, bl) = (component(nums[1], 100.0)? / 100.0, component(nums[2], 100.0)? / 100.0);
+                let (r, g, b) = if w + bl >= 1.0 {
+                    let gray = (w / (w + bl) * 255.0).round() as u8;
+                    (gray, gray, gray)
+                } else {
+                    let (r, g, b) = hsl_to_rgb(h, 1.0, 0.5);
+                    let mix = |c: u8| ((c as f32 / 255.0 * (1.0 - w - bl) + w) * 255.0).round() as u8;
+                    (mix(r), mix(g), mix(b))
+                };
+                Some(Color::rgba(r, g, b, alpha))
+            }
+            // Perceptual spaces (CSS Color 4), converted to sRGB (clamped)
+            "oklab" | "oklch" | "lab" | "lch" => {
+                let (lab_l, a, b) = match func {
+                    "oklab" => (component(nums[0], 1.0)?, component(nums[1], 0.4)?, component(nums[2], 0.4)?),
+                    "oklch" => {
+                        let (c, h) = (component(nums[1], 0.4)?, hue(nums[2])?.to_radians());
+                        (component(nums[0], 1.0)?, c * h.cos(), c * h.sin())
+                    }
+                    "lab" => (component(nums[0], 100.0)?, component(nums[1], 125.0)?, component(nums[2], 125.0)?),
+                    _ => {
+                        let (c, h) = (component(nums[1], 150.0)?, hue(nums[2])?.to_radians());
+                        (component(nums[0], 100.0)?, c * h.cos(), c * h.sin())
+                    }
+                };
+                let linear = if func.starts_with("ok") { oklab_to_linear_srgb(lab_l, a, b) } else { lab_to_linear_srgb(lab_l, a, b) };
+                let enc = |c: f32| {
+                    let c = c.clamp(0.0, 1.0);
+                    let v = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+                    (v * 255.0).round().clamp(0.0, 255.0) as u8
+                };
+                Some(Color::rgba(enc(linear[0]), enc(linear[1]), enc(linear[2]), alpha))
+            }
             _ => None,
         };
     }
     named_color(&lower)
+}
+
+/// A color component: a number, a percentage of `full`, or `none` (0)
+fn component(s: &str, full: f32) -> Option<f32> {
+    if s == "none" {
+        return Some(0.0);
+    }
+    match s.strip_suffix('%') {
+        Some(p) => p.parse::<f32>().ok().map(|x| x / 100.0 * full),
+        None => s.parse().ok(),
+    }
+}
+
+/// A hue in degrees (deg, rad, grad, turn or a bare number)
+fn hue(s: &str) -> Option<f32> {
+    if s == "none" {
+        return Some(0.0);
+    }
+    let unit = |suffix: &str, k: f32| s.strip_suffix(suffix).and_then(|n| n.parse::<f32>().ok()).map(|n| n * k);
+    unit("grad", 0.9).or_else(|| unit("deg", 1.0)).or_else(|| unit("rad", 180.0 / std::f32::consts::PI)).or_else(|| unit("turn", 360.0)).or_else(|| s.parse().ok())
+}
+
+/// OKLab to linear-light sRGB
+fn oklab_to_linear_srgb(l: f32, a: f32, b: f32) -> [f32; 3] {
+    let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    [
+        4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_94 * s_,
+        -1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_38 * s_,
+        -0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_,
+    ]
+}
+
+/// CIE Lab (D50) to linear-light sRGB (D65, Bradford adaptation)
+fn lab_to_linear_srgb(l: f32, a: f32, b: f32) -> [f32; 3] {
+    const KAPPA: f32 = 24389.0 / 27.0;
+    const EPS: f32 = 216.0 / 24389.0;
+    let fy = (l + 16.0) / 116.0;
+    let (fx, fz) = (fy + a / 500.0, fy - b / 200.0);
+    let inv = |f: f32| if f.powi(3) > EPS { f.powi(3) } else { (116.0 * f - 16.0) / KAPPA };
+    let y = if l > KAPPA * EPS { fy.powi(3) } else { l / KAPPA };
+    let (x, z) = (inv(fx) * 0.964_22, inv(fz) * 0.825_21);
+    let d65 = [
+        0.955_473_45 * x - 0.023_098_537 * y + 0.063_259_31 * z,
+        -0.028_369_706 * x + 1.009_995_5 * y + 0.021_041_4 * z,
+        0.012_314_002 * x - 0.020_507_697 * y + 1.330_366 * z,
+    ];
+    [
+        3.240_97 * d65[0] - 1.537_383_2 * d65[1] - 0.498_610_76 * d65[2],
+        -0.969_243_65 * d65[0] + 1.875_967_5 * d65[1] + 0.041_555_06 * d65[2],
+        0.055_630_08 * d65[0] - 0.203_976_96 * d65[1] + 1.056_971_5 * d65[2],
+    ]
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
@@ -1018,6 +1106,21 @@ mod tests {
         assert_eq!(color_of("a { color: rgb(100% 0% 0% / 25%) }"), (255, 0, 0, 64));
         assert_eq!(color_of("a { color: hsl(120, 100%, 50%) }"), (0, 255, 0, 255));
         assert_eq!(color_of("a { color: RebeccaPurple }"), (0x66, 0x33, 0x99, 255));
+        // CSS Color 4 spaces: sRGB red in each, within rounding
+        let near = |css: &str, want: (u8, u8, u8, u8)| {
+            let got = color_of(&format!("a {{ color: {css} }}"));
+            let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+            assert!(d(got.0, want.0) <= 2 && d(got.1, want.1) <= 2 && d(got.2, want.2) <= 2 && got.3 == want.3, "{css}: {got:?}");
+        };
+        near("oklch(62.8% 0.2577 29.23deg)", (255, 0, 0, 255));
+        near("oklab(0.628 0.2249 0.1258)", (255, 0, 0, 255));
+        near("lab(54.29% 80.8 69.89)", (255, 0, 0, 255));
+        near("lch(54.29 106.84 40.85)", (255, 0, 0, 255));
+        near("hwb(0 0% 0%)", (255, 0, 0, 255));
+        near("hwb(0 50% 50%)", (128, 128, 128, 255));
+        near("oklch(100% 0 0)", (255, 255, 255, 255));
+        // MDN's translucent overlay
+        near("oklch(0% 0 0deg/6%)", (0, 0, 0, 15));
     }
 
     #[test]

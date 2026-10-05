@@ -694,6 +694,22 @@ fn grid_areas_lines_and_spans() {
 }
 
 #[test]
+fn grid_item_spanning_a_flexible_row_leaves_it_the_space() {
+    // A card: a fixed height, an image spanning every row, a 50px row and
+    // a flexible row for the body. The spanning image does not inflate
+    // the auto rows; the body's row takes what is left.
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; width: 200px; height: 300px; grid-template-rows: auto auto minmax(0, 1fr) auto");
+    let media = el(&mut tree, g, "div", "grid-row: 1 / -1; grid-column: 1; height: 300px");
+    let safe = el(&mut tree, g, "div", "grid-row: 2; grid-column: 1; height: 50px");
+    let card_body = el(&mut tree, g, "div", "grid-row: 3; grid-column: 1");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, media), Rect::new(8.0, 8.0, 200.0, 300.0));
+    assert_eq!(rect_of(&t, safe), Rect::new(8.0, 8.0, 200.0, 50.0));
+    assert_eq!(rect_of(&t, card_body), Rect::new(8.0, 58.0, 200.0, 250.0));
+}
+
+#[test]
 fn grid_auto_fill_and_alignment() {
     let (mut tree, html, body) = doc();
     let g = el(&mut tree, body, "div", "display: grid; width: 500px; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); justify-items: center");

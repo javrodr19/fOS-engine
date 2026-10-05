@@ -389,7 +389,12 @@ fn objects_and_properties() {
         ("Symbol() + ''", "throws TypeError: Cannot convert a Symbol value to a string"),
         ("null.x", "throws TypeError: Cannot read properties of null (reading 'x')"),
         ("undefined.x = 1", "throws TypeError: Cannot set properties of undefined (setting 'x')"),
-        ("let o = {}; o.f()", "throws TypeError: undefined is not a function"),
+        ("let o = {}; o.f()", "throws TypeError: o.f is not a function"),
+        ("function local() { let o = {}; return o.f(); } local()", "throws TypeError: f is not a function"),
+        ("var g = {a: {}}; g.a.b(1, 2)", "throws TypeError: g.a.b is not a function"),
+        ("var h = 5; h()", "throws TypeError: h is not a function"),
+        ("var k = {}; k.m.n()", "throws TypeError: Cannot read properties of undefined (reading 'n')*"),
+        ("(1, 2)()", "throws TypeError: 2 is not a function"),
         ("'use strict'; 'str'.x = 1", "throws TypeError*"),
         ("'str'.x = 1; 'ok'", "'ok'"),
     ]);
@@ -518,6 +523,8 @@ fn strings() {
         ("`a${1 + 1}b${'c'}`", "'a2bc'"),
         ("function tag(s, ...v) { return s.raw.join('|') + v.join(','); } tag`x${1}y${2}z`", "'x|y|z1,2'"),
         ("String.raw`a\\nb`", "'a\\nb'"),
+        // One frozen template object per call site, whatever the evaluation
+        ("function tag(s) { return s; } const f = () => tag`a${1}b`; const a = f(); [a === f(), a !== tag`a${1}b`, Object.isFrozen(a), Object.isFrozen(a.raw)].join()", "'true,true,true,true'"),
         ("'abc'.localeCompare('abc')", "0"),
         ("new String('ab').length", "2"),
         ("typeof new String('ab')", "'object'"),
@@ -1150,5 +1157,331 @@ fn async_generators() {
             "42",
         ),
         ("function f() { for await (const x of []) {} }", "throws SyntaxError*"),
+    ]);
+}
+
+#[test]
+fn huge_functions_compile() {
+    // More property accesses than inline caches fit in an instruction
+    let mut src = String::from("var o = {a: 1, b: 2}, s = 0; (function () {\n");
+    for i in 0..70_000 {
+        src.push_str(if i % 2 == 0 { "s += o.a;\n" } else { "o.b = s;\n" });
+    }
+    src.push_str("})(); [s, o.b]");
+    assert_eq!(run(&src), "[ 35000, 35000 ]");
+}
+
+#[test]
+fn class_bindings() {
+    check(&[
+        // Declarations bind like `let` (decorators reassign them)
+        ("{ class A {} A = 1; A }", "1"),
+        ("function f() { class B { static k = 2 } B = B.k; return B; } f()", "2"),
+        ("class G {} G = 3; G", "3"),
+        // The class's own name is immutable inside its body
+        ("class C { static m() { C = 1; } } C.m()", "throws TypeError: Assignment to constant variable."),
+        ("(class D { static m() { D = 1; } }).m()", "throws TypeError: Assignment to constant variable."),
+        ("{ new E(); class E {} }", "throws ReferenceError: Cannot access 'E' before initialization*"),
+    ]);
+}
+
+#[test]
+fn regex_unicode_properties() {
+    check(&[
+        ("/^\\p{ID_Start}\\p{ID_Continue}*$/u.test('ñame_1')", "true"),
+        ("/^\\p{ID_Start}/u.test('1a')", "false"),
+        ("'a+b=$5 ©→😀'.match(/\\p{S}/gu).join('')", "'+=$©→😀'"),
+        ("'a+b=$5'.match(/\\p{Sc}/gu).join('')", "'$'"),
+        ("/\\p{Sm}/u.test('∑')", "true"),
+        ("'a\\u0000b\\u200dc\\u3000d'.replace(/[\\p{Cc}\\p{Cf}\\p{Zs}]/gu, '_')", "'a_b_c_d'"),
+        ("'(x)-[y]'.replace(/[\\p{Ps}\\p{Pe}\\p{Pd}]/gu, '')", "'xy'"),
+        ("'a\\u200bb\\ufe0fc'.replace(/\\p{Default_Ignorable_Code_Point}/gu, '')", "'abc'"),
+        ("/^\\p{RI}\\p{RI}$/u.test('🇪🇸')", "true"),
+    ]);
+}
+
+#[test]
+fn bigint() {
+    check(&[
+        // Literals and arithmetic
+        ("typeof 10n", "'bigint'"),
+        ("0x1fn + 0o7n + 0b11n", "41n"),
+        ("2n ** 64n", "18446744073709551616n"),
+        ("(2n ** 100n) / 3n", "422550200076076467165567735125n"),
+        ("-7n / 2n", "-3n"),
+        ("-7n % 2n", "-1n"),
+        ("(-5n) & 3n", "3n"),
+        ("(-5n) | 3n", "-5n"),
+        ("5n ^ -3n", "-8n"),
+        ("~5n", "-6n"),
+        ("-9n >> 1n", "-5n"),
+        ("1n << 70n", "1180591620717411303424n"),
+        ("let x = 9007199254740993n; x++; x", "9007199254740994n"),
+        ("let y = 1n; y--; -y", "0n"),
+        ("'n=' + 12345678901234567890n", "'n=12345678901234567890'"),
+        ("`${-1n}`", "'-1'"),
+        // Errors
+        ("1n + 1", "throws TypeError: Cannot mix BigInt and other types, use explicit conversions"),
+        ("1n / 0n", "throws RangeError: Division by zero"),
+        ("2n ** -1n", "throws RangeError*"),
+        ("1n >>> 0n", "throws TypeError*"),
+        ("+1n", "throws TypeError: Cannot convert a BigInt value to a number"),
+        ("Math.max(1n)", "throws TypeError*"),
+        ("JSON.stringify({a: 1n})", "throws TypeError: Do not know how to serialize a BigInt"),
+        ("new BigInt(1)", "throws TypeError: BigInt is not a constructor"),
+        ("BigInt(1.5)", "throws RangeError*"),
+        ("BigInt('1.5')", "throws SyntaxError*"),
+        ("BigInt(undefined)", "throws TypeError*"),
+        // Equality and comparison
+        ("[1n === 1n, 1n == 1, 1n == '1', 2n > 1, 1n < 1.5, 2n > '1', 1n == 1.5, 0n == '', 1n < NaN, 10n > 9.99]", "[ true, true, true, true, true, true, false, true, false, true ]"),
+        ("[Object.is(0n, -0n), [1n, 2n].includes(2n), 0n ? 'y' : 'n', !!1n]", "[ true, true, 'n', true ]"),
+        ("const m = new Map([[10n, 'a']]); m.get(10n) + m.has(BigInt(10)) + new Set([1n, 1n, 2n]).size", "'atrue2'"),
+        // Conversions and builtins
+        ("[BigInt(42), BigInt('0x10'), BigInt(' -12 '), BigInt(true), BigInt(1e21)]", "[ 42n, 16n, -12n, 1n, 1000000000000000000000n ]"),
+        ("[Number(2n ** 64n), Number(-5n), parseInt('12n'), String(7n)]", "[ 18446744073709552000, -5, 12, '7' ]"),
+        ("[(255n).toString(16), (-255n).toString(2), (1234567n).toLocaleString(), Object(3n) + 1n]", "[ 'ff', '-11111111', '1,234,567', 4n ]"),
+        ("[BigInt.asIntN(8, 255n), BigInt.asUintN(64, -1n), BigInt.asIntN(64, 2n ** 63n)]", "[ -1n, 18446744073709551615n, -9223372036854775808n ]"),
+        ("({[10n]: 'k'})['10']", "'k'"),
+        ("Object.prototype.toString.call(1n)", "'[object BigInt]'"),
+        ("let big = 1n; for (let i = 0; i < 100; i++) big *= 3n; big % 1000000007n", "886041711n"),
+    ]);
+}
+
+#[test]
+fn intl() {
+    check(&[
+        // Built on first use, then an ordinary property
+        ("[typeof Intl, Object.getOwnPropertyDescriptor(globalThis, 'Intl').get === undefined, String(Intl)]", "[ 'object', true, '[object Intl]' ]"),
+        ("Intl = 5; Intl", "5"),
+        // NumberFormat, DateTimeFormat and Collator work without `new`; the others throw
+        ("[Intl.DateTimeFormat().resolvedOptions().timeZone, Intl.NumberFormat('en', { style: 'percent' }).format(0.5), Intl.Collator().compare('a', 'b'), Intl.DateTimeFormat() instanceof Intl.DateTimeFormat, Intl.NumberFormat.name, typeof Intl.Collator.supportedLocalesOf, Intl.NumberFormat.prototype.constructor === Intl.NumberFormat]", "[ 'UTC', '50%', -1, true, 'NumberFormat', 'function', true ]"),
+        ("try { Intl.PluralRules(); } catch (e) { e.name }", "'TypeError'"),
+        // NumberFormat
+        ("new Intl.NumberFormat().format(1234567.891)", "'1,234,567.891'"),
+        ("new Intl.NumberFormat('de-DE').format(-0.5)", "'-0.5'"),
+        ("new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(1234.5)", "'$1,234.50'"),
+        ("new Intl.NumberFormat('en', { style: 'currency', currency: 'JPY' }).format(1234.5)", "'¥1,235'"),
+        ("new Intl.NumberFormat('en', { style: 'currency', currency: 'EUR', currencyDisplay: 'code' }).format(3)", "'EUR 3.00'"),
+        ("new Intl.NumberFormat('en', { style: 'percent' }).format(0.256)", "'26%'"),
+        ("new Intl.NumberFormat('en', { maximumFractionDigits: 1 }).format(2.25)", "'2.3'"),
+        ("new Intl.NumberFormat('en', { minimumFractionDigits: 2 }).format(5)", "'5.00'"),
+        ("new Intl.NumberFormat('en', { maximumSignificantDigits: 3 }).format(123456)", "'123,000'"),
+        ("[1234, 15300, 2500000, 999].map(n => new Intl.NumberFormat('en', { notation: 'compact' }).format(n)).join(' ')", "'1.2K 15K 2.5M 999'"),
+        ("new Intl.NumberFormat('en', { notation: 'compact', compactDisplay: 'long' }).format(2500000)", "'2.5 million'"),
+        ("new Intl.NumberFormat('en', { signDisplay: 'always' }).format(3)", "'+3'"),
+        ("new Intl.NumberFormat('en', { style: 'unit', unit: 'kilometer' }).format(12)", "'12 km'"),
+        ("new Intl.NumberFormat().format(12345678901234567890n)", "'12,345,678,901,234,567,890'"),
+        ("new Intl.NumberFormat('en', { useGrouping: false }).format(12345)", "'12345'"),
+        ("new Intl.NumberFormat().formatToParts(-1234.5).map(p => p.type).join()", "'minusSign,integer,group,integer,decimal,fraction'"),
+        ("const f = new Intl.NumberFormat().format; [1, 2000].map(f).join('|')", "'1|2,000'"),
+        ("new Intl.NumberFormat('en', { style: 'currency' })", "throws TypeError*"),
+        // DateTimeFormat (UTC)
+        ("new Intl.DateTimeFormat('en-US').format(Date.UTC(2024, 0, 5))", "'1/5/2024'"),
+        ("new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(Date.UTC(2024, 6, 4, 15, 30))", "'Jul 4, 2024'"),
+        ("new Intl.DateTimeFormat('en', { dateStyle: 'full' }).format(Date.UTC(2024, 6, 4))", "'Thursday, July 4, 2024'"),
+        ("new Intl.DateTimeFormat('en', { hour: 'numeric', minute: '2-digit' }).format(Date.UTC(2024, 6, 4, 15, 5))", "'3:05 PM'"),
+        ("new Intl.DateTimeFormat('en', { timeStyle: 'short' }).format(Date.UTC(2024, 6, 4, 0, 7))", "'12:07 AM'"),
+        ("new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(Date.UTC(2024, 11, 25))", "'Dec 25'"),
+        ("new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit', hour12: false }).format(Date.UTC(2024, 0, 1, 9, 3))", "'09:03'"),
+        ("new Intl.DateTimeFormat().resolvedOptions().timeZone", "'UTC'"),
+        // PluralRules, RelativeTimeFormat, ListFormat
+        ("[0, 1, 2].map(n => new Intl.PluralRules('en').select(n)).join()", "'other,one,other'"),
+        ("[1, 2, 3, 4, 11, 22].map(n => new Intl.PluralRules('en', { type: 'ordinal' }).select(n)).join()", "'one,two,few,other,other,two'"),
+        ("const r = new Intl.RelativeTimeFormat('en'); [r.format(-3, 'day'), r.format(1, 'hours'), r.format(1, 'year')].join('|')", "'3 days ago|in 1 hour|in 1 year'"),
+        ("new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(-1, 'day')", "'yesterday'"),
+        ("new Intl.ListFormat('en').format(['a', 'b', 'c'])", "'a, b, and c'"),
+        ("new Intl.ListFormat('en', { type: 'disjunction' }).format(['a', 'b'])", "'a or b'"),
+        // Collator, Segmenter, the rest
+        ("['b', 'a', 'C'].sort(new Intl.Collator().compare).join('')", "'abC'"),
+        ("['item10', 'item2', 'item1'].sort(new Intl.Collator('en', { numeric: true }).compare).join()", "'item1,item2,item10'"),
+        ("new Intl.Collator('en', { sensitivity: 'base' }).compare('a', 'Á')", "0"),
+        ("[...new Intl.Segmenter().segment('e\\u0301👍🏽🇪🇸x')].map(s => s.segment).length", "4"),
+        ("[...new Intl.Segmenter('en', { granularity: 'word' }).segment('Hi, you!')].filter(s => s.isWordLike).map(s => s.segment).join('|')", "'Hi|you'"),
+        ("Intl.getCanonicalLocales(['EN-us', 'es-mx', 'en-US'])", "[ 'en-US', 'es-MX' ]"),
+        ("new Intl.DisplayNames(['en'], { type: 'region' }).of('ES')", "'Spain'"),
+        ("new Intl.Locale('es-Latn-MX').region", "'MX'"),
+        ("Intl.getCanonicalLocales('not a locale!')", "throws RangeError*"),
+    ]);
+}
+
+#[test]
+fn normalize_and_locale_compare() {
+    check(&[
+        ("['Á'.normalize('NFD').length, 'A\\u0301'.normalize() === 'Á', 'ệ'.normalize('NFD').length, 'x'.normalize('NFD')]", "[ 2, true, 3, 'x' ]"),
+        ("'a'.normalize('bad')", "throws RangeError*"),
+        ("['b', 'a', 'B', 'á', 'A'].sort((x, y) => x.localeCompare(y)).join('')", "'aAábB'"),
+        ("['a'.localeCompare('Á', undefined, { sensitivity: 'base' }), 'a'.localeCompare('A', undefined, { sensitivity: 'accent' }), 'a'.localeCompare('A')]", "[ 0, 0, -1 ]"),
+        ("'v10'.localeCompare('v9', undefined, { numeric: true })", "1"),
+    ]);
+}
+
+/// Weak references let go of their targets once nothing else holds them
+#[test]
+fn weak_references() {
+    let mut vm = Vm::new();
+    let eval = |vm: &mut Vm, src: &str| -> String {
+        match vm.eval(src) {
+            Ok(v) => vm.display(v),
+            Err(e) => format!("throws {}", vm.display(e)),
+        }
+    };
+    let setup = r#"
+        var log = [];
+        var registry = new FinalizationRegistry(held => log.push(held));
+        var kept = { name: 'kept' };
+        var refKept = new WeakRef(kept);
+        var refLost = new WeakRef({ name: 'lost' });
+        (function () {
+            const a = {}, b = {}, c = {};
+            registry.register(a, 'a');
+            registry.register(b, 'b', b);
+            registry.register(c, 'c', kept);
+            registry.unregister(kept);
+        })();
+        registry.register(kept, 'never');
+        // An ephemeron: the value refers back to its key, and nothing else
+        // holds either; the map must not keep both alive
+        var wm = new WeakMap();
+        var probe = new WeakRef((() => { const k = {}; wm.set(k, { k }); return k; })());
+        // A value reachable only through a live key stays
+        var liveKey = {};
+        wm.set(liveKey, { tag: 'value' });
+        var valueRef = new WeakRef(wm.get(liveKey));
+        var sym = Symbol('weak');
+        var symRef = new WeakRef(sym);
+        typeof refLost.deref()
+    "#;
+    // A new WeakRef's target survives the script (until the job queue,
+    // drained after each script, is empty)
+    assert_eq!(eval(&mut vm, setup), "object");
+    vm.collect_garbage();
+    vm.run_jobs();
+    assert_eq!(eval(&mut vm, "[refKept.deref() === kept, refLost.deref(), probe.deref(), valueRef.deref().tag, symRef.deref() === sym]"), "[ true, undefined, undefined, 'value', true ]");
+    // The cleanup callback ran for a and b, but not c (unregistered) or kept
+    assert_eq!(eval(&mut vm, "log.sort().join()"), "a,b");
+    let errors = [
+        ("new WeakRef(1)", "throws TypeError: WeakRef: target must be an object or non-registered symbol"),
+        ("new WeakRef(Symbol.for('x'))", "throws TypeError: WeakRef: target must be an object or non-registered symbol"),
+        ("WeakRef({})", "throws TypeError: Constructor requires 'new'"),
+        ("new FinalizationRegistry(1)", "throws TypeError: FinalizationRegistry: cleanup must be callable"),
+        ("var o = {}; registry.register(o, o)", "throws TypeError: FinalizationRegistry.prototype.register: target and holdings must not be same"),
+        ("registry.unregister(1)", "throws TypeError: Invalid unregisterToken ('1')"),
+        ("registry.register({}, 1, 2)", "throws TypeError: FinalizationRegistry.prototype.register: invalid unregister token"),
+        ("[registry.register({}, 1), registry.unregister({})]", "[ undefined, false ]"),
+        ("Object.prototype.toString.call(refKept) + Object.prototype.toString.call(registry)", "[object WeakRef][object FinalizationRegistry]"),
+        ("var s = Symbol(); new WeakMap([[s, 1]]).get(s)", "1"),
+        ("new WeakSet().add(Symbol.for('y'))", "throws TypeError: Invalid value used as weak map key"),
+    ];
+    for (src, want) in errors {
+        assert_eq!(eval(&mut vm, src), want, "{src}");
+    }
+}
+
+/// Stack traces name each frame's function and source location
+#[test]
+fn stack_trace_locations() {
+    let mut vm = Vm::new();
+    let src = "function outer() {\n  return inner();\n}\nfunction inner() {\n  const o = {};\n  return o.missing.deep;\n}\ntry { outer(); } catch (e) { e.stack }";
+    let stack = vm.eval_named(src, "https://example.com/app.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(
+        stack,
+        "TypeError: Cannot read properties of undefined (reading 'deep')\n    at inner (https://example.com/app.js:6:20)\n    at outer (https://example.com/app.js:2:10)\n    at https://example.com/app.js:8:7"
+    );
+    // Errors made by `new Error` and `throw`, calls of non-functions, and
+    // lazily compiled functions on one long line
+    let src = "var f = () => { throw new Error('x'); }; var g = function named() { undefinedFn(); }; var h = () => { ({}).nope(); };\nvar r = [];\nfor (const fn of [f, g, h]) { try { fn(); } catch (e) { r.push(e.stack.split('\\n')[1]); } }\nr.join('|')";
+    let got = vm.eval_named(src, "t.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "    at f (t.js:1:23)|    at named (t.js:1:69)|    at h (t.js:1:108)");
+    // Syntax errors point at the offending token
+    let err = vm.eval_named("let a = 1;\nlet b = ;", "bad.js").unwrap_err();
+    let stack = vm.eval_named("x => x.stack", "").and_then(|f| vm.call(f, fos_jsvm::Value::UNDEFINED, &[err])).map(|v| vm.display(v)).unwrap();
+    assert_eq!(stack, "SyntaxError: unexpected ';': expected expression\n    at bad.js:2:9");
+    // The stack is formatted when first read, from the message then; it
+    // can be replaced; captureStackTrace leaves out the constructor's frames
+    let src = r#"
+        function MyError(msg) { this.message = msg; Error.captureStackTrace(this, MyError); }
+        function make() { return new MyError('custom'); }
+        var e = new Error('first');
+        var before = Object.getOwnPropertyNames(e).includes('stack');
+        e.message = 'second';
+        var head = e.stack.split('\n')[0];
+        var replaced = new TypeError('t'); replaced.stack = 'mine';
+        [before, Object.getOwnPropertyNames(e).includes('stack'), head, replaced.stack, make().stack.split('\n').slice(1).join('|'),
+         Error.stackTraceLimit, typeof Object.getOwnPropertyDescriptor(Error.prototype, 'stack').get, Object.create(Error.prototype).stack]
+    "#;
+    let got = vm.eval_named(src, "c.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "[ false, true, 'Error: second', 'mine', '    at make (c.js:3:34)|    at c.js:9:89', 10, 'function', undefined ]");
+    // A getter's caller is located at the property access
+    let src = "var o = { get g() { return new Error('g').stack; } };\nfunction f() { return [1, o.g][1]; }\nf().split('\\n').slice(1, 3).join('|')";
+    let got = vm.eval_named(src, "g.js").map(|v| vm.display(v)).unwrap();
+    assert_eq!(got, "    at get g (g.js:1:28)|    at f (g.js:2:29)");
+}
+
+/// Functions take their names from computed keys and accessor kinds
+#[test]
+fn computed_function_names() {
+    check(&[
+        ("const n = 'dyn'; ({ [n]: function () {} })[n].name", "'dyn'"),
+        ("({ [Symbol.iterator]: () => 0 })[Symbol.iterator].name", "'[Symbol.iterator]'"),
+        ("({ [Symbol()]: () => 0 })[Object.getOwnPropertySymbols({ [Symbol()]: 1 }).length - 1] === undefined", "true"),
+        ("const s = Symbol(); Object.getOwnPropertyDescriptor({ [s]() {} }, s).value.name", "''"),
+        ("({ [1 + 1]() {} })[2].name", "'2'"),
+        ("({ ['m' + 1]() {} }).m1.name", "'m1'"),
+        ("Object.getOwnPropertyDescriptor({ get ['a' + 'b']() { return 1; } }, 'ab').get.name", "'get ab'"),
+        ("Object.getOwnPropertyDescriptor({ get x() { return 1; }, set x(v) {} }, 'x').set.name", "'set x'"),
+        ("Object.getOwnPropertyDescriptor(class { static get y() { return 1; } }, 'y').get.name", "'get y'"),
+        ("class A { [Symbol.toPrimitive]() {} } A.prototype[Symbol.toPrimitive].name", "'[Symbol.toPrimitive]'"),
+        ("const k = 'c'; ({ [k]: class {} }).c.name", "'c'"),
+        ("const k2 = 'c'; ({ [k2]: class { static name() {} } }).c.name.call === Function.prototype.call", "true"),
+        ("const k3 = 'f'; ({ [k3]: function named() {} }).f.name", "'named'"),
+    ]);
+}
+
+/// Redefining a property with a partial descriptor keeps what it omits
+#[test]
+fn partial_property_redefinition() {
+    check(&[
+        // React's input value tracker
+        ("var o = {}, cur; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; }, set(x) { cur = x; } }); Object.defineProperty(o, 'v', { enumerable: false }); (function () { 'use strict'; o.v = 5; })(); var d = Object.getOwnPropertyDescriptor(o, 'v'); [cur, typeof d.get, typeof d.set, 'value' in d, d.configurable]", "[ 5, 'function', 'function', false, true ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; }, set(x) {} }); Object.defineProperty(o, 'v', { get() { return 2; } }); [o.v, typeof Object.getOwnPropertyDescriptor(o, 'v').set]", "[ 2, 'function' ]"),
+        ("var o = { v: 1 }; Object.defineProperty(o, 'v', { enumerable: false }); var d = Object.getOwnPropertyDescriptor(o, 'v'); [d.value, d.writable, d.enumerable]", "[ 1, true, false ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { configurable: true, get() { return 1; } }); Object.defineProperty(o, 'v', { value: 3 }); var d = Object.getOwnPropertyDescriptor(o, 'v'); [d.value, d.writable, 'get' in d]", "[ 3, false, false ]"),
+        ("var o = {}; Object.defineProperty(o, 'v', { get() { return 1; } }); try { Object.defineProperty(o, 'v', { enumerable: true }); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+    ]);
+}
+
+/// Frozen arrays, and arrays whose length is read-only
+#[test]
+fn frozen_arrays() {
+    check(&[
+        // DOMPurify's addToSet only writes to arrays that are not frozen
+        ("[Object.isFrozen(Object.freeze(['A'])), Object.isFrozen(Object.freeze([])), Object.isFrozen(Object.seal([1])), Object.isSealed(Object.freeze([1]))]", "[ true, true, false, true ]"),
+        ("Object.getOwnPropertyDescriptor(Object.freeze([1]), 'length').writable", "false"),
+        ("var a = Object.freeze([1, 2]); a.length = 0; a[5] = 1; a[0] = 9; [a.length, a[0], a[5]]", "[ 2, 1, undefined ]"),
+        ("var a = Object.freeze([1]); [() => a.push(2), () => a.pop(), () => a.shift(), () => a.unshift(0), () => a.splice(0, 1)].map(f => { try { f(); return 'ok'; } catch (e) { return e.constructor.name; } })", "[ 'TypeError', 'TypeError', 'TypeError', 'TypeError', 'TypeError' ]"),
+        ("var b = [1, 2, 3]; Object.defineProperty(b, 'length', { writable: false }); var r = []; try { b.push(4); } catch (e) { r.push(e.constructor.name); } b[0] = 7; b[3] = 1; [r[0], b.length, b[0], b[3], Object.isFrozen(b)]", "[ 'TypeError', 3, 7, undefined, false ]"),
+        ("(function () { 'use strict'; var a = Object.freeze([1]); try { a.length = 0; return 'no'; } catch (e) { return e.constructor.name; } })()", "'TypeError'"),
+        ("var b = [1]; Object.defineProperty(b, 'length', { writable: false }); try { Object.defineProperty(b, 'length', { writable: true }); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+    ]);
+}
+
+/// instanceof and isPrototypeOf see a proxy's [[GetPrototypeOf]]
+#[test]
+fn proxy_prototype_chain() {
+    check(&[
+        // Function.prototype[@@hasInstance], fixed and reachable (as Symbol[Symbol.hasInstance])
+        ("const d = Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance); [typeof d.value, d.writable, d.configurable, Symbol[Symbol.hasInstance].call(Array, []), Function.prototype[Symbol.hasInstance].call({}, []), [] instanceof Array, ({ [Symbol.hasInstance]: () => true }) instanceof Object]", "[ 'function', false, false, true, false, true, true ]"),
+        ("class A { static [Symbol.hasInstance](v) { return v === 1; } } [1 instanceof A, new A() instanceof A]", "[ true, false ]"),
+        ("class A {} [new Proxy(new A(), {}) instanceof A, A.prototype.isPrototypeOf(new Proxy(new A(), {}))]", "[ true, true ]"),
+        ("class B {} new Proxy({}, { getPrototypeOf() { return B.prototype; } }) instanceof B", "true"),
+        ("class C {} const p = new Proxy(Object.create(C.prototype), {}); Object.create(p) instanceof C", "true"),
+        ("var log = []; class D {} new Proxy({}, { getPrototypeOf(t) { log.push('trap'); return null; } }) instanceof D; log.join()", "'trap'"),
+        // Prototype and extensibility operations reach the target or the traps
+        ("function C() {} var t = {}; Object.setPrototypeOf(new Proxy(t, {}), C.prototype); Object.getPrototypeOf(t) === C.prototype", "true"),
+        ("var log = []; var p = new Proxy({}, { setPrototypeOf(t, v) { log.push('set'); return Reflect.setPrototypeOf(t, v); }, preventExtensions(t) { log.push('pe'); return Reflect.preventExtensions(t); }, isExtensible(t) { log.push('ie'); return Reflect.isExtensible(t); } }); Object.setPrototypeOf(p, null); Object.preventExtensions(p); [Object.isExtensible(p), log.join()]", "[ false, 'set,pe,ie' ]"),
+        ("var t = {}; Object.preventExtensions(new Proxy(t, {})); [Object.isExtensible(t), Reflect.preventExtensions(new Proxy({}, { preventExtensions() { return false; } }))]", "[ false, false ]"),
+        ("try { Object.preventExtensions(new Proxy({}, { preventExtensions() { return false; } })); 'no' } catch (e) { e.constructor.name }", "'TypeError'"),
+        ("var t = { a: 1, get g() { return 1; } }; var p = Object.freeze(new Proxy(t, {})); [Object.isFrozen(t), Object.isFrozen(p), Object.isSealed(p), Object.getOwnPropertyDescriptor(t, 'a').writable]", "[ true, true, true, false ]"),
+        ("var t = { a: 1 }; Object.seal(new Proxy(t, {})); [Object.isSealed(t), Object.isFrozen(t), Object.isFrozen(new Proxy({}, {}))]", "[ true, false, false ]"),
     ]);
 }

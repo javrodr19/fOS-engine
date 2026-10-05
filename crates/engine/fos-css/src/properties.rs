@@ -81,10 +81,127 @@ pub enum PropertyId {
     // Transform
     Transform,
     TransformOrigin,
+    /// The individual `translate`, `rotate` and `scale` properties
+    Translate,
+    Rotate,
+    Scale,
+    BoxShadow,
     
     // Transition & Animation
     Transition,
     Animation,
+
+    /// A custom property (`--name`); the name is in the value
+    Custom,
+
+    // Longhands (shorthands above are expanded into these when parsed)
+    BorderTopWidth,
+    BorderRightWidth,
+    BorderBottomWidth,
+    BorderLeftWidth,
+    BorderTopStyle,
+    BorderRightStyle,
+    BorderBottomStyle,
+    BorderLeftStyle,
+    BorderTopColor,
+    BorderRightColor,
+    BorderBottomColor,
+    BorderLeftColor,
+    BorderTopLeftRadius,
+    BorderTopRightRadius,
+    BorderBottomRightRadius,
+    BorderBottomLeftRadius,
+    OutlineWidth,
+    OutlineStyle,
+    OutlineColor,
+    OutlineOffset,
+    BoxSizing,
+    VerticalAlign,
+    ListStyleType,
+    ListStylePosition,
+    TextTransform,
+    TextIndent,
+    WordSpacing,
+    AlignSelf,
+    Order,
+    RowGap,
+    ColumnGap,
+    BackgroundImage,
+    BackgroundRepeat,
+    BackgroundClip,
+    BackgroundPosition,
+    BackgroundSize,
+    TextDecorationLine,
+    TextDecorationColor,
+    TextDecorationStyle,
+    TextOverflow,
+    OverflowWrap,
+    WordBreak,
+    Direction,
+    ObjectFit,
+    BorderCollapse,
+    BorderSpacing,
+    TableLayout,
+    PointerEvents,
+    GridTemplateColumns,
+    GridTemplateRows,
+    GridTemplateAreas,
+    Content,
+    CounterReset,
+    CounterIncrement,
+    CounterSet,
+    /// `clip: rect(...)` and `clip-path` (inset shapes)
+    Clip,
+    ClipPath,
+    ObjectPosition,
+    AspectRatio,
+    Filter,
+    /// SVG paint: `fill` and `stroke` (inline SVG)
+    Fill,
+    Stroke,
+    GridAutoColumns,
+    GridAutoRows,
+    GridAutoFlow,
+    GridColumnStart,
+    GridColumnEnd,
+    GridRowStart,
+    GridRowEnd,
+    JustifyItems,
+    JustifySelf,
+    MaskImage,
+    MaskSize,
+    MaskPosition,
+    MaskRepeat,
+}
+
+impl PropertyId {
+    /// Whether the property is inherited (CSS's "Inherited: yes")
+    pub fn is_inherited(self) -> bool {
+        matches!(
+            self,
+            Self::Color
+                | Self::FontFamily
+                | Self::FontSize
+                | Self::FontWeight
+                | Self::FontStyle
+                | Self::LineHeight
+                | Self::TextAlign
+                | Self::TextIndent
+                | Self::TextTransform
+                | Self::WhiteSpace
+                | Self::LetterSpacing
+                | Self::WordSpacing
+                | Self::Visibility
+                | Self::ListStyleType
+                | Self::ListStylePosition
+                | Self::Direction
+                | Self::WordBreak
+                | Self::OverflowWrap
+                | Self::BorderCollapse
+                | Self::BorderSpacing
+                | Self::PointerEvents
+        )
+    }
 }
 
 impl PropertyId {
@@ -185,6 +302,29 @@ pub enum PropertyValue {
     List(Vec<PropertyValue>),
     /// Raw CSS (for complex values we don't fully parse)
     Raw(String),
+    /// A value using `var()` or math functions, computed per element
+    /// (property name, value text)
+    Unresolved(Box<(String, String)>),
+    /// A custom property declaration (name with `--`, value text)
+    Custom(Box<(String, String)>),
+    /// A keyword of an enumerated property: the discriminant of its
+    /// `crate::style` enum
+    Enum(u8),
+    /// `calc()` mixing pixels and a percentage
+    Mix { px: f32, pct: f32 },
+    /// `currentcolor`
+    CurrentColor,
+    /// Background image layers
+    Images(std::sync::Arc<[crate::style::Image]>),
+    /// A grid property's (validated) text, parsed when computing styles
+    Grid(std::sync::Arc<str>),
+    /// `content`: what a `::before`/`::after` box shows (empty: none)
+    Content(std::sync::Arc<[crate::style::ContentItem]>),
+    /// `counter-reset`/`-increment`/`-set`: counter names and values
+    /// (empty: none)
+    Counters(std::sync::Arc<[(std::sync::Arc<str>, i32)]>),
+    /// A transform property's (validated) text, computed per element
+    Transform(std::sync::Arc<str>),
 }
 
 /// CSS keyword values
@@ -318,7 +458,7 @@ impl Keyword {
 }
 
 /// CSS length value
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Length {
     pub value: f32,
     pub unit: LengthUnit,
@@ -358,7 +498,7 @@ pub enum LengthUnit {
 }
 
 /// CSS color
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Color {
     pub r: u8,
     pub g: u8,

@@ -10,7 +10,8 @@
 //! enforced here: forbidden request headers are dropped, cross-origin
 //! responses are only readable when the server allows it (CORS, with
 //! preflight for non-simple requests), cookies follow the credentials
-//! mode, and secure pages cannot load insecure resources.
+//! mode and SameSite rules (in the browser's shared cookie jar), and
+//! secure pages cannot load insecure resources.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use fos_net::client::HttpClient;
 use fos_net::url_util;
-use fos_net::CookieJar;
+use fos_net::{CookieContext, CookieJar, SharedCookieJar};
 
 /// Wakes the browser's event loop when a request finishes
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -115,7 +116,7 @@ pub struct Completion {
 /// State the workers share
 struct Shared {
     requests: Mutex<Receiver<ScriptRequest>>,
-    cookies: Mutex<CookieJar>,
+    cookies: SharedCookieJar,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -135,18 +136,19 @@ pub struct FetchPool {
 
 impl Default for FetchPool {
     fn default() -> Self {
-        Self::new()
+        Self::new(CookieJar::shared())
     }
 }
 
 impl FetchPool {
-    pub fn new() -> Self {
+    /// A pool whose requests keep cookies in `cookies` (the browser's jar)
+    pub fn new(cookies: SharedCookieJar) -> Self {
         let (to_workers, requests) = mpsc::channel();
         let (completions_tx, from_workers) = mpsc::channel();
         Self {
             shared: Arc::new(Shared {
                 requests: Mutex::new(requests),
-                cookies: Mutex::new(CookieJar::new()),
+                cookies,
                 waker: Mutex::new(None),
             }),
             to_workers,
@@ -378,7 +380,7 @@ fn status_text(status: u16) -> &'static str {
 }
 
 /// Run `request` to completion
-fn perform(client: &mut HttpClient, cookies: &Mutex<CookieJar>, request: &ScriptRequest) -> Result<ScriptResponse, String> {
+fn perform(client: &mut HttpClient, cookies: &SharedCookieJar, request: &ScriptRequest) -> Result<ScriptResponse, String> {
     let origin = serialize_origin(&request.page_url);
     let scheme = scheme_of(&request.url);
     match scheme.as_str() {
@@ -420,6 +422,8 @@ fn perform(client: &mut HttpClient, cookies: &Mutex<CookieJar>, request: &Script
     // the origin it presents becomes opaque after a cross-origin redirect)
     let mut tainted = false;
     let mut preflighted = false;
+    // Whether the redirect chain went through a site other than the page's
+    let mut cross_site_redirect = false;
 
     for _hop in 0..=MAX_REDIRECTS {
         // Mixed content: a secure page never loads insecure resources
@@ -455,23 +459,21 @@ fn perform(client: &mut HttpClient, cookies: &Mutex<CookieJar>, request: &Script
         if let Some(referrer) = referrer_for(&request.page_url, &url) {
             hop_headers.push(("Referer".into(), referrer));
         }
-        let parts = UrlBits::parse(&url);
+        let mut cookie_context = CookieContext::subresource(Some(&request.page_url), &method);
+        cookie_context.cross_site_redirect = cross_site_redirect;
         if send_credentials {
             let jar = cookies.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(c) = jar.get_cookie_header(&parts.host, &parts.path, parts.secure) {
+            if let Some(c) = jar.cookie_header(&url, &cookie_context) {
                 hop_headers.push(("Cookie".into(), c));
             }
         }
 
         let response = client.request(&method, &url, Some(hop_headers), body.clone()).map_err(|e| e.to_string())?;
         if send_credentials {
-            let mut jar = cookies.lock().unwrap_or_else(|p| p.into_inner());
-            for (name, value) in &response.headers {
-                if name.eq_ignore_ascii_case("set-cookie") {
-                    jar.add_from_header(value, &parts.host);
-                }
-            }
+            cookies.lock().unwrap_or_else(|p| p.into_inner()).store_response(&url, &response.headers, &cookie_context);
         }
+        cookie_context.follow(&url);
+        cross_site_redirect = cookie_context.cross_site_redirect;
 
         let location = matches!(response.status, 301 | 302 | 303 | 307 | 308)
             .then(|| response.header("location").map(str::to_owned))
@@ -617,7 +619,7 @@ fn preflight(
 }
 
 /// The `Referer` sent with a request (strict-origin-when-cross-origin)
-fn referrer_for(page_url: &str, target: &str) -> Option<String> {
+pub(crate) fn referrer_for(page_url: &str, target: &str) -> Option<String> {
     let page_scheme = scheme_of(page_url);
     if !matches!(page_scheme.as_str(), "http" | "https") {
         return None;
@@ -647,24 +649,6 @@ fn strip_userinfo(url: &str) -> String {
 
 fn is_localhost(url: &str) -> bool {
     url_util::origin(url).is_some_and(|(_, host, _)| host == "localhost" || host == "127.0.0.1" || host == "[::1]")
-}
-
-/// Host, path and security of a URL, for cookie matching
-struct UrlBits {
-    host: String,
-    path: String,
-    secure: bool,
-}
-
-impl UrlBits {
-    fn parse(url: &str) -> Self {
-        let secure = scheme_of(url) == "https";
-        let host = url_util::origin(url).map(|(_, h, _)| h).unwrap_or_default();
-        let after = url.split_once("://").map_or("", |(_, r)| r);
-        let path = after.find('/').map_or("/", |i| &after[i..]);
-        let path = path.split(['?', '#']).next().unwrap_or("/").to_string();
-        Self { host, path, secure }
-    }
 }
 
 // ---- local schemes ----

@@ -128,11 +128,14 @@ pub enum ObjectKind {
     Bound(Box<BoundFunction>),
     /// A getter/setter pair (internal: the value of an accessor property)
     Accessor { getter: Value, setter: Value },
-    Error,
+    /// An error, with the frames captured when it was made (until its
+    /// `stack` is first read and formatted from them)
+    Error(Option<Box<CapturedStack>>),
     Boolean(bool),
     Number(f64),
     String(Gc<JsString>),
     Symbol(Gc<Symbol>),
+    BigInt(Gc<crate::bigint::BigInt>),
     Date(f64),
     Arguments,
     ForIn(Box<ForInIterator>),
@@ -144,10 +147,14 @@ pub enum ObjectKind {
     MapIterator { map: Gc<JsObject>, pos: u32, kind: u8 },
     /// A user-defined iterator with its `next` method and state
     IterRecord { iter: Value, next: Value, done: bool },
-    /// Keys of WeakMap/WeakSet entries are not traced (see the VM's
-    /// collector, which prunes dead keys)
+    /// WeakMap/WeakSet entries are not traced: the collector marks a
+    /// WeakMap value only once its key is marked (an ephemeron) and prunes
+    /// entries whose keys die
     WeakMap(Box<MapData>),
     WeakSet(Box<MapData>),
+    /// A WeakRef's target (untraced; cleared when the target dies)
+    WeakRef(Value),
+    FinalizationRegistry(Box<FinalizationData>),
     RegExp(Box<RegExpData>),
     ArrayBuffer(Box<Vec<u8>>),
     TypedArray(Box<TypedArrayData>),
@@ -159,6 +166,32 @@ pub enum ObjectKind {
     /// An object backed by embedder data (e.g. a DOM node): `class` tells
     /// the embedder's kinds apart, `id` names the thing it wraps
     Host { class: u32, id: u64 },
+    /// Embedder data owned by the object and freed with it (e.g. a canvas
+    /// bitmap)
+    HostData(Box<dyn HostData>),
+}
+
+/// Data an embedder attaches to an object (`ObjectKind::HostData`). It
+/// lives as long as the object; `trace` marks the JS values it holds.
+pub trait HostData: std::any::Any {
+    fn trace(&self, _tracer: &mut Tracer) {}
+}
+
+impl JsObject {
+    /// The object's host data, if it is a `T`
+    pub fn host_data<T: HostData>(&self) -> Option<&T> {
+        match &self.kind {
+            ObjectKind::HostData(d) => (&**d as &dyn std::any::Any).downcast_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn host_data_mut<T: HostData>(&mut self) -> Option<&mut T> {
+        match &mut self.kind {
+            ObjectKind::HostData(d) => (&mut **d as &mut dyn std::any::Any).downcast_mut(),
+            _ => None,
+        }
+    }
 }
 
 pub struct ProxyData {
@@ -300,6 +333,24 @@ pub struct ForInIterator {
 
 /// Insertion-ordered hash map for Map and Set (deleted entries are holes
 /// so iterators stay valid)
+/// Frames (function, saved pc) captured for an error, innermost first
+pub struct CapturedStack {
+    pub frames: Box<[(Rc<FunctionProto>, u32)]>,
+}
+
+/// A FinalizationRegistry: its cleanup callback and registered cells
+pub struct FinalizationData {
+    pub cleanup: Value,
+    pub cells: Vec<FinalizationCell>,
+}
+
+pub struct FinalizationCell {
+    pub target: Value,
+    pub held: Value,
+    /// Unregister token, or undefined
+    pub token: Value,
+}
+
 #[derive(Default)]
 pub struct MapData {
     pub index: FxHashMap<MapKey, u32>,
@@ -313,6 +364,7 @@ pub enum MapKey {
     /// Primitive compared by its bits (numbers normalized, strings by content)
     Bits(u64),
     String(Box<[u16]>),
+    BigInt(crate::bigint::BigInt),
 }
 
 /// Symbol value
@@ -360,6 +412,8 @@ pub struct JsObject {
     pub class_constructor: bool,
     /// Keep shape mode however many properties it gets (the global object)
     pub keep_shape: bool,
+    /// An array whose `length` is not writable (frozen, or so defined)
+    pub length_readonly: bool,
     /// Built-in properties not created yet (functions' `length`, `name`
     /// and `prototype`): see `LAZY_*`
     pub lazy: u8,
@@ -412,6 +466,7 @@ impl Trace for JsObject {
             }
             ObjectKind::String(s) => tracer.mark(*s),
             ObjectKind::Symbol(s) => tracer.mark(*s),
+            ObjectKind::BigInt(b) => tracer.mark(*b),
             ObjectKind::ForIn(it) => {
                 tracer.mark_values(&it.keys);
                 tracer.mark_value(it.object);
@@ -429,14 +484,14 @@ impl Trace for JsObject {
                 tracer.mark_value(*iter);
                 tracer.mark_value(*next);
             }
-            ObjectKind::WeakMap(m) => {
-                // Values stay alive while the entry does; dead keys are
-                // pruned after marking
-                for (_, v) in m.entries.iter().flatten() {
-                    tracer.mark_value(*v);
+            ObjectKind::WeakMap(_) | ObjectKind::WeakSet(_) | ObjectKind::WeakRef(_) => {}
+            ObjectKind::FinalizationRegistry(f) => {
+                // Held values are strong; targets and tokens are weak
+                tracer.mark_value(f.cleanup);
+                for c in &f.cells {
+                    tracer.mark_value(c.held);
                 }
             }
-            ObjectKind::WeakSet(_) => {}
             ObjectKind::RegExp(r) => {
                 tracer.mark(r.source);
                 tracer.mark(r.flags);
@@ -471,9 +526,15 @@ impl Trace for JsObject {
                     r.trace(tracer);
                 }
             }
+            ObjectKind::Error(stack) => {
+                // The functions' constants stay alive for the stack's sake
+                for (p, _) in stack.iter().flat_map(|s| s.frames.iter()) {
+                    p.trace(tracer);
+                }
+            }
+            ObjectKind::HostData(d) => d.trace(tracer),
             ObjectKind::Ordinary
             | ObjectKind::Array { .. }
-            | ObjectKind::Error
             | ObjectKind::Boolean(_)
             | ObjectKind::Host { .. }
             | ObjectKind::Number(_)
@@ -502,6 +563,7 @@ impl JsObject {
             is_prototype: false,
             class_constructor: false,
             keep_shape: false,
+            length_readonly: false,
             lazy: 0,
             proto,
             slots: Vec::new(),
@@ -617,7 +679,11 @@ impl JsObject {
     /// Switch to dictionary mode (after deletions, attribute changes or
     /// too many properties). Elements stay where they are.
     pub fn to_dictionary(&mut self, shapes: &Shapes) {
-        if self.dict.is_some() && self.shape == ShapeId::DICT {
+        if self.shape == ShapeId::DICT {
+            // Already a dictionary (proxies start out with no table)
+            if self.dict.is_none() {
+                self.dict = Some(Box::default());
+            }
             return;
         }
         let mut dict = self.dict.take().map(|d| *d).unwrap_or_default();

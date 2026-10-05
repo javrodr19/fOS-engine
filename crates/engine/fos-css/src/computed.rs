@@ -37,6 +37,11 @@ pub struct ComputedStyle {
     /// The parent's font size (what `em` and `%` font sizes resolve
     /// against); 0 when unknown
     pub parent_font_size: f32,
+    /// The root element's font size (`rem`); 0 means 16px
+    pub root_font_size: f32,
+    /// Custom properties (`--name`), inherited; shared with the parent
+    /// until the element declares its own
+    pub custom_properties: Option<std::sync::Arc<crate::values::CustomProperties>>,
     pub font_weight: u16,      // 100-900
     pub line_height: f32,      // multiplier
     
@@ -136,6 +141,60 @@ impl PropertyMask {
 }
 
 impl ComputedStyle {
+    /// Apply an element's matching declarations, in cascade order: custom
+    /// properties are computed first, then font-size (what other `em`
+    /// values depend on), then the rest; values using `var()` or math
+    /// functions are resolved against this element and `viewport`
+    pub fn apply_cascade(&mut self, decls: &[&Declaration], viewport: (f32, f32)) {
+        self.apply_cascade_cached(decls, viewport, &mut crate::values::ResolveCache::default());
+    }
+
+    /// [`Self::apply_cascade`], reusing resolutions across elements
+    pub fn apply_cascade_cached(&mut self, decls: &[&Declaration], viewport: (f32, f32), cache: &mut crate::values::ResolveCache) {
+        let own: Vec<(&str, &str)> = decls
+            .iter()
+            .filter_map(|d| match &d.value {
+                PropertyValue::Custom(b) => Some((b.0.as_str(), b.1.as_str())),
+                _ => None,
+            })
+            .collect();
+        if !own.is_empty() {
+            let computed = crate::values::compute_custom_properties(self.custom_properties.as_ref(), &own);
+            self.custom_properties = Some(std::sync::Arc::new(computed));
+        }
+        let parent_font_size = if self.parent_font_size > 0.0 { self.parent_font_size } else { self.font_size };
+        let root_font_size = if self.root_font_size > 0.0 { self.root_font_size } else { 16.0 };
+        for font_pass in [true, false] {
+            for d in decls {
+                let is_font = match &d.value {
+                    PropertyValue::Custom(_) => continue,
+                    PropertyValue::Unresolved(b) => b.0 == "font-size" || b.0 == "font",
+                    _ => d.property == PropertyId::FontSize,
+                };
+                if is_font != font_pass {
+                    continue;
+                }
+                match &d.value {
+                    PropertyValue::Unresolved(b) => {
+                        let custom = self.custom_properties.clone();
+                        let ctx = crate::values::ResolveContext {
+                            custom: custom.as_deref().map(|c| c as &dyn crate::values::VarSource),
+                            font_size: self.font_size,
+                            parent_font_size,
+                            root_font_size,
+                            viewport,
+                        };
+                        let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &ctx).to_vec();
+                        for r in &resolved {
+                            self.apply_declaration(r);
+                        }
+                    }
+                    _ => self.apply_declaration(d),
+                }
+            }
+        }
+    }
+
     /// Apply a declaration to this computed style
     pub fn apply_declaration(&mut self, decl: &Declaration) {
         match decl.property {
@@ -184,7 +243,11 @@ impl ComputedStyle {
             PropertyId::FontSize => {
                 if let PropertyValue::Length(len) = &decl.value {
                     let parent = if self.parent_font_size > 0.0 { self.parent_font_size } else { self.font_size };
-                    self.font_size = Self::length_to_px(len, parent);
+                    self.font_size = if len.unit == LengthUnit::Rem {
+                        len.value * if self.root_font_size > 0.0 { self.root_font_size } else { 16.0 }
+                    } else {
+                        Self::length_to_px(len, parent)
+                    };
                 }
             }
             PropertyId::FontWeight => {

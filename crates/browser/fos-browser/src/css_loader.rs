@@ -144,7 +144,7 @@ pub fn load(urls: &[String], fetch: &mut dyn FnMut(&[String]) -> Vec<Option<Stri
         let got = fetch(&frontier);
         let mut next = Vec::new();
         for (url, text) in frontier.iter().zip(got) {
-            let text = text.unwrap_or_default();
+            let text = absolutize_urls(&text.unwrap_or_default(), url);
             for imp in imports(&text) {
                 next.push(fos_net::url_util::resolve(url, &imp.url));
             }
@@ -158,6 +158,41 @@ pub fn load(urls: &[String], fetch: &mut dyn FnMut(&[String]) -> Vec<Option<Stri
         sheets.insert(url.clone(), Arc::from(inline_imports(url, &texts, &mut stack)));
     }
     Arc::new(sheets)
+}
+
+/// Rewrite relative `url()` references in a stylesheet fetched from
+/// `base` to absolute ones (they are relative to the sheet, which loses
+/// its URL once inlined into the page's CSS)
+pub fn absolutize_urls(css: &str, base: &str) -> String {
+    let lower = css.to_ascii_lowercase();
+    let b = css.as_bytes();
+    let mut out = String::with_capacity(css.len() + 64);
+    let mut at = 0;
+    let mut search = 0;
+    while let Some(p) = lower[search..].find("url(") {
+        let start = search + p;
+        // Not part of a longer identifier
+        if start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'-') {
+            search = start + 4;
+            continue;
+        }
+        let open = start + 4;
+        let Some(close_rel) = css[open..].find(')') else { break };
+        let close = open + close_rel;
+        let raw = css[open..close].trim();
+        let unquoted = raw.trim_matches(|c| c == '"' || c == '\'');
+        let keep = unquoted.is_empty() || unquoted.starts_with('#') || unquoted.starts_with("data:") || unquoted.contains("://") || unquoted.starts_with("//");
+        if !keep && !raw.contains('(') {
+            out.push_str(&css[at..open]);
+            out.push('"');
+            out.push_str(&fos_net::url_util::resolve(base, unquoted).replace('"', "%22"));
+            out.push('"');
+            at = close;
+        }
+        search = close + 1;
+    }
+    out.push_str(&css[at..]);
+    out
 }
 
 /// The text of sheet `url` with its imports (recursively) in place
@@ -232,6 +267,16 @@ pub fn load_for_page(network: &mut crate::network::NetworkManager, page: &crate:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_urls_become_absolute() {
+        let css = "a{background:url(img/x.png)} b{background:URL( '../y.svg' )} c{background:url(data:image/png;base64,AA)} d{x:url(https://e.com/z.png)}";
+        let out = absolutize_urls(css, "https://site.com/css/main.css");
+        assert!(out.contains("url(\"https://site.com/css/img/x.png\")"), "{out}");
+        assert!(out.contains("URL(\"https://site.com/y.svg\")"), "{out}");
+        assert!(out.contains("url(data:image/png;base64,AA)"));
+        assert!(out.contains("url(https://e.com/z.png)"));
+    }
 
     #[test]
     fn links_in_document_order() {

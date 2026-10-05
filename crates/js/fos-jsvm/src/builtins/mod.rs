@@ -1,16 +1,19 @@
 //! Built-in objects
 
 pub(crate) mod array;
+mod bigint;
+mod intl;
 mod collections;
+mod weakref;
 mod date;
 mod error;
-mod function;
+pub(crate) mod function;
 pub(crate) mod generator;
 pub(crate) mod promise;
-mod json;
+pub(crate) mod json;
 mod math;
 mod number;
-mod object;
+pub(crate) mod object;
 pub(crate) mod proxy;
 mod reflect;
 pub(crate) mod regexp;
@@ -33,9 +36,11 @@ pub(crate) fn init(vm: &mut Vm) {
     array::init(vm);
     string::init(vm);
     number::init(vm);
+    bigint::init(vm);
     math::init(vm);
     json::init(vm);
     collections::init(vm);
+    weakref::init(vm);
     reflect::init(vm);
     proxy::init(vm);
     regexp::init(vm);
@@ -44,6 +49,7 @@ pub(crate) fn init(vm: &mut Vm) {
     typedarray::init(vm);
     generator::init(vm);
     uri::init(vm);
+    intl::init(vm);
 
     let g = vm.global;
     vm.def_value(g, "globalThis", Value::object(g), PropFlags::HIDDEN);
@@ -158,6 +164,11 @@ impl Vm {
             }
             return;
         }
+        if let Some(b) = v.as_bigint() {
+            out.push_str(&b.get().to_string_radix(10));
+            out.push('n');
+            return;
+        }
         if let Some(s) = v.as_symbol() {
             match s.get().description {
                 Some(d) => out.push_str(&format!("Symbol({})", d.get().to_rust_string())),
@@ -179,7 +190,7 @@ impl Vm {
             }
             return;
         }
-        if matches!(o.get().kind, ObjectKind::Error) {
+        if matches!(o.get().kind, ObjectKind::Error(_)) {
             let s = error::error_to_string(self, v).unwrap_or_default();
             out.push_str(&s);
             return;

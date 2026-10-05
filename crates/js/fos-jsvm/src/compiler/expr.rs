@@ -135,7 +135,13 @@ impl<'a, 'h> Compiler<'a, 'h> {
             Expr::Null => {
                 self.emit(Insn::LoadNull { dst });
             }
-            Expr::BigInt(_) => return self.error("BigInt is not supported yet"),
+            Expr::BigInt(text) => {
+                let Some(b) = crate::bigint::BigInt::parse_digits(text, 10) else { return self.error("invalid BigInt literal") };
+                let extra = b.limb_bytes();
+                let v = Value::bigint(self.heap.alloc(b, extra));
+                let idx = self.const_index(v)?;
+                self.emit(Insn::LoadConst { dst, idx });
+            }
             Expr::Template(t) => self.template(t, dst)?,
             Expr::TaggedTemplate { tag, template } => self.tagged_template(tag, template, dst)?,
             Expr::Regex { pattern, flags } => {
@@ -198,17 +204,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.expr_to(alt, dst)?;
                 self.patch_here(vec![j])?;
             }
-            Expr::Call { callee, args, optional } => self.call(callee, args, *optional, dst)?,
+            Expr::Call { callee, args, optional, pos } => self.call(callee, args, *optional, dst, *pos)?,
             Expr::SuperCall(args) => self.super_call(args, dst)?,
-            Expr::New { callee, args } => {
+            Expr::New { callee, args, pos } => {
                 let f = self.alloc_n(2)?;
                 self.expr_to(callee, f)?;
-                match self.args(args, f + 2)? {
+                let argc = self.args(args, f + 2)?;
+                self.set_pos(*pos);
+                match argc {
                     Some(argc) => self.emit(Insn::New { dst, func: f, argc }),
                     None => self.emit(Insn::NewSpread { dst, func: f }),
                 };
             }
-            Expr::Member { object, prop, optional } => {
+            Expr::Member { object, prop, optional, pos } => {
                 let obj = if member_key_simple(prop) {
                     self.expr_any(object)?
                 } else {
@@ -219,6 +227,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 if *optional {
                     self.chain_jump(obj);
                 }
+                self.set_pos(*pos);
                 self.get_member(obj, prop, dst)?;
             }
             Expr::SuperMember(prop) => {
@@ -270,7 +279,25 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 self.emit(Insn::Await { dst, src: v });
             }
             Expr::Paren(inner) => self.expr_to(inner, dst)?,
-            Expr::Import(_) => return self.error("dynamic import is not supported"),
+            Expr::Import { spec, options } => {
+                let mark = self.mark();
+                let spec = self.expr_any(spec)?;
+                if let Some(options) = options {
+                    self.expr_effect(options)?;
+                }
+                let referrer = self.alloc()?;
+                match self.resolve(MODULE_REFERRER) {
+                    Res::Upval(idx) => {
+                        self.emit(Insn::GetUpval { dst: referrer, idx });
+                    }
+                    _ => {
+                        self.emit(Insn::LoadUndef { dst: referrer });
+                    }
+                }
+                self.emit(Insn::DynamicImport { dst, spec, referrer });
+                self.release(mark);
+            }
+            Expr::ImportMeta => self.load_var_static(MODULE_META, dst)?,
         }
         Ok(())
     }
@@ -360,7 +387,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
             target = inner;
         }
         match target {
-            Expr::Member { object, prop, .. } => {
+            Expr::Member { object, prop, pos, .. } => {
+                self.set_pos(*pos);
                 let obj = if value_simple && member_key_simple(prop) {
                     self.expr_any(object)?
                 } else {
@@ -782,11 +810,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
             callee = inner;
         }
         match callee {
-            Expr::Member { object, prop, optional } => {
+            Expr::Member { object, prop, optional, pos } => {
                 self.expr_to(object, f + 1)?;
                 if *optional {
                     self.chain_jump(f + 1);
                 }
+                self.set_pos(*pos);
                 let mark = self.mark();
                 self.get_member(f + 1, prop, f)?;
                 self.release(mark);
@@ -823,13 +852,17 @@ impl<'a, 'h> Compiler<'a, 'h> {
         Ok(())
     }
 
-    fn call(&mut self, callee: &'a Expr, args: &'a [ArrayElem], optional: bool, dst: Reg) -> CResult<()> {
+    fn call(&mut self, callee: &'a Expr, args: &'a [ArrayElem], optional: bool, dst: Reg, pos: u32) -> CResult<()> {
         let f = self.alloc_n(2)?;
+        // Also covers loading the callee (`undefinedFn()`)
+        self.set_pos(pos);
         self.callee(callee, f)?;
         if optional {
             self.chain_jump(f);
         }
-        match self.args(args, f + 2)? {
+        let argc = self.args(args, f + 2)?;
+        self.set_pos(pos);
+        match argc {
             Some(argc) => self.emit(Insn::Call { dst, func: f, argc }),
             None => self.emit(Insn::CallSpread { dst, func: f }),
         };
@@ -903,6 +936,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
         let site = TemplateSite {
             cooked: template.cooked.iter().map(|c| c.as_ref().map(|u| u.clone())).collect(),
             raw: template.raw.iter().map(|r| r.encode_utf16().collect::<Vec<u16>>().into_boxed_slice()).collect(),
+            object: Default::default(),
         };
         self.f().templates.push(site);
         let strings = self.alloc()?;
@@ -933,6 +967,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
             }
             PropKey::Computed(_) | PropKey::Private(_) => None,
         }
+    }
+
+    /// A method's function name: accessors are "get x" and "set x"
+    fn method_name(&mut self, name: Option<Atom>, kind: MethodKind) -> Option<Atom> {
+        let name = name?;
+        Some(match kind {
+            MethodKind::Method => name,
+            MethodKind::Getter | MethodKind::Setter => {
+                let prefix = if kind == MethodKind::Getter { "get " } else { "set " };
+                let s = self.atoms.string(name).get().to_rust_string();
+                self.intern(&format!("{prefix}{s}"))
+            }
+        })
     }
 
     fn key_name(&mut self, key: &'a PropKey) -> Option<Atom> {
@@ -986,6 +1033,9 @@ impl<'a, 'h> Compiler<'a, 'h> {
                             let v = self.alloc()?;
                             let name = self.key_name(key).map(|a| self.atoms.string(a).get().to_rust_string());
                             self.expr_named(value, v, name.as_deref())?;
+                            if name.is_none() && is_anonymous_function(value) {
+                                self.emit(Insn::SetFunctionName { func: v, key: k, prefix: 0 });
+                            }
                             self.emit(Insn::DefineElem { obj: dst, key: k, src: v });
                         }
                     }
@@ -1003,8 +1053,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
                     self.load_key(key, k)?;
                     let t = self.alloc()?;
                     let name = self.key_name(key);
+                    let name = self.method_name(name, *kind);
                     if self.closure(func, name, t, false)? {
                         self.emit(Insn::SetHomeObject { func: t, obj: dst });
+                    }
+                    if name.is_none() {
+                        self.emit(Insn::SetFunctionName { func: t, key: k, prefix: *kind as u8 });
                     }
                     let insn = match kind {
                         MethodKind::Method => Insn::DefineElem { obj: dst, key: k, src: t },
@@ -1219,8 +1273,12 @@ impl<'a, 'h> Compiler<'a, 'h> {
                         PropKey::Private(n) => Some(self.intern(&format!("#{n}"))),
                         key => self.key_name(key),
                     };
+                    let name = self.method_name(name, *kind);
                     if self.closure(func, name, t, false)? {
                         self.emit(Insn::SetHomeObject { func: t, obj: target });
+                    }
+                    if name.is_none() {
+                        self.emit(Insn::SetFunctionName { func: t, key: k, prefix: *kind as u8 });
                     }
                     let insn = match kind {
                         MethodKind::Method => Insn::DefineMethod { obj: target, key: k, func: t },

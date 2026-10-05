@@ -227,6 +227,19 @@ impl Parser<'_> {
     }
 }
 
+/// Parse JSON text (JSON modules)
+pub(crate) fn parse_value(vm: &mut Vm, text: Value) -> JsResult<Value> {
+    let s = vm.to_string(text)?;
+    let units = s.get().units();
+    let mut p = Parser { s: units, pos: 0 };
+    let v = p.value(vm, 0)?;
+    p.ws();
+    if p.pos != p.s.len() {
+        return Err(p.error(vm));
+    }
+    Ok(v)
+}
+
 fn parse(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let s = vm.to_string(arg(args, 0))?;
     let units = s.get().units();
@@ -322,7 +335,7 @@ impl Stringifier {
     /// serializable (undefined, functions, symbols)
     fn property(&mut self, vm: &mut Vm, holder: Value, key: PropertyKey, value: Value) -> JsResult<bool> {
         let mut value = value;
-        if value.is_object() || value.is_string() && false {
+        if value.is_object() || value.is_bigint() {
             let to_json = vm.get(value, PropertyKey::Atom(atoms::toJSON))?;
             if vm.is_callable(to_json) {
                 let kv = vm.key_value(key);
@@ -338,8 +351,12 @@ impl Stringifier {
                 ObjectKind::Number(_) => Value::number(vm.to_number(value)?),
                 ObjectKind::String(_) => Value::string(vm.to_string(value)?),
                 ObjectKind::Boolean(b) => Value::bool(b),
+                ObjectKind::BigInt(b) => Value::bigint(b),
                 _ => value,
             };
+        }
+        if value.is_bigint() {
+            return Err(vm.type_error("Do not know how to serialize a BigInt"));
         }
         match value {
             Value::NULL => self.push_str("null"),

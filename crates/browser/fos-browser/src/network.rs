@@ -2,8 +2,9 @@
 //!
 //! Integrates fos-net for HTTP caching, HTTP/2, and security.
 //!
-//! A single HTTP client is kept for the whole browser session, so cookies
-//! persist across navigations and keep-alive connections are reused.
+//! A single HTTP client is kept for the whole browser session, so
+//! keep-alive connections are reused. All requests (pages, subresources,
+//! and the requests page scripts make) share one cookie jar.
 
 use std::time::Duration;
 use std::collections::HashMap;
@@ -11,12 +12,16 @@ use fos_net::cache::HttpCache;
 use fos_net::client::blocking::Client;
 use fos_net::http2::Http2Connection;
 use fos_net::network_opt::{PredictiveDns, RequestCoalescer};
+use fos_net::{CookieContext, CookieJar, SharedCookieJar};
 use fos_security::https::{SecureContext, MixedContentChecker, MixedContentResult};
 use crate::charset;
 
 /// User agent sent with every request. The `Mozilla/5.0` prefix is what
 /// servers expect from browsers; some reject clients without it.
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; fOS-Browser/0.1; +https://github.com/fosproject)";
+
+/// Most subresource requests `fetch_many` runs at once
+const MAX_PARALLEL_FETCHES: usize = 6;
 
 /// Accept header for document navigations
 const ACCEPT_DOCUMENT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
@@ -30,8 +35,10 @@ pub struct NetworkManager {
     mixed_content: MixedContentChecker,
     /// User agent string
     user_agent: String,
-    /// Session HTTP client (cookie jar + keep-alive connection pool)
+    /// Session HTTP client (keep-alive connection pool)
     client: Client,
+    /// The session's cookies
+    cookies: SharedCookieJar,
     /// HTTP/2 connection pool by origin
     http2_pool: HashMap<String, Http2Connection>,
     /// Predictive DNS resolver
@@ -43,13 +50,8 @@ pub struct NetworkManager {
 impl NetworkManager {
     /// Create a new network manager with all fos-net features
     pub fn new() -> Self {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(30))
-            .default_header("Accept-Language", "en-US,en;q=0.9")
-            .build()
-            .unwrap_or_default();
+        let cookies = CookieJar::shared();
+        let client = Self::new_client(&cookies);
 
         Self {
             // 500 entries, 25MB cache
@@ -57,15 +59,32 @@ impl NetworkManager {
             mixed_content: MixedContentChecker::new(),
             user_agent: USER_AGENT.to_string(),
             client,
+            cookies,
             http2_pool: HashMap::new(),
             predictive_dns: PredictiveDns::new(),
             coalescer: RequestCoalescer::new(5, 50), // Batch 5 requests or 50ms
         }
     }
 
+    fn new_client(cookies: &SharedCookieJar) -> Client {
+        Client::builder()
+            .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(30))
+            .default_header("Accept-Language", "en-US,en;q=0.9")
+            .cookie_jar(cookies.clone())
+            .build()
+            .unwrap_or_default()
+    }
+
     /// User agent string sent with requests
     pub fn user_agent(&self) -> &str {
         &self.user_agent
+    }
+
+    /// The session's cookie jar (pages share it with their scripts)
+    pub fn cookie_jar(&self) -> &SharedCookieJar {
+        &self.cookies
     }
 
     // === HTTP/2 Connection Pool ===
@@ -110,32 +129,46 @@ impl NetworkManager {
 
     /// Fetch a URL with caching. Non-2xx responses are errors.
     pub fn fetch(&mut self, url: &str, page_url: Option<&str>) -> Result<FetchResult, NetworkError> {
-        let result = self.fetch_any_status(url, page_url, None)?;
+        let result = self.fetch_any_status(url, page_url, None, false)?;
         if !(200..300).contains(&result.status) {
             return Err(NetworkError::HttpError(result.status));
         }
         Ok(result)
     }
 
-    /// Fetch a URL, returning the response for any HTTP status
+    /// Fetch a URL, returning the response for any HTTP status. A
+    /// `navigation` loads a page, followed from `page_url` (None when the
+    /// user started it); otherwise `page_url` is the page loading a
+    /// subresource.
     fn fetch_any_status(
         &mut self,
         url: &str,
         page_url: Option<&str>,
         accept: Option<&str>,
+        navigation: bool,
     ) -> Result<FetchResult, NetworkError> {
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
         }
-        let url = self.admit(url, page_url)?;
+        // A navigation replaces the page, so the page's mixed-content
+        // rules do not apply to it
+        let url = self.admit(url, if navigation { None } else { page_url })?;
         if let Some(hit) = self.cached(&url) {
             return Ok(hit);
         }
 
         // Fetch from network
         log::debug!("Fetching from network: {}", url);
-        let headers = accept.map(|a| vec![("Accept".to_string(), a.to_string())]);
-        let response = self.client.request("GET", &url, headers, None)
+        let mut headers = request_headers(page_url, &url);
+        if let Some(accept) = accept {
+            headers.push(("Accept".to_string(), accept.to_string()));
+        }
+        let context = if navigation {
+            CookieContext::navigation(page_url, "GET")
+        } else {
+            CookieContext::subresource(page_url, "GET")
+        };
+        let response = self.client.request_in("GET", &url, Some(headers), None, &context)
             .map_err(|e| NetworkError::RequestFailed(format!("{}", e)))?;
         Ok(self.store(&url, response))
     }
@@ -240,32 +273,38 @@ impl NetworkManager {
         if pending.len() == 1 {
             // One request: the session client can reuse a connection
             let (i, url) = pending.pop().unwrap();
+            let context = CookieContext::subresource(page_url, "GET");
             out[i] = Some(
-                self.client.request("GET", &url, None, None)
+                self.client.request_in("GET", &url, Some(request_headers(page_url, &url)), None, &context)
                     .map(|r| self.store(&url, r))
                     .map_err(|e| NetworkError::RequestFailed(e.to_string())),
             );
         } else if !pending.is_empty() {
-            let user_agent = self.user_agent.clone();
+            // A few connections at a time (as browsers limit them per
+            // host); each worker reuses its connection for the next URL
+            let cookies = &self.cookies;
+            let workers = pending.len().min(MAX_PARALLEL_FETCHES);
+            let queue = std::sync::Mutex::new(pending.into_iter().collect::<std::collections::VecDeque<_>>());
             let responses: Vec<(usize, String, Result<fos_net::Response, String>)> = std::thread::scope(|scope| {
-                let handles: Vec<_> = pending
-                    .into_iter()
-                    .map(|(i, url)| {
-                        let user_agent = user_agent.clone();
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let queue = &queue;
                         scope.spawn(move || {
-                            let result = Client::builder()
-                                .user_agent(&user_agent)
-                                .connect_timeout(Duration::from_secs(15))
-                                .timeout(Duration::from_secs(30))
-                                .default_header("Accept-Language", "en-US,en;q=0.9")
-                                .build()
-                                .map_err(|e| e.to_string())
-                                .and_then(|mut c| c.request("GET", &url, None, None).map_err(|e| e.to_string()));
-                            (i, url, result)
+                            let mut client = Self::new_client(cookies);
+                            let mut done = Vec::new();
+                            loop {
+                                let next = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+                                let Some((i, url)) = next else { break };
+                                let context = CookieContext::subresource(page_url, "GET");
+                                let headers = request_headers(page_url, &url);
+                                let result = client.request_in("GET", &url, Some(headers), None, &context).map_err(|e| e.to_string());
+                                done.push((i, url, result));
+                            }
+                            done
                         })
                     })
                     .collect();
-                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                handles.into_iter().filter_map(|h| h.join().ok()).flatten().collect()
             });
             for (i, url, result) in responses {
                 out[i] = Some(match result {
@@ -296,7 +335,14 @@ impl NetworkManager {
     /// character encoding; plain text is wrapped for display, and other
     /// content types produce a short explanatory page.
     pub fn fetch_page(&mut self, url: &str) -> Result<FetchedPage, NetworkError> {
-        let result = self.fetch_any_status(url, None, Some(ACCEPT_DOCUMENT))?;
+        self.fetch_page_from(url, None)
+    }
+
+    /// Fetch a document for display, navigating from the page at
+    /// `initiator` (a link followed, a script's navigation); None when the
+    /// user started it. This decides the cookies sent and the Referer.
+    pub fn fetch_page_from(&mut self, url: &str, initiator: Option<&str>) -> Result<FetchedPage, NetworkError> {
+        let result = self.fetch_any_status(url, initiator, Some(ACCEPT_DOCUMENT), true)?;
         let mime = result.content_type
             .split(';')
             .next()
@@ -368,6 +414,14 @@ impl Default for NetworkManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Headers a request from the page at `page_url` carries (its Referer)
+fn request_headers(page_url: Option<&str>, url: &str) -> Vec<(String, String)> {
+    page_url
+        .and_then(|page| crate::script_fetch::referrer_for(page, url))
+        .map(|r| vec![("Referer".to_string(), r)])
+        .unwrap_or_default()
 }
 
 /// Escape text for inclusion in HTML

@@ -131,10 +131,13 @@ pub enum FontSource {
 
 /// Font database with custom implementation
 pub struct CustomFontDatabase {
-    /// All font entries, indexed by `FontId`
+    /// This database's font entries, indexed by `FontId` (after the base's)
     fonts: Vec<FontEntry>,
     /// Lowercased family name → faces in that family
     by_family: HashMap<String, Vec<FontId>>,
+    /// Faces this database extends (a page's web fonts over the system's):
+    /// its ids come first and its families after this database's
+    base: Option<Arc<CustomFontDatabase>>,
 }
 
 impl CustomFontDatabase {
@@ -143,7 +146,34 @@ impl CustomFontDatabase {
         Self {
             fonts: Vec::new(),
             by_family: HashMap::new(),
+            base: None,
         }
+    }
+
+    /// A database adding faces to `base` without copying it
+    pub fn overlay(base: Arc<CustomFontDatabase>) -> Self {
+        Self { fonts: Vec::new(), by_family: HashMap::new(), base: Some(base) }
+    }
+
+    /// Ids below this belong to the base
+    fn first_id(&self) -> u32 {
+        self.base.as_ref().map_or(0, |b| b.len() as u32)
+    }
+
+    /// Add a web font (TrueType, OpenType, WOFF or WOFF2) as `family`, with
+    /// the weight and style its `@font-face` rule gives
+    pub fn add_web_font(&mut self, family: &str, weight: FontWeight, style: FontStyle, data: Vec<u8>) -> Result<FontId> {
+        let data = if super::woff2::is_woff2(&data) || super::woff::is_woff(&data) { decode_web_font(&data)? } else { data };
+        let mut faces = scan_faces(&mut data.as_slice());
+        if faces.is_empty() {
+            return Err(TextError::FontParsing("No usable faces in web font".into()));
+        }
+        faces.truncate(1);
+        let meta = &mut faces[0].1;
+        meta.families = vec![family.to_string()];
+        meta.weight = weight;
+        meta.style = style;
+        Ok(self.add_faces(faces, FontSource::Memory(FaceData::owned(data)))[0])
     }
 
     /// Create with system fonts loaded
@@ -285,8 +315,9 @@ impl CustomFontDatabase {
     fn add_faces(&mut self, faces: Vec<(u32, FaceMetadata)>, source: FontSource) -> Vec<FontId> {
         let mut ids = Vec::with_capacity(faces.len());
 
+        let first = self.first_id();
         for (index, meta) in faces {
-            let id = FontId(self.fonts.len() as u32);
+            let id = FontId(first + self.fonts.len() as u32);
 
             for family in &meta.families {
                 let members = self.by_family.entry(family.to_lowercase()).or_default();
@@ -335,23 +366,31 @@ impl CustomFontDatabase {
             }
         }
 
-        self.fonts.iter()
-            .min_by_key(|f| fallback_score(f, query))
-            .map(|f| f.id)
+        match &self.base {
+            Some(base) => base.query(&FontQuery { families: Vec::new(), ..query.clone() }),
+            None => self.fonts.iter().min_by_key(|f| fallback_score(f, query)).map(|f| f.id),
+        }
     }
 
     /// Best face within one family for the requested weight and style
+    /// (this database's faces before the base's)
     fn best_in_family(&self, family: &str, query: &FontQuery) -> Option<FontId> {
-        self.by_family.get(&family.to_lowercase())?
-            .iter()
-            .filter_map(|id| self.font(*id))
-            .min_by_key(|f| face_score(f, query))
-            .map(|f| f.id)
+        let own = self.by_family.get(&family.to_lowercase()).and_then(|ids| {
+            ids.iter()
+                .filter_map(|id| self.font(*id))
+                .min_by_key(|f| face_score(f, query))
+                .map(|f| f.id)
+        });
+        own.or_else(|| self.base.as_ref().and_then(|b| b.best_in_family(family, query)))
     }
 
     /// Get font by ID
     pub fn font(&self, id: FontId) -> Option<&FontEntry> {
-        self.fonts.get(id.0 as usize)
+        let first = self.first_id();
+        if id.0 < first {
+            return self.base.as_ref()?.font(id);
+        }
+        self.fonts.get((id.0 - first) as usize)
     }
 
     /// Face data for a font, loaded on first use and cached for the lifetime
@@ -373,17 +412,21 @@ impl CustomFontDatabase {
 
     /// List all font families (lowercased)
     pub fn families(&self) -> impl Iterator<Item = &str> {
-        self.by_family.keys().map(String::as_str)
+        let base: Box<dyn Iterator<Item = &str>> = match &self.base {
+            Some(b) => Box::new(b.families()),
+            None => Box::new(std::iter::empty()),
+        };
+        self.by_family.keys().map(String::as_str).chain(base)
     }
 
-    /// Number of fonts
+    /// Number of fonts (ids are below this)
     pub fn len(&self) -> usize {
-        self.fonts.len()
+        self.first_id() as usize + self.fonts.len()
     }
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        self.fonts.is_empty()
+        self.len() == 0
     }
 }
 

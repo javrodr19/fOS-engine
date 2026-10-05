@@ -24,7 +24,6 @@ use fos_dom::Document;
 use crate::devtools::DevTools;
 use crate::accessibility::AccessibilityManager;
 use crate::media::MediaManager;
-use crate::canvas::CanvasManager;
 use crate::advanced_net::AdvancedNetworking;
 use crate::security::SecurityManager;
 use crate::memory::MemoryIntegration;
@@ -113,14 +112,15 @@ struct BrowserApp {
     last_timer_check: Instant,
     /// Wakes the event loop when a page script's network request finishes
     network_waker: Option<crate::script_fetch::Waker>,
+    /// The page the next load was started from (a link followed); None
+    /// when the user started it. Decides its SameSite cookies and Referer.
+    navigation_initiator: Option<String>,
     /// Developer tools
     devtools: DevTools,
     /// Accessibility manager
     a11y: AccessibilityManager,
     /// Media manager
     media: MediaManager,
-    /// Canvas manager
-    canvas: CanvasManager,
     /// Advanced networking (WebSocket, XHR, SSE)
     _advanced_net: AdvancedNetworking,
     /// Security manager (CSP, sandbox, privacy)
@@ -154,10 +154,10 @@ impl BrowserApp {
             current_page: None,
             last_timer_check: Instant::now(),
             network_waker: None,
+            navigation_initiator: None,
             devtools: DevTools::new(),
             a11y: AccessibilityManager::new(),
             media: MediaManager::new(),
-            canvas: CanvasManager::new(),
             _advanced_net: AdvancedNetworking::new(),
             _security: SecurityManager::new(),
             _memory: MemoryIntegration::new(),
@@ -176,6 +176,8 @@ impl BrowserApp {
 
     /// Load the current tab's page
     fn load_current_page(&mut self) {
+        // Only the load right after a link is followed comes from it
+        let initiator = self.navigation_initiator.take();
         // Get tab info
         let (url, needs_network, cached_html) = match self.tabs.active_tab() {
             Some(tab) => (tab.url.clone(), tab.needs_network_load, tab.cached_html.clone()),
@@ -204,7 +206,7 @@ impl BrowserApp {
                 .map(|page| (page, 200))
                 .map_err(|e| e.to_string())
         } else {
-            self.network.fetch_page(&url)
+            self.network.fetch_page_from(&url, initiator.as_deref())
                 .map(|fetched| (Page::from_html(&fetched.url, fetched.html), fetched.status))
                 .map_err(|e| e.to_string())
         };
@@ -274,6 +276,7 @@ impl BrowserApp {
         // Stylesheets block the first render, as in other browsers:
         // painting without them would show the page unstyled first
         page.stylesheets = self.load_stylesheets(&page);
+        self.renderer.new_page();
         self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
@@ -291,6 +294,38 @@ impl BrowserApp {
         }
     }
 
+    /// Fetch and decode the page's images (after its first render: images
+    /// do not block it), then re-render with them
+    fn load_images(&mut self) {
+        self.load_web_fonts();
+        let width = self.content_width() as f32;
+        let Some(page) = self.current_page.as_ref() else { return };
+        let previous = self.renderer.images().clone();
+        let css_urls = self.renderer.css_image_urls();
+        let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous, &css_urls);
+        if !Arc::ptr_eq(&images, &previous) {
+            self.renderer.set_images(images);
+            self.rerender_at(self.render_start_y);
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+    }
+
+    /// Fetch the web fonts the page's CSS uses; text is redrawn in them
+    /// once they arrive (like browsers' font-display: swap)
+    fn load_web_fonts(&mut self) {
+        let Some(doc) = self.current_document() else { return };
+        let Some(page_url) = self.current_page.as_ref().map(|p| p.url.clone()) else { return };
+        let wanted = self.renderer.web_font_requests(&lock_document(&doc));
+        let previous = self.renderer.web_fonts().clone();
+        let fonts = crate::font_loader::load(&mut self.network, &page_url, &wanted, &previous);
+        if !Arc::ptr_eq(&fonts, &previous) {
+            self.renderer.set_web_fonts(fonts);
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
+    }
+
     /// Fetch the page's external stylesheets
     fn load_stylesheets(&mut self, page: &Page) -> crate::css_loader::Stylesheets {
         crate::css_loader::load_for_page(&mut self.network, page)
@@ -301,6 +336,7 @@ impl BrowserApp {
     fn run_page_scripts(&mut self) {
         let Some(page) = self.current_page.as_mut() else { return };
 
+        page.set_cookie_jar(self.network.cookie_jar().clone());
         if let Err(e) = page.initialize_javascript() {
             log::warn!("Failed to initialize JavaScript: {}", e);
             self.devtools.warn(&format!("JS init failed: {}", e));
@@ -310,15 +346,16 @@ impl BrowserApp {
         }
         let network = &mut self.network;
         let page_url = page.url.clone();
-        if let Err(e) = page.execute_scripts_with(&mut |url| fetch_script(network, &page_url, url)) {
+        if let Err(e) = page.execute_scripts_with(&mut PageFetcher { network, page_url: &page_url }) {
             log::warn!("Failed to execute scripts: {}", e);
             self.devtools.error(&format!("Script error: {}", e));
         }
 
         self.refresh_if_dom_changed();
+        self.load_images();
         self.follow_script_navigation();
 
-        // Build accessibility tree and extract media/canvas from DOM
+        // Build accessibility tree and extract media from DOM
         let Some(doc) = self.current_document() else { return };
         let doc_guard = lock_document(&doc);
 
@@ -335,14 +372,6 @@ impl BrowserApp {
             log::info!("Found media: {} videos, {} audios",
                 media_stats.video_count, media_stats.audio_count);
         }
-
-        // Canvas elements
-        self.canvas.extract_from_document(&doc_guard);
-        let canvas_stats = self.canvas.stats();
-        if canvas_stats.canvas_count > 0 {
-            log::info!("Found {} canvas elements ({} total pixels)",
-                canvas_stats.canvas_count, canvas_stats.total_pixels);
-        }
     }
 
     /// The current page's DOM
@@ -352,6 +381,12 @@ impl BrowserApp {
 
     /// Re-render if the DOM changed since it was laid out (e.g. by a script)
     fn refresh_if_dom_changed(&mut self) {
+        // What scripts drew on canvases
+        let updates = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).map(|r| r.take_canvas_updates()).unwrap_or_default();
+        if self.renderer.update_canvases(updates) {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
         let Some(doc) = self.current_document() else { return };
         let current = self.renderer.is_layout_current(&lock_document(&doc));
         if !current {
@@ -359,6 +394,8 @@ impl BrowserApp {
             self.rerender_at(self.render_start_y);
             self.ensure_render_covers_scroll();
             self.request_redraw();
+            // Scripts may have added images
+            self.load_images();
         }
     }
 
@@ -377,6 +414,7 @@ impl BrowserApp {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
         }
+        self.sync_page_geometry();
     }
 
     /// Move the page buffer to document position `start_y`, repainting only
@@ -393,6 +431,7 @@ impl BrowserApp {
             self.rendered_page = Some(rendered);
             self.render_start_y = start_y;
         }
+        self.sync_page_geometry();
     }
 
     /// Height of the page pixel buffer: exactly the visible area. Scrolling
@@ -448,7 +487,7 @@ impl BrowserApp {
         self.last_timer_check = Instant::now();
         let network = &mut self.network;
         let page_url = page.url.clone();
-        if let Err(e) = page.process_timers_with(&mut |url| fetch_script(network, &page_url, url)) {
+        if let Err(e) = page.process_timers_with(&mut PageFetcher { network, page_url: &page_url }) {
             log::warn!("Timer processing error: {}", e);
         }
         // Timer callbacks may have changed the DOM or navigated
@@ -464,7 +503,7 @@ impl BrowserApp {
         }
         let network = &mut self.network;
         let page_url = page.url.clone();
-        match page.process_network_with(&mut |url| fetch_script(network, &page_url, url)) {
+        match page.process_network_with(&mut PageFetcher { network, page_url: &page_url }) {
             Ok(true) => {
                 // Callbacks may have changed the DOM or navigated
                 self.refresh_if_dom_changed();
@@ -475,8 +514,46 @@ impl BrowserApp {
         }
     }
 
-    /// Go where the page's scripts asked to (`location.href = ...`)
+    /// Give the page's scripts the current layout, viewport and scroll
+    /// position (`getBoundingClientRect`, `innerWidth`, `scrollY`, ...)
+    fn sync_page_geometry(&mut self) {
+        let layout = self.renderer.layout_snapshot();
+        let viewport = (self.content_width() as f32, self.viewport_height());
+        let scroll = (0.0, self.scroll_offset);
+        let box_scrolls = self.renderer.box_scrolls();
+        if let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
+            rt.set_layout(layout, viewport, scroll);
+            rt.set_box_scrolls(box_scrolls);
+        }
+    }
+
+    /// Go where the page's scripts asked to (`location.href = ...`), and
+    /// scroll where they asked to (`scrollTo`, `scrollIntoView`)
     fn follow_script_navigation(&mut self) {
+        let box_scrolls = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).map(|r| r.take_box_scroll_requests()).unwrap_or_default();
+        let mut moved = false;
+        for (node, x, y) in box_scrolls {
+            moved |= self.renderer.set_box_scroll(node, x, y);
+        }
+        if moved {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
+        let scroll = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()).and_then(|r| r.take_scroll_request());
+        if let Some(y) = scroll {
+            self.scroll_offset = y;
+            self.ensure_render_covers_scroll();
+            self.request_redraw();
+        }
+        // history.pushState: same page, new URL (links resolve against it)
+        if let Some(url) = self.current_page.as_mut().and_then(Page::take_url_change) {
+            self.current_url = url.clone();
+            self.chrome.url_bar.set_url(&url);
+            if let Some(tab) = self.tabs.active_tab_mut() {
+                tab.set_final_url(&url);
+            }
+            self.request_redraw();
+        }
         let Some(url) = self.current_page.as_mut().and_then(Page::take_script_navigation) else { return };
         log::info!("Script navigation to {}", url);
         self.follow_link(&url);
@@ -785,6 +862,7 @@ impl BrowserApp {
     /// Navigate to a URL or search typed by the user
     fn navigate_to(&mut self, input: &str) {
         let normalized = crate::navigation::omnibox_to_url(input);
+        self.navigation_initiator = None;
 
         // Update URL bar to show the URL we're navigating to
         self.chrome.url_bar.set_url(&normalized);
@@ -837,6 +915,7 @@ impl BrowserApp {
 
         log::info!("Navigating to: {}", target);
         self.navigate_to(&target);
+        self.navigation_initiator = Some(self.current_url.clone());
     }
 
     /// Handle a click inside the page area
@@ -870,14 +949,16 @@ impl BrowserApp {
             }
         }
 
-        let href = self.rendered_page.as_ref().and_then(|rendered| {
+        // Hit testing follows box scrolling; the link list is the fallback
+        let href = self.current_document().and_then(|doc| self.renderer.link_at(&lock_document(&doc), doc_x, doc_y));
+        let href = href.or_else(|| self.rendered_page.as_ref().and_then(|rendered| {
             rendered.links.iter()
                 .find(|link| {
                     hit_x >= link.x && hit_x <= link.x + link.width &&
                     hit_y >= link.y && hit_y <= link.y + link.height
                 })
                 .map(|link| link.href.clone())
-        });
+        }));
 
         if let Some(href) = href {
             self.follow_link(&href);
@@ -891,20 +972,57 @@ impl BrowserApp {
     }
 }
 
-/// Fetch the source of an external script of the page at `page_url`
-fn fetch_script(network: &mut NetworkManager, page_url: &str, url: &str) -> Option<String> {
-    if Loader::is_local_url(url) {
-        let path = crate::loader::file_url_to_path(url)?;
-        let bytes = std::fs::read(path).ok()?;
-        return Some(crate::charset::decode_html(bytes, Some("text/javascript")));
-    }
-    match network.fetch(url, Some(page_url)) {
-        Ok(result) => Some(crate::charset::decode_html(result.body, Some(&result.content_type))),
-        Err(e) => {
-            log::warn!("Failed to fetch script {}: {}", url, e);
-            None
+/// Fetches the scripts and modules of the page at `page_url` through the
+/// browser's network stack (HTTP cache, cookies, parallel connections)
+struct PageFetcher<'a> {
+    network: &'a mut NetworkManager,
+    page_url: &'a str,
+}
+
+impl crate::js_runtime::ScriptSource for PageFetcher<'_> {
+    fn fetch(&mut self, url: &str) -> Option<String> {
+        if Loader::is_local_url(url) {
+            return fetch_local_script(self.page_url, url);
+        }
+        match self.network.fetch(url, Some(self.page_url)) {
+            Ok(result) => Some(crate::charset::decode_html(result.body, Some(&result.content_type))),
+            Err(e) => {
+                log::warn!("Failed to fetch script {}: {}", url, e);
+                None
+            }
         }
     }
+
+    fn fetch_many(&mut self, urls: &[String]) -> Vec<Option<String>> {
+        let mut out = vec![None; urls.len()];
+        let mut remote = Vec::new();
+        for (i, url) in urls.iter().enumerate() {
+            if Loader::is_local_url(url) {
+                out[i] = fetch_local_script(self.page_url, url);
+            } else {
+                remote.push(i);
+            }
+        }
+        let remote_urls: Vec<String> = remote.iter().map(|&i| urls[i].clone()).collect();
+        for (&i, result) in remote.iter().zip(self.network.fetch_many(&remote_urls, Some(self.page_url))) {
+            match result {
+                Ok(r) => out[i] = Some(crate::charset::decode_html(r.body, Some(&r.content_type))),
+                Err(e) => log::warn!("Failed to fetch script {}: {}", urls[i], e),
+            }
+        }
+        out
+    }
+}
+
+/// A script from a local file: only local pages may load them
+fn fetch_local_script(page_url: &str, url: &str) -> Option<String> {
+    if !Loader::is_local_url(page_url) {
+        log::warn!("Not allowed to load local resource {url} from {page_url}");
+        return None;
+    }
+    let path = crate::loader::file_url_to_path(url)?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(crate::charset::decode_html(bytes, Some("text/javascript")))
 }
 
 /// Decode `%XX` escapes (javascript: URLs)
@@ -1027,11 +1145,20 @@ impl ApplicationHandler for BrowserApp {
                 self.chrome.handle_mouse_move(self.mouse_x, self.mouse_y);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll_amount = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
                 };
-                self.scroll_by(-scroll_amount);
+                // The innermost scroll container under the pointer that can
+                // move takes the scroll; otherwise the page does
+                let content_x = self.mouse_x - TAB_BAR_WIDTH as i32;
+                let doc_y = self.mouse_y as f32 + self.scroll_offset;
+                if content_x >= 0 && self.renderer.scroll_box_at(content_x as f32, doc_y, -dx, -dy) {
+                    self.rerender_at(self.render_start_y);
+                    self.request_redraw();
+                } else {
+                    self.scroll_by(-dy);
+                }
             }
             _ => {}
         }
@@ -1063,5 +1190,17 @@ mod tests {
     #[test]
     fn test_escape_html() {
         assert_eq!(escape_html("<script>&\""), "&lt;script&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn only_local_pages_load_local_scripts() {
+        let dir = std::env::temp_dir().join(format!("fos-local-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.json");
+        std::fs::write(&file, r#"{"secret": 1}"#).unwrap();
+        let url = format!("file://{}", file.display());
+        assert_eq!(fetch_local_script(&format!("file://{}/page.html", dir.display()), &url).as_deref(), Some(r#"{"secret": 1}"#));
+        assert_eq!(fetch_local_script("https://evil.example/", &url), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,8 +39,9 @@ use crate::value::Value;
 /// go in the global lexical scope shared by all scripts. The compiled
 /// function returns the value of the script's last top-level expression
 /// statement.
-pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
+pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, name: &str, program: &Program) -> Result<Rc<FunctionProto>, SyntaxError> {
+    let script = Script::new(name, Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: false };
     let mut no_fused = false;
     loop {
         match c.script(program, no_fused) {
@@ -55,10 +56,109 @@ pub fn compile_script(heap: &Heap, atoms: &mut Atoms, src: &str, program: &Progr
     }
 }
 
+/// How a module-scope binding starts out
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleBindingKind {
+    /// `var` and function declarations: undefined until set
+    Var,
+    /// `let`, `const` and `class`: in their dead zone until initialized
+    Lexical,
+    /// An import: bound to the exporting module's binding when linked
+    Import,
+    /// `import.meta` and the module's URL: set when linked
+    Hidden,
+}
+
+/// A compiled module. Its scope is a list of cells (closed upvalues) that
+/// the modules importing from it share, which makes imports live
+/// bindings and lets modules in an import cycle see each other.
+pub struct CompiledModule {
+    /// Creates the module's function declarations; run when the module is
+    /// linked, so modules in a cycle can call them before this one runs
+    pub init: Rc<FunctionProto>,
+    /// The module's code (an async function when it uses top-level await)
+    pub body: Rc<FunctionProto>,
+    /// The module scope: upvalue `i` of `init` and `body` is binding `i`
+    pub bindings: Vec<(Name, ModuleBindingKind)>,
+}
+
+/// Compile a module
+pub fn compile_module(heap: &Heap, atoms: &mut Atoms, src: &str, name: &str, module: &Module) -> Result<CompiledModule, SyntaxError> {
+    let mut scope: Vec<(Name, ModuleBindingKind, BindKind)> = Vec::new();
+    let mut add = |name: &Name, kind: ModuleBindingKind, bind: BindKind| -> Result<(), SyntaxError> {
+        if let Some(existing) = scope.iter().find(|b| b.0 == *name) {
+            if existing.1 == ModuleBindingKind::Var && kind == ModuleBindingKind::Var {
+                return Ok(());
+            }
+            return Err(SyntaxError { message: format!("Identifier '{name}' has already been declared"), pos: 0 });
+        }
+        scope.push((name.clone(), kind, bind));
+        Ok(())
+    };
+    // `var`s and function declarations
+    let mut vars = Vec::new();
+    collect_vars(&module.body, &mut vars, false);
+    for name in &vars {
+        add(name, ModuleBindingKind::Var, BindKind::Var)?;
+    }
+    for stmt in &module.body {
+        match stmt {
+            Stmt::Var { kind, decls } if *kind != VarKind::Var => {
+                let bind = if *kind == VarKind::Const { BindKind::Const } else { BindKind::Let };
+                let mut names = Vec::new();
+                for d in decls {
+                    pattern_names(&d.target, &mut names);
+                }
+                for name in &names {
+                    add(name, ModuleBindingKind::Lexical, bind)?;
+                }
+            }
+            Stmt::Class(c) => {
+                if let Some(name) = &c.name {
+                    add(name, ModuleBindingKind::Lexical, BindKind::Let)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    for import in &module.imports {
+        add(&import.local, ModuleBindingKind::Import, BindKind::Const)?;
+    }
+    add(&Rc::from(MODULE_META), ModuleBindingKind::Hidden, BindKind::Const)?;
+    add(&Rc::from(MODULE_REFERRER), ModuleBindingKind::Hidden, BindKind::Const)?;
+    for export in &module.exports {
+        if let ExportEntry::Local { local, .. } = export {
+            if !scope.iter().any(|b| b.0 == *local) {
+                return Err(SyntaxError { message: format!("Export '{local}' is not defined in module"), pos: 0 });
+            }
+        }
+    }
+    if scope.len() > u16::MAX as usize {
+        return Err(SyntaxError { message: "too many module bindings".into(), pos: 0 });
+    }
+
+    let names: Vec<Name> = scope.iter().map(|b| b.0.clone()).collect();
+    let upvals: Vec<UpvalInfo> = scope
+        .iter()
+        .enumerate()
+        .map(|(i, b)| UpvalInfo {
+            desc: UpvalDesc { from_parent_reg: false, index: i as u16 },
+            checked: matches!(b.1, ModuleBindingKind::Lexical | ModuleBindingKind::Import),
+            kind: b.2,
+        })
+        .collect();
+    let script = Script::new(name, Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: true };
+    let init = c.with_retry(|c, no_fused| c.module_init(module, &upvals, &names, no_fused))?;
+    let body = c.with_retry(|c, no_fused| c.module_body(module, &upvals, &names, no_fused))?;
+    Ok(CompiledModule { init, body, bindings: scope.into_iter().map(|b| (b.0, b.1)).collect() })
+}
+
 /// Compile a function created by the `Function` constructor (its scope is
 /// the global scope)
 pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: &Function) -> Result<Rc<FunctionProto>, SyntaxError> {
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: None, lazy_root: None };
+    let script = Script::new("", Rc::from(src));
+    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), script, lazy_root: None, in_module: false };
     // An empty script level to resolve names against (all globals)
     c.fs.push(FuncState::new(true, false, func.strict, FunctionKind::Normal, false));
     let name = c.atoms.intern_str(heap, "anonymous");
@@ -68,6 +168,9 @@ pub fn compile_function_object(heap: &Heap, atoms: &mut Atoms, src: &str, func: 
         Err(CErr::Syntax(e)) => Err(e),
     }
 }
+
+/// Inline caches a function gets before further sites share them by name
+const SHARED_ICS_FROM: usize = 49_152;
 
 pub(crate) enum CErr {
     Syntax(SyntaxError),
@@ -187,6 +290,8 @@ struct UpvalInfo {
 
 pub(crate) struct FuncState<'a> {
     code: Vec<Insn>,
+    /// (pc, source offset) of instructions that can throw
+    positions: Vec<(u32, u32)>,
     consts: Vec<Value>,
     num_consts: FxHashMap<u64, u32>,
     str_consts: FxHashMap<Atom, u32>,
@@ -225,12 +330,17 @@ pub(crate) struct FuncState<'a> {
     withs: Vec<(Reg, usize)>,
     /// Lazily compiled function: names of the precomputed upvalues
     lazy_names: Option<Vec<Name>>,
+    /// A module's top-level code (its declarations are module bindings)
+    is_module: bool,
+    /// Inline caches shared by name once a function has very many
+    shared_ics: FxHashMap<Atom, u16>,
 }
 
 impl<'a> FuncState<'a> {
     fn new(is_script: bool, is_arrow: bool, strict: bool, kind: FunctionKind, no_fused: bool) -> Self {
         FuncState {
             code: Vec::new(),
+            positions: Vec::new(),
             consts: Vec::new(),
             num_consts: FxHashMap::default(),
             str_consts: FxHashMap::default(),
@@ -265,6 +375,8 @@ impl<'a> FuncState<'a> {
             completion: None,
             withs: Vec::new(),
             lazy_names: None,
+            is_module: false,
+            shared_ics: FxHashMap::default(),
         }
     }
 }
@@ -282,11 +394,13 @@ pub(crate) struct Compiler<'a, 'h> {
     atoms: &'h mut Atoms,
     src: &'a str,
     fs: Vec<FuncState<'a>>,
-    /// Shared copy of `src` kept by lazy functions
-    src_rc: Option<Rc<str>>,
+    /// The script being compiled (its source is shared with lazy functions)
+    script: Rc<Script>,
     /// Compiling a lazy function: its upvalues (by name) and the
     /// strictness of its definition
     lazy_root: Option<(Vec<UpvalInfo>, Vec<Name>, bool)>,
+    /// Compiling module code
+    in_module: bool,
 }
 
 /// Compile the body of a lazy function (on its first call)
@@ -299,8 +413,10 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         is_async: proto.is_async,
         is_generator: proto.is_generator,
         outer_strict: info.outer_strict,
+        in_module: info.in_module,
     };
-    let src: &str = &info.source;
+    let script = proto.script.as_ref().expect("lazy functions know their script");
+    let src: &str = &script.source;
     let mut func = crate::parser::reparse_function(src, &reparse)?;
     func.name = info.fn_name.clone();
     let upvals: Vec<UpvalInfo> = proto
@@ -310,7 +426,15 @@ pub fn compile_lazy(heap: &Heap, atoms: &mut Atoms, proto: &FunctionProto) -> Re
         .map(|(&desc, (_, checked, kind))| UpvalInfo { desc, checked: *checked, kind: BindKind::from_u8(*kind) })
         .collect();
     let names: Vec<Name> = info.upval_names.iter().map(|(n, _, _)| n.clone()).collect();
-    let mut c = Compiler { heap, atoms, src, fs: Vec::new(), src_rc: Some(info.source.clone()), lazy_root: Some((upvals, names, info.outer_strict)) };
+    let mut c = Compiler {
+        heap,
+        atoms,
+        src,
+        fs: Vec::new(),
+        script: script.clone(),
+        lazy_root: Some((upvals, names, info.outer_strict)),
+        in_module: info.in_module,
+    };
     // The function borrows from `func`, which lives until the end
     let func: &Function = unsafe { &*(&func as *const Function) };
     match c.function(func, Some(proto.name), info.is_expression) {
@@ -340,6 +464,18 @@ impl<'a, 'h> Compiler<'a, 'h> {
     #[inline]
     fn fr(&self) -> &FuncState<'a> {
         self.fs.last().unwrap()
+    }
+
+    /// Record that the next instruction comes from source offset `pos`
+    /// (for stack traces); call right before emitting one that can throw
+    fn set_pos(&mut self, pos: u32) {
+        let pc = self.pc();
+        let positions = &mut self.f().positions;
+        match positions.last_mut() {
+            Some(last) if last.0 == pc => last.1 = pos,
+            Some(last) if last.1 == pos => {}
+            _ => positions.push((pc, pos)),
+        }
     }
 
     fn emit(&mut self, insn: Insn) -> u32 {
@@ -471,8 +607,19 @@ impl<'a, 'h> Compiler<'a, 'h> {
     fn new_ic(&mut self, atom: Atom) -> CResult<u16> {
         let f = self.f();
         let i = f.ics.len();
-        if i >= u16::MAX as usize {
-            return self.error("too many property accesses in one function");
+        // Huge functions (whole bundles wrapped in one function, mostly
+        // run once) share an uncached inline cache per name past this
+        // many sites, so an index still fits in an instruction
+        if i >= SHARED_ICS_FROM {
+            if let Some(&shared) = f.shared_ics.get(&atom) {
+                return Ok(shared);
+            }
+            if i >= u16::MAX as usize {
+                return self.error("too many property names in one function");
+            }
+            f.ics.push(Ic { atom, state: IcState::Megamorphic });
+            f.shared_ics.insert(atom, i as u16);
+            return Ok(i as u16);
         }
         f.ics.push(Ic { atom, state: IcState::Empty });
         Ok(i as u16)
@@ -837,6 +984,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
                     self.f().bindings[b].initialized = true;
                 }
             }
+            Res::Upval(idx) if init => {
+                // A module-scope declaration initializing its binding
+                self.emit(Insn::SetUpval { src, idx });
+            }
             Res::Upval(idx) => {
                 let u = self.fr().upvals[idx as usize];
                 let n = self.name_index(name)?;
@@ -879,9 +1030,10 @@ impl<'a, 'h> Compiler<'a, 'h> {
         f.scopes.iter().rev().find(|s| s.first_binding <= b).is_some_and(|s| s.switch_like)
     }
 
-    /// Compiling the script's top-level scope (not inside a block)
+    /// Compiling the script's or module's top-level scope (not inside a
+    /// block), whose declarations are not registers of the function
     fn at_script_top(&self) -> bool {
-        self.fs.len() == 1 && self.fr().is_script && self.fr().scopes.len() == 1
+        self.fs.len() == 1 && (self.fr().is_script || self.fr().is_module) && self.fr().scopes.len() == 1
     }
 
     fn is_global_lexical(&self, _name: &str) -> bool {
@@ -890,6 +1042,82 @@ impl<'a, 'h> Compiler<'a, 'h> {
         // `init` only for those (a top-level `var` initializer is an
         // assignment)
         true
+    }
+
+    // ---- modules ----
+
+    /// Run `f`, again without fused short jumps if one overflowed
+    fn with_retry<T>(&mut self, mut f: impl FnMut(&mut Self, bool) -> CResult<T>) -> Result<T, SyntaxError> {
+        match f(self, false) {
+            Ok(v) => Ok(v),
+            Err(CErr::Retry) => {
+                self.fs.clear();
+                match f(self, true) {
+                    Ok(v) => Ok(v),
+                    Err(CErr::Retry) => Err(SyntaxError { message: "function too large".into(), pos: 0 }),
+                    Err(CErr::Syntax(e)) => Err(e),
+                }
+            }
+            Err(CErr::Syntax(e)) => Err(e),
+        }
+    }
+
+    /// Start a function whose upvalues are the module scope
+    fn push_module_function(&mut self, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<()> {
+        self.fs.push(FuncState::new(false, false, true, FunctionKind::Normal, no_fused));
+        let f = self.f();
+        f.upvals = upvals.to_vec();
+        f.lazy_names = Some(names.to_vec());
+        f.is_module = true;
+        self.push_scope(false);
+        // `this` is undefined at the top level of a module
+        let this = self.alloc()?;
+        self.add_binding(Rc::from("this"), this, BindKind::This);
+        Ok(())
+    }
+
+    fn module_init(&mut self, module: &'a Module, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<Rc<FunctionProto>> {
+        self.push_module_function(upvals, names, no_fused)?;
+        for stmt in &module.body {
+            let Stmt::Function(func) = stmt else { continue };
+            let Some(name) = &func.name else { continue };
+            let shown = if &**name == DEFAULT_EXPORT { "default" } else { name };
+            let atom = self.intern(shown);
+            let mark = self.mark();
+            let t = self.alloc()?;
+            self.closure(func, Some(atom), t, false)?;
+            let idx = names.iter().position(|n| n == name).unwrap_or(0) as u16;
+            self.emit(Insn::SetUpval { src: t, idx });
+            self.release(mark);
+        }
+        self.emit(Insn::ReturnUndef);
+        let f = self.fs.pop().unwrap();
+        Ok(self.finish(f, atoms::empty, 0, (0, self.src.len() as u32)))
+    }
+
+    fn module_body(&mut self, module: &'a Module, upvals: &[UpvalInfo], names: &[Name], no_fused: bool) -> CResult<Rc<FunctionProto>> {
+        self.push_module_function(upvals, names, no_fused)?;
+        self.f().is_async = module.has_await;
+        let async_exc = if module.has_await {
+            self.emit(Insn::AsyncStart);
+            let r = self.alloc()?;
+            self.open_try(TryKind::Catch, r);
+            Some(r)
+        } else {
+            None
+        };
+        for stmt in &module.body {
+            self.stmt(stmt)?;
+        }
+        self.emit_return_undef();
+        if let Some(r) = async_exc {
+            let entry = self.close_try();
+            let target = self.pc();
+            self.set_handler_target(&entry, target);
+            self.emit(Insn::AsyncThrow { src: r });
+        }
+        let f = self.fs.pop().unwrap();
+        Ok(self.finish(f, atoms::empty, 0, (0, self.src.len() as u32)))
     }
 
     // ---- functions ----
@@ -1231,7 +1459,6 @@ impl<'a, 'h> Compiler<'a, 'h> {
             let n = names.iter().find(|(_, j)| *j as usize == i).map(|(n, _)| n.clone()).unwrap_or_else(|| Rc::from(""));
             upval_names.push((n, u.checked, u.kind.to_u8()));
         }
-        let source = self.src_rc.get_or_insert_with(|| Rc::from(self.src)).clone();
         let name = name.or_else(|| func.name.as_ref().map(|n| self.intern(n))).unwrap_or(atoms::empty);
         let is_constructor = matches!(func.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
             && !func.is_generator
@@ -1251,15 +1478,16 @@ impl<'a, 'h> Compiler<'a, 'h> {
             source: (func.span.start, func.span.end),
             traced: Cell::new(0),
             lazy: Some(Box::new(LazyInfo {
-                source,
                 params_start: func.params_start,
                 kind: func.kind,
                 fn_name: func.name.clone(),
                 is_expression,
                 outer_strict,
                 upval_names,
+                in_module: self.in_module,
             })),
             compiled: std::cell::OnceCell::new(),
+            script: Some(self.script.clone()),
         };
         Ok((Rc::new(proto), uses_super))
     }
@@ -1301,7 +1529,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
     }
 
     fn finish(&mut self, mut f: FuncState<'a>, name: Atom, length: u16, source: (u32, u32)) -> Rc<FunctionProto> {
-        strip_nops(&mut f.code, &mut f.handlers);
+        strip_nops(&mut f.code, &mut f.handlers, &mut f.positions);
         let arguments_reg = f.arguments_binding.map(|b| f.bindings.get(b).map(|b| b.reg).unwrap_or(0));
         let arguments_reg = if f.arguments_binding.is_some() { arguments_reg } else { None };
         let is_constructor = matches!(f.kind, FunctionKind::Normal | FunctionKind::ClassConstructor | FunctionKind::DerivedConstructor)
@@ -1321,6 +1549,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
             coerce_this: !f.strict && f.uses_this,
             arguments_reg,
             rest_reg: f.rest_reg,
+            positions: encode_positions(&f.positions),
         };
         Rc::new(FunctionProto {
             name,
@@ -1338,6 +1567,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
             traced: Cell::new(0),
             lazy: None,
             compiled: std::cell::OnceCell::from(code),
+            script: Some(self.script.clone()),
         })
     }
 
@@ -1358,9 +1588,11 @@ impl<'a, 'h> Compiler<'a, 'h> {
                         self.declare_lexical(&n, bk)?;
                     }
                 }
+                // A class declaration binds like `let`; only the class's
+                // own name inside its body is immutable
                 Stmt::Class(c) if !script_top => {
                     if let Some(n) = &c.name {
-                        self.declare_lexical(n, BindKind::Class)?;
+                        self.declare_lexical(n, BindKind::Let)?;
                     }
                 }
                 Stmt::Function(func) if !function_top && !script_top => {
@@ -1515,7 +1747,7 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
 /// Remove `Nop`s (unused placeholders) and fix up jump offsets and handler
 /// ranges
-fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler]) {
+fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler], positions: &mut Vec<(u32, u32)>) {
     if !code.iter().any(|i| matches!(i, Insn::Nop)) {
         return;
     }
@@ -1563,6 +1795,18 @@ fn strip_nops(code: &mut Vec<Insn>, handlers: &mut [Handler]) {
         }
         out.push(insn);
     }
+    // Several positions may now share a pc; the last one wins
+    for p in positions.iter_mut() {
+        p.0 = new_index[p.0 as usize];
+    }
+    positions.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = later.1;
+            true
+        } else {
+            false
+        }
+    });
     for h in handlers.iter_mut() {
         h.start = new_index[h.start as usize];
         h.end = new_index[h.end as usize];

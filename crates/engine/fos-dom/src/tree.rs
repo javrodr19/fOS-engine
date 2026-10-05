@@ -24,6 +24,9 @@ pub struct DomRevision {
     mutations: u64,
 }
 
+/// Local name of the detached elements that are shadow roots
+pub const SHADOW_ROOT: &str = "#shadow-root";
+
 /// Arena-based DOM tree
 pub struct DomTree {
     /// All nodes in contiguous memory (pub for TreeSink access). Code that
@@ -35,6 +38,13 @@ pub struct DomTree {
     id: u64,
     /// Mutations made through the tree's API
     mutations: u64,
+    /// Custom element names defined by scripts (`customElements.define`)
+    custom_defined: std::collections::HashSet<Box<str>>,
+    /// Shadow roots by host, and hosts by shadow root
+    shadow_roots: std::collections::HashMap<NodeId, NodeId>,
+    shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
+    /// The element `:scope` means while a query runs (none: the root)
+    selector_scope: std::cell::Cell<NodeId>,
 }
 
 impl DomTree {
@@ -45,6 +55,10 @@ impl DomTree {
             interner: StringInterner::new(),
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
+            custom_defined: Default::default(),
+            shadow_roots: Default::default(),
+            shadow_hosts: Default::default(),
+            selector_scope: std::cell::Cell::new(NodeId::NONE),
         };
         
         // Create document root at index 0
@@ -60,6 +74,10 @@ impl DomTree {
             interner: StringInterner::new(),
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
+            custom_defined: Default::default(),
+            shadow_roots: Default::default(),
+            shadow_hosts: Default::default(),
+            selector_scope: std::cell::Cell::new(NodeId::NONE),
         };
         tree.nodes.push(Node::document());
         tree
@@ -75,6 +93,151 @@ impl DomTree {
     #[inline]
     pub fn mark_mutated(&mut self) {
         self.mutations += 1;
+    }
+
+    /// Attach a shadow root (a detached `#shadow-root` element whose
+    /// children render in place of the host's) to `host`, or return the
+    /// one it has
+    pub fn attach_shadow(&mut self, host: NodeId) -> NodeId {
+        if let Some(&root) = self.shadow_roots.get(&host) {
+            return root;
+        }
+        let root = self.create_element(SHADOW_ROOT);
+        self.shadow_roots.insert(host, root);
+        self.shadow_hosts.insert(root, host);
+        self.mark_mutated();
+        root
+    }
+
+    /// The shadow root attached to `host`
+    #[inline]
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        if self.shadow_roots.is_empty() {
+            return None;
+        }
+        self.shadow_roots.get(&host).copied()
+    }
+
+    /// The host of shadow root `root`
+    #[inline]
+    pub fn shadow_host(&self, root: NodeId) -> Option<NodeId> {
+        if self.shadow_hosts.is_empty() {
+            return None;
+        }
+        self.shadow_hosts.get(&root).copied()
+    }
+
+    /// The element `:scope` matches (`NodeId::NONE`: the root element)
+    pub fn selector_scope(&self) -> NodeId {
+        self.selector_scope.get()
+    }
+
+    /// Set what `:scope` matches, returning the previous scope
+    pub fn set_selector_scope(&self, scope: NodeId) -> NodeId {
+        self.selector_scope.replace(scope)
+    }
+
+    /// Every (host, shadow root) pair
+    pub fn shadow_roots(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        self.shadow_roots.iter().map(|(&h, &r)| (h, r))
+    }
+
+    /// Whether any shadow root exists
+    #[inline]
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.shadow_roots.is_empty()
+    }
+
+    /// The root of `node`'s tree: the document, a shadow root, or the top
+    /// of a detached subtree
+    pub fn tree_root(&self, mut node: NodeId) -> NodeId {
+        while let Some(p) = self.get(node).map(|n| n.parent).filter(|p| p.is_valid()) {
+            node = p;
+        }
+        node
+    }
+
+    /// The host of the shadow tree `node` is in, if it is in one
+    pub fn containing_shadow_host(&self, node: NodeId) -> Option<NodeId> {
+        if self.shadow_hosts.is_empty() {
+            return None;
+        }
+        self.shadow_host(self.tree_root(node))
+    }
+
+    /// Whether `node` is in the document, counting shadow trees of
+    /// connected hosts
+    pub fn is_connected(&self, mut node: NodeId) -> bool {
+        loop {
+            let root = self.tree_root(node);
+            if root == NodeId::ROOT {
+                return true;
+            }
+            match self.shadow_host(root) {
+                Some(host) => node = host,
+                None => return false,
+            }
+        }
+    }
+
+    /// The slot named `name` that `host`'s child goes to: the first such
+    /// slot in tree order in the host's shadow tree
+    pub fn find_slot(&self, host: NodeId, name: &str) -> Option<NodeId> {
+        let root = self.shadow_root(host)?;
+        let mut found = None;
+        crate::selector::walk_elements(self, root, &mut |id| {
+            if found.is_some() {
+                return false;
+            }
+            let Some(e) = self.get(id).and_then(|n| n.as_element()) else { return true };
+            if self.resolve(e.name.local) == "slot" && self.get_attribute(id, "name").unwrap_or("") == name {
+                found = Some(id);
+                return false;
+            }
+            true
+        });
+        found
+    }
+
+    /// The slot name a host's child asks for ("" for the default slot;
+    /// `None` for nodes that are never slotted, like comments)
+    pub fn slot_name_of(&self, node: NodeId) -> Option<&str> {
+        match &self.get(node)?.data {
+            crate::node::NodeData::Text(_) => Some(""),
+            crate::node::NodeData::Element(_) => Some(self.get_attribute(node, "slot").unwrap_or("")),
+            _ => None,
+        }
+    }
+
+    /// The nodes assigned to `slot` (the host's children asking for it,
+    /// when it is the first slot with its name)
+    pub fn assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        let Some(host) = self.containing_shadow_host(slot) else { return Vec::new() };
+        let name = self.get_attribute(slot, "name").unwrap_or("").to_string();
+        if self.find_slot(host, &name) != Some(slot) {
+            return Vec::new();
+        }
+        self.children(host).map(|(c, _)| c).filter(|&c| self.slot_name_of(c) == Some(name.as_str())).collect()
+    }
+
+    /// The slot `node` (a host's child) is assigned to
+    pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
+        let parent = self.get(node)?.parent;
+        self.shadow_root(parent)?;
+        self.find_slot(parent, self.slot_name_of(node)?)
+    }
+
+    /// Record that a custom element name has been defined (it then
+    /// matches `:defined`)
+    pub fn define_custom_element(&mut self, name: &str) {
+        if self.custom_defined.insert(name.into()) {
+            self.mark_mutated();
+        }
+    }
+
+    /// Whether custom element `name` has been defined
+    pub fn is_custom_element_defined(&self, name: &str) -> bool {
+        self.custom_defined.contains(name)
     }
 
     /// Get the document root

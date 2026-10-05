@@ -14,7 +14,7 @@ use crate::tcp::{TcpConnection, TcpConfig};
 use crate::tls::{TlsStream, TlsConfig};
 use crate::http1::{Http1Request, Http1Parser};
 use crate::http2::{Http2Connection, Frame, Http2Event};
-use crate::cookies::CookieJar;
+use crate::cookies::{CookieContext, CookieJar, SharedCookieJar};
 use crate::content_encoding;
 use crate::quic::{AltSvc, AltSvcCache};
 use crate::url_util;
@@ -81,13 +81,22 @@ impl Default for ClientConfig {
 /// HTTP client builder
 pub struct HttpClientBuilder {
     config: ClientConfig,
+    cookie_jar: Option<SharedCookieJar>,
 }
 
 impl HttpClientBuilder {
     pub fn new() -> Self {
         Self {
             config: ClientConfig::default(),
+            cookie_jar: None,
         }
+    }
+
+    /// Keep cookies in `jar`, which other clients may share (by default
+    /// each client has its own)
+    pub fn cookie_jar(mut self, jar: SharedCookieJar) -> Self {
+        self.cookie_jar = Some(jar);
+        self
     }
 
     pub fn user_agent(mut self, ua: &str) -> Self {
@@ -145,7 +154,11 @@ impl HttpClientBuilder {
     }
 
     pub fn build(self) -> HttpClient {
-        HttpClient::with_config(self.config)
+        let mut client = HttpClient::with_config(self.config);
+        if let Some(jar) = self.cookie_jar {
+            client.cookies = jar;
+        }
+        client
     }
 }
 
@@ -257,8 +270,8 @@ struct IdleConnection {
 pub struct HttpClient {
     /// Configuration
     config: ClientConfig,
-    /// Cookie jar
-    cookies: CookieJar,
+    /// Cookie jar (possibly shared with other clients)
+    cookies: SharedCookieJar,
     /// Idle keep-alive connections by origin (`https://host:443`)
     idle: HashMap<String, Vec<IdleConnection>>,
     /// Alt-Svc cache for HTTP/3 discovery
@@ -280,7 +293,7 @@ impl HttpClient {
     pub fn with_config(config: ClientConfig) -> Self {
         Self {
             config,
-            cookies: CookieJar::new(),
+            cookies: CookieJar::shared(),
             idle: HashMap::new(),
             alt_svc_cache: AltSvcCache::new(),
         }
@@ -296,7 +309,8 @@ impl HttpClient {
         self.request("POST", url, None, body)
     }
 
-    /// Make an HTTP request, following redirects.
+    /// Make an HTTP request, following redirects, as a navigation the
+    /// user started (it carries all of the URL's cookies).
     ///
     /// The returned response's `url` is the final URL after redirects.
     pub fn request(
@@ -306,25 +320,44 @@ impl HttpClient {
         headers: Option<Vec<(String, String)>>,
         body: Option<Vec<u8>>,
     ) -> Result<Response, NetError> {
+        self.request_in(method, url, headers, body, &CookieContext::navigation(None, method))
+    }
+
+    /// Make an HTTP request in `context` (who it is made for), which
+    /// decides the cookies each hop carries and the ones it may set.
+    pub fn request_in(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+        body: Option<Vec<u8>>,
+        context: &CookieContext,
+    ) -> Result<Response, NetError> {
         let mut method = method.to_ascii_uppercase();
         let mut url = url.trim().to_string();
         let mut headers = headers.unwrap_or_default();
         let mut body = body;
         let mut redirects = 0;
+        let mut cross_site_redirect = context.cross_site_redirect;
 
         loop {
             let parsed = UrlParts::parse(&url)?;
-            let req = self.build_request(&method, &parsed, &headers, body.clone());
+            let cookies = CookieContext { method: &method, cross_site_redirect, ..*context };
+            let cookie_header = if self.config.cookies_enabled {
+                self.jar().cookie_header(&url, &cookies)
+            } else {
+                None
+            };
+            let req = self.build_request(&method, &parsed, &headers, body.clone(), cookie_header);
             let mut response = self.execute_request(&parsed, req)?;
 
-            // Store cookies from response
             if self.config.cookies_enabled {
-                for (name, value) in &response.headers {
-                    if name.eq_ignore_ascii_case("set-cookie") {
-                        self.cookies.add_from_header(value, &parsed.host);
-                    }
-                }
+                self.jar().store_response(&url, &response.headers, &cookies);
             }
+            // A cross-site hop makes the rest of a redirect chain cross-site
+            let mut chain = cookies;
+            chain.follow(&url);
+            cross_site_redirect = chain.cross_site_redirect;
 
             let location = match response.status {
                 301 | 302 | 303 | 307 | 308 if redirects < self.config.max_redirects => {
@@ -373,12 +406,17 @@ impl HttpClient {
         }
     }
 
+    fn jar(&self) -> std::sync::MutexGuard<'_, CookieJar> {
+        self.cookies.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn build_request(
         &self,
         method: &str,
         url: &UrlParts,
         headers: &[(String, String)],
         body: Option<Vec<u8>>,
+        cookie_header: Option<String>,
     ) -> Http1Request {
         let has = |name: &str| {
             headers.iter()
@@ -405,10 +443,8 @@ impl HttpClient {
             req = req.header(name, value);
         }
 
-        if self.config.cookies_enabled && !has("cookie") {
-            if let Some(cookie_header) = self.cookies.get_cookie_header(&url.host, &url.path, url.is_https) {
-                req = req.header("Cookie", &cookie_header);
-            }
+        if let Some(cookie_header) = cookie_header.filter(|_| !has("cookie")) {
+            req = req.header("Cookie", &cookie_header);
         }
 
         if !has("connection") {
@@ -659,14 +695,9 @@ impl HttpClient {
         url_util::resolve(base_url, location)
     }
 
-    /// Get cookie jar reference
-    pub fn cookies(&self) -> &CookieJar {
+    /// The cookie jar (possibly shared with other clients)
+    pub fn cookie_jar(&self) -> &SharedCookieJar {
         &self.cookies
-    }
-
-    /// Get mutable cookie jar
-    pub fn cookies_mut(&mut self) -> &mut CookieJar {
-        &mut self.cookies
     }
 }
 
@@ -974,6 +1005,23 @@ pub mod blocking {
             self.inner.request(method, url, headers, body)
         }
 
+        /// Make a request in `context` (see [`HttpClient::request_in`])
+        pub fn request_in(
+            &mut self,
+            method: &str,
+            url: &str,
+            headers: Option<Vec<(String, String)>>,
+            body: Option<Vec<u8>>,
+            context: &CookieContext,
+        ) -> Result<Response, NetError> {
+            self.inner.request_in(method, url, headers, body, context)
+        }
+
+        /// The cookie jar
+        pub fn cookie_jar(&self) -> &SharedCookieJar {
+            self.inner.cookie_jar()
+        }
+
         /// Close idle keep-alive connections
         pub fn clear_idle_connections(&mut self) {
             self.inner.clear_idle_connections();
@@ -1014,6 +1062,12 @@ pub mod blocking {
 
         pub fn default_header(mut self, name: &str, value: &str) -> Self {
             self.inner = self.inner.default_header(name, value);
+            self
+        }
+
+        /// Keep cookies in `jar`, shared with other clients
+        pub fn cookie_jar(mut self, jar: SharedCookieJar) -> Self {
+            self.inner = self.inner.cookie_jar(jar);
             self
         }
 

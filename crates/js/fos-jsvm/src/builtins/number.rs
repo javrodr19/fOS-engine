@@ -49,7 +49,11 @@ fn number_call(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> Js
     if args.is_empty() {
         return Ok(Value::int(0));
     }
-    Ok(Value::number(vm.to_number(args[0])?))
+    // Number(10n) converts (other numeric operations reject BigInts)
+    Ok(match vm.to_numeric(args[0])? {
+        crate::vm::ops::Numeric::Number(n) => Value::number(n),
+        crate::vm::ops::Numeric::BigInt(b) => Value::number(b.get().to_f64()),
+    })
 }
 
 fn number_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<JsObject>) -> JsResult<Value> {

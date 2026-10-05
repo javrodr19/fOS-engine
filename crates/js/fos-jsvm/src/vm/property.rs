@@ -35,6 +35,39 @@ impl Vm {
     // ---- own properties ----
 
     /// Create a function's lazy built-in properties
+    /// SetFunctionName for a function stored under a computed key, unless
+    /// it already has a name of its own (a class with a static `name`)
+    pub(crate) fn set_function_name(&mut self, f: Gc<JsObject>, key: PropertyKey, prefix: u8) {
+        if f.get().lazy & crate::object::LAZY_NAME == 0 {
+            // Classes materialize their properties while being built; their
+            // name is still the anonymous "" (a `static name` is not)
+            let anonymous = matches!(&f.get().kind, ObjectKind::Function(c) if c.proto.name == atoms::empty);
+            let unnamed = match f.get().find_own(&self.shapes, PropertyKey::Atom(atoms::name)) {
+                Some((slot, flags)) if !flags.is_accessor() => f.get().read(slot).as_string().is_some_and(|s| s.get().len() == 0),
+                _ => false,
+            };
+            if !(anonymous && unnamed) {
+                return;
+            }
+        }
+        self.materialize(f);
+        let name = match key {
+            PropertyKey::Atom(a) => self.atoms.string(a).get().to_rust_string(),
+            PropertyKey::Index(i) => i.to_string(),
+            PropertyKey::Symbol(s) => match s.get().description {
+                Some(d) => format!("[{}]", d.get().to_rust_string()),
+                None => String::new(),
+            },
+        };
+        let name = match prefix {
+            1 => format!("get {name}"),
+            2 => format!("set {name}"),
+            _ => name,
+        };
+        let v = self.str_value(&name);
+        self.define_value(f, PropertyKey::Atom(atoms::name), v, PropFlags::READONLY_HIDDEN);
+    }
+
     pub(crate) fn materialize(&mut self, o: Gc<JsObject>) {
         let lazy = o.get().lazy;
         if lazy == 0 {
@@ -79,7 +112,8 @@ impl Vm {
         let ob = o.get();
         match &ob.kind {
             ObjectKind::Array { length } if key == PropertyKey::Atom(atoms::length) => {
-                return Some(Own::Virtual(Value::number(*length as f64), PropFlags(PropFlags::WRITABLE)));
+                let flags = if ob.length_readonly { PropFlags::NONE } else { PropFlags(PropFlags::WRITABLE) };
+                return Some(Own::Virtual(Value::number(*length as f64), flags));
             }
             ObjectKind::TypedArray(t) => {
                 if let PropertyKey::Index(i) = key {
@@ -101,7 +135,7 @@ impl Vm {
         ob.find_own(&self.shapes, key).map(|(s, f)| Own::Slot(s, f))
     }
 
-    /// Add a property known to be absent
+    /// Add a property known to be absent (see `grows_readonly_length`)
     pub(crate) fn add_prop(&mut self, o: Gc<JsObject>, key: PropertyKey, v: Value, flags: PropFlags) -> Slot {
         let ob = o.get_mut();
         if let (PropertyKey::Index(i), ObjectKind::Array { length }) = (key, &mut ob.kind) {
@@ -169,6 +203,8 @@ impl Vm {
             Ok(self.realm.boolean_proto)
         } else if v.is_symbol() {
             Ok(self.realm.symbol_proto)
+        } else if v.is_bigint() {
+            Ok(self.realm.bigint_proto)
         } else {
             let k = self.key_display(key);
             Err(self.type_error(&format!("Cannot read properties of {v:?} (reading '{k}')")))
@@ -349,7 +385,7 @@ impl Vm {
                     break;
                 }
                 Some(Own::Virtual(_, flags)) => {
-                    if Value::object(cur) == receiver && cur.get().is_array() && key == PropertyKey::Atom(atoms::length) {
+                    if Value::object(cur) == receiver && cur.get().is_array() && key == PropertyKey::Atom(atoms::length) && flags.writable() {
                         self.set_array_length(cur, val)?;
                         return Ok(true);
                     }
@@ -395,7 +431,7 @@ impl Vm {
                 return Ok(true);
             }
         }
-        if !r.get().extensible {
+        if !r.get().extensible || grows_readonly_length(r, key) {
             return Ok(false);
         }
         self.add_prop(r, key, val, PropFlags::DEFAULT);
@@ -646,6 +682,11 @@ impl Vm {
         if let Some(s) = v.as_symbol() {
             return Ok(PropertyKey::Symbol(s));
         }
+        if let Some(b) = v.as_bigint() {
+            let text = b.get().to_string_radix(10);
+            let s = self.new_string(&text);
+            return self.to_property_key(Value::string(s));
+        }
         let atom = match v {
             Value::UNDEFINED => atoms::undefined,
             Value::NULL => atoms::null,
@@ -698,7 +739,8 @@ impl Vm {
             }
             ObjectKind::Array { .. } => {
                 let split = keys.iter().position(|(k, _)| !matches!(k, PropertyKey::Index(_))).unwrap_or(keys.len());
-                keys.insert(split, (PropertyKey::Atom(atoms::length), PropFlags(PropFlags::WRITABLE)));
+                let flags = if o.get().length_readonly { PropFlags::NONE } else { PropFlags(PropFlags::WRITABLE) };
+                keys.insert(split, (PropertyKey::Atom(atoms::length), flags));
             }
             _ => {}
         }
@@ -1166,6 +1208,10 @@ impl Vm {
 #[inline]
 fn set_state(cell: &Cell<Ic>, state: IcState) {
     let mut ic = cell.get();
+    // Megamorphic caches never cache: sites of any kind may share them
+    if matches!(ic.state, IcState::Megamorphic) {
+        return;
+    }
     ic.state = state;
     cell.set(ic);
 }
@@ -1176,4 +1222,11 @@ fn push_values(arr: Gc<JsObject>, values: &[Value]) {
     if let ObjectKind::Array { length } = &mut ob.kind {
         *length += values.len() as u32;
     }
+}
+
+/// Whether adding `key` would grow an array whose `length` is read-only,
+/// which arrays reject
+pub(crate) fn grows_readonly_length(o: Gc<JsObject>, key: PropertyKey) -> bool {
+    let ob = o.get();
+    matches!((key, &ob.kind), (PropertyKey::Index(i), ObjectKind::Array { length }) if ob.length_readonly && i >= *length)
 }

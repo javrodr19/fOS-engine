@@ -15,7 +15,8 @@ tracing.workspace = true
 thiserror.workspace = true
 bytemuck = "1"
 
-# Custom image decoders - no external dependencies needed
-
-[dev-dependencies]
+# Image codecs for untrusted bytes: fuzzed, widely deployed decoders
 png = "0.17"
+zune-jpeg = "0.5"
+gif = "0.14"
+image-webp = "0.2"

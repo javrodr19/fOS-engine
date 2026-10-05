@@ -56,6 +56,44 @@ fn is_inter_element_whitespace(text: &str) -> bool {
     text.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r'))
 }
 
+fn tag_of(tree: &DomTree, id: NodeId) -> Option<&str> {
+    tree.get(id).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))
+}
+
+/// Whether a whitespace-only text node can never render or matter: inside
+/// structural elements (tables, lists, the head), or between block-level
+/// elements. Whitespace next to inline content separates words, so it
+/// stays (as does any inside `pre`-like elements).
+fn whitespace_is_insignificant(tree: &DomTree, id: NodeId) -> bool {
+    let Some(node) = tree.get(id) else { return false };
+    match tag_of(tree, node.parent) {
+        None if node.parent == tree.root() => return true,
+        Some("html" | "head" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "colgroup" | "ul" | "ol" | "dl" | "select" | "optgroup" | "datalist" | "frameset" | "menu") => return true,
+        Some("pre" | "textarea" | "listing" | "plaintext" | "xmp" | "script" | "style") => return false,
+        _ => {}
+    }
+    let block_tag = |id: NodeId| -> bool {
+        match tree.get(id).map(|n| &n.data) {
+            Some(NodeData::Comment(_)) => true,
+            Some(NodeData::Element(_)) => matches!(
+                tag_of(tree, id).unwrap_or(""),
+                "address" | "article" | "aside" | "blockquote" | "body" | "center" | "details" | "dialog" | "dd" | "div" | "dl" | "dt"
+                    | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head"
+                    | "header" | "hgroup" | "hr" | "li" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "section" | "summary"
+                    | "table" | "ul" | "script" | "style" | "link" | "meta" | "title" | "template" | "noscript" | "base" | "br"
+                    | "option" | "optgroup" | "caption" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "colgroup" | "col"
+                    | "iframe" | "video" | "audio" | "canvas" | "svg" | "search" | "legend"
+            ),
+            _ => false,
+        }
+    };
+    // The edges of an inline element are not block boundaries: its only
+    // space (`<span> </span>`) separates the words around it
+    let parent_is_block = node.parent == tree.root() || block_tag(node.parent) || tag_of(tree, node.parent).is_some_and(|t| matches!(t, "html" | "td" | "th"));
+    let blockish = |sibling: NodeId| if sibling.is_valid() { block_tag(sibling) } else { parent_is_block };
+    blockish(node.prev_sibling) && blockish(node.next_sibling)
+}
+
 /// An element name owned by the caller, so no borrow of the sink's state
 /// outlives the call (tag names are almost always static atoms, so cloning
 /// one is a copy)
@@ -140,6 +178,9 @@ impl DomSink {
     }
 }
 
+/// Name of fragment elements (as the DOM bindings name them)
+const TEMPLATE_FRAGMENT: &str = "#document-fragment";
+
 impl TreeSink for DomSink {
     type Handle = NodeId;
     type Output = Document;
@@ -147,13 +188,78 @@ impl TreeSink for DomSink {
 
     fn finish(self) -> Document {
         let mut tree = self.tree.into_inner();
-        // Drop what is not part of the document (template contents, nodes
-        // the tree builder removed) and inter-element whitespace, and store
-        // the rest in document order
-        tree.compact(|node| !matches!(&node.data, NodeData::Text(t) if is_inter_element_whitespace(&t.content)));
+        // Template contents ride along as the template's child through
+        // compaction, then move out of the tree
+        for (&template, &contents) in self.template_contents.borrow().iter() {
+            tree.append_child(template, contents);
+        }
+        // Drop what is not part of the document (nodes the tree builder
+        // removed) and inter-element whitespace, and store the rest in
+        // document order
+        let mut droppable = Vec::new();
+        let mut stack = vec![tree.root()];
+        while let Some(id) = stack.pop() {
+            let mut child = tree.get(id).map_or(NodeId::NONE, |n| n.first_child);
+            while child.is_valid() {
+                let Some(n) = tree.get(child) else { break };
+                match &n.data {
+                    NodeData::Text(t) if is_inter_element_whitespace(&t.content) && whitespace_is_insignificant(&tree, child) => droppable.push(child),
+                    NodeData::Element(_) | NodeData::Document => stack.push(child),
+                    _ => {}
+                }
+                child = n.next_sibling;
+            }
+        }
+        for id in droppable {
+            tree.remove(id);
+        }
+        tree.compact(|_| true);
+
+        let mut contents = Vec::new();
+        fos_dom::selector::walk_elements(&tree, tree.root(), &mut |id| {
+            let is_template = tree.get(id).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "template");
+            if is_template {
+                let fragment = tree.children(id).find(|(_, n)| n.as_element().is_some_and(|e| tree.resolve(e.name.local) == TEMPLATE_FRAGMENT));
+                if let Some((fragment, _)) = fragment {
+                    contents.push((id, fragment));
+                }
+            }
+            true
+        });
+        for &(_, fragment) in &contents {
+            tree.remove(fragment);
+        }
+        // Declarative shadow roots: a <template shadowrootmode> becomes
+        // the shadow root of its parent element (the first one does), its
+        // contents moving in
+        let mut kept = Vec::with_capacity(contents.len());
+        for (template, fragment) in contents {
+            let mode = tree.get_attribute(template, "shadowrootmode").map(|m| m.trim().to_ascii_lowercase());
+            let parent = tree.get(template).map_or(NodeId::NONE, |n| n.parent);
+            let host_ok = tree.get(parent).is_some_and(|n| n.is_element()) && tree.shadow_root(parent).is_none();
+            match mode.as_deref() {
+                Some(mode @ ("open" | "closed")) if host_ok => {
+                    let root = tree.attach_shadow(parent);
+                    if mode == "closed" {
+                        tree.set_attribute(root, "mode", "closed");
+                    }
+                    let kids: Vec<NodeId> = tree.children(fragment).map(|(c, _)| c).collect();
+                    for kid in kids {
+                        tree.append_child(root, kid);
+                    }
+                    tree.remove(template);
+                }
+                _ => kept.push((template, fragment)),
+            }
+        }
+        let contents = kept;
 
         let mut document = Document::empty(&self.url);
         document.tree = tree;
+        document.set_quirks(self.quirks_mode.get() == QuirksMode::Quirks);
+        for (template, fragment) in contents {
+            document.set_template_content(template, fragment);
+        }
         document.finalize();
         document
     }
@@ -183,7 +289,8 @@ impl TreeSink for DomSink {
         }
 
         if flags.template {
-            let contents = tree.create_node(NodeData::Document);
+            // A fragment, as scripts see `template.content`
+            let contents = tree.create_element(TEMPLATE_FRAGMENT);
             self.template_contents.borrow_mut().insert(id, contents);
         }
         if flags.mathml_annotation_xml_integration_point {
@@ -401,6 +508,15 @@ mod tests {
             parse_outline("<ul>\n  <li>a</li>\n  <li>&nbsp;</li>\n</ul>"),
             "<html><head></><body><ul><li>'a'</><li>'\u{a0}'</></></></>"
         );
+        // Whitespace between inline elements separates words
+        assert_eq!(
+            parse_outline("<div>\n<p><a>x</a> <span>y</span></p>\n</div>"),
+            "<html><head></><body><div><p><a>'x'</>' '<span>'y'</></></></></>"
+        );
+        // An inline element's only whitespace is a word space (Pygments'
+        // <span class="w"> </span>), but a block's is not
+        assert_eq!(parse_outline("<p>x<span> </span>y</p>"), "<html><head></><body><p>'x'<span>' '</>'y'</></></>");
+        assert_eq!(parse_outline("<div><div> </div></div>"), "<html><head></><body><div><div></></></></>");
         // Template contents are not part of the document tree
         assert_eq!(
             parse_outline("<template><p>inert</p></template><p>live</p>"),

@@ -37,12 +37,17 @@ pub mod loader;
 pub mod ui;
 /// Page rendering pipeline
 pub mod renderer;
+pub mod paint;
 /// JavaScript runtime integration
 pub mod js_runtime;
+/// Import maps (module specifier resolution)
+pub mod import_map;
 pub mod dom_bindings;
 pub mod script_fetch;
 pub mod page_styles;
 pub mod css_loader;
+pub mod image_loader;
+pub mod font_loader;
 /// Network requests with HTTP cache
 pub mod network;
 /// Character encoding detection and decoding
@@ -53,8 +58,9 @@ pub mod devtools;
 pub mod accessibility;
 /// Media element handling (video, audio)
 pub mod media;
-/// Canvas 2D rendering
-pub mod canvas;
+pub mod web_crypto;
+/// Canvas 2D script bindings
+pub mod canvas_bindings;
 /// Security policies (CSP, CORS, sandbox)
 pub mod security;
 /// Memory management and pressure handling
@@ -81,8 +87,6 @@ pub mod form_history;
 pub mod contenteditable;
 /// Input mode and virtual keyboard
 pub mod input_mode;
-/// Cookie management
-pub mod cookies;
 /// Advanced networking (WebSocket, XHR, SSE)
 pub mod advanced_net;
 /// Profiling and performance metrics
@@ -234,7 +238,6 @@ pub use network::NetworkManager;
 pub use devtools::DevTools;
 pub use accessibility::AccessibilityManager;
 pub use media::MediaManager;
-pub use canvas::CanvasManager;
 pub use advanced_net::AdvancedNetworking;
 pub use security::SecurityManager;
 pub use memory::MemoryIntegration;
@@ -271,7 +274,7 @@ pub use file_upload::{FileUploadManager, FileList, FileEntry, AcceptFilter};
 pub use form_history::{FormHistoryManager, FieldKey};
 pub use contenteditable::{ContentEditor, EditCommand, EditSelection};
 pub use input_mode::{InputMode, EnterKeyHint, VirtualKeyboardManager};
-pub use cookies::{Cookie, CookieJar};
+pub use fos_net::{Cookie, CookieJar, SharedCookieJar};
 pub use service_worker::{ServiceWorkerManager, CacheStorage};
 pub use indexeddb::{IDBFactory, IDBDatabase};
 

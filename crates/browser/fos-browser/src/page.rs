@@ -148,7 +148,7 @@ impl Page {
 
     /// Run the page's inline scripts (external ones are not fetched)
     pub fn execute_scripts(&mut self) -> Result<(), String> {
-        self.execute_scripts_with(&mut |_| None)
+        self.execute_scripts_with(&mut |_: &str| None)
     }
 
     /// Run JavaScript timers that are due (call periodically)
@@ -161,7 +161,7 @@ impl Page {
 
     /// Run JavaScript timers that are due
     pub fn process_timers(&mut self) -> Result<(), String> {
-        self.process_timers_with(&mut |_| None)
+        self.process_timers_with(&mut |_: &str| None)
     }
 
     /// Deliver finished network requests to the page's scripts; whether
@@ -185,6 +185,14 @@ impl Page {
         }
     }
 
+    /// Give the page's scripts the browser's cookie jar (before
+    /// `initialize_javascript`)
+    pub fn set_cookie_jar(&mut self, cookies: fos_net::SharedCookieJar) {
+        if let Some(r) = self.js_runtime.as_mut() {
+            r.set_cookie_jar(cookies);
+        }
+    }
+
     /// Check if there are pending timers
     pub fn has_pending_timers(&self) -> bool {
         self.js_runtime.as_ref().map(|r| r.has_pending_timers()).unwrap_or(false)
@@ -198,6 +206,14 @@ impl Page {
     /// A navigation the page's scripts requested (taken)
     pub fn take_script_navigation(&mut self) -> Option<String> {
         self.js_runtime.as_mut().and_then(|r| r.take_navigation())
+    }
+
+    /// The page's new URL after `history.pushState`/`replaceState`, if it
+    /// changed (taken); the page itself stays
+    pub fn take_url_change(&mut self) -> Option<String> {
+        let url = self.js_runtime.as_mut().and_then(|r| r.take_url_change())?;
+        self.url = url.clone();
+        Some(url)
     }
 
     /// Deliver a click on DOM node `node` to the page's scripts; returns

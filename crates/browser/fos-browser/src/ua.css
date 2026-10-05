@@ -1,0 +1,93 @@
+/* The browser's default styles: the HTML standard's rendering section
+   (https://html.spec.whatwg.org/multipage/rendering.html), condensed. */
+
+html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, legend, listing,
+main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, nav, section, dir, dd, dl, dt,
+menu, ol, ul, details, summary, fieldset, optgroup, frameset, frame { display: block; }
+
+[hidden], area, base, basefont, datalist, head, link, meta, noembed, noframes, noscript, param, rp, script, style,
+template, title { display: none; }
+slot { display: contents; }
+
+li { display: list-item; }
+table { display: table; }
+caption { display: table-caption; }
+colgroup { display: table-column-group; }
+col { display: table-column; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; }
+input, select, button, textarea, meter, progress, marquee { display: inline-block; }
+audio:not([controls]), dialog:not([open]) { display: none; }
+details:not([open]) > :not(summary) { display: none; }
+summary { display: list-item; list-style-type: disc; }
+rt { font-size: 50%; }
+
+html { color: black; }
+body { margin: 8px; }
+
+p, blockquote, figure, listing, plaintext, pre, xmp, dl { margin-top: 1em; margin-bottom: 1em; }
+blockquote, figure { margin-left: 40px; margin-right: 40px; }
+dd { margin-left: 40px; }
+dl dl { margin-top: 0; margin-bottom: 0; }
+
+h1 { font-size: 2em; margin-top: 0.67em; margin-bottom: 0.67em; }
+h2 { font-size: 1.5em; margin-top: 0.83em; margin-bottom: 0.83em; }
+h3 { font-size: 1.17em; margin-top: 1em; margin-bottom: 1em; }
+h4 { margin-top: 1.33em; margin-bottom: 1.33em; }
+h5 { font-size: 0.83em; margin-top: 1.67em; margin-bottom: 1.67em; }
+h6 { font-size: 0.67em; margin-top: 2.33em; margin-bottom: 2.33em; }
+h1, h2, h3, h4, h5, h6, th, b, strong { font-weight: bold; }
+article h1, aside h1, nav h1, section h1 { font-size: 1.5em; margin-top: 0.83em; margin-bottom: 0.83em; }
+
+ul, ol, menu, dir { margin-top: 1em; margin-bottom: 1em; padding-left: 40px; }
+ol { list-style-type: decimal; }
+ul ul, ol ul, menu ul, ul menu { list-style-type: circle; }
+ul ul ul, ul ol ul, ol ul ul, ol ol ul { list-style-type: square; }
+ul ul, ul ol, ol ul, ol ol, menu ul, ul menu { margin-top: 0; margin-bottom: 0; }
+
+[dir=rtl], [dir=RTL] { direction: rtl; }
+[dir=ltr], [dir=LTR] { direction: ltr; }
+[dir=rtl] ul, [dir=rtl] ol, [dir=rtl] menu, ul[dir=rtl], ol[dir=rtl] { padding-left: 0; padding-right: 40px; }
+
+address, cite, dfn, em, i, var { font-style: italic; }
+code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace; }
+pre, listing, xmp, plaintext { white-space: pre; }
+textarea { white-space: pre-wrap; }
+nobr { white-space: nowrap; }
+sub { vertical-align: sub; font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
+small { font-size: smaller; }
+big { font-size: larger; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+mark { background-color: yellow; color: black; }
+center { text-align: -webkit-center; }
+
+a[href] { color: #0000ee; text-decoration: underline; }
+
+hr { color: gray; border-style: inset; border-width: 1px; margin: 0.5em auto; overflow: hidden; }
+
+table { border-spacing: 2px; border-collapse: separate; box-sizing: border-box; text-indent: 0; }
+td, th { padding: 1px; }
+th { text-align: center; }
+caption { text-align: center; }
+thead, tbody, tfoot, tr, td, th { vertical-align: middle; }
+
+fieldset { margin-left: 2px; margin-right: 2px; border: 2px groove #c0c0c0; padding: 0.35em 0.75em 0.625em; }
+legend { padding-left: 2px; padding-right: 2px; }
+
+input, select, textarea, button { font-family: sans-serif; font-size: 13.333px; letter-spacing: normal; word-spacing: normal;
+  line-height: normal; text-transform: none; text-indent: 0; text-align: start; }
+input, textarea { border: 2px inset #767676; padding: 1px 2px; background-color: white; color: black; }
+input[type=hidden] { display: none; }
+input[type=checkbox], input[type=radio] { margin: 3px 3px 3px 4px; padding: 0; border: none; }
+button, input[type=button], input[type=submit], input[type=reset], select { border: 2px outset #767676;
+  padding: 1px 6px; background-color: #efefef; color: black; }
+select { padding: 0 4px; }
+iframe { border: 2px inset #767676; }
+img, video, canvas, iframe, embed, object, svg { vertical-align: baseline; }
+q::before { content: open-quote }
+q::after { content: close-quote }

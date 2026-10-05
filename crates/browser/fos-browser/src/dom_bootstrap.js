@@ -9,9 +9,53 @@
       Object.defineProperty(o, k, d);
     }
   };
+  // Attributes that browsers expose as prototype accessors (scripts read
+  // their descriptors, e.g. Object.getOwnPropertyDescriptor(Response.prototype,
+  // 'url').get), kept per object in a hidden slot
+  const slots = new WeakMap();
+  const slotOf = (o) => { let s = slots.get(o); if (!s) slots.set(o, s = {}); return s; };
+  const accessorize = (proto, names) => {
+    for (const name of names) {
+      Object.defineProperty(proto, name, {
+        get() { return slotOf(this)[name]; },
+        set(v) { slotOf(this)[name] = v; },
+        enumerable: true, configurable: true,
+      });
+    }
+  };
   const E = HTMLElement.prototype;
 
   // ---- events ----
+
+  // Shadow roots: host -> root, and root -> { host, mode, ... }
+  const shadowOf = new WeakMap();
+  const shadowInfo = new WeakMap();
+  // Set up once MutationObserver exists: fires slotchange for `root`'s slots
+  let watchSlots = () => {};
+  // `el`'s shadow root, whatever its mode. Roots the parser made
+  // (declarative, from <template shadowrootmode>) are taken in when first
+  // seen.
+  function shadowRootOf(el) {
+    let root = shadowOf.get(el);
+    if (root === undefined && el && el.nodeType === 1) {
+      root = __fosShadowRoot(el);
+      if (root) {
+        shadowInfo.set(root, { host: el, mode: __fosShadowClosed(root) ? 'closed' : 'open', delegatesFocus: false, slotAssignment: 'named', clonable: false, declarative: true });
+        shadowOf.set(el, root);
+        watchSlots(root, el);
+      }
+    }
+    return root || null;
+  }
+  // What is known of shadow root `root` (null for other nodes)
+  function shadowInfoOf(root) {
+    let info = shadowInfo.get(root);
+    if (!info && root && root.nodeType === 11) {
+      const host = __fosShadowHost(root);
+      if (host && shadowRootOf(host)) info = shadowInfo.get(root);
+    }
+    return info || null;
+  }
 
   class Event {
     constructor(type, init = {}) {
@@ -36,6 +80,12 @@
     composedPath() { return this._path ? this._path.slice() : []; }
   }
   Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+  class PopStateEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.state = init.state ?? null; }
+  }
+  class HashChangeEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.oldURL = String(init.oldURL ?? ''); this.newURL = String(init.newURL ?? ''); }
+  }
   class CustomEvent extends Event {
     constructor(type, init = {}) { super(type, init); this.detail = init.detail === undefined ? null : init.detail; }
   }
@@ -68,8 +118,10 @@
   // Listeners of each target, by type: [{callback, capture, once, passive}]
   const listeners = new WeakMap();
   const EventTargetProto = EventTarget.prototype;
+  // Called bare (`addEventListener('load', f)`), they act on the window
   const eventTargetMethods = {
     addEventListener(type, callback, options) {
+      if (this == null) return global.addEventListener(type, callback, options);
       if (callback == null) return;
       const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
       const once = !!(options && typeof options === 'object' && options.once);
@@ -83,6 +135,7 @@
       if (signal) signal.addEventListener('abort', () => this.removeEventListener(type, callback, options));
     },
     removeEventListener(type, callback, options) {
+      if (this == null) return global.removeEventListener(type, callback, options);
       const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
       const list = listeners.get(this)?.get(type);
       if (!list) return;
@@ -90,17 +143,41 @@
       if (i >= 0) { list[i].removed = true; list.splice(i, 1); }
     },
     dispatchEvent(event) {
+      if (this == null) return global.dispatchEvent(event);
       event.target = this;
       event.isTrusted = !!event.isTrusted;
       const path = [];
-      for (let n = this; n; n = n === document ? global : n.parentNode) {
+      // What `target` reads as at each step: leaving a shadow tree, the
+      // target becomes its host (retargeting)
+      const targets = [];
+      const composed = event.composed || event.isTrusted;
+      // A document's parent is the window, except for load events (an
+      // image's or script's load never reaches window listeners). A
+      // slotted node's parent is its slot; a shadow root's is its host,
+      // for composed events.
+      let t = this;
+      for (let n = this; n;) {
         path.push(n);
+        targets.push(t);
         if (n === global) break;
+        let next;
+        if (n === document) next = event.type === 'load' ? null : global;
+        else {
+          next = n.parentNode;
+          if (next && shadowRootOf(next)) next = __fosAssignedSlot(n) || next;
+          else if (!next && shadowInfoOf(n)) {
+            if (!composed) break;
+            next = shadowInfoOf(n).host;
+            if (t.getRootNode() === n) t = next;
+          }
+        }
+        n = next;
       }
       event._path = path;
-      const invoke = (target, phase) => {
+      // `phase` filters listeners: 1 capturing, 3 bubbling, 2 both
+      const invoke = (target, phase, shown = phase) => {
         event.currentTarget = target;
-        event.eventPhase = phase;
+        event.eventPhase = shown;
         let list = listeners.get(target)?.get(event.type);
         if (list) {
           for (const l of list.slice()) {
@@ -123,9 +200,19 @@
           }
         }
       };
-      for (let i = path.length - 1; i > 0 && !event._stop; i--) invoke(path[i], 1);
+      for (let i = path.length - 1; i > 0 && !event._stop; i--) {
+        event.target = targets[i];
+        invoke(path[i], 1, targets[i] === path[i] ? 2 : 1);
+      }
+      event.target = this;
       if (!event._stop) invoke(this, 2);
-      if (event.bubbles) for (let i = 1; i < path.length && !event._stop; i++) invoke(path[i], 3);
+      // Hosts the event was retargeted to see it at target, bubbling or not
+      for (let i = 1; i < path.length && !event._stop; i++) {
+        event.target = targets[i];
+        if (targets[i] === path[i]) invoke(path[i], 3, 2);
+        else if (event.bubbles) invoke(path[i], 3);
+      }
+      event.target = this;
       event.currentTarget = null;
       event.eventPhase = 0;
       return !event.defaultPrevented;
@@ -178,12 +265,16 @@
     console.error('Uncaught', e && e.stack ? e.stack : e);
   }
 
-  // Called by the browser to deliver user input and lifecycle events
+  // Called by the browser to deliver user input and lifecycle events.
+  // Resource and focus events neither bubble nor cancel; input does both.
+  const quietEvents = new Set(['load', 'error', 'abort', 'loadstart', 'progress', 'loadend', 'focus', 'blur',
+    'mouseenter', 'mouseleave', 'toggle', 'readystatechange']);
   define(global, {
     __fosDispatch(target, type, init) {
       const Ctor = /^(click|dblclick|mouse|contextmenu)/.test(type) ? MouseEvent
         : /^key/.test(type) ? KeyboardEvent : Event;
-      const ev = new Ctor(type, init || { bubbles: true, cancelable: true });
+      const loud = !quietEvents.has(type);
+      const ev = new Ctor(type, init || { bubbles: loud, cancelable: loud });
       ev.isTrusted = true;
       const notCanceled = target.dispatchEvent(ev);
       if (notCanceled && type === 'click') {
@@ -196,60 +287,23 @@
 
   // ---- element conveniences ----
 
-  // Reflected attributes: string-valued ...
-  for (const [prop, attr] of [['title', 'title'], ['lang', 'lang'], ['dir', 'dir'], ['name', 'name'],
-    ['type', 'type'], ['alt', 'alt'], ['rel', 'rel'], ['target', 'target'], ['placeholder', 'placeholder'],
-    ['htmlFor', 'for'], ['accessKey', 'accesskey'], ['role', 'role'], ['slot', 'slot'],
-    ['width', 'width'], ['height', 'height'], ['min', 'min'], ['max', 'max'], ['step', 'step'],
-    ['pattern', 'pattern'], ['autocomplete', 'autocomplete'], ['method', 'method'], ['enctype', 'enctype'],
-    ['content', 'content'], ['charset', 'charset'], ['media', 'media'], ['label', 'label']]) {
+  // Reflected attributes common to all HTML elements (those of particular
+  // elements are defined on their interfaces, below)
+  for (const [prop, attr] of [['title', 'title'], ['lang', 'lang'], ['dir', 'dir'], ['accessKey', 'accesskey'],
+    ['role', 'role'], ['slot', 'slot'], ['nonce', 'nonce']]) {
     Object.defineProperty(E, prop, {
       get() { return this.getAttribute(attr) ?? ''; },
       set(v) { this.setAttribute(attr, String(v)); },
       configurable: true,
     });
   }
-  // ... URLs, resolved against the document ...
-  for (const prop of ['href', 'src', 'action', 'poster', 'cite', 'data']) {
+  for (const prop of ['hidden', 'autofocus', 'inert']) {
     Object.defineProperty(E, prop, {
-      get() {
-        const v = this.getAttribute(prop);
-        return v === null ? '' : __fosResolveURL(v, document.baseURI);
-      },
-      set(v) { this.setAttribute(prop, String(v)); },
+      get() { return this.hasAttribute(prop); },
+      set(v) { if (v) this.setAttribute(prop, ''); else this.removeAttribute(prop); },
       configurable: true,
     });
   }
-  // ... and boolean
-  for (const prop of ['hidden', 'disabled', 'checked', 'selected', 'readOnly', 'required', 'multiple',
-    'autofocus', 'async', 'defer', 'noValidate', 'open', 'controls', 'autoplay', 'loop', 'muted']) {
-    const attr = prop.toLowerCase();
-    Object.defineProperty(E, prop, {
-      get() { return this.hasAttribute(attr); },
-      set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
-      configurable: true,
-    });
-  }
-  // Form control values live in the `value` attribute (no separate dirty value)
-  Object.defineProperty(E, 'value', {
-    get() {
-      const tag = this.localName;
-      if (tag === 'textarea') return this.textContent;
-      if (tag === 'select') {
-        const opt = this.querySelector('option[selected]') || this.querySelector('option');
-        return opt ? opt.value : '';
-      }
-      if (tag === 'option') return this.getAttribute('value') ?? this.textContent.trim();
-      return this.getAttribute('value') ?? (this.type === 'checkbox' || this.type === 'radio' ? 'on' : '');
-    },
-    set(v) {
-      if (this.localName === 'textarea') this.textContent = String(v);
-      else if (this.localName === 'select') {
-        for (const o of this.querySelectorAll('option')) o.selected = o.value === String(v);
-      } else this.setAttribute('value', v == null ? '' : String(v));
-    },
-    configurable: true,
-  });
   Object.defineProperty(E, 'tabIndex', {
     get() { const v = parseInt(this.getAttribute('tabindex'), 10); return isNaN(v) ? -1 : v; },
     set(v) { this.setAttribute('tabindex', String(v)); },
@@ -283,23 +337,93 @@
       return el;
     },
     insertAdjacentText(where, text) { this.insertAdjacentElement(where, document.createTextNode(text)); },
+    // Geometry from the browser's layout: [x, y, width, height] in
+    // document coordinates, or null when the element is not rendered
     getBoundingClientRect() {
-      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON() { return this; } };
+      const g = __fosGeometry(this, true);
+      const v = __fosViewport();
+      return g ? domRect(g[0] - v[2], g[1] - v[3], g[2], g[3]) : domRect(0, 0, 0, 0);
     },
-    getClientRects() { return []; },
-    get offsetWidth() { return 0; }, get offsetHeight() { return 0; },
-    get offsetTop() { return 0; }, get offsetLeft() { return 0; }, get offsetParent() { return this.parentElement; },
-    get clientWidth() { return 0; }, get clientHeight() { return 0; },
-    get scrollWidth() { return 0; }, get scrollHeight() { return 0; },
-    scrollTop: 0, scrollLeft: 0,
-    scrollIntoView() {}, scrollTo() {}, scrollBy() {},
-    focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus')); },
-    blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur')); },
-    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); },
-    attachShadow() { return this; },
+    getClientRects() { return __fosGeometry(this, true) ? [this.getBoundingClientRect()] : []; },
+    get offsetWidth() { const g = __fosGeometry(this); return g ? Math.round(g[2]) : 0; },
+    get offsetHeight() { const g = __fosGeometry(this); return g ? Math.round(g[3]) : 0; },
+    get offsetTop() { const g = __fosGeometry(this); return g ? Math.round(g[1]) : 0; },
+    get offsetLeft() { const g = __fosGeometry(this); return g ? Math.round(g[0]) : 0; },
+    get offsetParent() {
+      if (this.localName === 'body' || this.localName === 'html' || !__fosGeometry(this)) return null;
+      return document.body;
+    },
+    get clientWidth() {
+      if (this === document.documentElement) return __fosViewport()[0];
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[4]) : 0;
+    },
+    get clientHeight() {
+      if (this === document.documentElement) return __fosViewport()[1];
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[5]) : 0;
+    },
+    get clientTop() { return 0; }, get clientLeft() { return 0; },
+    get scrollWidth() {
+      if (this === document.documentElement || this === document.body) return __fosViewport()[0];
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[2]) : 0;
+    },
+    get scrollHeight() {
+      if (this === document.documentElement || this === document.body) return Math.round(__fosViewport()[4]);
+      const m = __fosScrollMetrics(this); return m ? Math.round(m[3]) : 0;
+    },
+    get scrollTop() {
+      if (this === document.documentElement || this === document.body) return __fosViewport()[3];
+      const m = __fosScrollMetrics(this); return m ? m[1] : 0;
+    },
+    set scrollTop(v) {
+      if (this === document.documentElement || this === document.body) __fosScrollTo(+v || 0);
+      else __fosSetBoxScroll(this, null, +v || 0);
+    },
+    get scrollLeft() { const m = __fosScrollMetrics(this); return m ? m[0] : 0; },
+    set scrollLeft(v) { __fosSetBoxScroll(this, +v || 0, null); },
+    scrollIntoView() { const g = __fosGeometry(this); if (g) __fosScrollTo(g[1]); },
+    scrollTo(a, b) {
+      const o = typeof a === 'object' && a ? a : { left: a, top: b };
+      if (this === document.documentElement || this === document.body) { if (o.top != null) __fosScrollTo(+o.top || 0); return; }
+      __fosSetBoxScroll(this, o.left == null ? null : +o.left, o.top == null ? null : +o.top);
+    },
+    scrollBy(a, b) {
+      const o = typeof a === 'object' && a ? a : { left: a, top: b };
+      this.scrollTo({ left: this.scrollLeft + (+o.left || 0), top: this.scrollTop + (+o.top || 0) });
+    },
+    focus() { activeElement = this; this.dispatchEvent(new FocusEvent('focus', { composed: true })); },
+    blur() { if (activeElement === this) activeElement = null; this.dispatchEvent(new FocusEvent('blur', { composed: true })); },
+    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true })); },
+    attachShadow(init) {
+      const mode = init && init.mode === 'closed' ? 'closed' : 'open';
+      const existing = shadowRootOf(this);
+      if (existing) {
+        const info = shadowInfo.get(existing);
+        if (!info.declarative) throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+        // A declarative root is emptied and handed over once
+        existing.replaceChildren();
+        Object.assign(info, { mode, delegatesFocus: !!(init && init.delegatesFocus), declarative: false });
+        return existing;
+      }
+      const root = __fosAttachShadow(this);
+      shadowInfo.set(root, { host: this, mode, delegatesFocus: !!(init && init.delegatesFocus), slotAssignment: (init && init.slotAssignment) || 'named', clonable: !!(init && init.clonable) });
+      shadowOf.set(this, root);
+      watchSlots(root, this);
+      return root;
+    },
+    get shadowRoot() {
+      const root = shadowRootOf(this);
+      return root && shadowInfo.get(root).mode === 'open' ? root : null;
+    },
     animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; },
   });
   let activeElement = null;
+  function domRect(x, y, width, height) {
+    return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height,
+      toJSON() { return { x, y, width, height, left: x, top: y, right: x + width, bottom: y + height }; } };
+  }
+  global.DOMRect = class DOMRect {
+    constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, domRect(x, y, width, height)); }
+  };
 
   // classList
   const tokenLists = new WeakMap();
@@ -341,67 +465,30 @@
     set(v) { this.className = v; },
     configurable: true,
   });
+  // `part`, on every element
+  const otherTokenLists = new WeakMap(); // element -> { attr: list }
+  const tokenListProp = (proto, prop, attr) => Object.defineProperty(proto, prop, {
+    get() {
+      let lists = otherTokenLists.get(this);
+      if (!lists) otherTokenLists.set(this, lists = {});
+      return lists[attr] || (lists[attr] = new DOMTokenList(this, attr));
+    },
+    set(v) { this.setAttribute(attr, String(v)); },
+    configurable: true,
+  });
+  for (const proto of new Set([Element.prototype, E])) tokenListProp(proto, 'part', 'part');
 
   // style: a CSSStyleDeclaration over the `style` attribute
   const camelToKebab = s => s.startsWith('--') ? s : s.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, '-$1-');
-  function parseStyle(text) {
-    const map = new Map();
-    for (const decl of (text || '').split(';')) {
-      const i = decl.indexOf(':');
-      if (i < 0) continue;
-      const k = decl.slice(0, i).trim().toLowerCase();
-      if (k) map.set(k, decl.slice(i + 1).trim());
-    }
-    return map;
-  }
-  const writeStyle = (el, map) => {
-    const text = [...map].map(([k, v]) => k + ': ' + v).join('; ');
-    if (text) el.setAttribute('style', text + ';'); else el.removeAttribute('style');
-  };
-  const styleMethods = {
-    getPropertyValue(el, name) { return parseStyle(el.getAttribute('style')).get(String(name).toLowerCase()) ?? ''; },
-    setProperty(el, name, value) {
-      const map = parseStyle(el.getAttribute('style'));
-      name = String(name).toLowerCase();
-      if (value === null || value === undefined || value === '') map.delete(name);
-      else map.set(name, String(value).replace(/\s*!important\s*$/, ''));
-      writeStyle(el, map);
-    },
-    removeProperty(el, name) {
-      const map = parseStyle(el.getAttribute('style'));
-      const old = map.get(String(name).toLowerCase()) ?? '';
-      map.delete(String(name).toLowerCase());
-      writeStyle(el, map);
-      return old;
-    },
-  };
   const styles = new WeakMap();
   Object.defineProperty(E, 'style', {
     get() {
       let s = styles.get(this);
-      if (s) return s;
-      const el = this;
-      s = new Proxy({}, {
-        get(_, key) {
-          if (typeof key === 'symbol') return undefined;
-          if (key in styleMethods) return (...a) => styleMethods[key](el, ...a);
-          if (key === 'cssText') return el.getAttribute('style') || '';
-          if (key === 'length') return parseStyle(el.getAttribute('style')).size;
-          if (/^\d+$/.test(key)) return [...parseStyle(el.getAttribute('style')).keys()][+key];
-          if (key === 'item') return i => [...parseStyle(el.getAttribute('style')).keys()][i] ?? '';
-          if (key === 'cssFloat') key = 'float';
-          return parseStyle(el.getAttribute('style')).get(camelToKebab(key)) ?? '';
-        },
-        set(_, key, value) {
-          if (typeof key === 'symbol') return true;
-          if (key === 'cssText') { el.setAttribute('style', String(value)); return true; }
-          if (key === 'cssFloat') key = 'float';
-          styleMethods.setProperty(el, camelToKebab(key), value);
-          return true;
-        },
-        has(_, key) { return typeof key === 'string'; },
-      });
-      styles.set(this, s);
+      if (!s) {
+        const el = this;
+        s = makeDeclaration(() => el.getAttribute('style'), (t) => { if (t) el.setAttribute('style', t); else el.removeAttribute('style'); });
+        styles.set(this, s);
+      }
       return s;
     },
     set(v) { this.setAttribute('style', String(v)); },
@@ -436,24 +523,1445 @@
     configurable: true,
   });
 
+  // Node comparison (DOM "equals")
+  define(Node.prototype, {
+    isSameNode(other) { return this === other; },
+    isEqualNode(other) {
+      if (!other || this.nodeType !== other.nodeType || this.nodeName !== other.nodeName) return false;
+      if (this.nodeType === 1) {
+        const names = this.getAttributeNames();
+        const otherNames = other.getAttributeNames();
+        if (names.length !== otherNames.length) return false;
+        for (const n of names) {
+          if (other.getAttribute(n) !== this.getAttribute(n)) return false;
+        }
+      } else if (this.nodeType === 3 || this.nodeType === 8) {
+        if (this.nodeValue !== other.nodeValue) return false;
+      }
+      const a = this.childNodes, b = other.childNodes;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!a[i].isEqualNode(b[i])) return false;
+      }
+      return true;
+    },
+  });
+
   // NodeList helpers (query results are arrays with NodeList.prototype)
   define(NodeList.prototype, { item(i) { return this[i] ?? null; } });
   global.HTMLCollection = NodeList;
 
-  // Tag-specific interfaces, for `instanceof` checks; all share HTMLElement.prototype
-  for (const name of ['HTMLDivElement', 'HTMLSpanElement', 'HTMLAnchorElement', 'HTMLImageElement',
-    'HTMLInputElement', 'HTMLButtonElement', 'HTMLFormElement', 'HTMLSelectElement', 'HTMLOptionElement',
-    'HTMLTextAreaElement', 'HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLCanvasElement',
-    'HTMLVideoElement', 'HTMLAudioElement', 'HTMLMediaElement', 'HTMLIFrameElement', 'HTMLTemplateElement',
-    'HTMLParagraphElement', 'HTMLHeadingElement', 'HTMLLIElement', 'HTMLUListElement', 'HTMLTableElement',
-    'HTMLBodyElement', 'HTMLHeadElement', 'HTMLHtmlElement', 'HTMLLabelElement', 'HTMLUnknownElement',
-    'SVGElement', 'SVGSVGElement']) {
-    global[name] = HTMLElement;
+  // ---- node type constants, document order, traversal (DOM §4.4, §6) ----
+  const nodeConstants = {
+    ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, ENTITY_REFERENCE_NODE: 5,
+    ENTITY_NODE: 6, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+    DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12,
+    DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4,
+    DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16,
+    DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
+  };
+  for (const [k, v] of Object.entries(nodeConstants)) {
+    Object.defineProperty(Node, k, { value: v, enumerable: true });
+    Object.defineProperty(Node.prototype, k, { value: v, enumerable: true });
   }
+  const ancestry = n => { const chain = []; for (; n; n = n.parentNode) chain.push(n); return chain.reverse(); };
+  define(Node.prototype, {
+    compareDocumentPosition(other) {
+      if (!(other instanceof Node)) throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
+      if (this === other) return 0;
+      const a = ancestry(other), b = ancestry(this);
+      if (a[0] !== b[0]) return 1 | 32 | 2; // disconnected; any consistent order will do
+      let i = 0;
+      while (i < a.length && i < b.length && a[i] === b[i]) i++;
+      if (i === b.length) return 16 | 4;  // other is inside this
+      if (i === a.length) return 8 | 2;   // other contains this
+      // Siblings under the common ancestor decide the order
+      for (let s = a[i].nextSibling; s; s = s.nextSibling) if (s === b[i]) return 2;
+      return 4;
+    },
+  });
+
+  const NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4, SHOW_CDATA_SECTION: 0x8,
+    SHOW_ENTITY_REFERENCE: 0x10, SHOW_ENTITY: 0x20, SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80,
+    SHOW_DOCUMENT: 0x100, SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400, SHOW_NOTATION: 0x800,
+  };
+  // The "filter" algorithm shared by TreeWalker and NodeIterator
+  function traversalFilter(t, node) {
+    if (t._active) throw new DOMException('Filter is already running', 'InvalidStateError');
+    if (!((1 << (node.nodeType - 1)) & t.whatToShow)) return 3;
+    const f = t.filter;
+    if (f === null) return 1;
+    t._active = true;
+    try {
+      const r = typeof f === 'function' ? f.call(undefined, node) : f.acceptNode(node);
+      return Number(r) >>> 0 & 0xFFFF;
+    } finally { t._active = false; }
+  }
+  function traversalArgs(root, whatToShow, filter) {
+    if (!(root instanceof Node)) throw new TypeError("parameter 1 is not of type 'Node'.");
+    return [root, whatToShow === undefined ? 0xFFFFFFFF : whatToShow >>> 0, filter === undefined ? null : filter];
+  }
+
+  class TreeWalker {
+    constructor(root, whatToShow, filter) {
+      [this.root, this.whatToShow, this.filter] = traversalArgs(root, whatToShow, filter);
+      this._current = this.root;
+      this._active = false;
+    }
+    get currentNode() { return this._current; }
+    set currentNode(n) {
+      if (!(n instanceof Node)) throw new TypeError("Failed to set 'currentNode' on 'TreeWalker': not a Node.");
+      this._current = n;
+    }
+    parentNode() {
+      for (let n = this._current; n && n !== this.root;) {
+        n = n.parentNode;
+        if (n && traversalFilter(this, n) === 1) return (this._current = n);
+      }
+      return null;
+    }
+    _children(first) {
+      let node = first ? this._current.firstChild : this._current.lastChild;
+      while (node) {
+        const r = traversalFilter(this, node);
+        if (r === 1) return (this._current = node);
+        if (r === 3) {
+          const child = first ? node.firstChild : node.lastChild;
+          if (child) { node = child; continue; }
+        }
+        while (node) {
+          const sibling = first ? node.nextSibling : node.previousSibling;
+          if (sibling) { node = sibling; break; }
+          const parent = node.parentNode;
+          if (!parent || parent === this.root || parent === this._current) return null;
+          node = parent;
+        }
+      }
+      return null;
+    }
+    firstChild() { return this._children(true); }
+    lastChild() { return this._children(false); }
+    _siblings(next) {
+      let node = this._current;
+      if (node === this.root) return null;
+      for (;;) {
+        let sibling = next ? node.nextSibling : node.previousSibling;
+        while (sibling) {
+          node = sibling;
+          const r = traversalFilter(this, node);
+          if (r === 1) return (this._current = node);
+          sibling = next ? node.firstChild : node.lastChild;
+          if (r === 2 || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
+        }
+        node = node.parentNode;
+        if (!node || node === this.root) return null;
+        if (traversalFilter(this, node) === 1) return null;
+      }
+    }
+    nextSibling() { return this._siblings(true); }
+    previousSibling() { return this._siblings(false); }
+    previousNode() {
+      let node = this._current;
+      while (node !== this.root) {
+        let sibling = node.previousSibling;
+        while (sibling) {
+          node = sibling;
+          let r = traversalFilter(this, node);
+          while (r !== 2 && node.lastChild) {
+            node = node.lastChild;
+            r = traversalFilter(this, node);
+          }
+          if (r === 1) return (this._current = node);
+          sibling = node.previousSibling;
+        }
+        if (node === this.root || !node.parentNode) return null;
+        node = node.parentNode;
+        if (traversalFilter(this, node) === 1) return (this._current = node);
+      }
+      return null;
+    }
+    nextNode() {
+      let node = this._current, r = 1;
+      for (;;) {
+        while (r !== 2 && node.firstChild) {
+          node = node.firstChild;
+          r = traversalFilter(this, node);
+          if (r === 1) return (this._current = node);
+        }
+        let sibling = null;
+        for (let t = node; t; t = t.parentNode) {
+          if (t === this.root) return null;
+          sibling = t.nextSibling;
+          if (sibling) break;
+        }
+        if (!sibling) return null;
+        node = sibling;
+        r = traversalFilter(this, node);
+        if (r === 1) return (this._current = node);
+      }
+    }
+  }
+
+  // Node iterators that are alive, so removals can move their reference
+  // (the "pre-removing steps"); held weakly so dropped iterators cost nothing
+  const liveIterators = new Set();
+  const following = (node, root) => {
+    if (node.firstChild) return node.firstChild;
+    for (let n = node; n && n !== root; n = n.parentNode) if (n.nextSibling) return n.nextSibling;
+    return null;
+  };
+  const preceding = (node, root) => {
+    if (node === root) return null;
+    let p = node.previousSibling;
+    if (!p) return node.parentNode;
+    while (p.lastChild) p = p.lastChild;
+    return p;
+  };
+  class NodeIterator {
+    constructor(root, whatToShow, filter) {
+      [this.root, this.whatToShow, this.filter] = traversalArgs(root, whatToShow, filter);
+      this._ref = this.root;
+      this._before = true;
+      this._active = false;
+      liveIterators.add(new WeakRef(this));
+    }
+    get referenceNode() { return this._ref; }
+    get pointerBeforeReferenceNode() { return this._before; }
+    _traverse(next) {
+      let node = this._ref, before = this._before;
+      for (;;) {
+        if (next) {
+          if (!before) { node = following(node, this.root); if (!node) return null; } else before = false;
+        } else {
+          if (before) { node = preceding(node, this.root); if (!node) return null; } else before = true;
+        }
+        if (traversalFilter(this, node) === 1) break;
+      }
+      this._ref = node;
+      this._before = before;
+      return node;
+    }
+    nextNode() { return this._traverse(true); }
+    previousNode() { return this._traverse(false); }
+    detach() {}
+  }
+  // Called before `node` leaves the tree
+  function nodeIteratorsPreRemove(node) {
+    for (const w of liveIterators) {
+      const it = w.deref();
+      if (!it) { liveIterators.delete(w); continue; }
+      if (!node.contains(it._ref) || node.contains(it.root)) continue;
+      if (it._before) {
+        // The first following node not inside `node`
+        let n = node;
+        while (n && !n.nextSibling && n !== it.root) n = n.parentNode;
+        const next = n && n !== it.root ? n.nextSibling : null;
+        if (next) { it._ref = next; continue; }
+        it._before = false;
+      }
+      // The node before `node`: its previous sibling's last descendant, or its parent
+      let p = node.previousSibling;
+      if (p) { while (p.lastChild) p = p.lastChild; it._ref = p; } else it._ref = node.parentNode;
+    }
+  }
+  define(Document.prototype, {
+    createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); },
+    createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); },
+  });
+  Object.assign(global, { NodeFilter, TreeWalker, NodeIterator });
+
+  // ---- element interfaces ----
+  //
+  // One prototype per interface, as in browsers: `instanceof` tells
+  // elements apart, and reflected attributes (`async`, `value`, `src`...)
+  // exist only on the elements that have them, so a custom element class
+  // can define its own `value` or `async`. Wrappers get their interface's
+  // prototype by tag (__fosSetElementPrototype).
+  const elementInterfaces = [];
+  function makeInterface(name, parent, tags) {
+    // Constructible only as the base of a custom element (`super()`)
+    const ctor = ({ [name]: function () { return ceConstruct(new.target); } })[name];
+    ctor.prototype = Object.create(parent.prototype);
+    Object.defineProperty(ctor.prototype, 'constructor', { value: ctor, writable: true, configurable: true });
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    Object.setPrototypeOf(ctor, parent);
+    Object.defineProperty(global, name, { value: ctor, writable: true, configurable: true });
+    elementInterfaces.push(ctor);
+    for (const tag of tags ? tags.split(' ') : []) __fosSetElementPrototype(tag, ctor.prototype);
+    return ctor;
+  }
+  for (const [name, tags] of Object.entries({
+    HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLBaseElement: 'base', HTMLBodyElement: 'body',
+    HTMLBRElement: 'br', HTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDataElement: 'data',
+    HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details', HTMLDialogElement: 'dialog',
+    HTMLDivElement: 'div', HTMLDListElement: 'dl', HTMLEmbedElement: 'embed', HTMLFieldSetElement: 'fieldset',
+    HTMLFormElement: 'form', HTMLHeadElement: 'head', HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6',
+    HTMLHRElement: 'hr', HTMLHtmlElement: 'html', HTMLIFrameElement: 'iframe', HTMLImageElement: 'img',
+    HTMLInputElement: 'input', HTMLLabelElement: 'label', HTMLLegendElement: 'legend', HTMLLIElement: 'li',
+    HTMLLinkElement: 'link', HTMLMapElement: 'map', HTMLMenuElement: 'menu', HTMLMetaElement: 'meta',
+    HTMLMeterElement: 'meter', HTMLModElement: 'ins del', HTMLObjectElement: 'object', HTMLOListElement: 'ol',
+    HTMLOptGroupElement: 'optgroup', HTMLOptionElement: 'option', HTMLOutputElement: 'output',
+    HTMLParagraphElement: 'p', HTMLParamElement: 'param', HTMLPictureElement: 'picture',
+    HTMLPreElement: 'pre listing xmp', HTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote',
+    HTMLScriptElement: 'script', HTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source',
+    HTMLSpanElement: 'span', HTMLStyleElement: 'style', HTMLTableCaptionElement: 'caption',
+    HTMLTableCellElement: 'td th', HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table',
+    HTMLTableRowElement: 'tr', HTMLTableSectionElement: 'thead tbody tfoot', HTMLTemplateElement: 'template',
+    HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time', HTMLTitleElement: 'title', HTMLTrackElement: 'track',
+    HTMLUListElement: 'ul', HTMLUnknownElement: '',
+  })) makeInterface(name, HTMLElement, tags);
+  makeInterface('HTMLMediaElement', HTMLElement, '');
+  makeInterface('HTMLAudioElement', HTMLMediaElement, 'audio');
+  makeInterface('HTMLVideoElement', HTMLMediaElement, 'video');
+  // Media elements: nothing plays (play() is refused, as autoplay often
+  // is), but the API is there and reports an idle element
+  {
+    class TimeRanges {
+      get length() { return 0; }
+      start() { throw new DOMException('The index provided (0) is greater than or equal to the maximum bound (0).', 'IndexSizeError'); }
+      end() { throw new DOMException('The index provided (0) is greater than or equal to the maximum bound (0).', 'IndexSizeError'); }
+    }
+    global.TimeRanges = TimeRanges;
+    const media = new WeakMap();
+    const stateOf = (el) => {
+      let s = media.get(el);
+      if (!s) media.set(el, s = { paused: true, currentTime: 0, volume: 1, playbackRate: 1, defaultPlaybackRate: 1, srcObject: null, preservesPitch: true });
+      return s;
+    };
+    const M = HTMLMediaElement.prototype;
+    for (const [k, v] of Object.entries({ NETWORK_EMPTY: 0, NETWORK_IDLE: 1, NETWORK_LOADING: 2, NETWORK_NO_SOURCE: 3, HAVE_NOTHING: 0, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3, HAVE_ENOUGH_DATA: 4 })) {
+      Object.defineProperty(HTMLMediaElement, k, { value: v });
+      Object.defineProperty(M, k, { value: v });
+    }
+    define(M, {
+      load() { stateOf(this).currentTime = 0; },
+      play() {
+        this.dispatchEvent(new Event('play'));
+        return Promise.reject(new DOMException("play() failed because the user didn't interact with the document first.", 'NotAllowedError'));
+      },
+      pause() {
+        const s = stateOf(this);
+        if (!s.paused) { s.paused = true; this.dispatchEvent(new Event('pause')); }
+      },
+      canPlayType() { return ''; },
+      fastSeek(t) { stateOf(this).currentTime = +t || 0; },
+      addTextTrack() { return { kind: 'subtitles', label: '', language: '', mode: 'disabled', cues: [], addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; },
+      captureStream() { throw new DOMException('Not supported', 'NotSupportedError'); },
+      setSinkId() { return Promise.resolve(); },
+      setMediaKeys() { return Promise.resolve(); },
+      get paused() { return stateOf(this).paused; },
+      get ended() { return false; },
+      get seeking() { return false; },
+      get duration() { return NaN; },
+      get readyState() { return 0; },
+      get networkState() { return 0; },
+      get error() { return null; },
+      get currentSrc() { return ''; },
+      get buffered() { return new TimeRanges(); },
+      get played() { return new TimeRanges(); },
+      get seekable() { return new TimeRanges(); },
+      get textTracks() { const l = []; l.addEventListener = () => {}; l.removeEventListener = () => {}; l.getTrackById = () => null; return l; },
+      get audioTracks() { return []; },
+      get videoTracks() { return []; },
+      get mediaKeys() { return null; },
+      get sinkId() { return ''; },
+    });
+    for (const prop of ['currentTime', 'volume', 'playbackRate', 'defaultPlaybackRate', 'srcObject', 'preservesPitch']) {
+      Object.defineProperty(M, prop, {
+        get() { return stateOf(this)[prop]; },
+        set(v) { stateOf(this)[prop] = prop === 'srcObject' ? v : prop === 'preservesPitch' ? !!v : (+v || 0); },
+        configurable: true,
+      });
+    }
+    define(HTMLVideoElement.prototype, {
+      get videoWidth() { return 0; },
+      get videoHeight() { return 0; },
+      getVideoPlaybackQuality() { return { creationTime: performance.now(), droppedVideoFrames: 0, totalVideoFrames: 0 }; },
+      requestPictureInPicture() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); },
+      requestVideoFrameCallback() { return 0; },
+      cancelVideoFrameCallback() {},
+    });
+  }
+  // SVG elements keep HTMLElement's conveniences (style, dataset, events)
+  makeInterface('SVGElement', HTMLElement, 'svg:*');
+  makeInterface('SVGGraphicsElement', SVGElement, '');
+  makeInterface('SVGSVGElement', SVGGraphicsElement, 'svg:svg');
+
+  // Reflected attributes of particular elements
+  const reflectOn = (names, props, descriptor) => {
+    for (const name of names.split(' ')) {
+      for (const [prop, attr] of props) Object.defineProperty(global[name].prototype, prop, { ...descriptor(attr), configurable: true });
+    }
+  };
+  const stringAttr = (attr) => ({
+    get() { return this.getAttribute(attr) ?? ''; },
+    set(v) { this.setAttribute(attr, String(v)); },
+  });
+  const urlAttr = (attr) => ({
+    get() { const v = this.getAttribute(attr); return v === null ? '' : __fosResolveURL(v, document.baseURI); },
+    set(v) { this.setAttribute(attr, String(v)); },
+  });
+  const boolAttr = (attr) => ({
+    get() { return this.hasAttribute(attr); },
+    set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
+  });
+  const intAttr = (fallback) => (attr) => ({
+    get() { const v = parseInt(this.getAttribute(attr), 10); return v >= 0 ? v : fallback; },
+    set(v) { this.setAttribute(attr, String(Math.max(0, Math.trunc(Number(v)) || 0))); },
+  });
+  const props = (list) => list.split(' ').map(p => [p, p.toLowerCase()]);
+  reflectOn('HTMLButtonElement HTMLFieldSetElement HTMLFormElement HTMLIFrameElement HTMLInputElement HTMLMapElement HTMLMetaElement HTMLObjectElement HTMLOutputElement HTMLSelectElement HTMLSlotElement HTMLTextAreaElement HTMLAnchorElement HTMLImageElement HTMLParamElement', props('name'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLEmbedElement HTMLLinkElement HTMLObjectElement HTMLOListElement HTMLScriptElement HTMLSourceElement HTMLStyleElement HTMLUListElement HTMLLIElement', props('type'), stringAttr);
+  // An input's type is an enumerated attribute: unknown values are "text"
+  const inputTypes = new Set(['hidden', 'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month', 'week', 'time',
+    'datetime-local', 'number', 'range', 'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button']);
+  Object.defineProperty(HTMLInputElement.prototype, 'type', {
+    get() { const t = (this.getAttribute('type') || '').toLowerCase(); return inputTypes.has(t) ? t : 'text'; },
+    set(v) { this.setAttribute('type', String(v)); },
+    configurable: true,
+  });
+  Object.defineProperty(HTMLSelectElement.prototype, 'type', { get() { return this.multiple ? 'select-multiple' : 'select-one'; }, configurable: true });
+  Object.defineProperty(HTMLTextAreaElement.prototype, 'type', { get() { return 'textarea'; }, configurable: true });
+  Object.defineProperty(HTMLButtonElement.prototype, 'type', {
+    get() { const t = (this.getAttribute('type') || '').toLowerCase(); return t === 'reset' || t === 'button' ? t : 'submit'; },
+    set(v) { this.setAttribute('type', String(v)); },
+    configurable: true,
+  });
+  reflectOn('HTMLAreaElement HTMLImageElement HTMLInputElement', props('alt'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLLinkElement HTMLFormElement', props('rel'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLFormElement', props('target'), stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement', props('download hreflang ping referrerPolicy'), stringAttr);
+  reflectOn('HTMLInputElement HTMLTextAreaElement', props('placeholder dirName'), stringAttr);
+  reflectOn('HTMLLabelElement HTMLOutputElement', [['htmlFor', 'for']], stringAttr);
+  reflectOn('HTMLInputElement', props('min max step pattern accept'), stringAttr);
+  reflectOn('HTMLInputElement HTMLFormElement HTMLSelectElement HTMLTextAreaElement', props('autocomplete'), stringAttr);
+  reflectOn('HTMLFormElement', [['method', 'method'], ['enctype', 'enctype'], ['acceptCharset', 'accept-charset']], stringAttr);
+  reflectOn('HTMLMetaElement', [['content', 'content'], ['httpEquiv', 'http-equiv']], stringAttr);
+  reflectOn('HTMLMetaElement HTMLScriptElement', props('charset'), stringAttr);
+  reflectOn('HTMLLinkElement HTMLMetaElement HTMLSourceElement HTMLStyleElement', props('media'), stringAttr);
+  reflectOn('HTMLLinkElement HTMLScriptElement HTMLImageElement HTMLMediaElement', [['crossOrigin', 'crossorigin']], stringAttr);
+  reflectOn('HTMLLinkElement HTMLScriptElement', props('integrity'), stringAttr);
+  reflectOn('HTMLLinkElement', props('as sizes hreflang'), stringAttr);
+  reflectOn('HTMLImageElement HTMLSourceElement', props('srcset sizes'), stringAttr);
+  reflectOn('HTMLImageElement HTMLIFrameElement', props('loading'), stringAttr);
+  reflectOn('HTMLImageElement', props('decoding'), stringAttr);
+  reflectOn('HTMLOptionElement HTMLOptGroupElement HTMLTrackElement', props('label'), stringAttr);
+  reflectOn('HTMLTrackElement', props('kind srclang'), stringAttr);
+  reflectOn('HTMLIFrameElement HTMLEmbedElement HTMLObjectElement', props('width height'), stringAttr);
+  reflectOn('HTMLTableCellElement', props('headers abbr scope'), stringAttr);
+  reflectOn('HTMLTimeElement HTMLModElement', [['dateTime', 'datetime']], stringAttr);
+  reflectOn('HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLLinkElement', props('href'), urlAttr);
+  reflectOn('HTMLMediaElement HTMLEmbedElement HTMLIFrameElement HTMLImageElement HTMLInputElement HTMLScriptElement HTMLSourceElement HTMLTrackElement', props('src'), urlAttr);
+  reflectOn('HTMLFormElement', props('action'), urlAttr);
+  reflectOn('HTMLButtonElement HTMLInputElement', [['formAction', 'formaction']], urlAttr);
+  reflectOn('HTMLVideoElement', props('poster'), urlAttr);
+  reflectOn('HTMLQuoteElement HTMLModElement', props('cite'), urlAttr);
+  reflectOn('HTMLObjectElement', props('data'), urlAttr);
+  reflectOn('HTMLButtonElement HTMLFieldSetElement HTMLInputElement HTMLLinkElement HTMLOptGroupElement HTMLOptionElement HTMLSelectElement HTMLTextAreaElement', props('disabled'), boolAttr);
+  reflectOn('HTMLInputElement', [['checked', 'checked'], ['defaultChecked', 'checked'], ['indeterminate', 'indeterminate']], boolAttr);
+  reflectOn('HTMLOptionElement', [['selected', 'selected'], ['defaultSelected', 'selected']], boolAttr);
+  reflectOn('HTMLInputElement HTMLTextAreaElement', props('readOnly'), boolAttr);
+  reflectOn('HTMLInputElement HTMLSelectElement HTMLTextAreaElement', props('required'), boolAttr);
+  reflectOn('HTMLInputElement HTMLSelectElement', props('multiple'), boolAttr);
+  reflectOn('HTMLScriptElement', props('async defer noModule'), boolAttr);
+  reflectOn('HTMLFormElement', props('noValidate'), boolAttr);
+  reflectOn('HTMLButtonElement HTMLInputElement', props('formNoValidate'), boolAttr);
+  reflectOn('HTMLDetailsElement HTMLDialogElement', props('open'), boolAttr);
+  reflectOn('HTMLMediaElement', [['controls', 'controls'], ['autoplay', 'autoplay'], ['loop', 'loop'], ['muted', 'muted'], ['defaultMuted', 'muted']], boolAttr);
+  reflectOn('HTMLMediaElement', props('preload'), stringAttr);
+  reflectOn('HTMLVideoElement', props('playsInline'), boolAttr);
+  reflectOn('HTMLImageElement', props('isMap'), boolAttr);
+  reflectOn('HTMLOListElement', props('reversed'), boolAttr);
+  reflectOn('HTMLImageElement HTMLVideoElement HTMLInputElement', props('width height'), intAttr(0));
+  reflectOn('HTMLCanvasElement', props('width'), intAttr(300));
+  reflectOn('HTMLCanvasElement', props('height'), intAttr(150));
+  reflectOn('HTMLTextAreaElement', props('rows'), intAttr(2));
+  reflectOn('HTMLTextAreaElement', props('cols'), intAttr(20));
+  reflectOn('HTMLInputElement', props('size'), intAttr(20));
+  reflectOn('HTMLTableCellElement', props('colSpan rowSpan'), intAttr(1));
+  reflectOn('HTMLInputElement HTMLTextAreaElement', [['maxLength', 'maxlength'], ['minLength', 'minlength']], intAttr(-1));
+  // Form control values live in the `value` attribute (no separate dirty value)
+  const valueAttr = (fallback) => ({
+    get() { return this.getAttribute('value') ?? fallback(this); },
+    set(v) { this.setAttribute('value', v == null ? '' : String(v)); },
+    configurable: true,
+  });
+  for (const name of ['HTMLButtonElement', 'HTMLDataElement', 'HTMLParamElement']) {
+    Object.defineProperty(global[name].prototype, 'value', valueAttr(() => ''));
+  }
+  Object.defineProperty(HTMLInputElement.prototype, 'value', valueAttr((el) => el.type === 'checkbox' || el.type === 'radio' ? 'on' : ''));
+  Object.defineProperty(HTMLInputElement.prototype, 'defaultValue', valueAttr(() => ''));
+  Object.defineProperty(HTMLOptionElement.prototype, 'value', valueAttr((el) => el.textContent.trim()));
+  Object.defineProperty(HTMLOptionElement.prototype, 'text', { get() { return this.textContent.trim(); }, set(v) { this.textContent = v; }, configurable: true });
+  for (const name of ['HTMLTextAreaElement', 'HTMLOutputElement']) {
+    for (const prop of ['value', 'defaultValue']) {
+      Object.defineProperty(global[name].prototype, prop, { get() { return this.textContent; }, set(v) { this.textContent = String(v); }, configurable: true });
+    }
+  }
+  Object.defineProperty(HTMLSelectElement.prototype, 'value', {
+    get() {
+      const opt = this.querySelector('option[selected]') || this.querySelector('option');
+      return opt ? opt.value : '';
+    },
+    set(v) { for (const o of this.querySelectorAll('option')) o.selected = o.value === String(v); },
+    configurable: true,
+  });
+  define(HTMLSelectElement.prototype, {
+    get options() { return this.querySelectorAll('option'); },
+    get selectedIndex() { return Array.prototype.findIndex.call(this.querySelectorAll('option'), o => o.selected); },
+    set selectedIndex(i) { Array.prototype.forEach.call(this.querySelectorAll('option'), (o, j) => { o.selected = j === i; }); },
+    get length() { return this.querySelectorAll('option').length; },
+  });
+  for (const name of ['HTMLLIElement', 'HTMLMeterElement', 'HTMLProgressElement']) {
+    Object.defineProperty(global[name].prototype, 'value', {
+      get() { const v = parseFloat(this.getAttribute('value')); return isNaN(v) ? 0 : v; },
+      set(v) { this.setAttribute('value', String(v)); },
+      configurable: true,
+    });
+  }
+  define(HTMLScriptElement.prototype, {
+    get text() { return this.textContent; },
+    set text(v) { this.textContent = v; },
+  });
+  // Interfaces scripts test for or patch (polyfills walk them), and
+  // character data the page parser does not produce
+  for (const [name, parent] of [['CDATASection', Text], ['ProcessingInstruction', CharacterData], ['ShadowRoot', DocumentFragment],
+    ['Attr', Node], ['DocumentType', Node]]) {
+    const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
+    ctor.prototype = Object.create(parent.prototype, { constructor: { value: ctor, writable: true, configurable: true } });
+    Object.setPrototypeOf(ctor, parent);
+    global[name] = ctor;
+  }
+  // ParentNode.replaceChildren, through removeChild and append (so
+  // observers and custom element reactions see it)
+  for (const proto of [Element.prototype, Document.prototype, DocumentFragment.prototype]) {
+    Object.defineProperty(proto, 'replaceChildren', {
+      value: function replaceChildren(...nodes) {
+        while (this.lastChild) this.removeChild(this.lastChild);
+        this.append(...nodes);
+      },
+      writable: true, configurable: true,
+    });
+  }
+  // Attribute queries the bindings lack (namespaced ones ignore the
+  // namespace: attributes are stored by qualified name)
+  for (const proto of new Set([Element.prototype, E])) {
+    for (const [name, value] of Object.entries({
+      hasAttributes() { return this.getAttributeNames().length > 0; },
+      getAttributeNS(ns, name) { return this.getAttribute(name); },
+      hasAttributeNS(ns, name) { return this.hasAttribute(name); },
+    })) {
+      if (!(name in proto)) Object.defineProperty(proto, name, { value, writable: true, configurable: true });
+    }
+  }
+  const shadowState = (root) => {
+    const s = shadowInfoOf(root);
+    if (!s) throw new TypeError('Illegal invocation');
+    return s;
+  };
+  const escapeShadowText = (t) => t.replace(/&/g, '&amp;').replace(/\u00a0/g, '&nbsp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  Object.defineProperties(ShadowRoot.prototype, {
+    host: { get() { return shadowState(this).host; }, configurable: true },
+    mode: { get() { return shadowState(this).mode; }, configurable: true },
+    delegatesFocus: { get() { return shadowState(this).delegatesFocus; }, configurable: true },
+    slotAssignment: { get() { return shadowState(this).slotAssignment; }, configurable: true },
+    clonable: { get() { return shadowState(this).clonable; }, configurable: true },
+    serializable: { get() { return false; }, configurable: true },
+    activeElement: {
+      // The focused element, or the host in this tree it is under
+      get() {
+        for (let n = document.activeElement; n;) {
+          const root = n.getRootNode();
+          if (root === this) return n;
+          n = shadowInfoOf(root)?.host;
+        }
+        return null;
+      },
+      configurable: true,
+    },
+    innerHTML: {
+      get() {
+        return Array.from(this.childNodes, (n) => n.nodeType === 1 ? n.outerHTML : n.nodeType === 3 ? escapeShadowText(n.data) : n.nodeType === 8 ? `<!--${n.data}-->` : '').join('');
+      },
+      set(v) {
+        const t = document.createElement('template');
+        t.innerHTML = v;
+        this.replaceChildren(t.content);
+      },
+      configurable: true,
+    },
+    styleSheets: { get() { return Array.from(this.querySelectorAll('style, link'), (el) => el.sheet).filter(Boolean); }, configurable: true },
+  });
+  Object.defineProperty(ShadowRoot.prototype, Symbol.toStringTag, { value: 'ShadowRoot', configurable: true });
+  __fosSetElementPrototype('#shadow-root', ShadowRoot.prototype);
+  {
+    const getRootNode = Node.prototype.getRootNode;
+    Object.defineProperty(Node.prototype, 'getRootNode', {
+      value: function getRootNode_(options) { return getRootNode.call(this, !!(options && options.composed)); },
+      writable: true, configurable: true,
+    });
+  }
+  // Slots and what is assigned to them
+  const flatAssigned = (slot, flatten) => {
+    const nodes = __fosAssignedNodes(slot);
+    if (!flatten) return nodes;
+    const out = [];
+    for (const n of (nodes.length ? nodes : Array.from(slot.childNodes))) {
+      if (n.localName === 'slot' && n.getRootNode() instanceof ShadowRoot) out.push(...flatAssigned(n, true));
+      else out.push(n);
+    }
+    return out;
+  };
+  Object.defineProperties(HTMLSlotElement.prototype, {
+    assignedNodes: { value(options) { return flatAssigned(this, !!(options && options.flatten)); }, writable: true, configurable: true },
+    assignedElements: { value(options) { return flatAssigned(this, !!(options && options.flatten)).filter((n) => n.nodeType === 1); }, writable: true, configurable: true },
+    assign: { value() {}, writable: true, configurable: true },
+  });
+  for (const proto of [Element.prototype, Text.prototype]) {
+    Object.defineProperty(proto, 'assignedSlot', { get() { return __fosAssignedSlot(this); }, configurable: true });
+  }
+  Object.defineProperties(DocumentType.prototype, {
+    name: { get() { return this.nodeName; }, enumerable: true, configurable: true },
+    publicId: { get() { return ''; }, enumerable: true, configurable: true },
+    systemId: { get() { return ''; }, enumerable: true, configurable: true },
+  });
+  __fosSetElementPrototype('#doctype', DocumentType.prototype);
+  // `window instanceof Window`, with Window.prototype on the global's chain
+  {
+    const WindowCtor = function Window() { throw new TypeError('Illegal constructor'); };
+    let proto = Object.getPrototypeOf(global);
+    if (proto === Object.prototype || proto === null) {
+      proto = Object.create(EventTarget.prototype);
+      Object.setPrototypeOf(global, proto);
+    }
+    WindowCtor.prototype = proto;
+    Object.defineProperty(proto, 'constructor', { value: WindowCtor, writable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'Window', configurable: true });
+    global.Window = WindowCtor;
+  }
+  // ---- CSSOM: style sheets and rules ----
+  //
+  // A <style> element's sheet is parsed from its text when first used.
+  // Rules scripts insert or delete (CSS-in-JS libraries add every rule
+  // with insertRule) go to the renderer, which uses them while the
+  // element's text stays the same; new text makes a new sheet, as in
+  // browsers. Constructed sheets apply through adoptedStyleSheets.
+
+  // Top-level rules of CSS text (statements like @import included)
+  function splitRules(text) {
+    const out = [];
+    const n = text.length;
+    let depth = 0, start = 0, i = 0;
+    const take = (end) => {
+      const r = text.slice(start, end).replace(/^(\s*\/\*[\s\S]*?\*\/)+/, '').trim();
+      start = end;
+      return r;
+    };
+    while (i < n) {
+      const c = text[i];
+      if (c === '/' && text[i + 1] === '*') {
+        const e = text.indexOf('*/', i + 2);
+        i = e < 0 ? n : e + 2;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        i++;
+        while (i < n && text[i] !== c) i += text[i] === '\\' ? 2 : 1;
+        i++;
+        continue;
+      }
+      if (c === '{') depth++;
+      else if (c === '}' && depth > 0) {
+        if (--depth === 0) {
+          const r = take(i + 1);
+          if (r) out.push(r);
+        }
+      } else if (c === ';' && depth === 0) {
+        const r = take(i + 1);
+        if (r.startsWith('@')) out.push(r);
+      }
+      i++;
+    }
+    return out;
+  }
+  // Declarations of a block, split at semicolons outside strings and parentheses
+  function splitDeclarations(text) {
+    const out = [];
+    let depth = 0, quote = '', start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (c === quote) quote = '';
+      } else if (c === '"' || c === "'") quote = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth = Math.max(0, depth - 1);
+      else if (c === ';' && depth === 0) {
+        out.push(text.slice(start, i));
+        start = i + 1;
+      }
+    }
+    out.push(text.slice(start));
+    return out;
+  }
+  function parseDeclarations(text) {
+    const map = new Map();
+    for (const decl of splitDeclarations(text || '')) {
+      const i = decl.indexOf(':');
+      if (i < 0) continue;
+      const k = decl.slice(0, i).trim();
+      if (k) map.set(k.startsWith('--') ? k : k.toLowerCase(), decl.slice(i + 1).trim());
+    }
+    return map;
+  }
+  const serializeDeclarations = (map) => [...map].map(([k, v]) => k + ': ' + v + ';').join(' ');
+
+  // A CSSStyleDeclaration over declaration text that `read` returns and
+  // `write` stores (an element's style attribute, or a rule's body)
+  function CSSStyleDeclaration() { throw new TypeError('Illegal constructor'); }
+  const declarationMethods = {
+    getPropertyValue(d, name) { return d.map().get(normalizeProperty(name))?.replace(/\s*!important$/i, '') ?? ''; },
+    getPropertyPriority(d, name) { return /!important$/i.test(d.map().get(normalizeProperty(name)) ?? '') ? 'important' : ''; },
+    setProperty(d, name, value, priority = '') {
+      const map = d.map();
+      name = normalizeProperty(name);
+      if (value === null || value === undefined || value === '') map.delete(name);
+      else {
+        value = String(value).replace(/\s*!important\s*$/i, '');
+        map.set(name, String(priority).toLowerCase() === 'important' ? value + ' !important' : value);
+      }
+      d.write(serializeDeclarations(map));
+    },
+    removeProperty(d, name) {
+      const map = d.map();
+      name = normalizeProperty(name);
+      const old = map.get(name) ?? '';
+      map.delete(name);
+      d.write(serializeDeclarations(map));
+      return old;
+    },
+    item(d, i) { return [...d.map().keys()][i] ?? ''; },
+  };
+  const normalizeProperty = (name) => { name = String(name); return name.startsWith('--') ? name : name.toLowerCase(); };
+  function makeDeclaration(read, write, parentRule = null) {
+    const d = { map: () => parseDeclarations(read()), write };
+    return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
+      get(target, key) {
+        if (typeof key === 'symbol') return target[key];
+        if (key in declarationMethods) return (...a) => declarationMethods[key](d, ...a);
+        if (key === 'cssText') return serializeDeclarations(d.map());
+        if (key === 'length') return d.map().size;
+        if (key === 'parentRule') return parentRule;
+        if (key === 'constructor') return CSSStyleDeclaration;
+        if (/^\d+$/.test(key)) return [...d.map().keys()][+key];
+        if (key === 'cssFloat') key = 'float';
+        return declarationMethods.getPropertyValue(d, camelToKebab(key));
+      },
+      set(_, key, value) {
+        if (typeof key === 'symbol') return true;
+        if (key === 'cssText') { write(serializeDeclarations(parseDeclarations(String(value)))); return true; }
+        if (key === 'cssFloat') key = 'float';
+        declarationMethods.setProperty(d, camelToKebab(key), value);
+        return true;
+      },
+      has(_, key) { return typeof key === 'string'; },
+    });
+  }
+
+  const ruleTypes = {
+    STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, PAGE_RULE: 6,
+    KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9, NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11,
+    SUPPORTS_RULE: 12, FONT_FEATURE_VALUES_RULE: 14,
+  };
+  class CSSRule {
+    constructor(text, sheet, parent) {
+      Object.defineProperties(this, {
+        _text: { value: text, writable: true },
+        _sheet: { value: sheet, writable: true },
+        _parent: { value: parent ?? null, writable: true },
+      });
+    }
+    get cssText() { return this._text; }
+    set cssText(_) {}
+    get type() { return 0; }
+    get parentStyleSheet() { return this._sheet; }
+    get parentRule() { return this._parent; }
+    _changed() { if (this._parent) this._parent._childChanged(); else if (this._sheet) this._sheet._changed(); }
+  }
+  for (const [k, v] of Object.entries(ruleTypes)) {
+    Object.defineProperty(CSSRule, k, { value: v, enumerable: true });
+    Object.defineProperty(CSSRule.prototype, k, { value: v, enumerable: true });
+  }
+  // The prelude (before `{`) and block (inside the braces) of a rule
+  const prelude = (text) => { const i = text.indexOf('{'); return (i < 0 ? text : text.slice(0, i)).trim(); };
+  const block = (text) => { const i = text.indexOf('{'); const j = text.lastIndexOf('}'); return i < 0 ? '' : text.slice(i + 1, j < i ? text.length : j); };
+  // Rules with declarations: keep their text until a script changes them
+  class DeclarationsRule extends CSSRule {
+    get style() {
+      if (!this._style) {
+        Object.defineProperty(this, '_style', { value: makeDeclaration(() => this._body ?? block(this._text), (t) => {
+          this._body = t;
+          this._text = `${this._prelude()} { ${t} }`;
+          this._changed();
+        }, this), writable: true });
+      }
+      return this._style;
+    }
+    set style(v) { this.style.cssText = v; }
+    _prelude() { return prelude(this._text); }
+  }
+  class CSSStyleRule extends DeclarationsRule {
+    get type() { return 1; }
+    get selectorText() { return this._prelude(); }
+    set selectorText(v) { this._text = `${String(v).trim()} { ${block(this._text).trim()} }`; this._changed(); }
+  }
+  class CSSPageRule extends CSSStyleRule { get type() { return 6; } }
+  class CSSFontFaceRule extends DeclarationsRule { get type() { return 5; } }
+  class CSSKeyframeRule extends DeclarationsRule {
+    get type() { return 8; }
+    get keyText() { return this._prelude(); }
+  }
+  // Rules holding rules (@media, @supports, @keyframes...): children are
+  // parsed on first use; the text is rebuilt once they change
+  class CSSGroupingRule extends CSSRule {
+    _children() {
+      if (!this._rules) Object.defineProperty(this, '_rules', { value: splitRules(block(this._text)).map(r => this._makeChild(r)), writable: true });
+      return this._rules;
+    }
+    _makeChild(text) { return makeRule(text, this._sheet, this); }
+    get cssRules() { return ruleList(this._children()); }
+    insertRule(rule, index = 0) {
+      const rules = this._children();
+      index = Number(index) >>> 0;
+      if (index > rules.length) throw new DOMException(`Failed to execute 'insertRule': the index provided (${index}) is larger than the maximum index (${rules.length}).`, 'IndexSizeError');
+      const parts = splitRules(String(rule));
+      if (parts.length !== 1) throw new DOMException(`Failed to execute 'insertRule': Failed to parse the rule '${rule}'.`, 'SyntaxError');
+      rules.splice(index, 0, this._makeChild(parts[0]));
+      this._childChanged();
+      return index;
+    }
+    deleteRule(index) {
+      const rules = this._children();
+      index = Number(index) >>> 0;
+      if (index >= rules.length) throw new DOMException(`Failed to execute 'deleteRule': the index provided (${index}) is outside the range [0, ${rules.length}).`, 'IndexSizeError');
+      rules.splice(index, 1);
+      this._childChanged();
+    }
+    _childChanged() {
+      this._text = `${prelude(this._text)} {\n${this._children().map(r => '  ' + r.cssText).join('\n')}\n}`;
+      this._changed();
+    }
+    get conditionText() { return prelude(this._text).replace(/^@[-\w]+\s*/, ''); }
+  }
+  class CSSMediaRule extends CSSGroupingRule {
+    get type() { return 4; }
+    get media() { return new MediaList(this.conditionText); }
+  }
+  class CSSSupportsRule extends CSSGroupingRule { get type() { return 12; } }
+  class CSSContainerRule extends CSSGroupingRule {}
+  class CSSLayerBlockRule extends CSSGroupingRule { get name() { return this.conditionText; } }
+  class CSSKeyframesRule extends CSSGroupingRule {
+    get type() { return 7; }
+    get name() { return this.conditionText; }
+    _makeChild(text) { return new CSSKeyframeRule(text, this._sheet, this); }
+    appendRule(text) { this.insertRule(text, this._children().length); }
+    findRule(key) { return this._children().find(r => r.keyText === String(key)) ?? null; }
+    deleteRule(key) {
+      const i = this._children().findIndex(r => r.keyText === String(key));
+      if (i >= 0) super.deleteRule(i);
+    }
+  }
+  class CSSImportRule extends CSSRule {
+    get type() { return 3; }
+    get href() { return /^@import\s+(?:url\()?\s*['"]?([^'")\s]+)/i.exec(this._text)?.[1] ?? ''; }
+    get media() { return new MediaList(''); }
+    get styleSheet() { return null; }
+  }
+  class CSSNamespaceRule extends CSSRule { get type() { return 10; } }
+  function makeRule(text, sheet, parent) {
+    if (text[0] !== '@') return new CSSStyleRule(text, sheet, parent);
+    const name = (/^@([-\w]+)/.exec(text)?.[1] ?? '').toLowerCase().replace(/^-(webkit|moz|o|ms)-/, '');
+    const hasBlock = text.includes('{');
+    switch (name) {
+      case 'media': return new CSSMediaRule(text, sheet, parent);
+      case 'supports': return new CSSSupportsRule(text, sheet, parent);
+      case 'container': return new CSSContainerRule(text, sheet, parent);
+      case 'layer': return hasBlock ? new CSSLayerBlockRule(text, sheet, parent) : new CSSRule(text, sheet, parent);
+      case 'keyframes': return new CSSKeyframesRule(text, sheet, parent);
+      case 'font-face': return new CSSFontFaceRule(text, sheet, parent);
+      case 'page': return new CSSPageRule(text, sheet, parent);
+      case 'import': return new CSSImportRule(text, sheet, parent);
+      case 'namespace': return new CSSNamespaceRule(text, sheet, parent);
+      default: return hasBlock ? new CSSGroupingRule(text, sheet, parent) : new CSSRule(text, sheet, parent);
+    }
+  }
+  class CSSRuleList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  const ruleList = (rules) => { const l = new CSSRuleList(); l.push(...rules); return l; };
+  class MediaList {
+    constructor(text) { Object.defineProperty(this, '_items', { value: String(text).split(',').map(s => s.trim()).filter(Boolean), writable: true }); }
+    get mediaText() { return this._items.join(', '); }
+    set mediaText(v) { this._items = String(v).split(',').map(s => s.trim()).filter(Boolean); }
+    get length() { return this._items.length; }
+    item(i) { return this._items[i] ?? null; }
+    appendMedium(m) { if (!this._items.includes(m)) this._items.push(String(m)); }
+    deleteMedium(m) { this._items = this._items.filter(x => x !== m); }
+    toString() { return this.mediaText; }
+  }
+
+  class StyleSheet {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const sheetState = new WeakMap(); // sheet -> internal state
+  class CSSStyleSheet extends StyleSheet {
+    constructor(options = {}) {
+      const sheet = Object.create(new.target.prototype);
+      sheetState.set(sheet, { text: '', rules: [], parsed: true, owner: null, constructed: true, media: new MediaList(options.media ?? ''), href: null, title: null });
+      sheet.disabled = !!options.disabled;
+      return sheet;
+    }
+    get type() { return 'text/css'; }
+    get href() { return state(this).href; }
+    get title() { return state(this).title; }
+    get ownerNode() { return state(this).owner; }
+    get ownerRule() { return null; }
+    get parentStyleSheet() { return null; }
+    get media() { return state(this).media; }
+    get cssRules() { return ruleList(rulesOf(this)); }
+    get rules() { return this.cssRules; }
+    insertRule(rule, index = 0) {
+      const s = state(this), rules = rulesOf(this);
+      index = Number(index) >>> 0;
+      if (index > rules.length) throw new DOMException(`Failed to execute 'insertRule' on 'CSSStyleSheet': The index provided (${index}) is larger than the maximum index (${rules.length}).`, 'IndexSizeError');
+      const parts = splitRules(String(rule));
+      if (parts.length !== 1 || (s.constructed && /^@import/i.test(parts[0]))) {
+        throw new DOMException(`Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '${rule}'.`, 'SyntaxError');
+      }
+      rules.splice(index, 0, makeRule(parts[0], this, null));
+      this._changed();
+      return index;
+    }
+    deleteRule(index) {
+      const rules = rulesOf(this);
+      index = Number(index) >>> 0;
+      if (index >= rules.length) throw new DOMException(`Failed to execute 'deleteRule' on 'CSSStyleSheet': The index provided (${index}) is outside the range [0, ${rules.length}).`, 'IndexSizeError');
+      rules.splice(index, 1);
+      this._changed();
+    }
+    addRule(selector = 'undefined', style = 'undefined', index) {
+      this.insertRule(`${selector} { ${style} }`, index === undefined ? rulesOf(this).length : index);
+      return -1;
+    }
+    removeRule(index = 0) { this.deleteRule(index); }
+    replaceSync(text) {
+      const s = state(this);
+      if (!s.constructed) throw new DOMException("Failed to execute 'replaceSync' on 'CSSStyleSheet': Can't call replaceSync on non-constructed CSSStyleSheets.", 'NotAllowedError');
+      s.rules = splitRules(String(text)).filter(r => !/^@import/i.test(r)).map(r => makeRule(r, this, null));
+      this._changed();
+    }
+    replace(text) {
+      try { this.replaceSync(text); } catch (e) { return Promise.reject(e); }
+      return Promise.resolve(this);
+    }
+    _css() { return rulesOf(this).map(r => r.cssText).join('\n'); }
+    _changed() {
+      const s = state(this);
+      if (s.owner && s.owner.localName === 'style') __fosSetSheetCSS(s.owner, this._css());
+      else if (s.constructed) flushAdopted(null, this);
+    }
+  }
+  const state = (sheet) => {
+    const s = sheetState.get(sheet);
+    if (!s) throw new TypeError('Illegal invocation');
+    return s;
+  };
+  // A sheet's rules, parsed on first use. Cross-origin <link> sheets
+  // can't be read; the browser fetched same-origin ones for rendering
+  // only, so they read as empty.
+  function rulesOf(sheet) {
+    const s = state(sheet);
+    if (s.href && !s.owner?.isConnected) return s.rules;
+    if (s.href && new URL(s.href, document.baseURI).origin !== location.origin) {
+      throw new DOMException("Failed to read the 'cssRules' property from 'CSSStyleSheet': Cannot access rules", 'SecurityError');
+    }
+    if (!s.parsed) {
+      s.parsed = true;
+      s.rules = splitRules(s.text).map(r => makeRule(r, sheet, null));
+    }
+    return s.rules;
+  }
+  // The sheet of a <style> or stylesheet <link>, while connected
+  const elementSheets = new WeakMap(); // element -> { sheet, text }
+  function sheetOf(el) {
+    if (!el.isConnected) return null;
+    const isLink = el.localName === 'link';
+    if (isLink && !/(^|\s)stylesheet(\s|$)/i.test(el.getAttribute('rel') || '')) return null;
+    const text = isLink ? el.href : el.textContent;
+    const cached = elementSheets.get(el);
+    if (cached && cached.text === text) return cached.sheet;
+    if (cached && !isLink) __fosSetSheetCSS(el, null);
+    const sheet = Object.create(CSSStyleSheet.prototype);
+    sheetState.set(sheet, {
+      text: isLink ? '' : text, rules: [], parsed: isLink, owner: el, constructed: false,
+      media: new MediaList(el.getAttribute('media') ?? ''), href: isLink ? el.href : null, title: el.getAttribute('title'),
+    });
+    sheet.disabled = false;
+    elementSheets.set(el, { sheet, text });
+    return sheet;
+  }
+  for (const proto of [HTMLStyleElement.prototype, HTMLLinkElement.prototype]) {
+    Object.defineProperty(proto, 'sheet', { get() { return sheetOf(this); }, configurable: true });
+  }
+  class StyleSheetList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.defineProperty(Document.prototype, 'styleSheets', {
+    get() {
+      const list = new StyleSheetList();
+      for (const el of this.querySelectorAll('style, link')) {
+        const s = sheetOf(el);
+        if (s) list.push(s);
+      }
+      return list;
+    },
+    configurable: true,
+  });
+  // adoptedStyleSheets, on the document and on shadow roots (each
+  // applies to its own tree). A flush updates `only` (an owner), or the
+  // owners adopting `sheet`, or all.
+  const adopters = new Set();
+  const adopted = new WeakMap(); // document or shadow root -> array proxy
+  function flushAdopted(only, sheet) {
+    const memo = new Map();
+    const cssOf = (s) => {
+      let c = memo.get(s);
+      if (c === undefined) memo.set(s, c = s._css());
+      return c;
+    };
+    for (const owner of only ? [only] : adopters) {
+      const list = adopted.get(owner) || [];
+      if (sheet && !list.includes(sheet)) continue;
+      let css = '';
+      for (const s of list) if (s && !s.disabled) css += cssOf(s) + '\n';
+      if (shadowInfoOf(owner)) __fosSetShadowAdoptedCSS(owner, css);
+      else __fosSetAdoptedCSS(css);
+    }
+  }
+  const adoptedSheets = {
+    get() {
+      let list = adopted.get(this);
+      if (!list) adopted.set(this, list = observedArray([], this));
+      return list;
+    },
+    set(v) {
+      const sheets = Array.from(v);
+      for (const s of sheets) {
+        if (!(s instanceof CSSStyleSheet) || !state(s).constructed) throw new DOMException("Failed to set the 'adoptedStyleSheets' property: Can't adopt non-constructed stylesheets.", 'NotAllowedError');
+      }
+      adopted.set(this, observedArray(sheets, this));
+      adopters.add(this);
+      flushAdopted(this);
+    },
+    configurable: true,
+  };
+  // An array whose changes (push, splice, index stores) re-apply the sheets
+  const observedArray = (arr, owner) => new Proxy(arr, {
+    set(target, key, value) { target[key] = value; adopters.add(owner); flushAdopted(owner); return true; },
+    deleteProperty(target, key) { delete target[key]; flushAdopted(owner); return true; },
+  });
+  Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedSheets);
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedSheets);
+  Object.assign(global, {
+    CSSStyleDeclaration, CSSRule, CSSStyleRule, CSSPageRule, CSSFontFaceRule, CSSKeyframeRule, CSSKeyframesRule,
+    CSSGroupingRule, CSSConditionRule: CSSGroupingRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule,
+    CSSImportRule, CSSNamespaceRule, CSSRuleList, MediaList, StyleSheet, CSSStyleSheet, StyleSheetList,
+  });
+
+  // Legacy factory constructors
+  function Image(width, height) {
+    const img = document.createElement('img');
+    if (width !== undefined) img.setAttribute('width', String(width));
+    if (height !== undefined) img.setAttribute('height', String(height));
+    return img;
+  }
+  function Audio(src) {
+    const audio = document.createElement('audio');
+    audio.setAttribute('preload', 'auto');
+    if (src !== undefined) audio.setAttribute('src', String(src));
+    return audio;
+  }
+  function Option(text = '', value, defaultSelected = false, selected = false) {
+    const option = document.createElement('option');
+    option.textContent = String(text);
+    if (value !== undefined) option.setAttribute('value', String(value));
+    if (defaultSelected) option.setAttribute('selected', '');
+    if (selected) option.selected = true;
+    return option;
+  }
+  for (const f of [Image, Audio, Option]) f.prototype = HTMLElement.prototype;
+  Object.assign(global, { Image, Audio, Option });
+
+  // ---- custom elements ----
+  //
+  // A registry of element definitions. Elements are upgraded (their
+  // wrapper gets the class's prototype and the constructor runs on it)
+  // when a definition arrives for elements already in the document, when
+  // created with createElement or `new`, and when inserted. Lifecycle
+  // callbacks run synchronously after the DOM operation that causes them.
+  // Nothing here costs anything until a page defines an element.
+  const NativeHTMLElement = global.HTMLElement;
+  const ceDefs = new Map();      // name -> definition
+  const ceByCtor = new Map();    // constructor -> definition
+  const ceWaiting = new Map();   // name -> { promise, resolve }
+  const ceState = new WeakMap(); // element -> 'custom' | 'failed'
+  let ceDefining = false;
+  const ceReserved = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri',
+    'font-face-format', 'font-face-name', 'missing-glyph']);
+  const ceValidName = (n) => /^[a-z][-.0-9_a-z·À-￿]*$/.test(n) && n.includes('-') && !ceReserved.has(n);
+  const rawCreateElement = Document.prototype.createElement;
+
+  // `super()` in a custom element class: the element being upgraded, or a
+  // new one for `new MyElement()`
+  const HTMLElementCtor = function HTMLElement() { return ceConstruct(new.target); };
+  // `super()` reaching an element interface's constructor
+  function ceConstruct(newTarget) {
+    const def = newTarget && ceByCtor.get(newTarget);
+    if (!def) throw new TypeError('Illegal constructor');
+    let el = def.stack.pop();
+    if (!el) {
+      el = rawCreateElement.call(document, def.extends || def.name);
+      if (def.extends) el.setAttribute('is', def.name);
+      ceState.set(el, 'custom');
+    }
+    Object.setPrototypeOf(el, newTarget.prototype);
+    return el;
+  }
+  HTMLElementCtor.prototype = NativeHTMLElement.prototype;
+  Object.defineProperty(NativeHTMLElement.prototype, 'constructor', { value: HTMLElementCtor, writable: true, configurable: true });
+  global.HTMLElement = HTMLElementCtor;
+  for (const c of elementInterfaces) {
+    if (Object.getPrototypeOf(c) === NativeHTMLElement) Object.setPrototypeOf(c, HTMLElementCtor);
+  }
+
+  function ceDefinitionOf(el) {
+    if (el.nodeType !== 1) return undefined;
+    const def = ceDefs.get(el.localName);
+    if (def && !def.extends) return def;
+    const is = el.getAttribute('is');
+    const custom = is && ceDefs.get(is);
+    return custom && custom.extends === el.localName ? custom : undefined;
+  }
+
+  function ceCallback(el, name, args) {
+    if (ceState.get(el) !== 'custom') return;
+    const def = ceDefinitionOf(el);
+    const f = def && def.callbacks[name];
+    if (!f) return;
+    try { f.apply(el, args); } catch (e) { reportError(e); }
+  }
+
+  function ceUpgrade(el) {
+    if (ceState.has(el)) return;
+    const def = ceDefinitionOf(el);
+    if (!def) return;
+    ceState.set(el, 'failed');
+    def.stack.push(el);
+    try {
+      const made = new def.ctor();
+      if (made !== el) throw new DOMException('The custom element constructor did not produce the element being upgraded.', 'InvalidStateError');
+    } catch (e) {
+      reportError(e);
+      def.stack.length = 0;
+      return;
+    }
+    ceState.set(el, 'custom');
+    for (const attr of def.observed) {
+      if (el.hasAttribute(attr)) ceCallback(el, 'attributeChangedCallback', [attr, null, el.getAttribute(attr)]);
+    }
+    if (el.isConnected) ceCallback(el, 'connectedCallback', []);
+  }
+
+  // Elements of `root`'s subtree (root included), in tree order
+  // (shadow-including: shadow trees follow their hosts)
+  function ceSubtree(root) {
+    if (!root || (root.nodeType !== 1 && root.nodeType !== 11 && root.nodeType !== 9)) return [];
+    const out = [];
+    const visit = (r) => {
+      const all = Array.from(r.querySelectorAll('*'));
+      if (r.nodeType === 1) all.unshift(r);
+      for (const el of all) {
+        out.push(el);
+        const sr = shadowRootOf(el);
+        if (sr) visit(sr);
+      }
+    };
+    visit(root);
+    return out;
+  }
+
+  // `nodes` were inserted: upgrade what was waiting, connect what is custom
+  function ceInserted(nodes) {
+    if (!ceDefs.size) return;
+    for (const node of nodes) {
+      if (!node || !node.isConnected) continue;
+      for (const el of ceSubtree(node)) {
+        if (ceState.get(el) === 'custom') ceCallback(el, 'connectedCallback', []);
+        else ceUpgrade(el);
+      }
+    }
+  }
+
+  // The custom elements under `nodes` that are connected (before a removal)
+  function ceConnectedIn(nodes) {
+    if (!ceDefs.size) return [];
+    const out = [];
+    for (const node of nodes) {
+      if (!node || !node.isConnected) continue;
+      for (const el of ceSubtree(node)) if (ceState.get(el) === 'custom') out.push(el);
+    }
+    return out;
+  }
+  function ceRemoved(list) {
+    for (const el of list) if (!el.isConnected) ceCallback(el, 'disconnectedCallback', []);
+  }
+
+  // Nodes an insertion call adds (fragments add their children)
+  const ceArgNodes = (args) => {
+    const out = [];
+    for (const a of args) {
+      if (a && typeof a === 'object' && a.nodeType) {
+        if (a.nodeType === 11) out.push(...a.childNodes); else out.push(a);
+      }
+    }
+    return out;
+  };
+  const NodeP = Node.prototype, ElementP = NativeHTMLElement.prototype;
+  const ceWrap = (proto, name, plan) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    define(proto, { [name](...args) {
+      if (!ceDefs.size) return original.apply(this, args);
+      const { added, removed } = plan.call(this, args);
+      const gone = ceConnectedIn(removed);
+      const r = original.apply(this, args);
+      ceRemoved(gone);
+      ceInserted(added);
+      return r;
+    } });
+  };
+  ceWrap(NodeP, 'appendChild', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [] }));
+  ceWrap(NodeP, 'insertBefore', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [] }));
+  ceWrap(NodeP, 'replaceChild', (a) => ({ added: ceArgNodes(a.slice(0, 1)), removed: [a[1]] }));
+  ceWrap(NodeP, 'removeChild', (a) => ({ added: [], removed: [a[0]] }));
+  for (const name of ['append', 'prepend', 'before', 'after']) {
+    ceWrap(NodeP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+    ceWrap(ElementP, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+  }
+  // Fragments (shadow roots among them) and documents have their own
+  for (const proto of [DocumentFragment.prototype, Document.prototype]) {
+    for (const name of ['append', 'prepend']) {
+      if (Object.prototype.hasOwnProperty.call(proto, name)) ceWrap(proto, name, (a) => ({ added: ceArgNodes(a), removed: [] }));
+    }
+  }
+  for (const proto of [NodeP, ElementP]) {
+    ceWrap(proto, 'replaceWith', function (a) { return { added: ceArgNodes(a), removed: [this] }; });
+    ceWrap(proto, 'remove', function () { return { added: [], removed: [this] }; });
+  }
+  ceWrap(ElementP, 'insertAdjacentHTML', function (a) {
+    const where = String(a[0]).toLowerCase();
+    return { added: [where === 'beforebegin' || where === 'afterend' ? this.parentNode : this], removed: [] };
+  });
+  // Markup setters replace the children
+  for (const [proto, name] of [[ElementP, 'innerHTML'], [NodeP, 'textContent'], [ElementP, 'outerHTML']]) {
+    let owner = proto, d;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+    if (!d || !d.set) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      get: d.get,
+      set(v) {
+        if (!ceDefs.size) return d.set.call(this, v);
+        const outer = name === 'outerHTML';
+        const parent = this.parentNode;
+        const gone = ceConnectedIn(outer ? [this] : Array.from(this.childNodes));
+        d.set.call(this, v);
+        ceRemoved(gone);
+        ceInserted([outer ? parent : this]);
+      },
+    });
+  }
+  // Removals move live NodeIterators off the removed subtree
+  const iterWrap = (proto, name, removed) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    define(proto, { [name](...args) {
+      if (liveIterators.size) for (const n of removed.call(this, args)) if (n && n.parentNode) nodeIteratorsPreRemove(n);
+      return original.apply(this, args);
+    } });
+  };
+  iterWrap(NodeP, 'removeChild', (a) => [a[0]]);
+  iterWrap(NodeP, 'replaceChild', (a) => [a[1]]);
+  for (const proto of [NodeP, ElementP, CharacterData.prototype]) {
+    iterWrap(proto, 'remove', function () { return [this]; });
+    iterWrap(proto, 'replaceWith', function () { return [this]; });
+  }
+  for (const [proto, name] of [[ElementP, 'innerHTML'], [NodeP, 'textContent']]) {
+    let owner = proto, d;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+    if (!d || !d.set) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      get: d.get,
+      set(v) {
+        if (liveIterators.size) for (const n of Array.from(this.childNodes)) nodeIteratorsPreRemove(n);
+        d.set.call(this, v);
+      },
+    });
+  }
+  // Observed attributes
+  for (const name of ['setAttribute', 'removeAttribute', 'toggleAttribute']) {
+    const original = ElementP[name] || NodeP[name];
+    if (typeof original !== 'function') continue;
+    define(ElementP, { [name](...args) {
+      if (ceState.get(this) !== 'custom') return original.apply(this, args);
+      const attr = String(args[0]).toLowerCase();
+      const old = this.getAttribute(attr);
+      const r = original.apply(this, args);
+      const def = ceDefinitionOf(this);
+      if (def && def.observed.has(attr)) {
+        const now = this.getAttribute(attr);
+        if (!(old === null && now === null)) ceCallback(this, 'attributeChangedCallback', [attr, old, now]);
+      }
+      return r;
+    } });
+  }
+  define(Document.prototype, { createElement(name, options) {
+    const el = rawCreateElement.call(this, name);
+    if (options && typeof options === 'object' && options.is) el.setAttribute('is', String(options.is));
+    if (ceDefs.size) ceUpgrade(el);
+    return el;
+  } });
+
+  class CustomElementRegistry {
+    define(name, ctor, options) {
+      name = String(name);
+      if (typeof ctor !== 'function') throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': The provided value is not a constructor.");
+      if (!ceValidName(name)) throw new DOMException(`Failed to execute 'define' on 'CustomElementRegistry': "${name}" is not a valid custom element name`, 'SyntaxError');
+      if (ceDefs.has(name)) throw new DOMException(`Failed to execute 'define' on 'CustomElementRegistry': the name "${name}" has already been used with this registry`, 'NotSupportedError');
+      if (ceByCtor.has(ctor)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': this constructor has already been used with this registry", 'NotSupportedError');
+      if (ceDefining) throw new DOMException('Custom element definitions cannot be nested', 'NotSupportedError');
+      const ext = options && options.extends ? String(options.extends).toLowerCase() : null;
+      ceDefining = true;
+      let callbacks, observed;
+      try {
+        const proto = ctor.prototype;
+        if (proto === null || typeof proto !== 'object') throw new TypeError('The constructor\'s prototype is not an object');
+        callbacks = {};
+        for (const k of ['connectedCallback', 'disconnectedCallback', 'adoptedCallback', 'attributeChangedCallback']) {
+          const f = proto[k];
+          if (f !== undefined && typeof f !== 'function') throw new TypeError(`${k} is not a function`);
+          callbacks[k] = f;
+        }
+        observed = new Set(callbacks.attributeChangedCallback && ctor.observedAttributes ? Array.from(ctor.observedAttributes, a => String(a)) : []);
+      } finally {
+        ceDefining = false;
+      }
+      const def = { name, ctor, extends: ext, callbacks, observed, stack: [] };
+      ceDefs.set(name, def);
+      ceByCtor.set(ctor, def);
+      __fosDefineElement(name);
+      const selector = ext ? `${ext}[is="${name}"]` : CSS.escape(name);
+      for (const el of document.querySelectorAll(selector)) ceUpgrade(el);
+      const waiting = ceWaiting.get(name);
+      if (waiting) { ceWaiting.delete(name); waiting.resolve(ctor); }
+    }
+    get(name) { return ceDefs.get(String(name))?.ctor; }
+    getName(ctor) { return ceByCtor.get(ctor)?.name ?? null; }
+    whenDefined(name) {
+      name = String(name);
+      if (!ceValidName(name)) return Promise.reject(new DOMException(`"${name}" is not a valid custom element name`, 'SyntaxError'));
+      if (ceDefs.has(name)) return Promise.resolve(ceDefs.get(name).ctor);
+      let w = ceWaiting.get(name);
+      if (!w) {
+        let resolve;
+        const promise = new Promise(r => { resolve = r; });
+        ceWaiting.set(name, w = { promise, resolve });
+      }
+      return w.promise;
+    }
+    upgrade(root) { for (const el of ceSubtree(root)) ceUpgrade(el); }
+  }
+  // ElementInternals, as far as scripts commonly use it
+  class ElementInternals {
+    constructor(el) { Object.defineProperty(this, '_el', { value: el }); this.states = new Set(); this.validity = { valid: true }; this.validationMessage = ''; this.willValidate = false; }
+    get form() { return this._el.closest('form'); }
+    get labels() { return []; }
+    get shadowRoot() { return shadowRootOf(this._el); }
+    setFormValue() {}
+    setValidity(flags = {}, message = '') { this.validity = { ...flags, valid: !Object.values(flags).some(Boolean) }; this.validationMessage = String(message); }
+    checkValidity() { return this.validity.valid; }
+    reportValidity() { return this.validity.valid; }
+  }
+  define(ElementP, {
+    attachInternals() {
+      if (!ceDefinitionOf(this)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", 'NotSupportedError');
+      return new ElementInternals(this);
+    },
+  });
+  Object.assign(global, { customElements: new CustomElementRegistry(), CustomElementRegistry, ElementInternals });
+
+  // <template>: its parsed children live in a fragment outside the page
+  Object.defineProperty(ElementP, 'content', {
+    configurable: true,
+    get() { return this.localName === 'template' ? __fosTemplateContent(this) : undefined; },
+  });
+
+  // ---- crypto (random values only; no SubtleCrypto yet) ----
+  const integerArrays = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
+  class Crypto {
+    getRandomValues(array) {
+      const kind = array && Object.prototype.toString.call(array).slice(8, -1);
+      if (!integerArrays.includes(kind)) {
+        throw new DOMException("Failed to execute 'getRandomValues' on 'Crypto': The provided ArrayBufferView is not an integer array type.", 'TypeMismatchError');
+      }
+      if (array.byteLength > 65536) {
+        throw new DOMException(`Failed to execute 'getRandomValues' on 'Crypto': The ArrayBufferView's byte length (${array.byteLength}) exceeds the number of bytes of entropy available via this API (65536).`, 'QuotaExceededError');
+      }
+      new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(new Uint8Array(__fosRandomBytes(array.byteLength)));
+      return array;
+    }
+    randomUUID() {
+      const b = new Uint8Array(__fosRandomBytes(16));
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+      return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+    }
+  }
+  Object.assign(global, { crypto: new Crypto(), Crypto });
 
   // ---- document ----
 
   let readyState = 'loading';
+  Object.defineProperty(Node.prototype, 'baseURI', {
+    get() { return (this.nodeType === 9 ? this : this.ownerDocument || document).baseURI; },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(Document.prototype, 'doctype', {
+    get() { for (const n of this.childNodes) if (n.nodeType === 10) return n; return null; },
+    enumerable: true, configurable: true,
+  });
+  // NodeLists are arrays here, with an own length; the accessor serves
+  // scripts that call it from the descriptor
+  Object.defineProperty(NodeList.prototype, 'length', {
+    get() { const d = Object.getOwnPropertyDescriptor(this, 'length'); return d ? d.value : 0; },
+    configurable: true,
+  });
   define(Document.prototype, {
     get readyState() { return readyState; },
     get defaultView() { return global; },
@@ -464,22 +1972,15 @@
     },
     get location() { return global.location; },
     set location(v) { global.location.href = v; },
-    get cookie() { return cookieJar; },
-    set cookie(v) {
-      const [pair] = String(v).split(';');
-      const i = pair.indexOf('=');
-      if (i < 0) return;
-      const jar = new Map(cookieJar ? cookieJar.split('; ').map(c => { const j = c.indexOf('='); return [c.slice(0, j), c.slice(j + 1)]; }) : []);
-      jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
-      cookieJar = [...jar].map(([k, v]) => k + '=' + v).join('; ');
-    },
+    get cookie() { return __fosCookie(); },
+    set cookie(v) { __fosSetCookie(String(v)); },
     get forms() { return this.querySelectorAll('form'); },
     get images() { return this.querySelectorAll('img'); },
     get links() { return this.querySelectorAll('a[href], area[href]'); },
     get scripts() { return this.querySelectorAll('script'); },
     get characterSet() { return 'UTF-8'; },
     get charset() { return 'UTF-8'; },
-    get compatMode() { return 'CSS1Compat'; },
+    get compatMode() { return __fosQuirks() ? 'BackCompat' : 'CSS1Compat'; },
     get contentType() { return 'text/html'; },
     get visibilityState() { return 'visible'; },
     get hidden() { return false; },
@@ -499,7 +2000,6 @@
       return { setStart() {}, setEnd() {}, collapse() {}, selectNodeContents() {}, getBoundingClientRect: () => E.getBoundingClientRect(),
         createContextualFragment(html) { const t = document.createElement('div'); t.innerHTML = html; const f = document.createDocumentFragment(); f.append(...t.childNodes); return f; } };
     },
-    createTreeWalker(root) { return { currentNode: root, nextNode: () => null }; },
     write(...parts) { writeBuffer.push(parts.join('')); },
     writeln(...parts) { writeBuffer.push(parts.join('') + '\n'); },
     open() {}, close() {},
@@ -536,7 +2036,6 @@
     escape(s) { return String(s).replace(/([\0-\x1f\x7f]|^-?\d)|^-$|[^\0-\x1f\x7f-\uFFFF\w-]/g, (m, ctl) => ctl ? (m === '\0' ? '\uFFFD' : m.slice(0, -1) + '\\' + m.slice(-1).charCodeAt(0).toString(16) + ' ') : '\\' + m); },
     supports: () => false,
   };
-  let cookieJar = '';
   let currentScript = null;
   // document.write output, inserted after the running script by the browser
   const writeBuffer = [];
@@ -655,8 +2154,81 @@
   for (const k of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'origin']) {
     Object.defineProperty(Location.prototype, k, { get() { return this._url[k]; }, set(v) { const u = new URL(this._url.href); u[k] = v; this.href = u.href; } });
   }
+  // <a> and <area>: the parts of their URL (HTMLHyperlinkElementUtils)
+  for (const proto of [HTMLAnchorElement.prototype, HTMLAreaElement.prototype]) {
+    const parsed = (el) => {
+      if (!el.hasAttribute('href')) return null;
+      try { return new URL(el.getAttribute('href'), document.baseURI); } catch (e) { return null; }
+    };
+    for (const k of ['protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+      Object.defineProperty(proto, k, {
+        get() { const u = parsed(this); return u ? u[k] : (k === 'protocol' ? ':' : ''); },
+        set(v) { const u = parsed(this); if (!u) return; u[k] = v; this.setAttribute('href', u.href); },
+        configurable: true,
+      });
+    }
+    Object.defineProperty(proto, 'origin', { get() { const u = parsed(this); return u ? u.origin : ''; }, configurable: true });
+  }
   const pendingNavigation = [];
   function __fosNavigate(url) { pendingNavigation.push(url); }
+
+  // Session history of the page: pushState/replaceState change the URL
+  // (the browser shows it) without loading anything
+  class History {
+    constructor() {
+      Object.defineProperties(this, {
+        _entries: { value: [{ state: null, url: document.URL }] },
+        _index: { value: 0, writable: true },
+      });
+      this.scrollRestoration = 'auto';
+    }
+    get length() { return this._entries.length; }
+    get state() { return this._entries[this._index].state; }
+    _target(url) {
+      if (url === undefined || url === null) return global.location.href;
+      const u = new URL(String(url), global.location.href);
+      if (u.origin !== global.location.origin) {
+        throw new DOMException(`A history state object with URL '${u.href}' cannot be created in a document with origin '${global.location.origin}'.`, 'SecurityError');
+      }
+      return u.href;
+    }
+    pushState(state, _title, url) {
+      const target = this._target(url);
+      this._entries.splice(this._index + 1);
+      this._entries.push({ state: structuredCloneState(state), url: target });
+      this._index++;
+      setDocumentURL(target);
+    }
+    replaceState(state, _title, url) {
+      const target = this._target(url);
+      this._entries[this._index] = { state: structuredCloneState(state), url: target };
+      setDocumentURL(target);
+    }
+    back() { this.go(-1); }
+    forward() { this.go(1); }
+    go(delta = 0) {
+      delta = Math.trunc(+delta) || 0;
+      if (delta === 0) { global.location.reload(); return; }
+      const index = this._index + delta;
+      if (index < 0 || index >= this._entries.length) return;
+      const oldURL = global.location.href;
+      this._index = index;
+      const entry = this._entries[index];
+      setDocumentURL(entry.url);
+      setTimeout(() => {
+        global.dispatchEvent(new PopStateEvent('popstate', { state: entry.state }));
+        if (oldURL.split('#')[0] === entry.url.split('#')[0] && oldURL !== entry.url) {
+          global.dispatchEvent(new HashChangeEvent('hashchange', { oldURL, newURL: entry.url }));
+        }
+      }, 0);
+    }
+  }
+  const structuredCloneState = (v) => (v === undefined ? null : v);
+  // The URL changes, the page stays (the browser picks it up after the task)
+  function setDocumentURL(url) {
+    if (global.location) global.location._url = new URL(url);
+    __fosSetURL(url);
+  }
 
   class Storage {
     constructor() { Object.defineProperty(this, '_m', { value: new Map() }); }
@@ -749,7 +2321,32 @@
       this.ignoreBOM = !!options.ignoreBOM;
     }
     get encoding() { return labelName(this._label); }
-    decode(input) { return input === undefined ? '' : __fosDecode(input, this._label); }
+    // `{stream: true}` keeps an incomplete UTF-8 sequence for the next call
+    decode(input, options) {
+      const stream = !!(options && options.stream);
+      let bytes = input === undefined ? new Uint8Array(0) : new Uint8Array(toArrayBuffer(input));
+      if (this._pending && this._pending.length) {
+        const joined = new Uint8Array(this._pending.length + bytes.length);
+        joined.set(this._pending);
+        joined.set(bytes, this._pending.length);
+        bytes = joined;
+      }
+      this._pending = null;
+      if (stream && this.encoding === 'utf-8') {
+        // Back up to the start of a trailing sequence that is not complete
+        let cut = bytes.length;
+        for (let i = bytes.length - 1, n = 0; i >= 0 && n < 4; i--, n++) {
+          const b = bytes[i];
+          if ((b & 0xC0) === 0x80) continue;
+          const need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+          if (bytes.length - i < need) cut = i;
+          break;
+        }
+        this._pending = bytes.slice(cut);
+        bytes = bytes.slice(0, cut);
+      }
+      return bytes.length ? __fosDecode(bytes, this._label) : '';
+    }
   }
 
   // Bytes as a fresh ArrayBuffer
@@ -787,7 +2384,7 @@
     text() { return Promise.resolve(__fosDecode(this._buf, 'utf-8')); }
     arrayBuffer() { return Promise.resolve(this._buf.slice(0)); }
     bytes() { return Promise.resolve(new Uint8Array(this._buf.slice(0))); }
-    stream() { const buf = this._buf; return new ReadableStream(() => new Uint8Array(buf.slice(0))); }
+    stream() { const buf = this._buf; return bytesStream(() => new Uint8Array(buf.slice(0))); }
     get [Symbol.toStringTag]() { return 'Blob'; }
   }
   class File extends Blob {
@@ -800,27 +2397,428 @@
   }
 
   // Only what reading a whole body at once needs: one chunk, then done
+  // ---- streams (WHATWG Streams: queues, backpressure, piping) ----
+
+  class ReadableStreamDefaultController {
+    constructor(stream) { Object.defineProperty(this, '_s', { value: stream }); }
+    get desiredSize() { const s = this._s; return s._state === 'errored' ? null : s._state === 'closed' ? 0 : s._hwm - s._queueSize; }
+    enqueue(chunk) { this._s._enqueue(chunk); }
+    close() { this._s._requestClose(); }
+    error(e) { this._s._error(e); }
+  }
+
+  class ReadableStreamDefaultReader {
+    constructor(stream) {
+      if (!(stream instanceof ReadableStream)) throw new TypeError('ReadableStreamDefaultReader needs a ReadableStream');
+      if (stream._reader) throw new TypeError('ReadableStream is locked');
+      Object.defineProperty(this, '_s', { value: stream, writable: true });
+      stream._reader = this;
+      this._closed = deferred();
+      if (stream._state === 'closed') this._closed.resolve();
+      if (stream._state === 'errored') { this._closed.reject(stream._storedError); this._closed.promise.catch(() => {}); }
+    }
+    get closed() { return this._closed.promise; }
+    read() {
+      if (!this._s) return Promise.reject(new TypeError('This reader has been released'));
+      return this._s._read();
+    }
+    releaseLock() {
+      const s = this._s;
+      if (!s) return;
+      for (const r of s._readRequests.splice(0)) r.reject(new TypeError('Reader was released'));
+      if (s._state === 'readable') { this._closed.reject(new TypeError('Reader was released')); this._closed.promise.catch(() => {}); }
+      s._reader = null;
+      this._s = null;
+    }
+    cancel(reason) { return this._s ? this._s._cancel(reason) : Promise.reject(new TypeError('This reader has been released')); }
+  }
+
+  function deferred() {
+    let resolve, reject;
+    const promise = new Promise((a, b) => { resolve = a; reject = b; });
+    return { promise, resolve, reject };
+  }
+
   class ReadableStream {
-    constructor(pull) { this._pull = typeof pull === 'function' ? pull : () => null; this.locked = false; }
-    getReader() {
-      if (this.locked) throw new TypeError('ReadableStream is locked');
-      this.locked = true;
-      let done = false;
-      return {
-        read: () => {
-          if (done) return Promise.resolve({ value: undefined, done: true });
+    constructor(source = {}, strategy = {}) {
+      source = source ?? {};
+      Object.defineProperties(this, {
+        _source: { value: source }, _queue: { value: [], writable: true }, _state: { value: 'readable', writable: true },
+        _reader: { value: null, writable: true }, _readRequests: { value: [] }, _storedError: { value: undefined, writable: true },
+        _closeRequested: { value: false, writable: true }, _pulling: { value: false, writable: true }, _pullAgain: { value: false, writable: true },
+        _started: { value: false, writable: true }, _queueSize: { value: 0, writable: true },
+        _hwm: { value: strategy.highWaterMark ?? (source.type === 'bytes' ? 0 : 1) }, _size: { value: strategy.size },
+      });
+      const controller = new ReadableStreamDefaultController(this);
+      Object.defineProperty(this, '_controller', { value: controller });
+      let started;
+      try { started = source.start ? source.start.call(source, controller) : undefined; } catch (e) { this._error(e); started = undefined; }
+      Promise.resolve(started).then(() => { this._started = true; this._pullIfNeeded(); }, (e) => this._error(e));
+    }
+    get locked() { return !!this._reader; }
+    _enqueue(chunk) {
+      if (this._closeRequested || this._state !== 'readable') throw new TypeError('Cannot enqueue a chunk into a closed stream');
+      const reqs = this._readRequests;
+      if (reqs.length) reqs.shift().resolve({ value: chunk, done: false });
+      else {
+        const size = this._size ? Number(this._size(chunk)) : 1;
+        this._queue.push({ chunk, size });
+        this._queueSize += size;
+      }
+      this._pullIfNeeded();
+    }
+    _requestClose() {
+      if (this._closeRequested || this._state !== 'readable') throw new TypeError('The stream is not in a state that permits close');
+      this._closeRequested = true;
+      if (!this._queue.length) this._close();
+    }
+    _close() {
+      if (this._state !== 'readable') return;
+      this._state = 'closed';
+      for (const r of this._readRequests.splice(0)) r.resolve({ value: undefined, done: true });
+      if (this._reader) this._reader._closed.resolve();
+    }
+    _error(e) {
+      if (this._state !== 'readable') return;
+      this._state = 'errored';
+      this._storedError = e;
+      this._queue = [];
+      this._queueSize = 0;
+      for (const r of this._readRequests.splice(0)) r.reject(e);
+      if (this._reader) { this._reader._closed.reject(e); this._reader._closed.promise.catch(() => {}); }
+    }
+    _pullIfNeeded() {
+      if (!this._started || this._state !== 'readable' || this._closeRequested || !this._source.pull) return;
+      if (!this._readRequests.length && this._hwm - this._queueSize <= 0) return;
+      if (this._pulling) { this._pullAgain = true; return; }
+      this._pulling = true;
+      Promise.resolve()
+        .then(() => this._source.pull.call(this._source, this._controller))
+        .then(() => {
+          this._pulling = false;
+          if (this._pullAgain) { this._pullAgain = false; this._pullIfNeeded(); }
+        }, (e) => this._error(e));
+    }
+    _read() {
+      if (this._queue.length) {
+        const { chunk, size } = this._queue.shift();
+        this._queueSize -= size;
+        if (this._closeRequested && !this._queue.length) this._close();
+        else this._pullIfNeeded();
+        return Promise.resolve({ value: chunk, done: false });
+      }
+      if (this._state === 'closed') return Promise.resolve({ value: undefined, done: true });
+      if (this._state === 'errored') return Promise.reject(this._storedError);
+      const d = deferred();
+      this._readRequests.push(d);
+      this._pullIfNeeded();
+      return d.promise;
+    }
+    _cancel(reason) {
+      if (this._state === 'closed') return Promise.resolve();
+      if (this._state === 'errored') return Promise.reject(this._storedError);
+      this._queue = [];
+      this._queueSize = 0;
+      this._close();
+      const cancel = this._source.cancel;
+      return Promise.resolve().then(() => cancel && cancel.call(this._source, reason)).then(() => undefined);
+    }
+    getReader(options) {
+      if (options && options.mode !== undefined && options.mode !== 'byob') throw new TypeError('Invalid reader mode');
+      return new ReadableStreamDefaultReader(this);
+    }
+    cancel(reason) {
+      if (this.locked) return Promise.reject(new TypeError('Cannot cancel a locked stream'));
+      return this._cancel(reason);
+    }
+    pipeTo(dest, options = {}) {
+      if (this.locked || dest.locked) return Promise.reject(new TypeError('Cannot pipe a locked stream'));
+      const { preventClose, preventAbort, preventCancel, signal } = options || {};
+      const reader = this.getReader();
+      const writer = dest.getWriter();
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (err, isError) => {
+          if (done) return;
           done = true;
-          return Promise.resolve(this._pull()).then(v => v == null ? { value: undefined, done: true } : { value: v, done: false });
+          reader.releaseLock();
+          writer.releaseLock();
+          isError ? reject(err) : resolve();
+        };
+        if (signal) {
+          const abort = () => {
+            const reason = signal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
+            Promise.all([preventAbort ? null : dest.abort(reason), preventCancel ? null : this.cancel(reason)].map((p) => p && Promise.resolve(p).catch(() => {})))
+              .then(() => finish(reason, true));
+          };
+          if (signal.aborted) { abort(); return; }
+          signal.addEventListener('abort', abort);
+        }
+        const step = () => {
+          reader.read().then(({ value, done: end }) => {
+            if (done) return;
+            if (end) {
+              if (preventClose) return finish();
+              writer.close().then(() => finish(), (e) => finish(e, true));
+              return;
+            }
+            writer.write(value).then(step, (e) => {
+              if (!preventCancel) reader.cancel(e).catch(() => {});
+              finish(e, true);
+            });
+          }, (e) => {
+            if (!preventAbort) writer.abort(e).catch(() => {});
+            finish(e, true);
+          });
+        };
+        step();
+      });
+    }
+    pipeThrough(transform, options) {
+      this.pipeTo(transform.writable, options).catch(() => {});
+      return transform.readable;
+    }
+    tee() {
+      const reader = this.getReader();
+      let reading = false;
+      const controllers = [];
+      const canceled = [false, false];
+      const pull = () => {
+        if (reading) return;
+        reading = true;
+        return reader.read().then(({ value, done }) => {
+          reading = false;
+          controllers.forEach((c, i) => { if (!canceled[i]) { try { done ? c.close() : c.enqueue(value); } catch {} } });
+        }, (e) => controllers.forEach((c) => c.error(e)));
+      };
+      const branch = (i) => new ReadableStream({
+        start(c) { controllers[i] = c; },
+        pull,
+        cancel(reason) { canceled[i] = true; if (canceled[0] && canceled[1]) return reader.cancel(reason); },
+      });
+      return [branch(0), branch(1)];
+    }
+    values(options = {}) {
+      const reader = this.getReader();
+      const preventCancel = !!(options && options.preventCancel);
+      return {
+        next: () => reader.read().then((r) => { if (r.done) reader.releaseLock(); return r; }),
+        return: (value) => {
+          const p = preventCancel ? Promise.resolve() : reader.cancel(value);
+          return p.then(() => { reader.releaseLock(); return { value, done: true }; });
         },
-        releaseLock: () => { this.locked = false; },
-        cancel: () => Promise.resolve(),
-        closed: Promise.resolve(),
+        [Symbol.asyncIterator]() { return this; },
       };
     }
-    cancel() { return Promise.resolve(); }
-    [Symbol.asyncIterator]() {
-      const r = this.getReader();
-      return { next: () => r.read(), return: () => Promise.resolve({ value: undefined, done: true }), [Symbol.asyncIterator]() { return this; } };
+    [Symbol.asyncIterator](options) { return this.values(options); }
+    static from(iterable) {
+      const it = iterable[Symbol.asyncIterator] ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+      return new ReadableStream({
+        pull(c) { return Promise.resolve(it.next()).then(({ value, done }) => (done ? c.close() : Promise.resolve(value).then((v) => c.enqueue(v)))); },
+        cancel(reason) { return it.return && it.return(reason); },
+      }, { highWaterMark: 0 });
+    }
+  }
+
+  class WritableStreamDefaultWriter {
+    constructor(stream) {
+      if (stream._writer) throw new TypeError('WritableStream is locked');
+      Object.defineProperty(this, '_s', { value: stream, writable: true });
+      stream._writer = this;
+    }
+    get closed() { return this._s ? this._s._closed.promise : Promise.reject(new TypeError('Writer was released')); }
+    get ready() { return this._s ? this._s._readyPromise() : Promise.reject(new TypeError('Writer was released')); }
+    get desiredSize() { return this._s ? this._s._desiredSize() : null; }
+    write(chunk) { return this._s ? this._s._write(chunk) : Promise.reject(new TypeError('Writer was released')); }
+    close() { return this._s ? this._s._closeStream() : Promise.reject(new TypeError('Writer was released')); }
+    abort(reason) { return this._s ? this._s._abort(reason) : Promise.reject(new TypeError('Writer was released')); }
+    releaseLock() { if (this._s) { this._s._writer = null; this._s = null; } }
+  }
+
+  class WritableStream {
+    constructor(sink = {}, strategy = {}) {
+      sink = sink ?? {};
+      const abortController = new AbortController();
+      Object.defineProperties(this, {
+        _sink: { value: sink }, _queue: { value: [] }, _state: { value: 'writable', writable: true }, _writer: { value: null, writable: true },
+        _writing: { value: false, writable: true }, _started: { value: false, writable: true }, _closeRequest: { value: null, writable: true },
+        _storedError: { value: undefined, writable: true }, _closed: { value: deferred() }, _hwm: { value: strategy.highWaterMark ?? 1 },
+        _abortController: { value: abortController },
+      });
+      this._closed.promise.catch(() => {});
+      const controller = { error: (e) => this._error(e), signal: abortController.signal };
+      Object.defineProperty(this, '_controller', { value: controller });
+      let started;
+      try { started = sink.start ? sink.start.call(sink, controller) : undefined; } catch (e) { this._error(e); }
+      Promise.resolve(started).then(() => { this._started = true; this._advance(); }, (e) => this._error(e));
+    }
+    get locked() { return !!this._writer; }
+    getWriter() { return new WritableStreamDefaultWriter(this); }
+    close() { return this.locked ? Promise.reject(new TypeError('Cannot close a locked stream')) : this._closeStream(); }
+    abort(reason) { return this.locked ? Promise.reject(new TypeError('Cannot abort a locked stream')) : this._abort(reason); }
+    _desiredSize() { return this._state === 'errored' ? null : this._state === 'closed' ? 0 : this._hwm - this._queue.length - (this._writing ? 1 : 0); }
+    _readyPromise() { return this._state === 'errored' ? Promise.reject(this._storedError) : Promise.resolve(); }
+    _write(chunk) {
+      if (this._state !== 'writable' || this._closeRequest) return Promise.reject(this._state === 'errored' ? this._storedError : new TypeError('Cannot write to a closing or closed stream'));
+      const d = deferred();
+      this._queue.push({ chunk, d });
+      this._advance();
+      return d.promise;
+    }
+    _advance() {
+      if (!this._started || this._writing || this._state !== 'writable') return;
+      if (!this._queue.length) {
+        if (this._closeRequest) this._finishClose();
+        return;
+      }
+      this._writing = true;
+      const { chunk, d } = this._queue.shift();
+      Promise.resolve()
+        .then(() => this._sink.write && this._sink.write.call(this._sink, chunk, this._controller))
+        .then(() => { this._writing = false; d.resolve(); this._advance(); }, (e) => { this._writing = false; d.reject(e); this._error(e); });
+    }
+    _closeStream() {
+      if (this._state !== 'writable' || this._closeRequest) return Promise.reject(new TypeError('The stream is closing or closed'));
+      this._closeRequest = deferred();
+      this._advance();
+      return this._closeRequest.promise;
+    }
+    _finishClose() {
+      const req = this._closeRequest;
+      Promise.resolve()
+        .then(() => this._sink.close && this._sink.close.call(this._sink))
+        .then(() => { this._state = 'closed'; this._closed.resolve(); req.resolve(); }, (e) => { this._error(e); req.reject(e); });
+    }
+    _error(e) {
+      if (this._state !== 'writable') return;
+      this._state = 'errored';
+      this._storedError = e;
+      for (const { d } of this._queue.splice(0)) d.reject(e);
+      this._closed.reject(e);
+      if (this._closeRequest) this._closeRequest.reject(e);
+    }
+    _abort(reason) {
+      if (this._state === 'closed' || this._state === 'errored') return Promise.resolve();
+      this._abortController.abort(reason);
+      this._error(reason);
+      return Promise.resolve().then(() => this._sink.abort && this._sink.abort.call(this._sink, reason)).then(() => undefined);
+    }
+  }
+
+  class TransformStream {
+    constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+      transformer = transformer ?? {};
+      let readController;
+      const readable = new ReadableStream({ start(c) { readController = c; } }, readableStrategy);
+      let writable;
+      const controller = {
+        enqueue: (chunk) => readController.enqueue(chunk),
+        error: (e) => { readController.error(e); writable._error(e); },
+        terminate: () => { try { readController.close(); } catch {} writable._error(new TypeError('The transform stream has been terminated')); },
+        get desiredSize() { return readController.desiredSize; },
+      };
+      writable = new WritableStream({
+        start: () => transformer.start && transformer.start.call(transformer, controller),
+        write: (chunk) => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk)),
+        close: () => Promise.resolve(transformer.flush && transformer.flush.call(transformer, controller)).then(() => { try { readController.close(); } catch {} }),
+        abort: (reason) => readController.error(reason),
+      }, writableStrategy);
+      Object.defineProperties(this, { readable: { value: readable, enumerable: true }, writable: { value: writable, enumerable: true } });
+    }
+  }
+
+  class TextEncoderStream extends TransformStream {
+    constructor() {
+      const encoder = new TextEncoder();
+      super({ transform(chunk, c) { const s = String(chunk); if (s) c.enqueue(encoder.encode(s)); } });
+    }
+    get encoding() { return 'utf-8'; }
+  }
+
+  class TextDecoderStream extends TransformStream {
+    constructor(label = 'utf-8', options = {}) {
+      const decoder = new TextDecoder(label, options);
+      super({
+        transform(chunk, c) { const s = decoder.decode(chunk, { stream: true }); if (s) c.enqueue(s); },
+        flush(c) { const s = decoder.decode(); if (s) c.enqueue(s); },
+      });
+      Object.defineProperty(this, '_decoder', { value: decoder });
+    }
+    get encoding() { return this._decoder.encoding; }
+  }
+
+  // Byte-stream sources a body or blob gives: one chunk, then done
+  const bytesStream = (getBytes) => new ReadableStream({
+    pull(c) {
+      const bytes = getBytes();
+      if (bytes && bytes.byteLength) c.enqueue(bytes);
+      c.close();
+    },
+  }, { highWaterMark: 0 });
+
+  // ---- MessageChannel ----
+
+  class MessagePort extends EventTargetCtor {
+    constructor() {
+      super();
+      Object.defineProperties(this, { _other: { value: null, writable: true }, _closed: { value: false, writable: true }, _onmessage: { value: null, writable: true } });
+    }
+    get onmessage() { return this._onmessage; }
+    set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; }
+    postMessage(data) {
+      const target = this._other;
+      if (!target || this._closed) return;
+      const value = structuredClone(data);
+      setTimeout(() => {
+        if (target._closed) return;
+        const ev = Object.assign(new Event('message'), { data: value, ports: [], origin: '', lastEventId: '' });
+        target.dispatchEvent(ev);
+        if (target._onmessage) { try { target._onmessage.call(target, ev); } catch (e) { reportError(e); } }
+      }, 0);
+    }
+    start() {}
+    close() { this._closed = true; }
+  }
+  // Channels by name. There is one browsing context per page, so a
+  // message reaches the other channels of the same name in this page.
+  const broadcastChannels = new Map(); // name -> Set of channels
+  class BroadcastChannel extends EventTargetCtor {
+    constructor(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+      super();
+      Object.defineProperties(this, { _name: { value: String(name) }, _closed: { value: false, writable: true }, _onmessage: { value: null, writable: true } });
+      let set = broadcastChannels.get(this._name);
+      if (!set) broadcastChannels.set(this._name, set = new Set());
+      set.add(this);
+    }
+    get name() { return this._name; }
+    get onmessage() { return this._onmessage; }
+    set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; }
+    postMessage(data) {
+      if (this._closed) throw new DOMException("Failed to execute 'postMessage' on 'BroadcastChannel': Channel is closed", 'InvalidStateError');
+      const value = structuredClone(data);
+      const targets = [...(broadcastChannels.get(this._name) || [])].filter(c => c !== this);
+      setTimeout(() => {
+        for (const target of targets) {
+          if (target._closed) continue;
+          const ev = Object.assign(new Event('message'), { data: value, ports: [], origin: location.origin, lastEventId: '' });
+          target.dispatchEvent(ev);
+          if (target._onmessage) { try { target._onmessage.call(target, ev); } catch (e) { reportError(e); } }
+        }
+      }, 0);
+    }
+    close() {
+      this._closed = true;
+      broadcastChannels.get(this._name)?.delete(this);
+    }
+  }
+  global.BroadcastChannel = BroadcastChannel;
+  class MessageChannel {
+    constructor() {
+      const port1 = new MessagePort(), port2 = new MessagePort();
+      port1._other = port2;
+      port2._other = port1;
+      Object.defineProperties(this, { port1: { value: port1, enumerable: true }, port2: { value: port2, enumerable: true } });
     }
   }
 
@@ -953,7 +2951,7 @@
     get body() {
       if (this._body == null) return null;
       if (!this._stream) {
-        this._stream = new ReadableStream(() => {
+        this._stream = bytesStream(() => {
           if (this.bodyUsed) return null;
           this.bodyUsed = true;
           return new Uint8Array(toArrayBuffer(this._body));
@@ -999,6 +2997,7 @@
     }
   }
   define(Request.prototype, bodyMixin);
+  accessorize(Request.prototype, ['url', 'method', 'headers', 'mode', 'credentials', 'redirect', 'cache', 'referrer', 'referrerPolicy', 'integrity', 'keepalive', 'signal', 'destination', 'bodyUsed']);
 
   class Response {
     constructor(body = null, init = {}) {
@@ -1020,6 +3019,7 @@
     clone() {
       if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
       const r = Object.create(Response.prototype);
+      slots.set(r, { ...slotOf(this) });
       Object.assign(r, this, { headers: new Headers(this.headers), bodyUsed: false, _stream: undefined });
       return r;
     }
@@ -1039,6 +3039,7 @@
     }
   }
   define(Response.prototype, bodyMixin);
+  accessorize(Response.prototype, ['status', 'statusText', 'headers', 'type', 'url', 'redirected', 'bodyUsed']);
 
   // A Response from what __fosFetch delivers
   function hostResponse(r) {
@@ -1229,12 +3230,131 @@
     }
     get responseXML() { return null; }
   }
+  accessorize(XMLHttpRequest.prototype, ['readyState', 'status', 'statusText', 'responseURL', 'timeout', 'withCredentials', 'upload']);
   for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
     Object.defineProperty(XMLHttpRequest, k, { value: v });
     Object.defineProperty(XMLHttpRequest.prototype, k, { value: v });
   }
 
   const noopObserver = class { constructor(cb) { this._cb = cb; } observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
+
+  // ---- performance timeline (User Timing) ----
+
+  class PerformanceEntry {
+    constructor(name, entryType, startTime, duration) {
+      Object.assign(this, { name: String(name), entryType, startTime, duration });
+    }
+    toJSON() { return { ...this }; }
+  }
+  class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      super(name, 'mark', options.startTime ?? performance.now(), 0);
+      this.detail = options.detail ?? null;
+    }
+  }
+  class PerformanceMeasure extends PerformanceEntry {}
+  const perfEntries = [];
+  const perfObservers = new Set();
+  const navigationEntry = new PerformanceEntry(document.URL, 'navigation', 0, 0);
+  Object.assign(navigationEntry, { type: 'navigate', redirectCount: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, loadEventStart: 0, loadEventEnd: 0 });
+  function recordEntry(entry) {
+    perfEntries.push(entry);
+    for (const o of perfObservers) {
+      if (o._types.has(entry.entryType)) {
+        o._queue.push(entry);
+        scheduleObserver(o);
+      }
+    }
+    return entry;
+  }
+  // Observers get their entries in a later task, batched
+  function scheduleObserver(o) {
+    if (o._scheduled) return;
+    o._scheduled = true;
+    setTimeout(() => {
+      o._scheduled = false;
+      const list = o.takeRecords();
+      if (list.length) o._cb(new PerformanceObserverEntryList(list), o);
+    }, 0);
+  }
+  function entriesOf(type) {
+    return type === 'navigation' ? [navigationEntry] : perfEntries.filter(e => e.entryType === type);
+  }
+  function markTime(v) {
+    if (v === undefined) return undefined;
+    if (typeof v === 'number') return v;
+    if (v === 'navigationStart' || v === 'fetchStart') return 0;
+    const marks = perfEntries.filter(e => e.entryType === 'mark' && e.name === String(v));
+    if (!marks.length) throw new DOMException(`The mark '${v}' does not exist.`, 'SyntaxError');
+    return marks[marks.length - 1].startTime;
+  }
+  const timeOrigin = Date.now() - performance.now();
+  Object.assign(performance, {
+    timeOrigin,
+    timing: { navigationStart: timeOrigin, fetchStart: timeOrigin, responseEnd: timeOrigin, domLoading: timeOrigin, domInteractive: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+    navigation: { type: 0, redirectCount: 0 },
+    eventCounts: new Map(),
+    mark(name, options) { return recordEntry(new PerformanceMark(name, options)); },
+    measure(name, start, end) {
+      let startTime, endTime, detail = null;
+      if (start && typeof start === 'object') {
+        detail = start.detail ?? null;
+        startTime = markTime(start.start);
+        endTime = markTime(start.end);
+        if (start.duration !== undefined) {
+          if (startTime === undefined) startTime = endTime - start.duration;
+          else endTime = startTime + start.duration;
+        }
+      } else {
+        startTime = markTime(start);
+        endTime = markTime(end);
+      }
+      startTime ??= 0;
+      endTime ??= performance.now();
+      const m = new PerformanceMeasure(name, 'measure', startTime, endTime - startTime);
+      m.detail = detail;
+      return recordEntry(m);
+    },
+    getEntries() { return [navigationEntry, ...perfEntries]; },
+    getEntriesByType(type) { return entriesOf(String(type)); },
+    getEntriesByName(name, type) {
+      return (type ? entriesOf(String(type)) : this.getEntries()).filter(e => e.name === String(name));
+    },
+    clearMarks(name) { removeEntries('mark', name); },
+    clearMeasures(name) { removeEntries('measure', name); },
+    clearResourceTimings() {},
+    setResourceTimingBufferSize() {},
+    toJSON() { return { timeOrigin, timing: this.timing, navigation: this.navigation }; },
+  });
+  function removeEntries(type, name) {
+    for (let i = perfEntries.length - 1; i >= 0; i--) {
+      if (perfEntries[i].entryType === type && (name === undefined || perfEntries[i].name === String(name))) perfEntries.splice(i, 1);
+    }
+  }
+  class PerformanceObserverEntryList {
+    constructor(list) { this._list = list; }
+    getEntries() { return this._list.slice(); }
+    getEntriesByType(t) { return this._list.filter(e => e.entryType === t); }
+    getEntriesByName(n, t) { return this._list.filter(e => e.name === n && (!t || e.entryType === t)); }
+  }
+  class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function.");
+      Object.assign(this, { _cb: callback, _types: new Set(), _queue: [], _scheduled: false });
+    }
+    observe(options = {}) {
+      const types = options.entryTypes || (options.type ? [options.type] : []);
+      for (const t of types) this._types.add(String(t));
+      perfObservers.add(this);
+      if (options.buffered) {
+        for (const t of types) for (const e of entriesOf(String(t))) this._queue.push(e);
+        if (this._queue.length) scheduleObserver(this);
+      }
+    }
+    disconnect() { perfObservers.delete(this); this._queue = []; }
+    takeRecords() { return this._queue.splice(0); }
+    static get supportedEntryTypes() { return ['mark', 'measure', 'navigation']; }
+  }
 
   function matchMedia(query) {
     const q = String(query);
@@ -1253,8 +3373,12 @@
   define(global, {
     self: global, top: global, parent: global, frames: global, opener: null, closed: false,
     frameElement: null, length: 0, name: '', origin: '', isSecureContext: true,
-    innerWidth: 1024, innerHeight: 768, outerWidth: 1024, outerHeight: 768, devicePixelRatio: 1,
-    scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0, screenX: 0, screenY: 0,
+    get innerWidth() { return __fosViewport()[0]; }, get innerHeight() { return __fosViewport()[1]; },
+    get outerWidth() { return __fosViewport()[0]; }, get outerHeight() { return __fosViewport()[1]; },
+    devicePixelRatio: 1,
+    get scrollX() { return __fosViewport()[2]; }, get scrollY() { return __fosViewport()[3]; },
+    get pageXOffset() { return __fosViewport()[2]; }, get pageYOffset() { return __fosViewport()[3]; },
+    screenX: 0, screenY: 0,
     screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080, colorDepth: 24, pixelDepth: 24 },
     navigator: {
       userAgent: 'Mozilla/5.0 (X11; Linux x86_64) fOS/0.1 (KHTML, like Gecko)',
@@ -1268,24 +3392,22 @@
       },
       clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
     },
-    history: {
-      length: 1, state: null, scrollRestoration: 'auto',
-      pushState(state) { this.state = state; }, replaceState(state) { this.state = state; },
-      back() {}, forward() {}, go() {},
-    },
+    history: new History(),
     localStorage: new Storage(),
     sessionStorage: new Storage(),
     Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, FocusEvent, InputEvent, ErrorEvent,
     PointerEvent: MouseEvent, TouchEvent: UIEvent, WheelEvent: MouseEvent, AnimationEvent: Event,
-    TransitionEvent: Event, PopStateEvent: Event, HashChangeEvent: Event, MessageEvent: Event,
+    TransitionEvent: Event, PopStateEvent, HashChangeEvent, MessageEvent: Event,
     ProgressEvent,
     URL, URLSearchParams, Storage, DOMTokenList, AbortController, AbortSignal, DOMException,
     EventTarget: EventTargetCtor,
     fetch, Headers, Request, Response, Blob, File, FormData, ReadableStream,
+    ReadableStreamDefaultReader, ReadableStreamDefaultController, WritableStream, WritableStreamDefaultWriter,
+    TransformStream, TextEncoderStream, TextDecoderStream, MessageChannel, MessagePort,
     XMLHttpRequest, XMLHttpRequestUpload, XMLHttpRequestEventTarget,
     TextEncoder, TextDecoder,
     MutationObserver: noopObserver, IntersectionObserver: noopObserver, ResizeObserver: noopObserver,
-    PerformanceObserver: noopObserver,
+    PerformanceObserver, PerformanceEntry, PerformanceMark, PerformanceMeasure,
     requestAnimationFrame(cb) {
       const id = ++rafId;
       rafs.set(id, setTimeout(() => { rafs.delete(id); cb(performance.now()); }, 16));
@@ -1297,7 +3419,10 @@
     matchMedia,
     getComputedStyle(el) { return el.style; },
     getSelection() { return { rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }; },
-    scrollTo() {}, scrollBy() {}, scroll() {}, focus() {}, blur() {}, print() {}, stop() {},
+    scrollTo(x, y) { __fosScrollTo(typeof x === 'object' && x ? (+x.top || 0) : (+y || 0)); },
+    scroll(x, y) { global.scrollTo(x, y); },
+    scrollBy(x, y) { __fosScrollTo(__fosViewport()[3] + (typeof x === 'object' && x ? (+x.top || 0) : (+y || 0))); },
+    focus() {}, blur() {}, print() {}, stop() {},
     alert(msg) { console.info('[alert]', msg); },
     confirm(msg) { console.info('[confirm]', msg); return false; },
     prompt(msg) { console.info('[prompt]', msg); return null; },
@@ -1316,4 +3441,1995 @@
   });
   global.location = new Location();
   global.origin = global.location.origin;
+
+  // ---- interface objects for the window's singletons ----
+  //
+  // Scripts look methods up on prototypes (Navigator.prototype.sendBeacon,
+  // History.prototype.replaceState) and test `instanceof`, so each
+  // singleton's members move to its interface's prototype.
+  function exposeInterface(name, instance, parentProto = Object.prototype) {
+    const ctor = ({ [name]: function () { throw new TypeError('Illegal constructor'); } })[name];
+    const proto = Object.create(parentProto);
+    for (const k of Reflect.ownKeys(instance)) {
+      const d = Object.getOwnPropertyDescriptor(instance, k);
+      if ('value' in d && typeof d.value !== 'function') {
+        const value = d.value;
+        Object.defineProperty(proto, k, { get() { return value; }, enumerable: true, configurable: true });
+      } else {
+        Object.defineProperty(proto, k, d);
+      }
+      delete instance[k];
+    }
+    Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+    Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true });
+    ctor.prototype = proto;
+    Object.setPrototypeOf(instance, proto);
+    Object.defineProperty(global, name, { value: ctor, writable: true, configurable: true });
+    return instance;
+  }
+  exposeInterface('Navigator', global.navigator);
+  exposeInterface('Screen', global.screen, EventTarget.prototype);
+  exposeInterface('Performance', global.performance, EventTarget.prototype);
+  for (const [name, ctor] of [['History', History], ['Location', Location]]) {
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    global[name] = ctor;
+  }
+
+  // ---- more event interfaces ----
+  // Each event class's own fields (accessors on its prototype, made by
+  // eventAccessors once the classes exist)
+  const eventFields = (target, init, cls, fields) => {
+    const slot = slotOf(target);
+    for (const [k, d] of Object.entries(fields)) slot[k] = init[k] ?? d;
+  };
+  class MessageEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, MessageEvent, { data: null, origin: '', lastEventId: '', source: null, ports: [] }); }
+  }
+  class PointerEvent extends MouseEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, PointerEvent, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false });
+    }
+    getCoalescedEvents() { return []; }
+    getPredictedEvents() { return []; }
+  }
+  class WheelEvent extends MouseEvent {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, WheelEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }); }
+  }
+  Object.assign(WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  class DragEvent extends MouseEvent {
+    constructor(type, init = {}) { super(type, init); this.dataTransfer = init.dataTransfer ?? null; }
+  }
+  class TouchEvent extends UIEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, TouchEvent, { touches: [], targetTouches: [], changedTouches: [], altKey: false, metaKey: false, ctrlKey: false, shiftKey: false });
+    }
+  }
+  class CompositionEvent extends UIEvent {
+    constructor(type, init = {}) { super(type, init); this.data = String(init.data ?? ''); }
+  }
+  class AnimationEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, AnimationEvent, { animationName: '', elapsedTime: 0, pseudoElement: '' }); }
+  }
+  class TransitionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, TransitionEvent, { propertyName: '', elapsedTime: 0, pseudoElement: '' }); }
+  }
+  class SubmitEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.submitter = init.submitter ?? null; }
+  }
+  class ClipboardEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.clipboardData = init.clipboardData ?? null; }
+  }
+  class PageTransitionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.persisted = !!init.persisted; }
+  }
+  class StorageEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventFields(this, init, StorageEvent, { key: null, oldValue: null, newValue: null, url: '', storageArea: null }); }
+  }
+  class PromiseRejectionEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.promise = init.promise; this.reason = init.reason; }
+  }
+  class SecurityPolicyViolationEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      eventFields(this, init, SecurityPolicyViolationEvent, { documentURI: '', referrer: '', blockedURI: '', violatedDirective: '', effectiveDirective: '', originalPolicy: '', sourceFile: '', sample: '', disposition: 'enforce', statusCode: 0, lineNumber: 0, columnNumber: 0 });
+    }
+  }
+  accessorize(MessageEvent.prototype, ['data', 'origin', 'lastEventId', 'source', 'ports']);
+  accessorize(PointerEvent.prototype, ['pointerId', 'width', 'height', 'pressure', 'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'pointerType', 'isPrimary']);
+  accessorize(WheelEvent.prototype, ['deltaX', 'deltaY', 'deltaZ', 'deltaMode']);
+  accessorize(TouchEvent.prototype, ['touches', 'targetTouches', 'changedTouches', 'altKey', 'metaKey', 'ctrlKey', 'shiftKey']);
+  accessorize(AnimationEvent.prototype, ['animationName', 'elapsedTime', 'pseudoElement']);
+  accessorize(TransitionEvent.prototype, ['propertyName', 'elapsedTime', 'pseudoElement']);
+  accessorize(StorageEvent.prototype, ['key', 'oldValue', 'newValue', 'url', 'storageArea']);
+  accessorize(SecurityPolicyViolationEvent.prototype, ['documentURI', 'referrer', 'blockedURI', 'violatedDirective', 'effectiveDirective', 'originalPolicy', 'sourceFile', 'sample', 'disposition', 'statusCode', 'lineNumber', 'columnNumber']);
+  class BeforeUnloadEvent extends Event {}
+  Object.assign(global, {
+    MessageEvent, PointerEvent, WheelEvent, DragEvent, TouchEvent, CompositionEvent, AnimationEvent, TransitionEvent,
+    SubmitEvent, ClipboardEvent, PageTransitionEvent, StorageEvent, PromiseRejectionEvent, SecurityPolicyViolationEvent,
+    BeforeUnloadEvent,
+  });
+
+  // ---- performance entry interfaces ----
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  for (const k of ['initiatorType', 'nextHopProtocol', 'renderBlockingStatus']) Object.defineProperty(PerformanceResourceTiming.prototype, k, { get() { return ''; }, configurable: true });
+  for (const k of ['workerStart', 'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'transferSize', 'encodedBodySize', 'decodedBodySize']) {
+    Object.defineProperty(PerformanceResourceTiming.prototype, k, { get() { return 0; }, configurable: true });
+  }
+  PerformanceResourceTiming.prototype.toJSON = function () { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; };
+  Object.assign(global, { PerformanceResourceTiming, PerformanceObserverEntryList });
+
+  // ---- attributes: NamedNodeMap of Attr ----
+  const attrState = new WeakMap(); // attr -> { el, name }
+  function makeAttr(el, name) {
+    const a = Object.create(Attr.prototype);
+    attrState.set(a, { el, name });
+    return a;
+  }
+  const attr = (a) => attrState.get(a) || (() => { throw new TypeError('Illegal invocation'); })();
+  define(Attr.prototype, {
+    get name() { return attr(this).name; },
+    get localName() { const n = attr(this).name; return n.includes(':') ? n.slice(n.indexOf(':') + 1) : n; },
+    get nodeName() { return attr(this).name; },
+    get value() { const s = attr(this); return s.el ? s.el.getAttribute(s.name) ?? '' : s.value ?? ''; },
+    set value(v) { const s = attr(this); if (s.el) s.el.setAttribute(s.name, String(v)); else s.value = String(v); },
+    get nodeValue() { return this.value; },
+    set nodeValue(v) { this.value = v; },
+    get textContent() { return this.value; },
+    set textContent(v) { this.value = v; },
+    get ownerElement() { return attr(this).el; },
+    get namespaceURI() { return null; },
+    get prefix() { const n = attr(this).name; return n.includes(':') ? n.slice(0, n.indexOf(':')) : null; },
+    get specified() { return true; },
+    get nodeType() { return 2; },
+  });
+  class NamedNodeMap extends Array {
+    getNamedItem(name) { return this._el && this._el.hasAttribute(name) ? makeAttr(this._el, String(name).toLowerCase()) : null; }
+    getNamedItemNS(ns, name) { return this.getNamedItem(name); }
+    item(i) { return this[i] ?? null; }
+    setNamedItem(a) {
+      const s = attr(a);
+      const old = this.getNamedItem(s.name);
+      this._el.setAttribute(s.name, a.value);
+      s.el = this._el;
+      return old;
+    }
+    setNamedItemNS(a) { return this.setNamedItem(a); }
+    removeNamedItem(name) {
+      const old = this.getNamedItem(name);
+      if (!old) throw new DOMException(`Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '${name}' was found.`, 'NotFoundError');
+      const value = old.value;
+      this._el.removeAttribute(name);
+      attrState.set(old, { el: null, name: attr(old).name, value });
+      return old;
+    }
+    removeNamedItemNS(ns, name) { return this.removeNamedItem(name); }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.defineProperty(E, 'attributes', {
+    get() {
+      const map = new NamedNodeMap();
+      Object.defineProperty(map, '_el', { value: this });
+      for (const name of this.getAttributeNames()) {
+        const a = makeAttr(this, name);
+        map.push(a);
+        // Named access (attributes.href), as in browsers
+        if (!(name in map)) Object.defineProperty(map, name, { value: a, configurable: true });
+      }
+      return map;
+    },
+    configurable: true,
+  });
+  define(E, {
+    getAttributeNode(name) { return this.hasAttribute(name) ? makeAttr(this, String(name).toLowerCase()) : null; },
+    getAttributeNodeNS(ns, name) { return this.getAttributeNode(name); },
+    setAttributeNode(a) { const old = this.getAttributeNode(attr(a).name); this.setAttribute(attr(a).name, a.value); attr(a).el = this; return old; },
+    removeAttributeNode(a) { this.removeAttribute(attr(a).name); return a; },
+  });
+  Document.prototype.createAttribute = function (name) {
+    const a = Object.create(Attr.prototype);
+    attrState.set(a, { el: null, name: String(name).toLowerCase(), value: '' });
+    return a;
+  };
+  global.NamedNodeMap = NamedNodeMap;
+
+  // ---- SVG odds and ends ----
+  class SVGAnimatedString {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const animatedString = (el, attrs) => {
+    const s = Object.create(SVGAnimatedString.prototype);
+    Object.defineProperties(s, {
+      baseVal: { get() { for (const a of attrs) { const v = el.getAttribute(a); if (v !== null) return v; } return ''; }, set(v) { el.setAttribute(attrs[0], String(v)); } },
+      animVal: { get() { return s.baseVal; } },
+    });
+    return s;
+  };
+  makeInterface('SVGAElement', SVGGraphicsElement, 'svg:a');
+  Object.defineProperty(SVGAElement.prototype, 'href', { get() { return animatedString(this, ['href', 'xlink:href']); }, configurable: true });
+  Object.defineProperty(SVGAElement.prototype, 'target', { get() { return animatedString(this, ['target']); }, configurable: true });
+  for (const [name, tags] of [['SVGGElement', 'g'], ['SVGPathElement', 'path'], ['SVGCircleElement', 'circle'], ['SVGRectElement', 'rect'],
+    ['SVGLineElement', 'line'], ['SVGPolylineElement', 'polyline'], ['SVGPolygonElement', 'polygon'], ['SVGEllipseElement', 'ellipse'],
+    ['SVGTextElement', 'text'], ['SVGUseElement', 'use'], ['SVGImageElement', 'image'], ['SVGDefsElement', 'defs'], ['SVGSymbolElement', 'symbol']]) {
+    makeInterface(name, SVGGraphicsElement, 'svg:' + tags);
+  }
+  global.SVGAnimatedString = SVGAnimatedString;
+
+  // ---- constraint validation ----
+  class ValidityState {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  for (const k of ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort', 'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError', 'valid']) {
+    Object.defineProperty(ValidityState.prototype, k, { get() { return !!slotOf(this)[k]; }, enumerable: true, configurable: true });
+  }
+  const customValidity = new WeakMap();
+  const emailRe = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+  function validityOf(el) {
+    const v = Object.create(ValidityState.prototype);
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const value = el.value ?? '';
+    const barred = el.disabled || el.readOnly || ['hidden', 'reset', 'button', 'submit', 'image'].includes(type) && el.localName === 'input';
+    const flags = {
+      valueMissing: !barred && el.required && (type === 'checkbox' || type === 'radio' ? !el.checked : value === ''),
+      typeMismatch: value !== '' && ((type === 'email' && !value.split(el.multiple ? ',' : '\0').every(s => emailRe.test(s.trim())))
+        || (type === 'url' && (() => { try { new URL(value); return false; } catch { return true; } })())),
+      patternMismatch: value !== '' && el.hasAttribute('pattern') && (() => { try { return !new RegExp(`^(?:${el.getAttribute('pattern')})$`, 'u').test(value); } catch { return false; } })(),
+      // Only edits by the user can make a value too long or short
+      tooLong: false,
+      tooShort: false,
+      rangeUnderflow: value !== '' && el.hasAttribute('min') && ['number', 'range'].includes(type) && +value < +el.getAttribute('min'),
+      rangeOverflow: value !== '' && el.hasAttribute('max') && ['number', 'range'].includes(type) && +value > +el.getAttribute('max'),
+      stepMismatch: false,
+      badInput: type === 'number' && value !== '' && isNaN(+value),
+      customError: !!customValidity.get(el),
+    };
+    flags.valid = !barred ? !Object.values(flags).some(Boolean) : true;
+    Object.assign(slotOf(v), flags);
+    return v;
+  }
+  const validationMessage = (el) => {
+    const v = validityOf(el);
+    if (v.customError) return customValidity.get(el);
+    if (v.valueMissing) return 'Please fill out this field.';
+    if (v.typeMismatch) return el.type === 'email' ? 'Please enter an email address.' : 'Please enter a URL.';
+    if (v.patternMismatch) return 'Please match the requested format.';
+    if (v.rangeUnderflow) return `Value must be greater than or equal to ${el.getAttribute('min')}.`;
+    if (v.rangeOverflow) return `Value must be less than or equal to ${el.getAttribute('max')}.`;
+    if (v.badInput) return 'Please enter a number.';
+    return '';
+  };
+  const constraintMethods = {
+    get validity() { return validityOf(this); },
+    get validationMessage() { return validationMessage(this); },
+    get willValidate() { return !this.disabled && !(this.localName === 'input' && ['hidden', 'reset', 'button'].includes(this.type)); },
+    checkValidity() {
+      if (validityOf(this).valid) return true;
+      this.dispatchEvent(new Event('invalid', { cancelable: true }));
+      return false;
+    },
+    reportValidity() { return this.checkValidity(); },
+    setCustomValidity(message) { customValidity.set(this, String(message)); },
+    get form() { return this.closest('form'); },
+    get labels() { return this.id ? [...document.querySelectorAll(`label[for="${CSS.escape(this.id)}"]`), ...(this.closest('label') ? [this.closest('label')] : [])] : (this.closest('label') ? [this.closest('label')] : []); },
+  };
+  for (const name of ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLButtonElement', 'HTMLOutputElement', 'HTMLFieldSetElement', 'HTMLObjectElement']) {
+    for (const k of Object.keys(constraintMethods)) {
+      Object.defineProperty(global[name].prototype, k, { ...Object.getOwnPropertyDescriptor(constraintMethods, k), configurable: true });
+    }
+  }
+  define(HTMLFormElement.prototype, {
+    get elements() { return this.querySelectorAll('input, select, textarea, button, output, fieldset, object'); },
+    get length() { return this.elements.length; },
+    checkValidity() { let ok = true; for (const el of this.elements) if (el.checkValidity && !el.checkValidity()) ok = false; return ok; },
+    reportValidity() { return this.checkValidity(); },
+    requestSubmit(submitter) {
+      if (!this.checkValidity()) return;
+      const ev = new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter ?? null });
+      this.dispatchEvent(ev);
+    },
+    reset() { this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true })); },
+  });
+  global.ValidityState = ValidityState;
+
+  // ---- structuredClone (the HTML structured clone algorithm) ----
+  function structuredCloneImpl(value, options) {
+    const memory = new Map();
+    const transfer = options && options.transfer ? Array.from(options.transfer) : [];
+    const fail = (what) => { throw new DOMException(`Failed to execute 'structuredClone' on 'Window': ${what} could not be cloned.`, 'DataCloneError'); };
+    const clone = (v) => {
+      if (v === null || (typeof v !== 'object' && typeof v !== 'function')) {
+        if (typeof v === 'symbol') fail(String(v));
+        return v;
+      }
+      if (typeof v === 'function') fail(String(v).slice(0, 40));
+      if (memory.has(v)) return memory.get(v);
+      let out;
+      const tag = Object.prototype.toString.call(v).slice(8, -1);
+      if (v instanceof Date) out = new Date(v.getTime());
+      else if (v instanceof RegExp) out = new RegExp(v.source, v.flags);
+      else if (v instanceof ArrayBuffer) out = transfer.includes(v) ? v : v.slice(0);
+      else if (ArrayBuffer.isView(v)) {
+        const buffer = clone(v.buffer);
+        out = v instanceof DataView ? new DataView(buffer, v.byteOffset, v.byteLength) : new v.constructor(buffer, v.byteOffset, v.length);
+      } else if (v instanceof Map) {
+        out = new Map();
+        memory.set(v, out);
+        for (const [k, val] of v) out.set(clone(k), clone(val));
+        return out;
+      } else if (v instanceof Set) {
+        out = new Set();
+        memory.set(v, out);
+        for (const k of v) out.add(clone(k));
+        return out;
+      } else if (v instanceof Error) {
+        const Ctor = { EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError }[v.name] || Error;
+        out = Object.create(Ctor.prototype);
+        memory.set(v, out);
+        if ('message' in v) Object.defineProperty(out, 'message', { value: String(v.message), writable: true, configurable: true });
+        if (typeof v.stack === 'string') Object.defineProperty(out, 'stack', { value: v.stack, writable: true, configurable: true });
+        if ('cause' in v) Object.defineProperty(out, 'cause', { value: clone(v.cause), writable: true, configurable: true });
+        return out;
+      } else if (tag === 'Boolean' || tag === 'Number' || tag === 'String' || tag === 'BigInt') {
+        out = Object(v.valueOf());
+      } else if (v instanceof Blob) out = v;
+      else if (Array.isArray(v)) {
+        out = new Array(v.length);
+        memory.set(v, out);
+        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+        return out;
+      } else if (v instanceof Node || v instanceof Promise || v instanceof WeakMap || v instanceof WeakSet || tag === 'Symbol') {
+        fail(`#<${tag}>`);
+      } else {
+        out = {};
+        memory.set(v, out);
+        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+        return out;
+      }
+      memory.set(v, out);
+      return out;
+    };
+    return clone(value);
+  }
+  global.structuredClone = function structuredClone(value, options) {
+    if (arguments.length === 0) throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+    return structuredCloneImpl(value, options);
+  };
+
+  // ---- geometry: DOMPoint, DOMMatrix ----
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { Object.defineProperties(this, { _x: { value: +x, writable: true }, _y: { value: +y, writable: true }, _z: { value: +z, writable: true }, _w: { value: +w, writable: true } }); }
+    static fromPoint(p = {}) { return new this(p.x ?? 0, p.y ?? 0, p.z ?? 0, p.w ?? 1); }
+    get x() { return this._x; } get y() { return this._y; } get z() { return this._z; } get w() { return this._w; }
+    matrixTransform(m) { return (m instanceof DOMMatrixReadOnly ? m : DOMMatrix.fromMatrix(m)).transformPoint(this); }
+    toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
+  }
+  class DOMPoint extends DOMPointReadOnly {
+    set x(v) { this._x = +v; } set y(v) { this._y = +v; } set z(v) { this._z = +v; } set w(v) { this._w = +v; }
+    get x() { return this._x; } get y() { return this._y; } get z() { return this._z; } get w() { return this._w; }
+  }
+  const M = ['m11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44'];
+  const identity = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  // Column-major 4x4 product a·b (CSS/DOMMatrix convention: m[col*4+row])
+  const mul = (a, b) => {
+    const out = new Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      out[c * 4 + r] = s;
+    }
+    return out;
+  };
+  const deg = (v) => v * Math.PI / 180;
+  // A CSS <transform-list> as a matrix (and whether it is 2D)
+  function parseTransformList(text) {
+    let m = identity(), is2D = true;
+    text = String(text).trim();
+    if (text === '' || text === 'none') return { m, is2D };
+    const re = /([a-zA-Z0-9]+)\(([^)]*)\)/g;
+    let match, consumed = '';
+    while ((match = re.exec(text))) {
+      consumed += match[0];
+      const fn = match[1].toLowerCase();
+      const args = match[2].split(/\s*,\s*|\s+/).filter(Boolean);
+      const num = (s, unit) => {
+        const v = parseFloat(s);
+        if (isNaN(v)) throw new SyntaxError(`Failed to parse '${text}'`);
+        if (unit === 'angle') return /turn$/.test(s) ? v * 360 : /grad$/.test(s) ? v * 0.9 : /rad$/.test(s) && !/grad$/.test(s) ? v * 180 / Math.PI : v;
+        return v;
+      };
+      let t = identity();
+      const a = (i, unit) => num(args[i], unit);
+      switch (fn) {
+        case 'matrix': t = [a(0), a(1), 0, 0, a(2), a(3), 0, 0, 0, 0, 1, 0, a(4), a(5), 0, 1]; break;
+        case 'matrix3d': t = args.map(s => num(s)); is2D = false; break;
+        case 'translate': t[12] = a(0); t[13] = args[1] ? a(1) : 0; break;
+        case 'translatex': t[12] = a(0); break;
+        case 'translatey': t[13] = a(0); break;
+        case 'translatez': t[14] = a(0); is2D = false; break;
+        case 'translate3d': t[12] = a(0); t[13] = a(1); t[14] = a(2); is2D = false; break;
+        case 'scale': t[0] = a(0); t[5] = args[1] ? a(1) : a(0); break;
+        case 'scalex': t[0] = a(0); break;
+        case 'scaley': t[5] = a(0); break;
+        case 'scalez': t[10] = a(0); is2D = false; break;
+        case 'scale3d': t[0] = a(0); t[5] = a(1); t[10] = a(2); is2D = false; break;
+        case 'rotate': case 'rotatez': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[0] = c; t[1] = s; t[4] = -s; t[5] = c; break; }
+        case 'rotatex': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[5] = c; t[6] = s; t[9] = -s; t[10] = c; is2D = false; break; }
+        case 'rotatey': { const r = deg(a(0, 'angle')), c = Math.cos(r), s = Math.sin(r); t[0] = c; t[2] = -s; t[8] = s; t[10] = c; is2D = false; break; }
+        case 'skew': t[4] = Math.tan(deg(a(0, 'angle'))); if (args[1]) t[1] = Math.tan(deg(a(1, 'angle'))); break;
+        case 'skewx': t[4] = Math.tan(deg(a(0, 'angle'))); break;
+        case 'skewy': t[1] = Math.tan(deg(a(0, 'angle'))); break;
+        case 'perspective': if (a(0) !== 0) t[11] = -1 / a(0); is2D = false; break;
+        default: throw new DOMException(`Failed to construct 'DOMMatrix': Failed to parse '${text}'.`, 'SyntaxError');
+      }
+      m = mul(m, t);
+    }
+    if (consumed.replace(/\s/g, '') !== text.replace(/\s/g, '')) throw new DOMException(`Failed to construct 'DOMMatrix': Failed to parse '${text}'.`, 'SyntaxError');
+    return { m, is2D };
+  }
+  class DOMMatrixReadOnly {
+    constructor(init) {
+      let m = identity(), is2D = true;
+      if (typeof init === 'string') ({ m, is2D } = parseTransformList(init));
+      else if (init !== undefined && init !== null) {
+        const v = Array.from(init, Number);
+        if (v.length === 6) m = [v[0], v[1], 0, 0, v[2], v[3], 0, 0, 0, 0, 1, 0, v[4], v[5], 0, 1];
+        else if (v.length === 16) { m = v; is2D = false; }
+        else throw new TypeError(`Failed to construct 'DOMMatrix': The sequence must contain 6 elements for a 2D matrix or 16 elements for a 3D matrix.`);
+      }
+      Object.defineProperties(this, { _m: { value: m, writable: true }, _2d: { value: is2D, writable: true } });
+    }
+    static fromMatrix(o = {}) {
+      if (o instanceof DOMMatrixReadOnly) return new this(o._2d ? [o.a, o.b, o.c, o.d, o.e, o.f] : o._m);
+      const m = new this();
+      const a = o.a ?? o.m11 ?? 1, b = o.b ?? o.m12 ?? 0, c = o.c ?? o.m21 ?? 0, d = o.d ?? o.m22 ?? 1, e = o.e ?? o.m41 ?? 0, f = o.f ?? o.m42 ?? 0;
+      m._m = [a, b, o.m13 ?? 0, o.m14 ?? 0, c, d, o.m23 ?? 0, o.m24 ?? 0, o.m31 ?? 0, o.m32 ?? 0, o.m33 ?? 1, o.m34 ?? 0, e, f, o.m43 ?? 0, o.m44 ?? 1];
+      m._2d = o.is2D ?? M.every((k, i) => [2, 3, 6, 7, 8, 9, 11, 14].includes(i) ? !o[k] : [10, 15].includes(i) ? (o[k] ?? 1) === 1 : true);
+      return m;
+    }
+    static fromFloat32Array(a) { return new this(Array.from(a)); }
+    static fromFloat64Array(a) { return new this(Array.from(a)); }
+    get a() { return this._m[0]; } get b() { return this._m[1]; } get c() { return this._m[4]; }
+    get d() { return this._m[5]; } get e() { return this._m[12]; } get f() { return this._m[13]; }
+    get is2D() { return this._2d; }
+    get isIdentity() { return this._m.every((v, i) => v === (i % 5 === 0 ? 1 : 0)); }
+    _derive(m, is2D = this._2d) { const r = new DOMMatrix(); r._m = m; r._2d = is2D; return r; }
+    multiply(o) { const b = o instanceof DOMMatrixReadOnly ? o : DOMMatrix.fromMatrix(o); return this._derive(mul(this._m, b._m), this._2d && b._2d); }
+    translate(tx = 0, ty = 0, tz = 0) { const t = identity(); t[12] = tx; t[13] = ty; t[14] = tz; return this._derive(mul(this._m, t), this._2d && !tz); }
+    scale(sx = 1, sy = sx, sz = 1, ox = 0, oy = 0, oz = 0) {
+      const t = identity(); t[0] = sx; t[5] = sy; t[10] = sz;
+      return this.translate(ox, oy, oz).multiply(this._derive(t, sz === 1)).translate(-ox, -oy, -oz);
+    }
+    scaleNonUniform(sx = 1, sy = 1) { return this.scale(sx, sy); }
+    rotate(rx = 0, ry, rz) {
+      if (ry === undefined && rz === undefined) { rz = rx; rx = 0; ry = 0; }
+      let m = this._m;
+      const is2D = this._2d && !rx && !ry;
+      for (const [angle, fn] of [[rx, 'rotateX'], [ry, 'rotateY'], [rz, 'rotate']]) {
+        if (angle) m = mul(m, parseTransformList(`${fn}(${angle}deg)`).m);
+      }
+      return this._derive(m, is2D);
+    }
+    rotateFromVector(x = 0, y = 0) { return this.rotate(x === 0 && y === 0 ? 0 : Math.atan2(y, x) * 180 / Math.PI); }
+    skewX(sx = 0) { return this._derive(mul(this._m, parseTransformList(`skewX(${sx}deg)`).m)); }
+    skewY(sy = 0) { return this._derive(mul(this._m, parseTransformList(`skewY(${sy}deg)`).m)); }
+    flipX() { return this.scale(-1, 1); }
+    flipY() { return this.scale(1, -1); }
+    inverse() {
+      const m = this._m, inv = new Array(16);
+      inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+      inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+      inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+      inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+      inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+      inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+      inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+      inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+      inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+      inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+      inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+      inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+      inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+      inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+      inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+      inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+      const det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+      if (!det) return this._derive(new Array(16).fill(NaN), false);
+      return this._derive(inv.map(v => v / det));
+    }
+    transformPoint(p = {}) {
+      const m = this._m, x = p.x ?? 0, y = p.y ?? 0, z = p.z ?? 0, w = p.w ?? 1;
+      return new DOMPoint(
+        m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w,
+        m[2] * x + m[6] * y + m[10] * z + m[14] * w, m[3] * x + m[7] * y + m[11] * z + m[15] * w);
+    }
+    toFloat32Array() { return new Float32Array(this._m); }
+    toFloat64Array() { return new Float64Array(this._m); }
+    toString() {
+      const f = (v) => { if (!isFinite(v)) throw new DOMException('Cannot stringify a matrix with non-finite values', 'InvalidStateError'); return String(Object.is(v, -0) ? 0 : v); };
+      return this._2d ? `matrix(${[this.a, this.b, this.c, this.d, this.e, this.f].map(f).join(', ')})` : `matrix3d(${this._m.map(f).join(', ')})`;
+    }
+    toJSON() { const o = { a: this.a, b: this.b, c: this.c, d: this.d, e: this.e, f: this.f, is2D: this.is2D, isIdentity: this.isIdentity }; M.forEach((k, i) => { o[k] = this._m[i]; }); return o; }
+  }
+  M.forEach((k, i) => Object.defineProperty(DOMMatrixReadOnly.prototype, k, { get() { return this._m[i]; }, configurable: true }));
+  class DOMMatrix extends DOMMatrixReadOnly {
+    _self(m, is2D = this._2d) { this._m = m; this._2d = is2D; return this; }
+    multiplySelf(o) { const r = this.multiply(o); return this._self(r._m, r._2d); }
+    preMultiplySelf(o) { const b = o instanceof DOMMatrixReadOnly ? o : DOMMatrix.fromMatrix(o); return this._self(mul(b._m, this._m), this._2d && b._2d); }
+    translateSelf(...a) { const r = this.translate(...a); return this._self(r._m, r._2d); }
+    scaleSelf(...a) { const r = this.scale(...a); return this._self(r._m, r._2d); }
+    rotateSelf(...a) { const r = this.rotate(...a); return this._self(r._m, r._2d); }
+    skewXSelf(s) { return this._self(this.skewX(s)._m); }
+    skewYSelf(s) { return this._self(this.skewY(s)._m); }
+    invertSelf() { const r = this.inverse(); return this._self(r._m, r._2d); }
+    setMatrixValue(text) { const { m, is2D } = parseTransformList(text); return this._self(m, is2D); }
+  }
+  M.forEach((k, i) => Object.defineProperty(DOMMatrix.prototype, k, {
+    get() { return this._m[i]; },
+    set(v) { this._m[i] = +v; if (![0, 1, 4, 5, 10, 12, 13, 15].includes(i) && +v !== 0) this._2d = false; },
+    configurable: true,
+  }));
+  for (const [k, i] of [['a', 0], ['b', 1], ['c', 4], ['d', 5], ['e', 12], ['f', 13]]) {
+    Object.defineProperty(DOMMatrix.prototype, k, { get() { return this._m[i]; }, set(v) { this._m[i] = +v; }, configurable: true });
+  }
+  class DOMQuad {
+    constructor(p1 = {}, p2 = {}, p3 = {}, p4 = {}) { [this.p1, this.p2, this.p3, this.p4] = [p1, p2, p3, p4].map(p => DOMPoint.fromPoint(p)); }
+    static fromRect(r = {}) { const x = r.x ?? 0, y = r.y ?? 0, w = r.width ?? 0, h = r.height ?? 0; return new DOMQuad({ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }); }
+    getBounds() {
+      const xs = [this.p1, this.p2, this.p3, this.p4].map(p => p.x), ys = [this.p1, this.p2, this.p3, this.p4].map(p => p.y);
+      const x = Math.min(...xs), y = Math.min(...ys);
+      return new DOMRect(x, y, Math.max(...xs) - x, Math.max(...ys) - y);
+    }
+  }
+  Object.assign(global, { DOMPointReadOnly, DOMPoint, DOMMatrixReadOnly, DOMMatrix, WebKitCSSMatrix: DOMMatrix, DOMQuad, DOMRectReadOnly: DOMRect });
+
+  // ---- Range and Selection (DOM §5, Selection API) ----
+  //
+  // Ranges are static: unlike browsers' live ranges they do not move when
+  // the DOM changes under them.
+  const nodeLength = (n) => [3, 4, 7, 8].includes(n.nodeType) ? n.data.length : n.nodeType === 10 ? 0 : n.childNodes.length;
+  const indexOfNode = (n) => { let i = 0; for (let s = n.previousSibling; s; s = s.previousSibling) i++; return i; };
+  const rootOfNode = (n) => { while (n.parentNode) n = n.parentNode; return n; };
+  // Position of boundary point (nA, oA) relative to (nB, oB): -1 before, 0 equal, 1 after
+  function comparePoints(nA, oA, nB, oB) {
+    if (nA === nB) return oA === oB ? 0 : oA < oB ? -1 : 1;
+    const pos = nB.compareDocumentPosition(nA);
+    if (pos & 4) return -comparePoints(nB, oB, nA, oA);
+    if (pos & 8) {
+      let child = nB;
+      while (child.parentNode !== nA) child = child.parentNode;
+      return indexOfNode(child) < oA ? 1 : -1;
+    }
+    return -1;
+  }
+  const isCharacterData = (n) => n.nodeType === 3 || n.nodeType === 4 || n.nodeType === 7 || n.nodeType === 8;
+  class AbstractRange {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get startContainer() { return this._sc; }
+    get startOffset() { return this._so; }
+    get endContainer() { return this._ec; }
+    get endOffset() { return this._eo; }
+    get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+  }
+  class StaticRange extends AbstractRange {
+    constructor(init) {
+      const r = Object.create(new.target.prototype);
+      Object.assign(r, { _sc: init.startContainer, _so: init.startOffset >>> 0, _ec: init.endContainer, _eo: init.endOffset >>> 0 });
+      return r;
+    }
+  }
+  class Range extends AbstractRange {
+    constructor() {
+      const r = Object.create(new.target.prototype);
+      Object.defineProperties(r, { _sc: { value: document, writable: true }, _so: { value: 0, writable: true }, _ec: { value: document, writable: true }, _eo: { value: 0, writable: true } });
+      return r;
+    }
+    get commonAncestorContainer() {
+      let c = this._sc;
+      while (!c.contains(this._ec)) c = c.parentNode;
+      return c;
+    }
+    _boundary(node, offset, which) {
+      if (!(node instanceof Node)) throw new TypeError(`Failed to execute 'set${which}' on 'Range': parameter 1 is not of type 'Node'.`);
+      if (node.nodeType === 10) throw new DOMException(`Failed to execute 'set${which}' on 'Range': The node provided is a DocumentType.`, 'InvalidNodeTypeError');
+      offset = Number(offset) >>> 0;
+      if (offset > nodeLength(node)) throw new DOMException(`Failed to execute 'set${which}' on 'Range': The offset ${offset} is larger than the node's length (${nodeLength(node)}).`, 'IndexSizeError');
+      return offset;
+    }
+    setStart(node, offset) {
+      offset = this._boundary(node, offset, 'Start');
+      this._sc = node; this._so = offset;
+      if (rootOfNode(node) !== rootOfNode(this._ec) || comparePoints(node, offset, this._ec, this._eo) > 0) { this._ec = node; this._eo = offset; }
+    }
+    setEnd(node, offset) {
+      offset = this._boundary(node, offset, 'End');
+      this._ec = node; this._eo = offset;
+      if (rootOfNode(node) !== rootOfNode(this._sc) || comparePoints(node, offset, this._sc, this._so) < 0) { this._sc = node; this._so = offset; }
+    }
+    _parentOf(node, name) {
+      const p = node.parentNode;
+      if (!p) throw new DOMException(`Failed to execute '${name}' on 'Range': the given Node has no parent.`, 'InvalidNodeTypeError');
+      return p;
+    }
+    setStartBefore(n) { this.setStart(this._parentOf(n, 'setStartBefore'), indexOfNode(n)); }
+    setStartAfter(n) { this.setStart(this._parentOf(n, 'setStartAfter'), indexOfNode(n) + 1); }
+    setEndBefore(n) { this.setEnd(this._parentOf(n, 'setEndBefore'), indexOfNode(n)); }
+    setEndAfter(n) { this.setEnd(this._parentOf(n, 'setEndAfter'), indexOfNode(n) + 1); }
+    collapse(toStart = false) { if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; } }
+    selectNode(n) { const p = this._parentOf(n, 'selectNode'), i = indexOfNode(n); this._sc = this._ec = p; this._so = i; this._eo = i + 1; }
+    selectNodeContents(n) {
+      if (n.nodeType === 10) throw new DOMException("Failed to execute 'selectNodeContents' on 'Range': The node provided is a DocumentType.", 'InvalidNodeTypeError');
+      this._sc = this._ec = n; this._so = 0; this._eo = nodeLength(n);
+    }
+    compareBoundaryPoints(how, source) {
+      const [a, b] = [[['_sc', '_so'], ['_sc', '_so']], [['_ec', '_eo'], ['_sc', '_so']], [['_ec', '_eo'], ['_ec', '_eo']], [['_sc', '_so'], ['_ec', '_eo']]][how] ?? [];
+      if (!a) throw new DOMException("Failed to execute 'compareBoundaryPoints' on 'Range': The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.", 'NotSupportedError');
+      if (rootOfNode(this._sc) !== rootOfNode(source._sc)) throw new DOMException("Failed to execute 'compareBoundaryPoints' on 'Range': The source range is in a different document than this range.", 'WrongDocumentError');
+      return comparePoints(this[a[0]], this[a[1]], source[b[0]], source[b[1]]);
+    }
+    comparePoint(node, offset) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) throw new DOMException("Failed to execute 'comparePoint' on 'Range': The node provided and the Range are not in the same tree.", 'WrongDocumentError');
+      offset = this._boundary(node, offset, 'Point');
+      if (comparePoints(node, offset, this._sc, this._so) < 0) return -1;
+      if (comparePoints(node, offset, this._ec, this._eo) > 0) return 1;
+      return 0;
+    }
+    isPointInRange(node, offset) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) return false;
+      return this.comparePoint(node, offset) === 0;
+    }
+    intersectsNode(node) {
+      if (rootOfNode(node) !== rootOfNode(this._sc)) return false;
+      const parent = node.parentNode;
+      if (!parent) return true;
+      const i = indexOfNode(node);
+      return comparePoints(parent, i, this._ec, this._eo) < 0 && comparePoints(parent, i + 1, this._sc, this._so) > 0;
+    }
+    cloneRange() { const r = new Range(); Object.assign(r, { _sc: this._sc, _so: this._so, _ec: this._ec, _eo: this._eo }); return r; }
+    _contains(node) {
+      return rootOfNode(node) === rootOfNode(this._sc) && comparePoints(node, 0, this._sc, this._so) > 0 && comparePoints(node, nodeLength(node), this._ec, this._eo) < 0;
+    }
+    _partiallyContains(node) {
+      const a = node.contains(this._sc), b = node.contains(this._ec);
+      return a !== b;
+    }
+    // The "extract" and "clone the contents" algorithms
+    _contents(extract) {
+      const fragment = document.createDocumentFragment();
+      if (this.collapsed) return fragment;
+      const { _sc: sc, _so: so, _ec: ec, _eo: eo } = this;
+      if (sc === ec && isCharacterData(sc)) {
+        const clone = sc.cloneNode(false);
+        clone.data = sc.data.slice(so, eo);
+        fragment.appendChild(clone);
+        if (extract) sc.data = sc.data.slice(0, so) + sc.data.slice(eo);
+        return fragment;
+      }
+      let common = sc;
+      while (!common.contains(ec)) common = common.parentNode;
+      let firstPartial = null, lastPartial = null;
+      if (!sc.contains(ec)) { for (let n = sc; n !== common; n = n.parentNode) if (n.parentNode === common) firstPartial = n; }
+      if (!ec.contains(sc)) { for (let n = ec; n !== common; n = n.parentNode) if (n.parentNode === common) lastPartial = n; }
+      const contained = Array.from(common.childNodes).filter(c => this._contains(c));
+      let newNode, newOffset;
+      if (extract) {
+        if (sc.contains(ec)) { newNode = sc; newOffset = so; }
+        else {
+          let ref = sc;
+          while (ref.parentNode && !ref.parentNode.contains(ec)) ref = ref.parentNode;
+          newNode = ref.parentNode; newOffset = indexOfNode(ref) + 1;
+        }
+      }
+      if (firstPartial) {
+        if (isCharacterData(firstPartial)) {
+          const clone = firstPartial.cloneNode(false);
+          clone.data = sc.data.slice(so);
+          fragment.appendChild(clone);
+          if (extract) sc.data = sc.data.slice(0, so);
+        } else {
+          const clone = firstPartial.cloneNode(false);
+          fragment.appendChild(clone);
+          const sub = new Range();
+          sub.setStart(sc, so); sub.setEnd(firstPartial, nodeLength(firstPartial));
+          clone.appendChild(sub._contents(extract));
+        }
+      }
+      for (const c of contained) fragment.appendChild(extract ? c : c.cloneNode(true));
+      if (lastPartial) {
+        if (isCharacterData(lastPartial)) {
+          const clone = lastPartial.cloneNode(false);
+          clone.data = ec.data.slice(0, eo);
+          fragment.appendChild(clone);
+          if (extract) ec.data = ec.data.slice(eo);
+        } else {
+          const clone = lastPartial.cloneNode(false);
+          fragment.appendChild(clone);
+          const sub = new Range();
+          sub.setStart(lastPartial, 0); sub.setEnd(ec, eo);
+          clone.appendChild(sub._contents(extract));
+        }
+      }
+      if (extract) { this._sc = this._ec = newNode; this._so = this._eo = newOffset; }
+      return fragment;
+    }
+    cloneContents() { return this._contents(false); }
+    extractContents() { return this._contents(true); }
+    deleteContents() { this._contents(true); }
+    insertNode(node) {
+      const { _sc: sc, _so: so } = this;
+      if (sc === node || ([4, 7, 8].includes(sc.nodeType)) || (sc.nodeType === 3 && !sc.parentNode)) {
+        throw new DOMException("Failed to execute 'insertNode' on 'Range': The node provided cannot be inserted here.", 'HierarchyRequestError');
+      }
+      let reference = null, parent;
+      if (sc.nodeType === 3) {
+        // Split the text node at the offset
+        parent = sc.parentNode;
+        const tail = document.createTextNode(sc.data.slice(so));
+        sc.data = sc.data.slice(0, so);
+        parent.insertBefore(tail, sc.nextSibling);
+        reference = tail;
+      } else {
+        parent = sc;
+        reference = sc.childNodes[so] ?? null;
+      }
+      if (reference === node) reference = node.nextSibling;
+      parent.insertBefore(node, reference);
+      if (this.collapsed) { this._ec = parent; this._eo = (reference ? indexOfNode(reference) : parent.childNodes.length); }
+    }
+    surroundContents(newParent) {
+      const cut = (n) => this._partiallyContains(n) && !isCharacterData(n);
+      for (let n = this._sc; n; n = n.parentNode) if (cut(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", 'InvalidStateError');
+      for (let n = this._ec; n; n = n.parentNode) if (cut(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", 'InvalidStateError');
+      const fragment = this.extractContents();
+      while (newParent.firstChild) newParent.removeChild(newParent.firstChild);
+      this.insertNode(newParent);
+      newParent.appendChild(fragment);
+      this.selectNode(newParent);
+    }
+    toString() {
+      const { _sc: sc, _so: so, _ec: ec, _eo: eo } = this;
+      if (sc === ec && sc.nodeType === 3) return sc.data.slice(so, eo);
+      let s = sc.nodeType === 3 ? sc.data.slice(so) : '';
+      const walker = document.createTreeWalker(this.commonAncestorContainer, NodeFilter.SHOW_TEXT);
+      for (let t; (t = walker.nextNode());) if (t !== sc && t !== ec && this._contains(t)) s += t.data;
+      if (ec.nodeType === 3 && ec !== sc) s += ec.data.slice(0, eo);
+      return s;
+    }
+    _elements() {
+      const out = [];
+      const add = (n) => { const el = n.nodeType === 1 ? n : n.parentElement; if (el && !out.includes(el)) out.push(el); };
+      if (this.collapsed) { add(this._sc); return out; }
+      add(this._sc);
+      const walker = document.createTreeWalker(this.commonAncestorContainer, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      for (let n; (n = walker.nextNode());) if (this._contains(n)) add(n);
+      add(this._ec);
+      return out;
+    }
+    getClientRects() { return this._elements().flatMap(el => Array.from(el.getClientRects())); }
+    getBoundingClientRect() {
+      const rects = this.getClientRects().filter(r => r.width || r.height);
+      if (!rects.length) return new DOMRect(0, 0, 0, 0);
+      const l = Math.min(...rects.map(r => r.left)), t = Math.min(...rects.map(r => r.top));
+      return new DOMRect(l, t, Math.max(...rects.map(r => r.right)) - l, Math.max(...rects.map(r => r.bottom)) - t);
+    }
+    createContextualFragment(html) {
+      const context = this._sc.nodeType === 1 ? this._sc : this._sc.parentElement || document.body;
+      const t = document.createElement(context && context.localName !== 'html' ? context.localName : 'body');
+      t.innerHTML = html;
+      const f = document.createDocumentFragment();
+      f.append(...t.childNodes);
+      return f;
+    }
+    detach() {}
+  }
+  Object.assign(Range, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+  Object.assign(Range.prototype, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+  Document.prototype.createRange = function () { return new Range(); };
+
+  class Selection {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get rangeCount() { return this._range ? 1 : 0; }
+    get anchorNode() { return this._range ? (this._backward ? this._range._ec : this._range._sc) : null; }
+    get anchorOffset() { return this._range ? (this._backward ? this._range._eo : this._range._so) : 0; }
+    get focusNode() { return this._range ? (this._backward ? this._range._sc : this._range._ec) : null; }
+    get focusOffset() { return this._range ? (this._backward ? this._range._so : this._range._eo) : 0; }
+    get isCollapsed() { return !this._range || this._range.collapsed; }
+    get type() { return !this._range ? 'None' : this._range.collapsed ? 'Caret' : 'Range'; }
+    get direction() { return !this._range || this._range.collapsed ? 'none' : this._backward ? 'backward' : 'forward'; }
+    getRangeAt(i) {
+      if (!this._range || i !== 0) throw new DOMException(`Failed to execute 'getRangeAt' on 'Selection': ${i} is not a valid index.`, 'IndexSizeError');
+      return this._range;
+    }
+    addRange(r) { if (!this._range) { this._range = r; this._backward = false; } }
+    removeRange(r) {
+      if (r !== this._range) throw new DOMException("Failed to execute 'removeRange' on 'Selection': The given range isn't in document.", 'NotFoundError');
+      this._range = null;
+    }
+    removeAllRanges() { this._range = null; }
+    empty() { this._range = null; }
+    collapse(node, offset = 0) {
+      if (node === null) { this._range = null; return; }
+      const r = new Range();
+      r.setStart(node, offset);
+      this._range = r; this._backward = false;
+    }
+    setPosition(node, offset) { this.collapse(node, offset); }
+    collapseToStart() { if (!this._range) throw new DOMException('Selection has no ranges', 'InvalidStateError'); this.collapse(this._range._sc, this._range._so); }
+    collapseToEnd() { if (!this._range) throw new DOMException('Selection has no ranges', 'InvalidStateError'); this.collapse(this._range._ec, this._range._eo); }
+    extend(node, offset = 0) {
+      if (!this._range) throw new DOMException("Failed to execute 'extend' on 'Selection': This Selection object doesn't have any Ranges.", 'InvalidStateError');
+      const anchor = [this.anchorNode, this.anchorOffset];
+      const r = new Range();
+      if (comparePoints(node, offset, anchor[0], anchor[1]) < 0) { r.setStart(node, offset); r.setEnd(anchor[0], anchor[1]); this._backward = true; }
+      else { r.setStart(anchor[0], anchor[1]); r.setEnd(node, offset); this._backward = false; }
+      this._range = r;
+    }
+    setBaseAndExtent(an, ao, fn, fo) { this.collapse(an, ao); this.extend(fn, fo); }
+    selectAllChildren(node) { const r = new Range(); r.selectNodeContents(node); this._range = r; this._backward = false; }
+    containsNode(node, partial = false) {
+      if (!this._range) return false;
+      return partial ? this._range.intersectsNode(node) : this._range._contains(node);
+    }
+    deleteFromDocument() { if (this._range) this._range.deleteContents(); }
+    toString() { return this._range ? this._range.toString() : ''; }
+  }
+  const selection = Object.create(Selection.prototype);
+  Object.defineProperties(selection, { _range: { value: null, writable: true }, _backward: { value: false, writable: true } });
+  global.getSelection = function getSelection() { return selection; };
+  Document.prototype.getSelection = function () { return selection; };
+  Object.assign(global, { AbstractRange, StaticRange, Range, Selection });
+
+  // ---- DOMParser and XMLSerializer ----
+  //
+  // Every type parses as HTML (there is no XML parser); scripts in the
+  // parsed document do not run.
+  class DOMParser {
+    parseFromString(text, type) {
+      type = String(type);
+      if (!['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'].includes(type)) {
+        throw new TypeError(`Failed to execute 'parseFromString' on 'DOMParser': The provided value '${type}' is not a valid enum value of type DOMParserSupportedType.`);
+      }
+      const html = __fosParseDocument(String(text).replace(/^\s*<\?xml[^>]*\?>/i, ''));
+      const child = (tag) => Array.from(html.children).find(c => c.localName === tag) || null;
+      const doc = Object.create(document);
+      define(doc, {
+        documentElement: html,
+        get head() { return child('head'); },
+        get body() { return child('body'); },
+        get title() { const t = html.querySelector('title'); return t ? t.textContent.trim() : ''; },
+        get contentType() { return type; },
+        get URL() { return 'about:blank'; },
+        getElementById(id) { return html.querySelector('#' + CSS.escape(String(id))); },
+        querySelector(s) { return html.matches(s) ? html : html.querySelector(s); },
+        querySelectorAll(s) { return html.querySelectorAll(s); },
+        getElementsByTagName(t) { return html.getElementsByTagName(t); },
+        getElementsByClassName(c) { return html.getElementsByClassName(c); },
+        get readyState() { return 'complete'; },
+        get defaultView() { return null; },
+      });
+      if (type !== 'text/html') {
+        // An XML document's element is the root, not a body child
+        const root = child('body')?.firstElementChild || Array.from(html.children).find(c => c.localName !== 'head');
+        if (root) define(doc, { documentElement: root });
+      }
+      return doc;
+    }
+  }
+  const escapeText = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  class XMLSerializer {
+    serializeToString(node) {
+      if (!(node instanceof Node) && !(node && node.documentElement)) throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+      if (node.documentElement && node.nodeType !== 1) return '<!DOCTYPE html>' + node.documentElement.outerHTML;
+      switch (node.nodeType) {
+        case 1: return node.outerHTML;
+        case 3: return escapeText(node.data);
+        case 8: return `<!--${node.data}-->`;
+        case 11: return Array.from(node.childNodes, n => this.serializeToString(n)).join('');
+        default: return '';
+      }
+    }
+  }
+  Object.assign(global, { DOMParser, XMLSerializer });
+
+  // ---- crypto.subtle (natives in web_crypto.rs) ----
+  //
+  // Digests, HMAC, AES-GCM, PBKDF2, HKDF and ECDSA (P-256, P-384). Other
+  // algorithms reject with NotSupportedError.
+  const keyMaterial = new WeakMap(); // CryptoKey -> { secret } | { pkcs8, point, d }
+  class CryptoKey {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get type() { return keyMaterial.get(this).type; }
+    get extractable() { return keyMaterial.get(this).extractable; }
+    get algorithm() { return keyMaterial.get(this).algorithm; }
+    get usages() { return keyMaterial.get(this).usages.slice(); }
+  }
+  const makeKey = (type, extractable, algorithm, usages, material) => {
+    const k = Object.create(CryptoKey.prototype);
+    keyMaterial.set(k, { type, extractable: !!extractable, algorithm: Object.freeze(algorithm), usages: Array.from(usages), ...material });
+    return k;
+  };
+  const cryptoError = (name, message) => new DOMException(message, name);
+  // Natives throw TypeErrors whose message starts with a DOMException name
+  const native = (f) => {
+    try { return f(); } catch (e) {
+      const m = /^(OperationError|NotSupportedError|DataError|InvalidAccessError): (.*)$/.exec(e && e.message);
+      throw m ? cryptoError(m[1], m[2]) : e;
+    }
+  };
+  const algName = (alg) => {
+    const n = typeof alg === 'string' ? alg : alg && alg.name;
+    if (typeof n !== 'string') throw new TypeError('Algorithm: name is missing');
+    const known = ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512', 'HMAC', 'AES-GCM', 'AES-CBC', 'AES-CTR', 'AES-KW', 'PBKDF2', 'HKDF', 'ECDSA', 'ECDH',
+      'RSASSA-PKCS1-V1_5', 'RSA-PSS', 'RSA-OAEP', 'ED25519', 'X25519'];
+    const upper = n.toUpperCase();
+    return known.includes(upper) ? upper : n;
+  };
+  const hashName = (h) => algName(h);
+  const bytesOf = (data, what = 'data') => {
+    if (data instanceof ArrayBuffer) return data;
+    if (ArrayBuffer.isView(data)) return data;
+    throw new TypeError(`Failed to execute on 'SubtleCrypto': The provided value for ${what} is not of type '(ArrayBuffer or ArrayBufferView)'.`);
+  };
+  // A copy of the bytes, as an ArrayBuffer
+  const copyBytes = (data, what) => { bytesOf(data, what); return data instanceof ArrayBuffer ? data.slice(0) : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength); };
+  const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const fromB64url = (s) => Uint8Array.from(atob(String(s).replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((String(s).length + 3) % 4)), c => c.charCodeAt(0));
+  const hmacBlock = (hash) => hash === 'SHA-384' || hash === 'SHA-512' ? 1024 : 512;
+  const checkUsage = (key, usage, alg) => {
+    const m = keyMaterial.get(key);
+    if (!m) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+    if (!m.usages.includes(usage) || (alg && m.algorithm.name !== alg)) throw cryptoError('InvalidAccessError', `The requested operation is not valid for the provided key`);
+    return m;
+  };
+  const ecUsages = { public: ['verify'], private: ['sign'] };
+  class SubtleCrypto {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    digest(alg, data) {
+      return new Promise(resolve => resolve(native(() => __fosDigest(algName(alg), bytesOf(data)))));
+    }
+    generateKey(alg, extractable, usages) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        if (name === 'HMAC') {
+          const hash = hashName(alg.hash), length = alg.length ?? hmacBlock(hash);
+          resolve(makeKey('secret', extractable, { name, hash: { name: hash }, length }, usages, { secret: __fosRandomBytes(length / 8) }));
+        } else if (name === 'AES-GCM') {
+          if (![128, 192, 256].includes(alg.length)) throw cryptoError('OperationError', 'AES key length must be 128, 192 or 256 bits');
+          resolve(makeKey('secret', extractable, { name, length: alg.length }, usages, { secret: __fosRandomBytes(alg.length / 8) }));
+        } else if (name === 'ECDSA') {
+          const curve = alg.namedCurve;
+          const [pkcs8, point, d] = native(() => __fosEcGenerate(curve));
+          const algorithm = { name, namedCurve: curve };
+          resolve({
+            publicKey: makeKey('public', true, algorithm, usages.filter(u => ecUsages.public.includes(u)), { point }),
+            privateKey: makeKey('private', extractable, algorithm, usages.filter(u => ecUsages.private.includes(u)), { pkcs8, point, d }),
+          });
+        } else throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    importKey(format, keyData, alg, extractable, usages) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        if (['HMAC', 'AES-GCM', 'PBKDF2', 'HKDF'].includes(name)) {
+          let secret;
+          if (format === 'raw') secret = copyBytes(keyData, 'keyData');
+          else if (format === 'jwk' && keyData && keyData.kty === 'oct') secret = fromB64url(keyData.k).buffer;
+          else throw cryptoError('NotSupportedError', `Unsupported import key format for ${name}`);
+          const algorithm = name === 'HMAC' ? { name, hash: { name: hashName(alg.hash) }, length: secret.byteLength * 8 }
+            : name === 'AES-GCM' ? { name, length: secret.byteLength * 8 } : { name };
+          if (name === 'AES-GCM' && ![16, 24, 32].includes(secret.byteLength)) throw cryptoError('DataError', 'AES key data must be 128, 192 or 256 bits');
+          resolve(makeKey('secret', (name === 'PBKDF2' || name === 'HKDF') ? false : extractable, algorithm, usages, { secret }));
+        } else if (name === 'ECDSA') {
+          const curve = alg.namedCurve;
+          const algorithm = { name, namedCurve: curve };
+          if (format === 'raw') resolve(makeKey('public', true, algorithm, usages, { point: copyBytes(keyData, 'keyData') }));
+          else if (format === 'spki') resolve(makeKey('public', true, algorithm, usages, { point: native(() => __fosEcSpki(curve, undefined, bytesOf(keyData, 'keyData'))) }));
+          else if (format === 'pkcs8') {
+            const [pkcs8, point, d] = native(() => __fosEcImportPkcs8(curve, bytesOf(keyData, 'keyData')));
+            resolve(makeKey('private', extractable, algorithm, usages, { pkcs8, point, d }));
+          } else if (format === 'jwk' && keyData && keyData.kty === 'EC') {
+            const x = fromB64url(keyData.x), y = fromB64url(keyData.y);
+            const point = new Uint8Array(1 + x.length + y.length);
+            point[0] = 4; point.set(x, 1); point.set(y, 1 + x.length);
+            if (keyData.d) {
+              const [pkcs8, p, d] = native(() => __fosEcImportPrivate(curve, fromB64url(keyData.d), point));
+              resolve(makeKey('private', extractable, algorithm, usages, { pkcs8, point: p, d }));
+            } else resolve(makeKey('public', true, algorithm, usages, { point: point.buffer }));
+          } else throw cryptoError('NotSupportedError', `Unsupported import key format for ${name}`);
+        } else throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    exportKey(format, key) {
+      return new Promise(resolve => {
+        const m = keyMaterial.get(key);
+        if (!m) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+        if (!m.extractable) throw cryptoError('InvalidAccessError', 'key is not extractable');
+        const name = m.algorithm.name;
+        if (m.type === 'secret') {
+          if (format === 'raw') return resolve(m.secret.slice(0));
+          if (format === 'jwk') {
+            const alg = name === 'HMAC' ? 'HS' + m.algorithm.hash.name.slice(4) : name === 'AES-GCM' ? `A${m.algorithm.length}GCM` : undefined;
+            return resolve({ kty: 'oct', k: b64url(m.secret), alg, ext: true, key_ops: m.usages.slice() });
+          }
+        } else {
+          const size = m.algorithm.namedCurve === 'P-384' ? 48 : 32;
+          const point = new Uint8Array(m.point);
+          if (format === 'raw' && m.type === 'public') return resolve(m.point.slice(0));
+          if (format === 'spki' && m.type === 'public') return resolve(__fosEcSpki(m.algorithm.namedCurve, m.point));
+          if (format === 'pkcs8' && m.type === 'private') return resolve(m.pkcs8.slice(0));
+          if (format === 'jwk') {
+            const jwk = { kty: 'EC', crv: m.algorithm.namedCurve, x: b64url(point.slice(1, 1 + size)), y: b64url(point.slice(1 + size)), ext: true, key_ops: m.usages.slice() };
+            if (m.type === 'private') jwk.d = b64url(m.d);
+            return resolve(jwk);
+          }
+        }
+        throw cryptoError('NotSupportedError', `Unsupported export key format ${format}`);
+      });
+    }
+    sign(alg, key, data) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'sign', name);
+        if (name === 'HMAC') return resolve(native(() => __fosHmac(m.algorithm.hash.name, m.secret, bytesOf(data))));
+        if (name === 'ECDSA') {
+          if (hashName(alg.hash) !== (m.algorithm.namedCurve === 'P-384' ? 'SHA-384' : 'SHA-256')) throw cryptoError('NotSupportedError', 'ECDSA signing uses the curve\'s own hash');
+          return resolve(native(() => __fosEcSign(m.algorithm.namedCurve, m.pkcs8, bytesOf(data))));
+        }
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    verify(alg, key, signature, data) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'verify', name);
+        if (name === 'HMAC') return resolve(native(() => __fosHmac(m.algorithm.hash.name, m.secret, bytesOf(data), bytesOf(signature, 'signature'))));
+        if (name === 'ECDSA') return resolve(native(() => __fosEcVerify(m.algorithm.namedCurve, hashName(alg.hash), m.point, bytesOf(signature, 'signature'), bytesOf(data))));
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    encrypt(alg, key, data) { return this._aes(alg, key, data, true); }
+    decrypt(alg, key, data) { return this._aes(alg, key, data, false); }
+    _aes(alg, key, data, encrypt) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, encrypt ? 'encrypt' : 'decrypt', name);
+        if (name !== 'AES-GCM') throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+        resolve(native(() => __fosAesGcm(encrypt, m.secret, bytesOf(alg.iv, 'iv'), bytesOf(data), alg.additionalData === undefined ? undefined : bytesOf(alg.additionalData, 'additionalData'), alg.tagLength)));
+      });
+    }
+    deriveBits(alg, key, length) {
+      return new Promise(resolve => {
+        const name = algName(alg);
+        const m = checkUsage(key, 'deriveBits', name);
+        if (name === 'PBKDF2') return resolve(native(() => __fosPbkdf2(hashName(alg.hash), m.secret, bytesOf(alg.salt, 'salt'), alg.iterations, length)));
+        if (name === 'HKDF') return resolve(native(() => __fosHkdf(hashName(alg.hash), m.secret, bytesOf(alg.salt, 'salt'), bytesOf(alg.info, 'info'), length)));
+        throw cryptoError('NotSupportedError', `Algorithm: Unrecognized name ${name}`);
+      });
+    }
+    async deriveKey(alg, key, derivedAlg, extractable, usages) {
+      const m = keyMaterial.get(key);
+      if (!m || !m.usages.includes('deriveKey')) throw cryptoError('InvalidAccessError', 'The requested operation is not valid for the provided key');
+      const name = algName(derivedAlg);
+      const length = name === 'HMAC' ? (derivedAlg.length ?? hmacBlock(hashName(derivedAlg.hash))) : derivedAlg.length;
+      const bits = await this.deriveBits(alg, makeKey('secret', false, m.algorithm, ['deriveBits'], { secret: m.secret }), length);
+      return this.importKey('raw', bits, derivedAlg, extractable, usages);
+    }
+    wrapKey() { return Promise.reject(cryptoError('NotSupportedError', 'wrapKey is not supported')); }
+    unwrapKey() { return Promise.reject(cryptoError('NotSupportedError', 'unwrapKey is not supported')); }
+  }
+  const subtle = Object.create(SubtleCrypto.prototype);
+  Object.defineProperty(Crypto.prototype, 'subtle', { get() { return subtle; }, configurable: true });
+  Object.assign(global, { SubtleCrypto, CryptoKey });
+
+  // ---- matchMedia with the CSS engine's media queries ----
+  class MediaQueryList extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get media() { return this._media; }
+    get matches() { return __fosMatchMedia(this._media); }
+    get onchange() { return this._onchange ?? null; }
+    set onchange(f) { this._onchange = typeof f === 'function' ? f : null; }
+    addListener(f) { if (f) this.addEventListener('change', f); }
+    removeListener(f) { if (f) this.removeEventListener('change', f); }
+  }
+  class MediaQueryListEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.media = String(init.media ?? ''); this.matches = !!init.matches; }
+  }
+  // Lists that may fire `change`, re-evaluated when the window resizes
+  const liveQueries = new Set();
+  global.matchMedia = function matchMedia(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+    const mql = Object.create(MediaQueryList.prototype);
+    Object.defineProperties(mql, { _media: { value: String(query).trim() }, _last: { value: __fosMatchMedia(String(query)), writable: true }, _onchange: { value: null, writable: true } });
+    liveQueries.add(new WeakRef(mql));
+    return mql;
+  };
+  global.addEventListener('resize', () => {
+    for (const ref of liveQueries) {
+      const mql = ref.deref();
+      if (!mql) { liveQueries.delete(ref); continue; }
+      const now = mql.matches;
+      if (now === mql._last) continue;
+      mql._last = now;
+      const ev = new MediaQueryListEvent('change', { media: mql.media, matches: now });
+      mql.dispatchEvent(ev);
+      if (mql._onchange) { try { mql._onchange.call(mql, ev); } catch (e) { reportError(e); } }
+    }
+  });
+  Object.assign(global, { MediaQueryList, MediaQueryListEvent });
+
+  // ---- FileReader ----
+  class FileReader extends EventTargetCtor {
+    constructor() {
+      super();
+      Object.defineProperties(this, { _state: { value: 0, writable: true }, _result: { value: null, writable: true }, _error: { value: null, writable: true }, _abort: { value: false, writable: true } });
+      for (const t of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) this['on' + t] = null;
+    }
+    get readyState() { return this._state; }
+    get result() { return this._result; }
+    get error() { return this._error; }
+    _read(blob, as, encoding) {
+      if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
+      if (this._state === 1) throw new DOMException("Failed to execute 'read' on 'FileReader': The object is already busy reading Blobs.", 'InvalidStateError');
+      this._state = 1; this._result = null; this._abort = false;
+      const fire = (type) => {
+        const ev = Object.assign(new ProgressEvent(type, { lengthComputable: true, loaded: blob.size, total: blob.size }), {});
+        this.dispatchEvent(ev);
+        const h = this['on' + type];
+        if (typeof h === 'function') { try { h.call(this, ev); } catch (e) { reportError(e); } }
+      };
+      setTimeout(() => {
+        if (this._abort) return;
+        fire('loadstart');
+        const buf = blob._buf;
+        if (as === 'text') this._result = __fosDecode(buf, encoding || 'utf-8');
+        else if (as === 'buffer') this._result = buf.slice(0);
+        else if (as === 'binary') this._result = String.fromCharCode(...new Uint8Array(buf));
+        else this._result = `data:${blob.type || 'application/octet-stream'};base64,` + btoa(Array.from(new Uint8Array(buf), c => String.fromCharCode(c)).join(''));
+        this._state = 2;
+        fire('progress'); fire('load'); fire('loadend');
+      }, 0);
+    }
+    readAsText(blob, encoding) { this._read(blob, 'text', encoding); }
+    readAsArrayBuffer(blob) { this._read(blob, 'buffer'); }
+    readAsDataURL(blob) { this._read(blob, 'dataurl'); }
+    readAsBinaryString(blob) { this._read(blob, 'binary'); }
+    abort() {
+      if (this._state !== 1) return;
+      this._abort = true; this._state = 2; this._result = null;
+      for (const t of ['abort', 'loadend']) {
+        const ev = new ProgressEvent(t);
+        this.dispatchEvent(ev);
+        if (typeof this['on' + t] === 'function') this['on' + t].call(this, ev);
+      }
+    }
+  }
+  Object.assign(FileReader, { EMPTY: 0, LOADING: 1, DONE: 2 });
+  class FileList extends Array {
+    item(i) { return this[i] ?? null; }
+    static get [Symbol.species]() { return Array; }
+  }
+  Object.assign(global, { FileReader, FileList });
+
+  // ---- DOMStringMap (dataset), DOMImplementation, XMLDocument, importNode ----
+  function DOMStringMap() { throw new TypeError('Illegal constructor'); }
+  {
+    const desc = Object.getOwnPropertyDescriptor(E, 'dataset');
+    if (desc && desc.get) {
+      const get = desc.get;
+      Object.defineProperty(E, 'dataset', {
+        get() {
+          const d = get.call(this);
+          // The dataset proxy's target gets DOMStringMap.prototype once
+          if (!(d instanceof DOMStringMap)) try { Object.setPrototypeOf(d, DOMStringMap.prototype); } catch {}
+          return d;
+        },
+        configurable: true,
+      });
+    }
+  }
+  function DOMImplementation() { throw new TypeError('Illegal constructor'); }
+  Object.setPrototypeOf(document.implementation, DOMImplementation.prototype);
+  define(DOMImplementation.prototype, {
+    hasFeature() { return true; },
+    createHTMLDocument(title) { return createHTMLDocument(title); },
+    createDocument(ns, qualifiedName) {
+      const doc = createHTMLDocument();
+      if (qualifiedName) define(doc, { documentElement: document.createElementNS(ns, qualifiedName) });
+      return doc;
+    },
+    createDocumentType(name, publicId, systemId) {
+      const dt = Object.create(DocumentType.prototype);
+      Object.defineProperties(dt, { name: { value: String(name) }, publicId: { value: String(publicId ?? '') }, systemId: { value: String(systemId ?? '') }, nodeType: { value: 10 }, nodeName: { value: String(name) } });
+      return dt;
+    },
+  });
+  function XMLDocument() { throw new TypeError('Illegal constructor'); }
+  XMLDocument.prototype = Object.create(Document.prototype);
+  define(Document.prototype, {
+    importNode(node, deep = false) {
+      if (!(node instanceof Node) || node.nodeType === 9) throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", 'NotSupportedError');
+      return node.cloneNode(!!deep);
+    },
+    adoptNode(node) {
+      if (!(node instanceof Node) || node.nodeType === 9) throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", 'NotSupportedError');
+      if (node.parentNode) node.parentNode.removeChild(node);
+      return node;
+    },
+    get fonts() { return fontFaceSet; },
+  });
+  Object.assign(global, { DOMStringMap, DOMImplementation, XMLDocument });
+
+  // ---- fonts: FontFace and document.fonts ----
+  //
+  // Web fonts are not downloaded yet; faces load as the page's fallback
+  // fonts, so "ready" resolves at once.
+  class FontFace {
+    constructor(family, source, descriptors = {}) {
+      Object.assign(this, { family: String(family), style: 'normal', weight: 'normal', stretch: 'normal', unicodeRange: 'U+0-10FFFF', variant: 'normal', featureSettings: 'normal', display: 'auto', ...descriptors });
+      Object.defineProperties(this, { _status: { value: 'unloaded', writable: true }, _source: { value: source } });
+      let resolve;
+      Object.defineProperty(this, 'loaded', { value: new Promise(r => { resolve = r; }) });
+      Object.defineProperty(this, '_resolve', { value: resolve });
+    }
+    get status() { return this._status; }
+    load() { this._status = 'loaded'; this._resolve(this); return this.loaded; }
+  }
+  class FontFaceSet extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get ready() { return Promise.resolve(this); }
+    get status() { return 'loaded'; }
+    get size() { return this._faces.size; }
+    add(face) { this._faces.add(face); return this; }
+    delete(face) { return this._faces.delete(face); }
+    has(face) { return this._faces.has(face); }
+    clear() { this._faces.clear(); }
+    forEach(f, t) { this._faces.forEach(v => f.call(t, v, v, this)); }
+    values() { return this._faces.values(); }
+    keys() { return this._faces.values(); }
+    entries() { return Array.from(this._faces, f => [f, f]).values(); }
+    [Symbol.iterator]() { return this._faces.values(); }
+    check() { return true; }
+    load(font) { return Promise.resolve(Array.from(this._faces).filter(f => String(font).includes(f.family))); }
+  }
+  const fontFaceSet = Object.create(FontFaceSet.prototype);
+  Object.defineProperty(fontFaceSet, '_faces', { value: new Set() });
+  for (const t of ['loading', 'loadingdone', 'loadingerror']) fontFaceSet['on' + t] = null;
+  Object.assign(global, { FontFace, FontFaceSet });
+
+  // ---- scheduling: scheduler.postTask/yield, TaskController ----
+  class TaskSignal extends AbortSignal {
+    get priority() { return this._priority ?? 'user-visible'; }
+  }
+  class TaskController extends AbortController {
+    constructor(init = {}) {
+      super();
+      const signal = this.signal;
+      Object.setPrototypeOf(signal, TaskSignal.prototype);
+      Object.defineProperty(signal, '_priority', { value: init.priority ?? 'user-visible', writable: true });
+      signal.onprioritychange = null;
+    }
+    setPriority(priority) {
+      const s = this.signal;
+      const previous = s._priority;
+      s._priority = String(priority);
+      const ev = Object.assign(new Event('prioritychange'), { previousPriority: previous });
+      s.dispatchEvent(ev);
+      if (typeof s.onprioritychange === 'function') s.onprioritychange(ev);
+    }
+  }
+  const priorityDelay = { 'user-blocking': 0, 'user-visible': 0, background: 10 };
+  class Scheduler {
+    postTask(callback, options = {}) {
+      const signal = options.signal;
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) return reject(signal.reason);
+        const priority = options.priority ?? (signal && signal.priority) ?? 'user-visible';
+        const id = setTimeout(() => {
+          try { resolve(callback()); } catch (e) { reject(e); }
+        }, (options.delay ?? 0) + (priorityDelay[priority] ?? 0));
+        if (signal) signal.addEventListener('abort', () => { clearTimeout(id); reject(signal.reason); }, { once: true });
+      });
+    }
+    yield() { return new Promise(r => setTimeout(r, 0)); }
+  }
+  Object.assign(global, { scheduler: Object.create(Scheduler.prototype), Scheduler, TaskController, TaskSignal });
+
+  // ---- Trusted Types (policies; nothing enforces them without CSP) ----
+  class TrustedHTML { toString() { return this._v; } toJSON() { return this._v; } }
+  class TrustedScript { toString() { return this._v; } toJSON() { return this._v; } }
+  class TrustedScriptURL { toString() { return this._v; } toJSON() { return this._v; } }
+  const trusted = (C, v) => { const o = Object.create(C.prototype); Object.defineProperty(o, '_v', { value: String(v) }); return o; };
+  class TrustedTypePolicy {
+    createHTML(s, ...a) { if (!this._p.createHTML) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createHTML' member.`); return trusted(TrustedHTML, this._p.createHTML(s, ...a)); }
+    createScript(s, ...a) { if (!this._p.createScript) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createScript' member.`); return trusted(TrustedScript, this._p.createScript(s, ...a)); }
+    createScriptURL(s, ...a) { if (!this._p.createScriptURL) throw new TypeError(`Policy ${this.name}'s TrustedTypePolicyOptions did not specify a 'createScriptURL' member.`); return trusted(TrustedScriptURL, this._p.createScriptURL(s, ...a)); }
+  }
+  const policies = new Map();
+  class TrustedTypePolicyFactory {
+    createPolicy(name, options = {}) {
+      const p = Object.create(TrustedTypePolicy.prototype);
+      Object.defineProperties(p, { name: { value: String(name), enumerable: true }, _p: { value: options } });
+      if (name === 'default') policies.set('default', p);
+      return p;
+    }
+    isHTML(v) { return v instanceof TrustedHTML; }
+    isScript(v) { return v instanceof TrustedScript; }
+    isScriptURL(v) { return v instanceof TrustedScriptURL; }
+    get emptyHTML() { return trusted(TrustedHTML, ''); }
+    get emptyScript() { return trusted(TrustedScript, ''); }
+    get defaultPolicy() { return policies.get('default') ?? null; }
+    getAttributeType() { return null; }
+    getPropertyType() { return null; }
+  }
+  Object.assign(global, { trustedTypes: Object.create(TrustedTypePolicyFactory.prototype), TrustedHTML, TrustedScript, TrustedScriptURL, TrustedTypePolicy, TrustedTypePolicyFactory });
+
+  // ---- permission-gated APIs: present, and answering "no" ----
+  class PermissionStatus extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  class Permissions {
+    query(descriptor) {
+      if (!descriptor || typeof descriptor.name !== 'string') return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor'."));
+      const s = Object.create(PermissionStatus.prototype);
+      Object.assign(s, { name: descriptor.name, state: 'prompt', onchange: null });
+      return Promise.resolve(s);
+    }
+  }
+  class GeolocationPositionError {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  Object.assign(GeolocationPositionError, { PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 });
+  class Geolocation {
+    getCurrentPosition(success, error) {
+      if (typeof error === 'function') setTimeout(() => {
+        const e = Object.create(GeolocationPositionError.prototype);
+        Object.assign(e, { code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 });
+        error(e);
+      }, 0);
+    }
+    watchPosition(success, error) { this.getCurrentPosition(success, error); return 0; }
+    clearWatch() {}
+  }
+  class Notification extends EventTargetCtor {
+    constructor(title, options = {}) {
+      super();
+      Object.assign(this, { title: String(title), body: options.body ?? '', tag: options.tag ?? '', icon: options.icon ?? '', data: options.data ?? null, onclick: null, onshow: null, onerror: null, onclose: null });
+      setTimeout(() => this.dispatchEvent(new Event('error')), 0);
+    }
+    static get permission() { return 'default'; }
+    static requestPermission(cb) { if (typeof cb === 'function') setTimeout(() => cb('denied'), 0); return Promise.resolve('denied'); }
+    close() {}
+  }
+  class Clipboard extends EventTargetCtor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    readText() { return Promise.reject(new DOMException('Read permission denied.', 'NotAllowedError')); }
+    read() { return this.readText(); }
+    writeText() { return Promise.resolve(); }
+    write() { return Promise.resolve(); }
+  }
+  class ClipboardItem {
+    constructor(items) { Object.defineProperty(this, '_items', { value: items }); }
+    get types() { return Object.keys(this._items); }
+    getType(t) { return Promise.resolve(this._items[t]); }
+    static supports() { return true; }
+  }
+  define(Navigator.prototype, {
+    permissions: Object.create(Permissions.prototype),
+    geolocation: Object.create(Geolocation.prototype),
+    clipboard: Object.create(Clipboard.prototype),
+    userActivation: { hasBeenActive: false, isActive: false },
+    mediaDevices: { enumerateDevices: () => Promise.resolve([]), getUserMedia: () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError')), addEventListener() {}, removeEventListener() {} },
+    canShare() { return false; },
+    vibrate() { return false; },
+    pdfViewerEnabled: false,
+    deviceMemory: 8,
+    connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'unknown', addEventListener() {}, removeEventListener() {} },
+  });
+  Object.assign(global, { Permissions, PermissionStatus, Geolocation, GeolocationPositionError, Notification, Clipboard, ClipboardItem });
+
+  // ---- MutationObserver (DOM §4.3) ----
+  //
+  // DOM operations are wrapped to queue mutation records for the
+  // observers interested in them, delivered in a microtask. Nothing is
+  // recorded (or computed) while no observer is registered.
+  class MutationRecord {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  const makeRecord = (fields) => {
+    const r = Object.create(MutationRecord.prototype);
+    Object.assign(r, { type: '', target: null, addedNodes: nodeList([]), removedNodes: nodeList([]), previousSibling: null, nextSibling: null,
+      attributeName: null, attributeNamespace: null, oldValue: null }, fields);
+    return r;
+  };
+  const nodeList = (nodes) => Object.setPrototypeOf(nodes, NodeList.prototype);
+  const registrations = new Map(); // node -> [{ observer, options }]
+  let observedCount = 0;
+  const pendingObservers = new Set();
+  let deliveryQueued = false;
+  function deliverMutations() {
+    deliveryQueued = false;
+    const observers = [...pendingObservers];
+    pendingObservers.clear();
+    for (const mo of observers) {
+      const records = mo._records.splice(0);
+      if (records.length) {
+        try { mo._callback.call(mo, records, mo); } catch (e) { reportError(e); }
+      }
+    }
+  }
+  // Queue a record for every observer interested in a change to `target`
+  function queueMutation(type, target, fields, name, oldValue) {
+    const interested = new Map(); // observer -> oldValue to record
+    for (let node = target; node; node = node.parentNode) {
+      const regs = registrations.get(node);
+      if (!regs) continue;
+      for (const { observer, options } of regs) {
+        if (node !== target && !options.subtree) continue;
+        if (type === 'attributes') {
+          if (!options.attributes || (options.attributeFilter && !options.attributeFilter.includes(name))) continue;
+        } else if (type === 'characterData') {
+          if (!options.characterData) continue;
+        } else if (!options.childList) continue;
+        const wantsOld = (type === 'attributes' && options.attributeOldValue) || (type === 'characterData' && options.characterDataOldValue);
+        if (!interested.has(observer) || wantsOld) interested.set(observer, wantsOld ? oldValue : interested.get(observer) ?? null);
+      }
+    }
+    for (const [observer, old] of interested) {
+      observer._records.push(makeRecord({ type, target, ...fields, oldValue: old }));
+      pendingObservers.add(observer);
+    }
+    if (interested.size && !deliveryQueued) {
+      deliveryQueued = true;
+      queueMicrotask(deliverMutations);
+    }
+  }
+  class MutationObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'MutationObserver': The callback provided as parameter 1 is not a function.");
+      Object.defineProperties(this, { _callback: { value: callback }, _records: { value: [] }, _targets: { value: new Set() } });
+    }
+    observe(target, options = {}) {
+      if (!(target instanceof Node)) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+      const o = {
+        childList: !!options.childList, subtree: !!options.subtree,
+        attributes: options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined ? true : false),
+        characterData: options.characterData ?? (options.characterDataOldValue !== undefined ? true : false),
+        attributeOldValue: !!options.attributeOldValue, characterDataOldValue: !!options.characterDataOldValue,
+        attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
+      };
+      if (!o.childList && !o.attributes && !o.characterData) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      if (o.attributeOldValue && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+      if (o.attributeFilter && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+      if (o.characterDataOldValue && !o.characterData) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+      let regs = registrations.get(target);
+      if (!regs) registrations.set(target, regs = []);
+      const existing = regs.find(r => r.observer === this);
+      if (existing) existing.options = o;
+      else { regs.push({ observer: this, options: o }); observedCount++; this._targets.add(target); }
+    }
+    disconnect() {
+      for (const t of this._targets) {
+        const regs = registrations.get(t);
+        if (!regs) continue;
+        const i = regs.findIndex(r => r.observer === this);
+        if (i >= 0) { regs.splice(i, 1); observedCount--; }
+        if (!regs.length) registrations.delete(t);
+      }
+      this._targets.clear();
+      this._records.length = 0;
+    }
+    takeRecords() { return this._records.splice(0); }
+  }
+
+  // The hooks. Each runs the original operation; only with observers does
+  // it work out what changed.
+  const argNodes = (args) => args.flatMap(a => a instanceof Node ? (a.nodeType === 11 ? Array.from(a.childNodes) : [a]) : [null]);
+  // Records for nodes leaving their old parents (moves, fragments)
+  const removalsOf = (nodes) => nodes.filter(n => n && n.parentNode).map(n => [n.parentNode, { removedNodes: nodeList([n]), previousSibling: n.previousSibling, nextSibling: n.nextSibling }]);
+  const childListHook = (proto, name, plan) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    define(proto, { [name](...args) {
+      if (!observedCount) return original.apply(this, args);
+      const p = plan.call(this, args);
+      const r = original.apply(this, args);
+      for (const [target, fields] of p.before) queueMutation('childList', target, fields);
+      const after = p.after();
+      if (after && (after.addedNodes.length || after.removedNodes.length)) queueMutation('childList', after.target, after);
+      return r;
+    } });
+  };
+  // Added nodes found after the operation, as the run between two siblings
+  const runBetween = (parent, prev, next) => {
+    const nodes = [];
+    for (let n = prev ? prev.nextSibling : parent.firstChild; n && n !== next; n = n.nextSibling) nodes.push(n);
+    return nodes;
+  };
+  const insertionPlan = (parentOf, prevOf, nextOf, nodesOf) => function (args) {
+    const nodes = argNodes(nodesOf(args));
+    const before = removalsOf(nodes.filter(Boolean));
+    const parent = parentOf.call(this, args);
+    // The siblings the inserted run will have, skipping nodes being moved
+    let prev = prevOf.call(this, args), next = nextOf.call(this, args);
+    while (prev && nodes.includes(prev)) prev = prev.previousSibling;
+    while (next && nodes.includes(next)) next = next.nextSibling;
+    return {
+      before,
+      after: () => parent && ({ target: parent, addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([]), previousSibling: prev, nextSibling: next }),
+    };
+  };
+  const self = function () { return this; };
+  childListHook(NodeP, 'appendChild', insertionPlan(self, function () { return this.lastChild; }, () => null, a => a.slice(0, 1)));
+  childListHook(NodeP, 'insertBefore', insertionPlan(self, function (a) { return a[1] ? a[1].previousSibling : this.lastChild; }, a => a[1] ?? null, a => a.slice(0, 1)));
+  for (const proto of [NodeP, ElementP]) {
+    childListHook(proto, 'append', insertionPlan(self, function () { return this.lastChild; }, () => null, a => a));
+    childListHook(proto, 'prepend', insertionPlan(self, () => null, function () { return this.firstChild; }, a => a));
+  }
+  for (const proto of [ElementP, CharacterData.prototype]) {
+    childListHook(proto, 'before', insertionPlan(function () { return this.parentNode; }, function () { return this.previousSibling; }, self, a => a));
+    childListHook(proto, 'after', insertionPlan(function () { return this.parentNode; }, self, function () { return this.nextSibling; }, a => a));
+  }
+  childListHook(NodeP, 'removeChild', function (args) {
+    const node = args[0];
+    const fields = node instanceof Node && node.parentNode === this ? removalsOf([node]) : [];
+    return { before: [], after: () => fields.length ? { target: this, ...fields[0][1], addedNodes: nodeList([]) } : null };
+  });
+  for (const proto of [ElementP, CharacterData.prototype]) {
+    childListHook(proto, 'remove', function () {
+      const parent = this.parentNode;
+      const fields = parent ? removalsOf([this]) : [];
+      return { before: [], after: () => fields.length ? { target: parent, ...fields[0][1], addedNodes: nodeList([]) } : null };
+    });
+    childListHook(proto, 'replaceWith', function (args) {
+      const parent = this.parentNode;
+      if (!parent) return { before: [], after: () => null };
+      const prev = this.previousSibling, next = this.nextSibling;
+      const nodes = argNodes(args).filter(Boolean);
+      const before = removalsOf(nodes.filter(n => n !== this));
+      return { before, after: () => ({ target: parent, addedNodes: nodeList(runBetween(parent, nodes.includes(prev) ? null : prev, nodes.includes(next) ? null : next)), removedNodes: nodeList([this]), previousSibling: prev, nextSibling: next }) };
+    });
+  }
+  childListHook(NodeP, 'replaceChild', function (args) {
+    const [node, child] = args;
+    if (!(child instanceof Node) || child.parentNode !== this) return { before: [], after: () => null };
+    const prev = child.previousSibling === node ? node.previousSibling : child.previousSibling;
+    const next = child.nextSibling === node ? node.nextSibling : child.nextSibling;
+    const before = removalsOf(argNodes([node]).filter(n => n && n !== child));
+    return { before, after: () => ({ target: this, addedNodes: nodeList(runBetween(this, prev, next)), removedNodes: nodeList([child]), previousSibling: prev, nextSibling: next }) };
+  });
+  childListHook(ElementP, 'insertAdjacentHTML', function (args) {
+    const where = String(args[0]).toLowerCase();
+    const outside = where === 'beforebegin' || where === 'afterend';
+    const parent = outside ? this.parentNode : this;
+    const prev = where === 'beforebegin' ? this.previousSibling : where === 'afterbegin' ? null : where === 'beforeend' ? this.lastChild : this;
+    const next = where === 'beforebegin' ? this : where === 'afterbegin' ? this.firstChild : where === 'beforeend' ? null : this.nextSibling;
+    return { before: [], after: () => parent && ({ target: parent, addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([]), previousSibling: prev, nextSibling: next }) };
+  });
+  // Setters that replace children (innerHTML, textContent) or the element itself (outerHTML)
+  const wrapSetter = (proto, name, hook) => {
+    let owner = proto, d;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);
+    if (!d || !d.set) return;
+    Object.defineProperty(owner, name, { configurable: true, enumerable: d.enumerable, get: d.get, set(v) {
+      if (!observedCount) return d.set.call(this, v);
+      hook.call(this, () => d.set.call(this, v));
+    } });
+  };
+  const replaceChildrenHook = function (run) {
+    if (this.nodeType === 3 || this.nodeType === 8) return characterDataHook.call(this, run);
+    const removed = Array.from(this.childNodes);
+    run();
+    const added = Array.from(this.childNodes);
+    if (removed.length || added.length) queueMutation('childList', this, { addedNodes: nodeList(added), removedNodes: nodeList(removed) });
+  };
+  wrapSetter(ElementP, 'innerHTML', replaceChildrenHook);
+  wrapSetter(NodeP, 'textContent', replaceChildrenHook);
+  wrapSetter(ElementP, 'outerHTML', function (run) {
+    const parent = this.parentNode;
+    if (!parent) return run();
+    const prev = this.previousSibling, next = this.nextSibling;
+    run();
+    queueMutation('childList', parent, { addedNodes: nodeList(runBetween(parent, prev, next)), removedNodes: nodeList([this]), previousSibling: prev, nextSibling: next });
+  });
+  // Character data
+  const characterDataHook = function (run) {
+    const old = this.data;
+    run();
+    queueMutation('characterData', this, {}, null, old);
+  };
+  for (const name of ['data', 'nodeValue']) wrapSetter(CharacterData.prototype, name, characterDataHook);
+  // Attributes
+  const attributeHook = (name, el, run) => {
+    const old = el.getAttribute(name);
+    const r = run();
+    queueMutation('attributes', el, { attributeName: name }, name, old);
+    return r;
+  };
+  for (const name of ['setAttribute', 'removeAttribute', 'toggleAttribute', 'setAttributeNS', 'removeAttributeNS']) {
+    let owner = ElementP;
+    while (owner && !Object.getOwnPropertyDescriptor(owner, name)) owner = Object.getPrototypeOf(owner);
+    if (!owner) continue;
+    const original = owner[name];
+    const ns = name.endsWith('NS');
+    define(owner, { [name](...args) {
+      if (!observedCount || !(this instanceof Element)) return original.apply(this, args);
+      let attr = String(ns ? args[1] : args[0]);
+      if (ns && attr.includes(':')) attr = attr.slice(attr.indexOf(':') + 1);
+      attr = this.namespaceURI === 'http://www.w3.org/1999/xhtml' ? attr.toLowerCase() : attr;
+      if ((name === 'removeAttribute' || name === 'removeAttributeNS') && !this.hasAttribute(attr)) return original.apply(this, args);
+      if (name === 'toggleAttribute') {
+        const had = this.hasAttribute(attr);
+        const want = args[1] === undefined ? !had : !!args[1];
+        if (want === had) return original.apply(this, args);
+      }
+      return attributeHook(attr, this, () => original.apply(this, args));
+    } });
+  }
+  for (const [prop, attr] of [['id', 'id'], ['className', 'class']]) {
+    wrapSetter(ElementP, prop, function (run) { attributeHook(attr, this, run); });
+  }
+
+  // CharacterData editing methods, as the DOM standard defines them
+  define(CharacterData.prototype, {
+    appendData(s) { this.data += String(s); },
+    insertData(offset, s) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'insertData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + String(s) + this.data.slice(offset);
+    },
+    deleteData(offset, count) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'deleteData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + this.data.slice(offset + (count >>> 0));
+    },
+    replaceData(offset, count, s) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'replaceData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + String(s) + this.data.slice(offset + (count >>> 0));
+    },
+    substringData(offset, count) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'substringData' on 'CharacterData': The offset is greater than the node's length.", 'IndexSizeError');
+      return this.data.substr(offset, count >>> 0);
+    },
+  });
+  define(Text.prototype, {
+    splitText(offset) {
+      offset >>>= 0;
+      if (offset > this.data.length) throw new DOMException("Failed to execute 'splitText' on 'Text': The offset is greater than the Text node's length.", 'IndexSizeError');
+      const tail = document.createTextNode(this.data.slice(offset));
+      if (this.parentNode) this.parentNode.insertBefore(tail, this.nextSibling);
+      this.data = this.data.slice(0, offset);
+      return tail;
+    },
+    get wholeText() {
+      let first = this, s = '';
+      while (first.previousSibling && first.previousSibling.nodeType === 3) first = first.previousSibling;
+      for (let n = first; n && n.nodeType === 3; n = n.nextSibling) s += n.data;
+      return s;
+    },
+  });
+
+  // ---- IntersectionObserver and ResizeObserver, from layout geometry ----
+  //
+  // Observations are checked when they start, on scroll and resize, and
+  // a few times a second while any are active (to follow layout changes),
+  // and notified when an element crosses a threshold or changes size.
+  const geometryObservers = new Set();
+  let geometryTimer = 0;
+  function scheduleGeometry() {
+    if (geometryTimer || !geometryObservers.size) return;
+    geometryTimer = setTimeout(() => {
+      geometryTimer = 0;
+      for (const o of [...geometryObservers]) o._check();
+      if (geometryObservers.size) geometryTimer = setTimeout(function again() {
+        geometryTimer = 0;
+        scheduleGeometry();
+      }, 250);
+    }, 0);
+  }
+  global.addEventListener('scroll', () => { for (const o of geometryObservers) o._check(); });
+  global.addEventListener('resize', () => { for (const o of geometryObservers) o._check(); });
+  const rectOf = (el) => el.getBoundingClientRect();
+  const parseMargin = (s) => {
+    const parts = String(s || '0px').trim().split(/\s+/).map(v => ({ v: parseFloat(v) || 0, pct: v.endsWith('%') }));
+    while (parts.length < 4) parts.push(parts[parts.length === 3 ? 1 : parts.length === 2 ? 0 : 0]);
+    return parts.slice(0, 4);
+  };
+  class IntersectionObserverEntry {
+    constructor(init) { Object.assign(this, init); }
+  }
+  class IntersectionObserver {
+    constructor(callback, options = {}) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+      let thresholds = options.threshold ?? 0;
+      thresholds = (Array.isArray(thresholds) ? thresholds : [thresholds]).map(Number);
+      if (thresholds.some(t => !(t >= 0 && t <= 1))) throw new RangeError("Failed to construct 'IntersectionObserver': Threshold values must be numbers between 0 and 1");
+      Object.defineProperties(this, {
+        _callback: { value: callback }, _targets: { value: new Map() }, _records: { value: [] },
+        root: { value: options.root ?? null, enumerable: true }, rootMargin: { value: String(options.rootMargin ?? '0px'), enumerable: true },
+        thresholds: { value: Object.freeze(thresholds.sort((a, b) => a - b)), enumerable: true },
+        scrollMargin: { value: String(options.scrollMargin ?? '0px'), enumerable: true },
+      });
+    }
+    observe(target) {
+      if (!(target instanceof Element)) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+      if (this._targets.has(target)) return;
+      this._targets.set(target, { index: -1, intersecting: null });
+      geometryObservers.add(this);
+      scheduleGeometry();
+    }
+    unobserve(target) { this._targets.delete(target); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
+    takeRecords() { return this._records.splice(0); }
+    _check() {
+      const [vw, vh] = [global.innerWidth, global.innerHeight];
+      const rootRect = this.root && this.root.getBoundingClientRect ? this.root.getBoundingClientRect() : new DOMRect(0, 0, vw, vh);
+      const m = parseMargin(this.rootMargin);
+      const px = (x, base) => x.pct ? x.v * base / 100 : x.v;
+      const root = new DOMRect(rootRect.left - px(m[3], rootRect.width), rootRect.top - px(m[0], rootRect.height),
+        rootRect.width + px(m[1], rootRect.width) + px(m[3], rootRect.width), rootRect.height + px(m[0], rootRect.height) + px(m[2], rootRect.height));
+      for (const [target, state] of this._targets) {
+        const rendered = target.isConnected && target.getClientRects().length > 0;
+        const b = rectOf(target);
+        const left = Math.max(b.left, root.left), top = Math.max(b.top, root.top);
+        const right = Math.min(b.right, root.right), bottom = Math.min(b.bottom, root.bottom);
+        // Edge-adjacent counts as intersecting (zero-area sentinels work)
+        const intersecting = rendered && right >= left && bottom >= top;
+        const area = b.width * b.height;
+        const inter = intersecting ? new DOMRect(left, top, right - left, bottom - top) : new DOMRect(0, 0, 0, 0);
+        const ratio = !intersecting ? 0 : area > 0 ? (inter.width * inter.height) / area : 1;
+        let index = -1;
+        for (let i = 0; i < this.thresholds.length; i++) if (ratio >= this.thresholds[i] && (intersecting || this.thresholds[i] > 0)) index = i;
+        if (index === state.index && intersecting === state.intersecting) continue;
+        state.index = index;
+        state.intersecting = intersecting;
+        this._records.push(new IntersectionObserverEntry({ time: performance.now(), rootBounds: root, boundingClientRect: b, intersectionRect: inter, isIntersecting: intersecting, isVisible: false, intersectionRatio: ratio, target }));
+      }
+      if (this._records.length) {
+        const entries = this._records.splice(0);
+        try { this._callback.call(this, entries, this); } catch (e) { reportError(e); }
+      }
+    }
+  }
+  class ResizeObserverSize {
+    constructor(inline, block) { Object.assign(this, { inlineSize: inline, blockSize: block }); }
+  }
+  class ResizeObserverEntry {
+    constructor(target, rect) {
+      const size = [new ResizeObserverSize(rect.width, rect.height)];
+      Object.assign(this, { target, contentRect: new DOMRect(0, 0, rect.width, rect.height), borderBoxSize: size, contentBoxSize: size, devicePixelContentBoxSize: size });
+    }
+  }
+  class ResizeObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+      Object.defineProperties(this, { _callback: { value: callback }, _targets: { value: new Map() } });
+    }
+    observe(target) {
+      if (!(target instanceof Element)) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+      // The first check always reports (from an initial size of -1 x -1)
+      this._targets.set(target, { w: -1, h: -1 });
+      geometryObservers.add(this);
+      scheduleGeometry();
+    }
+    unobserve(target) { this._targets.delete(target); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
+    _check() {
+      const entries = [];
+      for (const [target, last] of this._targets) {
+        const r = target.isConnected ? rectOf(target) : new DOMRect(0, 0, 0, 0);
+        if (r.width === last.w && r.height === last.h) continue;
+        last.w = r.width; last.h = r.height;
+        entries.push(new ResizeObserverEntry(target, r));
+      }
+      if (entries.length) { try { this._callback.call(this, entries, this); } catch (e) { reportError(e); } }
+    }
+  }
+  // slotchange: an internal observer watches each shadow tree and its
+  // host's children; after changes, slots whose assigned nodes differ
+  // from what they had get the event
+  {
+    const assignedBefore = new WeakMap(); // slot -> nodes
+    const dirtyHosts = new Set();
+    const checkSlots = () => {
+      const hosts = Array.from(dirtyHosts);
+      dirtyHosts.clear();
+      for (const host of hosts) {
+        const root = shadowRootOf(host);
+        if (!root) continue;
+        for (const slot of root.querySelectorAll('slot')) {
+          const now = __fosAssignedNodes(slot);
+          const before = assignedBefore.get(slot) || [];
+          if (now.length === before.length && now.every((n, i) => n === before[i])) continue;
+          assignedBefore.set(slot, now);
+          slot.dispatchEvent(new Event('slotchange', { bubbles: true }));
+        }
+      }
+    };
+    const slotObserver = new MutationObserver((records) => {
+      for (const r of records) {
+        const t = r.target;
+        if (shadowInfo.has(t)) dirtyHosts.add(shadowInfo.get(t).host);
+        else if (shadowRootOf(t)) dirtyHosts.add(t);
+        else if (r.type === 'attributes' && r.attributeName === 'slot' && t.parentNode && shadowRootOf(t.parentNode)) dirtyHosts.add(t.parentNode);
+        else {
+          const info = shadowInfoOf(t.getRootNode());
+          if (info) dirtyHosts.add(info.host);
+        }
+      }
+      checkSlots();
+    });
+    watchSlots = (root, host) => {
+      slotObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['name'] });
+      slotObserver.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['slot'] });
+      // Slots of a tree filled before (declarative roots) report once
+      dirtyHosts.add(host);
+      queueMicrotask(checkSlots);
+    };
+  }
+  Object.assign(global, { MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver, ResizeObserverEntry, ResizeObserverSize });
+  // dataset belongs to both HTML and SVG elements (HTMLOrSVGElement)
+  Object.defineProperty(SVGElement.prototype, 'dataset', Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'dataset'));
+})(globalThis);
+
+// ---- canvas (contexts, paths and bitmaps are native: canvas_bindings.rs) ----
+(function (global) {
+  'use strict';
+  const define = (o, props) => {
+    for (const k of Object.keys(props)) {
+      const d = Object.getOwnPropertyDescriptor(props, k);
+      d.enumerable = false;
+      Object.defineProperty(o, k, d);
+    }
+  };
+  const getContext = __fosCanvasGetContext, dataURL = __fosCanvasDataURL, png = __fosCanvasPNG;
+  const imageBitmap = __fosImageBitmap, transfer = __fosTransferToImageBitmap;
+  const pngBlob = (buf) => buf ? new Blob([buf], { type: 'image/png' }) : null;
+  const C = HTMLCanvasElement.prototype;
+  define(C, {
+    getContext(type, options) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getContext' on 'HTMLCanvasElement': 1 argument required, but only 0 present.");
+      return getContext(this, String(type), options);
+    },
+    toDataURL() { return dataURL(this); },
+    toBlob(callback) {
+      if (typeof callback !== 'function') throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': The callback provided as parameter 1 is not a function.");
+      const blob = pngBlob(png(this));
+      setTimeout(() => callback(blob), 0);
+    },
+    captureStream() { throw new DOMException("Failed to execute 'captureStream' on 'HTMLCanvasElement': Media streams are not supported.", 'NotSupportedError'); },
+    transferControlToOffscreen() { throw new DOMException("Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Not supported.", 'NotSupportedError'); },
+  });
+  define(OffscreenCanvas.prototype, {
+    getContext(type, options) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getContext' on 'OffscreenCanvas': 1 argument required, but only 0 present.");
+      return getContext(this, String(type), options);
+    },
+    convertToBlob() {
+      try {
+        const buf = png(this);
+        if (!buf) throw new DOMException("Failed to execute 'convertToBlob' on 'OffscreenCanvas': The canvas has no pixels.", 'IndexSizeError');
+        return Promise.resolve(pngBlob(buf));
+      } catch (e) { return Promise.reject(e); }
+    },
+    transferToImageBitmap() { return transfer(this); },
+  });
+
+  const MAX_PIXELS = 2 ** 28;
+  const dim = (v, what) => {
+    const n = Math.trunc(Number(v)) >>> 0;
+    if (n === 0) throw new DOMException(`Failed to construct 'ImageData': The source ${what} is zero or not a number.`, 'IndexSizeError');
+    return n;
+  };
+  class ImageData {
+    constructor(a, b, c) {
+      if (arguments.length < 2) throw new TypeError(`Failed to construct 'ImageData': 2 arguments required, but only ${arguments.length} present.`);
+      let data, width, height;
+      if (ArrayBuffer.isView(a)) {
+        if (!(a instanceof Uint8ClampedArray)) throw new TypeError("Failed to construct 'ImageData': parameter 1 is not of type 'Uint8ClampedArray'.");
+        if (a.length === 0 || a.length % 4) throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of 4.", 'InvalidStateError');
+        width = dim(b, 'width');
+        const pixels = a.length / 4;
+        if (pixels % width) throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of (4 * width).", 'IndexSizeError');
+        height = pixels / width;
+        if (c !== undefined && dim(c, 'height') !== height) throw new DOMException("Failed to construct 'ImageData': The input data length is not equal to (4 * width * height).", 'IndexSizeError');
+        data = a;
+      } else {
+        width = dim(a, 'width');
+        height = dim(b, 'height');
+        if (width * height > MAX_PIXELS) throw new RangeError("Failed to construct 'ImageData': Out of memory at ImageData creation");
+        data = new Uint8ClampedArray(width * height * 4);
+      }
+      Object.defineProperties(this, { data: { value: data }, width: { value: width }, height: { value: height }, colorSpace: { value: 'srgb' } });
+    }
+    get [Symbol.toStringTag]() { return 'ImageData'; }
+  }
+
+  global.createImageBitmap = function createImageBitmap(image, ...rest) {
+    try {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'createImageBitmap' on 'Window': 1 argument required, but only 0 present.");
+      const crop = rest.length >= 4 ? rest.slice(0, 4) : [];
+      if (image instanceof Blob) return image.arrayBuffer().then(buf => imageBitmap(buf, ...crop));
+      return Promise.resolve(imageBitmap(image, ...crop));
+    } catch (e) { return Promise.reject(e); }
+  };
+  define(global, { ImageData });
+})(globalThis);
+
+// ---- Cookie Store API, over document.cookie (the jar applies its rules) ----
+(function (global) {
+  'use strict';
+  const listCookies = () => document.cookie.split(';').map(c => c.trim()).filter(Boolean).map(c => {
+    const i = c.indexOf('=');
+    return i < 0 ? { name: '', value: c } : { name: c.slice(0, i), value: c.slice(i + 1) };
+  });
+  const describe = (c) => ({ name: c.name, value: c.value, domain: null, path: '/', expires: null, secure: location.protocol === 'https:', sameSite: 'lax', partitioned: false });
+  const query = (arg) => {
+    if (arg === undefined) return {};
+    if (arg !== null && typeof arg === 'object') return { name: arg.name === undefined ? undefined : String(arg.name), url: arg.url };
+    return { name: String(arg) };
+  };
+  const eventData = new WeakMap();
+  class CookieChangeEvent extends Event {
+    constructor(type, init = {}) { super(type, init); eventData.set(this, { changed: init.changed || [], deleted: init.deleted || [] }); }
+    get changed() { return eventData.get(this)?.changed ?? []; }
+    get deleted() { return eventData.get(this)?.deleted ?? []; }
+  }
+  class CookieStore extends EventTarget {
+    constructor(key) {
+      if (key !== listCookies) throw new TypeError('Illegal constructor');
+      super();
+      this.onchange = null;
+    }
+    get(arg) {
+      try {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'get' on 'CookieStore': Options must not be empty.");
+        const q = query(arg);
+        const c = listCookies().find(c => q.name === undefined || c.name === q.name);
+        return Promise.resolve(c ? describe(c) : null);
+      } catch (e) { return Promise.reject(e); }
+    }
+    getAll(arg) {
+      const q = query(arg);
+      return Promise.resolve(listCookies().filter(c => q.name === undefined || c.name === q.name).map(describe));
+    }
+    set(a, b) {
+      try {
+        const o = (a !== null && typeof a === 'object') ? a : { name: a, value: b };
+        const name = String(o.name ?? ''), value = String(o.value ?? '');
+        if (name.includes('=') || /[;\x00-\x1f]/.test(name + value)) throw new TypeError("Failed to execute 'set' on 'CookieStore': Cookie name or value is invalid.");
+        let cookie = `${name}=${value}; path=${o.path ?? '/'}`;
+        if (o.domain) cookie += `; domain=${o.domain}`;
+        if (o.expires != null) cookie += `; expires=${new Date(o.expires).toUTCString()}`;
+        cookie += `; samesite=${o.sameSite || 'strict'}`;
+        if (location.protocol === 'https:') cookie += '; secure';
+        if (o.partitioned) cookie += '; partitioned';
+        const before = listCookies().find(c => c.name === name);
+        document.cookie = cookie;
+        const after = listCookies().find(c => c.name === name);
+        this._notify(after && (!before || before.value !== after.value) ? [describe(after)] : [], before && !after ? [describe(before)] : []);
+        return Promise.resolve();
+      } catch (e) { return Promise.reject(e); }
+    }
+    delete(arg) {
+      const o = (arg !== null && typeof arg === 'object') ? arg : { name: arg };
+      return this.set({ ...o, value: '', expires: 0 });
+    }
+    _notify(changed, deleted) {
+      if (!changed.length && !deleted.length) return;
+      queueMicrotask(() => {
+        const ev = new CookieChangeEvent('change', { changed, deleted });
+        this.dispatchEvent(ev);
+        if (typeof this.onchange === 'function') this.onchange(ev);
+      });
+    }
+  }
+  const store = new CookieStore(listCookies);
+  Object.defineProperty(global, 'cookieStore', { value: store, configurable: true, enumerable: false, writable: true });
+  Object.defineProperties(global, {
+    CookieStore: { value: CookieStore, configurable: true, writable: true },
+    CookieChangeEvent: { value: CookieChangeEvent, configurable: true, writable: true },
+  });
 })(globalThis);

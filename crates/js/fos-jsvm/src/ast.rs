@@ -16,6 +16,74 @@ pub struct Program {
     pub strict: bool,
 }
 
+/// Binding of a module's default export when it has no name of its own
+/// (`export default 1 + 2`, `export default function () {}`)
+pub const DEFAULT_EXPORT: &str = "*default*";
+/// Hidden module binding holding the `import.meta` object
+pub const MODULE_META: &str = "%meta";
+/// Hidden module binding holding the module's URL (the referrer of the
+/// `import()` calls in it)
+pub const MODULE_REFERRER: &str = "%referrer";
+
+/// A module: its code, with `import` declarations removed and `export`
+/// keywords stripped from declarations, plus what it imports and exports
+#[derive(Debug)]
+pub struct Module {
+    pub body: Vec<Stmt>,
+    /// The modules it imports from, in source order, without duplicates
+    pub requests: Vec<ModuleRequest>,
+    pub imports: Vec<ImportEntry>,
+    pub exports: Vec<ExportEntry>,
+    /// Uses `await` outside any function (top-level await)
+    pub has_await: bool,
+}
+
+/// A module specifier with its import attributes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRequest {
+    pub specifier: Rc<str>,
+    /// `with { type: "json" }`
+    pub json: bool,
+}
+
+/// `import { import as local } from requests[request]`
+#[derive(Debug, Clone)]
+pub struct ImportEntry {
+    pub request: usize,
+    pub import: ImportName,
+    pub local: Name,
+}
+
+/// What an import or re-export takes from a module
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportName {
+    /// An export by name (`default` for default imports)
+    Name(Rc<str>),
+    /// The module namespace object (`* as ns`)
+    Namespace,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportEntry {
+    /// A binding of this module: `export { local as export }`,
+    /// `export let x`, `export default ...`
+    Local { export: Rc<str>, local: Name },
+    /// A re-export: `export { a as b } from "m"`, `export * as ns from "m"`
+    Indirect { export: Rc<str>, request: usize, import: ImportName },
+    /// `export * from "m"`
+    Star { request: usize },
+}
+
+impl ExportEntry {
+    /// The name it exports under (None for `export *`)
+    pub fn export_name(&self) -> Option<&Rc<str>> {
+        match self {
+            ExportEntry::Local { export, .. } | ExportEntry::Indirect { export, .. } => Some(export),
+            ExportEntry::Star { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarKind {
     Var,
@@ -39,7 +107,8 @@ pub enum Stmt {
     DoWhile { body: Box<Stmt>, test: Expr },
     Break(Option<Name>),
     Continue(Option<Name>),
-    Throw(Expr),
+    /// The thrown value and the `throw` keyword's source offset
+    Throw(Expr, u32),
     Try { block: Vec<Stmt>, param: Option<Pattern>, handler: Option<Vec<Stmt>>, finalizer: Option<Vec<Stmt>> },
     Switch { discriminant: Expr, cases: Vec<SwitchCase> },
     Labeled { label: Name, body: Box<Stmt> },
@@ -185,11 +254,13 @@ pub enum Expr {
     Logical { op: LogicalOp, left: Box<Expr>, right: Box<Expr> },
     Assign { op: AssignOp, target: Box<Pattern>, value: Box<Expr> },
     Cond { test: Box<Expr>, cons: Box<Expr>, alt: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<ArrayElem>, optional: bool },
+    /// `pos`: source offset for stack traces (the callee's property, or the `(`)
+    Call { callee: Box<Expr>, args: Vec<ArrayElem>, optional: bool, pos: u32 },
     /// `super(...)`
     SuperCall(Vec<ArrayElem>),
-    New { callee: Box<Expr>, args: Vec<ArrayElem> },
-    Member { object: Box<Expr>, prop: MemberProp, optional: bool },
+    New { callee: Box<Expr>, args: Vec<ArrayElem>, pos: u32 },
+    /// `pos`: source offset of the property (for stack traces)
+    Member { object: Box<Expr>, prop: MemberProp, optional: bool, pos: u32 },
     /// `super.x` / `super[x]`
     SuperMember(MemberProp),
     /// An optional chain (`a?.b.c`): short-circuits as a whole
@@ -199,8 +270,10 @@ pub enum Expr {
     Await(Box<Expr>),
     /// Parenthesized expression (kept so `(a) = 1` and `(a, b) =>` parse right)
     Paren(Box<Expr>),
-    /// Dynamic `import(specifier)`
-    Import(Box<Expr>),
+    /// Dynamic `import(specifier, options)`
+    Import { spec: Box<Expr>, options: Option<Box<Expr>> },
+    /// `import.meta`
+    ImportMeta,
 }
 
 #[derive(Debug)]
@@ -226,9 +299,9 @@ pub struct Template {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
-    Method,
-    Getter,
-    Setter,
+    Method = 0,
+    Getter = 1,
+    Setter = 2,
 }
 
 #[derive(Debug)]
@@ -479,7 +552,7 @@ fn expr_refs(e: &Expr, out: &mut Refs) {
             expr_refs(cons, out);
             expr_refs(alt, out);
         }
-        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+        Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
             expr_refs(callee, out);
             elems_refs(args, out);
         }
@@ -498,7 +571,15 @@ fn expr_refs(e: &Expr, out: &mut Refs) {
             out.push(Rc::from("this"));
             member_refs(p, out);
         }
-        Expr::OptionalChain(e) | Expr::Await(e) | Expr::Paren(e) | Expr::Import(e) => expr_refs(e, out),
+        Expr::OptionalChain(e) | Expr::Await(e) | Expr::Paren(e) => expr_refs(e, out),
+        Expr::Import { spec, options } => {
+            out.push(Rc::from(MODULE_REFERRER));
+            expr_refs(spec, out);
+            if let Some(o) = options {
+                expr_refs(o, out);
+            }
+        }
+        Expr::ImportMeta => out.push(Rc::from(MODULE_META)),
         Expr::Seq(v) => v.iter().for_each(|x| expr_refs(x, out)),
         Expr::Yield { arg, .. } => {
             if let Some(a) = arg {
@@ -516,7 +597,7 @@ fn stmts_refs(v: &[Stmt], out: &mut Refs) {
 
 fn stmt_refs(s: &Stmt, out: &mut Refs) {
     match s {
-        Stmt::Expr(e) | Stmt::Throw(e) => expr_refs(e, out),
+        Stmt::Expr(e) | Stmt::Throw(e, _) => expr_refs(e, out),
         Stmt::Var { decls, .. } => {
             for d in decls {
                 pattern_refs(&d.target, out);

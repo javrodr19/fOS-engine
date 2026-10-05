@@ -653,6 +653,58 @@ enum Esc {
     Set(ClassSet),
 }
 
+/// Letter numbers (Nl): Roman numerals and the like
+fn is_letter_number(c: char) -> bool {
+    matches!(c, '\u{16EE}'..='\u{16F0}' | '\u{2160}'..='\u{2188}' | '\u{3007}' | '\u{3021}'..='\u{3029}' | '\u{3038}'..='\u{303A}' | '\u{A6E6}'..='\u{A6EF}')
+}
+
+fn is_math_symbol(c: char) -> bool {
+    matches!(c, '+' | '<' | '=' | '>' | '|' | '~' | '\u{AC}' | '\u{B1}' | '\u{D7}' | '\u{F7}' | '\u{3F6}' | '\u{2044}' | '\u{2052}'
+        | '\u{207A}'..='\u{207C}' | '\u{208A}'..='\u{208C}' | '\u{2118}' | '\u{2140}'..='\u{2144}' | '\u{2190}'..='\u{2194}'
+        | '\u{21D2}' | '\u{21D4}' | '\u{2200}'..='\u{22FF}' | '\u{27C0}'..='\u{27C4}' | '\u{27C7}'..='\u{27E5}' | '\u{27F0}'..='\u{27FF}'
+        | '\u{2900}'..='\u{2982}' | '\u{2999}'..='\u{29D7}' | '\u{29DC}'..='\u{29FB}' | '\u{29FE}'..='\u{2AFF}' | '\u{FB29}' | '\u{FE62}'
+        | '\u{FE64}'..='\u{FE66}' | '\u{FF0B}' | '\u{FF1C}'..='\u{FF1E}' | '\u{FF5C}' | '\u{FF5E}' | '\u{FFE2}' | '\u{FFE9}'..='\u{FFEC}')
+}
+
+fn is_currency_symbol(c: char) -> bool {
+    matches!(c, '$' | '\u{A2}'..='\u{A5}' | '\u{58F}' | '\u{60B}' | '\u{9F2}' | '\u{9F3}' | '\u{E3F}' | '\u{17DB}'
+        | '\u{20A0}'..='\u{20C0}' | '\u{FDFC}' | '\u{FE69}' | '\u{FF04}' | '\u{FFE0}' | '\u{FFE1}' | '\u{FFE5}' | '\u{FFE6}')
+}
+
+fn is_modifier_symbol(c: char) -> bool {
+    matches!(c, '^' | '`' | '\u{A8}' | '\u{AF}' | '\u{B4}' | '\u{B8}' | '\u{2C2}'..='\u{2C5}' | '\u{2D2}'..='\u{2DF}'
+        | '\u{2E5}'..='\u{2EB}' | '\u{2ED}' | '\u{2EF}'..='\u{2FF}' | '\u{375}' | '\u{384}' | '\u{385}' | '\u{1FBD}' | '\u{1FBF}'..='\u{1FC1}'
+        | '\u{1FCD}'..='\u{1FCF}' | '\u{1FDD}'..='\u{1FDF}' | '\u{1FED}'..='\u{1FEF}' | '\u{1FFD}' | '\u{1FFE}' | '\u{309B}' | '\u{309C}'
+        | '\u{A700}'..='\u{A716}' | '\u{A720}' | '\u{A721}' | '\u{A789}' | '\u{A78A}' | '\u{FF3E}' | '\u{FF40}' | '\u{FFE3}' | '\u{1F3FB}'..='\u{1F3FF}')
+}
+
+fn is_other_symbol(c: char) -> bool {
+    !is_math_symbol(c) && !is_modifier_symbol(c) && !c.is_alphanumeric()
+        && matches!(c, '\u{A6}' | '\u{A9}' | '\u{AE}' | '\u{B0}' | '\u{482}' | '\u{2100}'..='\u{214F}' | '\u{2195}'..='\u{23FF}'
+            | '\u{2400}'..='\u{24FF}' | '\u{2500}'..='\u{27BF}' | '\u{2800}'..='\u{28FF}' | '\u{2B00}'..='\u{2BFF}' | '\u{2E80}'..='\u{2FFF}'
+            | '\u{3004}' | '\u{3012}' | '\u{3013}' | '\u{3020}' | '\u{3036}' | '\u{3037}' | '\u{3190}' | '\u{3191}' | '\u{3196}'..='\u{319F}'
+            | '\u{31C0}'..='\u{31E3}' | '\u{3200}'..='\u{33FF}' | '\u{4DC0}'..='\u{4DFF}' | '\u{A490}'..='\u{A4C6}' | '\u{FFE4}' | '\u{FFE8}'
+            | '\u{FFED}' | '\u{FFEE}' | '\u{FFFC}' | '\u{FFFD}' | '\u{1D000}'..='\u{1D24F}' | '\u{1F000}'..='\u{1FAFF}')
+}
+
+/// Format characters (Cf): invisible controls such as ZWJ and bidi marks
+fn is_format(c: char) -> bool {
+    matches!(c, '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+fn is_private_use(c: char) -> bool {
+    matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
+}
+
+/// Combining marks of the main combining blocks
+fn is_combining_mark(c: char) -> bool {
+    matches!(c, '\u{300}'..='\u{36F}' | '\u{483}'..='\u{489}' | '\u{591}'..='\u{5BD}' | '\u{610}'..='\u{61A}' | '\u{64B}'..='\u{65F}'
+        | '\u{900}'..='\u{903}' | '\u{93A}'..='\u{94F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}'
+        | '\u{3099}' | '\u{309A}' | '\u{FE00}'..='\u{FE0F}' | '\u{FE20}'..='\u{FE2F}')
+}
+
 /// `\p{...}` for common properties and general categories
 fn property_class(name: &str) -> Option<ClassSet> {
     let name = name.strip_prefix("General_Category=").or_else(|| name.strip_prefix("gc=")).unwrap_or(name);
@@ -664,6 +716,46 @@ fn property_class(name: &str) -> Option<ClassSet> {
         "Nd" | "Decimal_Number" | "digit" => |c| c.is_numeric() && c.to_digit(10).is_some() || matches!(c, '\u{660}'..='\u{669}' | '\u{6F0}'..='\u{6F9}' | '\u{966}'..='\u{96F}' | '\u{FF10}'..='\u{FF19}'),
         "White_Space" | "space" => char::is_whitespace,
         "P" | "Punctuation" => |c| c.is_ascii_punctuation() || matches!(c, '\u{2010}'..='\u{2027}' | '\u{3000}'..='\u{303F}'),
+        // Identifier characters (approximated from Rust's Unicode tables,
+        // which cover letters, numbers and the common combining marks)
+        "ID_Start" | "IDS" | "XID_Start" | "XIDS" => |c| c.is_alphabetic() || is_letter_number(c),
+        "ID_Continue" | "IDC" | "XID_Continue" | "XIDC" => {
+            |c| c.is_alphanumeric() || c == '_' || is_letter_number(c) || is_combining_mark(c) || matches!(c, '\u{203F}' | '\u{2040}' | '\u{2054}' | '\u{FE33}' | '\u{FE34}' | '\u{FE4D}'..='\u{FE4F}' | '\u{FF3F}')
+        }
+        "M" | "Mark" | "Combining_Mark" | "Mn" | "Nonspacing_Mark" => is_combining_mark,
+        // Symbols (approximated by their main blocks)
+        "S" | "Symbol" => |c| is_math_symbol(c) || is_currency_symbol(c) || is_modifier_symbol(c) || is_other_symbol(c),
+        "Sm" | "Math_Symbol" => is_math_symbol,
+        "Sc" | "Currency_Symbol" => is_currency_symbol,
+        "Sk" | "Modifier_Symbol" => is_modifier_symbol,
+        "So" | "Other_Symbol" => is_other_symbol,
+        // Other general categories (approximated)
+        "C" | "Other" => |c| c.is_control() || is_format(c) || is_private_use(c),
+        "Cc" | "Control" | "cntrl" => char::is_control,
+        "Cf" | "Format" => is_format,
+        "Co" | "Private_Use" => is_private_use,
+        "Z" | "Separator" => |c| matches!(c, ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}'),
+        "Zs" | "Space_Separator" => |c| matches!(c, ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'),
+        "Zl" | "Line_Separator" => |c| c == '\u{2028}',
+        "Zp" | "Paragraph_Separator" => |c| c == '\u{2029}',
+        "Lo" | "Other_Letter" => |c| c.is_alphabetic() && !c.is_uppercase() && !c.is_lowercase(),
+        "LC" | "Cased_Letter" => |c| c.is_uppercase() || c.is_lowercase(),
+        "Nl" | "Letter_Number" => is_letter_number,
+        "No" | "Other_Number" => |c| c.is_numeric() && c.to_digit(10).is_none() && !is_letter_number(c),
+        "Pd" | "Dash_Punctuation" => |c| matches!(c, '-' | '\u{58A}' | '\u{5BE}' | '\u{2010}'..='\u{2015}' | '\u{2E3A}' | '\u{2E3B}' | '\u{301C}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}'),
+        "Ps" | "Open_Punctuation" => |c| matches!(c, '(' | '[' | '{' | '\u{2018}' | '\u{201C}' | '\u{3008}' | '\u{300A}' | '\u{300C}' | '\u{300E}' | '\u{3010}' | '\u{FF08}' | '\u{FF3B}' | '\u{FF5B}'),
+        "Pe" | "Close_Punctuation" => |c| matches!(c, ')' | ']' | '}' | '\u{2019}' | '\u{201D}' | '\u{3009}' | '\u{300B}' | '\u{300D}' | '\u{300F}' | '\u{3011}' | '\u{FF09}' | '\u{FF3D}' | '\u{FF5D}'),
+        "Pc" | "Connector_Punctuation" => |c| matches!(c, '_' | '\u{203F}' | '\u{2040}' | '\u{2054}' | '\u{FE33}' | '\u{FE34}' | '\u{FE4D}'..='\u{FE4F}' | '\u{FF3F}'),
+        // Common binary properties
+        "Default_Ignorable_Code_Point" | "DI" => |c| is_format(c) && !matches!(c, '\u{600}'..='\u{605}' | '\u{6DD}' | '\u{70F}' | '\u{FFF9}'..='\u{FFFB}')
+            || matches!(c, '\u{34F}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}' | '\u{FFA0}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}'),
+        "Variation_Selector" | "VS" => |c| matches!(c, '\u{180B}'..='\u{180D}' | '\u{180F}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'),
+        "Regional_Indicator" | "RI" => |c| matches!(c, '\u{1F1E6}'..='\u{1F1FF}'),
+        "Emoji_Modifier" | "EMod" => |c| matches!(c, '\u{1F3FB}'..='\u{1F3FF}'),
+        "Emoji_Component" | "EComp" => |c| matches!(c, '#' | '*' | '0'..='9' | '\u{200D}' | '\u{20E3}' | '\u{FE0F}' | '\u{1F1E6}'..='\u{1F1FF}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{1F9B0}'..='\u{1F9B3}' | '\u{E0020}'..='\u{E007F}'),
+        "Hex_Digit" | "Hex" | "ASCII_Hex_Digit" | "AHex" => |c| c.is_ascii_hexdigit(),
+        "Ideographic" | "Ideo" => |c| matches!(c, '\u{3006}' | '\u{3007}' | '\u{3021}'..='\u{3029}' | '\u{3038}'..='\u{303A}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{3134F}'),
         "ASCII" => |c| c.is_ascii(),
         "Any" => |_| true,
         "Emoji" | "Emoji_Presentation" | "Extended_Pictographic" => {

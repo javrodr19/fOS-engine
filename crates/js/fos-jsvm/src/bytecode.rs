@@ -154,8 +154,14 @@ pub enum Insn {
 
     /// Create a closure from nested function `idx`
     Closure { dst: Reg, idx: u16 },
+    /// `import(spec)`: a promise for the module namespace; `referrer` is
+    /// the importing module's URL (undefined in scripts)
+    DynamicImport { dst: Reg, spec: Reg, referrer: Reg },
     /// Set a function's home object (methods that use `super`)
     SetHomeObject { func: Reg, obj: Reg },
+    /// Name an anonymous function after a computed key (SetFunctionName);
+    /// `prefix`: 0 none, 1 "get ", 2 "set "
+    SetFunctionName { func: Reg, key: Reg, prefix: u8 },
     /// Create a class: dst = constructor from closure `ctor` (already
     /// created), with prototype object `proto` and parent `parent`
     MakeClass { ctor: Reg, proto: Reg, parent: Reg },
@@ -228,6 +234,16 @@ pub enum Insn {
     Debugger,
 }
 
+impl Insn {
+    /// The register the instruction writes its result to, if any
+    pub fn dst(self) -> Option<Reg> {
+        match self {
+            Insn::Mov { dst, .. } | Insn::LoadInt { dst, .. } | Insn::LoadConst { dst, .. } | Insn::LoadUndef { dst, .. } | Insn::LoadNull { dst, .. } | Insn::LoadTrue { dst, .. } | Insn::LoadFalse { dst, .. } | Insn::LoadHole { dst, .. } | Insn::GetUpval { dst, .. } | Insn::GetUpvalChecked { dst, .. } | Insn::GetGlobal { dst, .. } | Insn::TypeofGlobal { dst, .. } | Insn::Add { dst, .. } | Insn::Sub { dst, .. } | Insn::Mul { dst, .. } | Insn::Div { dst, .. } | Insn::Mod { dst, .. } | Insn::Exp { dst, .. } | Insn::BitAnd { dst, .. } | Insn::BitOr { dst, .. } | Insn::BitXor { dst, .. } | Insn::Shl { dst, .. } | Insn::Sar { dst, .. } | Insn::Shr { dst, .. } | Insn::AddImm { dst, .. } | Insn::SubImm { dst, .. } | Insn::Eq { dst, .. } | Insn::Ne { dst, .. } | Insn::StrictEq { dst, .. } | Insn::StrictNe { dst, .. } | Insn::Lt { dst, .. } | Insn::Le { dst, .. } | Insn::Gt { dst, .. } | Insn::Ge { dst, .. } | Insn::In { dst, .. } | Insn::Instanceof { dst, .. } | Insn::Neg { dst, .. } | Insn::Plus { dst, .. } | Insn::ToNumeric { dst, .. } | Insn::Not { dst, .. } | Insn::BitNot { dst, .. } | Insn::Typeof { dst, .. } | Insn::Inc { dst, .. } | Insn::Dec { dst, .. } | Insn::ToStr { dst, .. } | Insn::ToPropertyKey { dst, .. } | Insn::NewObject { dst, .. } | Insn::NewArray { dst, .. } | Insn::GetProp { dst, .. } | Insn::GetElem { dst, .. } | Insn::CopyRest { dst, .. } | Insn::DeleteProp { dst, .. } | Insn::DeleteElem { dst, .. } | Insn::Closure { dst, .. } | Insn::DynamicImport { dst, .. } | Insn::Call { dst, .. } | Insn::CallSpread { dst, .. } | Insn::New { dst, .. } | Insn::NewSpread { dst, .. } | Insn::SuperCall { dst, .. } | Insn::SuperCallSpread { dst, .. } | Insn::GetSuperBase { dst, .. } | Insn::LoadNewTarget { dst, .. } | Insn::LoadCallee { dst, .. } | Insn::ForInInit { dst, .. } | Insn::ForInNext { dst, .. } | Insn::GetIterator { dst, .. } | Insn::IterNext { dst, .. } | Insn::IterValue { dst, .. } | Insn::IterRest { dst, .. } | Insn::GetAsyncIterator { dst, .. } | Insn::AsyncIterReturn { dst, .. } | Insn::TemplateObject { dst, .. } | Insn::RegExp { dst, .. } | Insn::NewPrivateName { dst, .. } | Insn::WithHas { dst, .. } | Insn::Yield { dst, .. } | Insn::IterSend { dst, .. } | Insn::Await { dst, .. } => Some(dst),
+            _ => None,
+        }
+    }
+}
+
 /// Kinds for `ThrowError`
 pub const ERR_TYPE: u8 = 0;
 pub const ERR_REFERENCE: u8 = 1;
@@ -289,6 +305,10 @@ pub enum IcState {
 pub struct TemplateSite {
     pub cooked: Vec<Option<Box<[u16]>>>,
     pub raw: Vec<Box<[u16]>>,
+    /// The site's template object, made on first evaluation: every
+    /// evaluation passes the same (frozen) strings array, which libraries
+    /// use as a cache key
+    pub object: Cell<Option<Gc<JsObject>>>,
 }
 
 /// A regular expression literal (compiled on first evaluation)
@@ -321,6 +341,78 @@ pub struct FunctionProto {
     /// How to compile the body later (lazy functions)
     pub lazy: Option<Box<LazyInfo>>,
     pub compiled: std::cell::OnceCell<Code>,
+    /// The script or module defining this function (stack traces)
+    pub script: Option<Rc<Script>>,
+}
+
+/// A script or module: its name (URL) and source, shared by its functions
+pub struct Script {
+    pub name: Box<str>,
+    pub source: Rc<str>,
+    /// Byte offsets of line starts, built on first use
+    line_starts: std::cell::OnceCell<Box<[u32]>>,
+}
+
+impl Script {
+    pub fn new(name: &str, source: Rc<str>) -> Rc<Script> {
+        Rc::new(Script { name: name.into(), source, line_starts: std::cell::OnceCell::new() })
+    }
+
+    /// 1-based line and column (in UTF-16 units, as browsers count) of a
+    /// byte offset into the source
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let src = &*self.source;
+        let starts = self.line_starts.get_or_init(|| {
+            let b = src.as_bytes();
+            let mut starts = vec![0u32];
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    b'\n' => starts.push(i as u32 + 1),
+                    b'\r' if b.get(i + 1) != Some(&b'\n') => starts.push(i as u32 + 1),
+                    // U+2028 and U+2029
+                    0xE2 if b.get(i + 1) == Some(&0x80) && matches!(b.get(i + 2), Some(0xA8 | 0xA9)) => {
+                        starts.push(i as u32 + 3);
+                        i += 2;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            starts.into_boxed_slice()
+        });
+        let offset = offset.min(src.len() as u32);
+        let line = starts.partition_point(|&s| s <= offset).max(1);
+        let start = starts[line - 1] as usize;
+        let mut end = offset as usize;
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        let col: usize = src[start..end].chars().map(char::len_utf16).sum();
+        (line as u32, col as u32 + 1)
+    }
+}
+
+/// Encode (pc, source offset) pairs, in pc order, as deltas: a varint pc
+/// step and a zigzag varint offset step per entry
+pub fn encode_positions(entries: &[(u32, u32)]) -> Box<[u8]> {
+    fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    let mut out = Vec::with_capacity(entries.len() * 3);
+    let (mut pc, mut pos) = (0u32, 0i64);
+    for &(p, q) in entries {
+        varint(&mut out, (p - pc) as u64);
+        let d = q as i64 - pos;
+        varint(&mut out, ((d << 1) ^ (d >> 63)) as u64);
+        pc = p;
+        pos = q as i64;
+    }
+    out.into_boxed_slice()
 }
 
 /// A compiled function body
@@ -340,12 +432,44 @@ pub struct Code {
     pub arguments_reg: Option<Reg>,
     /// Register receiving the rest parameter array, if any
     pub rest_reg: Option<Reg>,
+    /// Source offsets of instructions that can throw (see `encode_positions`)
+    pub positions: Box<[u8]>,
+}
+
+impl Code {
+    /// Source offset of the instruction at `pc`: the nearest recorded at
+    /// or before it
+    pub fn position_at(&self, pc: u32) -> Option<u32> {
+        fn read(b: &[u8], i: &mut usize) -> u64 {
+            let (mut v, mut shift) = (0u64, 0);
+            while *i < b.len() {
+                let byte = b[*i];
+                *i += 1;
+                v |= ((byte & 0x7F) as u64) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            v
+        }
+        let b = &*self.positions;
+        let (mut i, mut cur_pc, mut pos, mut found) = (0usize, 0u32, 0i64, None);
+        while i < b.len() {
+            cur_pc += read(b, &mut i) as u32;
+            let z = read(b, &mut i);
+            pos += ((z >> 1) as i64) ^ -((z & 1) as i64);
+            if cur_pc > pc {
+                break;
+            }
+            found = Some(pos as u32);
+        }
+        found
+    }
 }
 
 /// Source and scope information for compiling a lazy function
 pub struct LazyInfo {
-    /// The whole script's source
-    pub source: Rc<str>,
     pub params_start: u32,
     pub kind: crate::ast::FunctionKind,
     pub fn_name: Option<crate::ast::Name>,
@@ -355,6 +479,8 @@ pub struct LazyInfo {
     /// Names reachable through upvalues, parallel to `upvals`, with
     /// dead-zone check and binding kind flags
     pub upval_names: Vec<(crate::ast::Name, bool, u8)>,
+    /// Defined in a module
+    pub in_module: bool,
 }
 
 impl FunctionProto {
@@ -375,6 +501,11 @@ impl FunctionProto {
                 }
                 IcState::Add { proto: Some(p), .. } => tracer.mark(p),
                 _ => {}
+            }
+        }
+        for t in code.templates.iter() {
+            if let Some(o) = t.object.get() {
+                tracer.mark(o);
             }
         }
         for f in code.funcs.iter() {

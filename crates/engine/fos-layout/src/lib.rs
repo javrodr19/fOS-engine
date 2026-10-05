@@ -28,6 +28,7 @@ pub mod constraint_cache;
 pub mod intrinsic_size_cache;
 pub mod parallel_layout;
 pub mod grid_cache;
+pub mod engine;
 
 pub use box_model::{BoxDimensions, EdgeSizes, Rect};
 pub use layout_tree::{LayoutTree, LayoutBox, LayoutBoxId, BoxType, ChildIterator};

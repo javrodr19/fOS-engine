@@ -14,6 +14,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+use crate::bigint::BigInt;
 use crate::object::{JsObject, Symbol, Upvalue};
 use crate::string::JsString;
 use crate::value::Value;
@@ -26,6 +27,7 @@ pub enum CellKind {
     Object,
     Upvalue,
     Symbol,
+    BigInt,
 }
 
 #[repr(C)]
@@ -170,6 +172,8 @@ impl Tracer {
             self.mark(o);
         } else if let Some(s) = value.as_symbol() {
             self.mark(s);
+        } else if let Some(b) = value.as_bigint() {
+            self.mark(b);
         }
     }
 
@@ -265,14 +269,22 @@ impl Heap {
         self.collections.get()
     }
 
-    /// Collect garbage. `mark_roots` marks every root; `before_sweep`
-    /// runs after marking completes, when `Gc::is_marked` tells what will
-    /// survive (for weak tables).
-    pub fn collect(&self, mark_roots: impl FnOnce(&mut Tracer), before_sweep: impl FnOnce()) {
+    /// Collect garbage. `mark_roots` marks every root. `ephemerons` runs
+    /// whenever marking runs dry and marks what weakly keyed entries keep
+    /// alive (a WeakMap value whose key is marked); marking ends when it
+    /// adds nothing. `before_sweep` then runs, when `Gc::is_marked` tells
+    /// what will survive (for weak tables).
+    pub fn collect(&self, mark_roots: impl FnOnce(&mut Tracer), mut ephemerons: impl FnMut(&mut Tracer), before_sweep: impl FnOnce()) {
         let mut tracer = Tracer { stack: Vec::with_capacity(256), epoch: self.collections.get() + 1 };
         mark_roots(&mut tracer);
-        while let Some(header) = tracer.stack.pop() {
-            unsafe { trace_cell(header, &mut tracer) };
+        loop {
+            while let Some(header) = tracer.stack.pop() {
+                unsafe { trace_cell(header, &mut tracer) };
+            }
+            ephemerons(&mut tracer);
+            if tracer.stack.is_empty() {
+                break;
+            }
         }
         before_sweep();
 
@@ -325,6 +337,7 @@ unsafe fn trace_cell(header: *mut Header, tracer: &mut Tracer) {
             CellKind::Object => (*(*(header as *mut GcBox<JsObject>)).value.get()).trace(tracer),
             CellKind::Upvalue => (*(*(header as *mut GcBox<Upvalue>)).value.get()).trace(tracer),
             CellKind::Symbol => (*(*(header as *mut GcBox<Symbol>)).value.get()).trace(tracer),
+            CellKind::BigInt => {}
         }
     }
 }
@@ -336,6 +349,7 @@ unsafe fn free_cell(header: *mut Header) {
             CellKind::Object => drop(Box::from_raw(header as *mut GcBox<JsObject>)),
             CellKind::Upvalue => drop(Box::from_raw(header as *mut GcBox<Upvalue>)),
             CellKind::Symbol => drop(Box::from_raw(header as *mut GcBox<Symbol>)),
+            CellKind::BigInt => drop(Box::from_raw(header as *mut GcBox<BigInt>)),
         }
     }
 }

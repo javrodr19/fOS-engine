@@ -37,6 +37,19 @@ struct WoffTableEntry {
 
 /// Decode WOFF1 to raw OpenType/TrueType data
 pub fn decode_woff(data: &[u8]) -> Option<Vec<u8>> {
+    let mut zlib = |input: &[u8], size: usize| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use std::io::Read;
+        let mut out = Vec::with_capacity(size.min(64 << 20));
+        flate2::read::ZlibDecoder::new(input).take(64 << 20).read_to_end(&mut out)?;
+        Ok(out)
+    };
+    if let Ok(font) = wuff::decompress_woff1_with_custom_z(data, &mut zlib) {
+        return Some(font);
+    }
+    decode_woff_own(data)
+}
+
+fn decode_woff_own(data: &[u8]) -> Option<Vec<u8>> {
     let mut reader = FontReader::new(data);
     
     // Parse header

@@ -19,6 +19,7 @@ pub mod tcp;
 pub mod tls;
 pub mod http1;
 pub mod cookies;
+pub mod psl;
 pub mod client;
 pub mod coalescing;
 pub mod prefetch;
@@ -61,7 +62,7 @@ pub use quic::{
 pub use network_opt::{RequestCoalescer, PredictiveDns, DeltaSync, CrossTabCache};
 pub use connection_pool::{ConnectionPool, PooledConnection, PoolConfig, HostKey, AcquireResult};
 pub use client::{HttpClient, HttpClientBuilder, ClientConfig};
-pub use cookies::{Cookie, CookieJar, SameSite, PartitionKey, PartitionedCookieJar};
+pub use cookies::{Cookie, CookieContext, CookieJar, CookieSource, SameSite, SharedCookieJar};
 pub use tcp::{TcpConnection, TcpConfig, BufferedTcpConnection};
 pub use tls::{TlsStream, TlsConfig, TlsState};
 pub use http1::{Http1Request, Http1Response, Http1Parser, HttpVersion};

@@ -50,7 +50,13 @@ pub mod view_transitions;
 // Phase 5: Surpassing Chromium
 pub mod predictive;
 
-pub use parser::{CssParser, MediaContext, parse_declarations, parse_color, parse_length, media_matches};
+pub mod values;
+pub mod style;
+pub mod grid;
+pub mod transform;
+mod longhand;
+pub use values::{ResolveCache, ResolveContext, resolve_declaration, substitute_vars, compute_custom_properties, CustomProperties, VarSource};
+pub use parser::{CssParser, MediaContext, parse_declarations, parse_color, parse_length, media_matches, font_faces, FontFace};
 pub use cascade::StyleResolver;
 pub use properties::{PropertyId, PropertyValue};
 pub use computed::ComputedStyle;
@@ -202,6 +208,9 @@ pub struct Selector {
     pub specificity: Specificity,
     /// Parsed selector parts
     pub parts: Vec<SelectorPart>,
+    /// The selector parsed for matching (taken by whoever compiles the
+    /// sheet, so it is parsed once)
+    pub parsed: Option<fos_dom::SelectorList>,
 }
 
 /// Part of a compound selector

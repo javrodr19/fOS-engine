@@ -21,5 +21,8 @@ tiny-skia.workspace = true
 # Error handling
 thiserror.workspace = true
 rustc-hash = "2.1"
+brotli-decompressor = "6.0.1"
+flate2 = "1"
+wuff = { version = "0.2.9", default-features = false }
 
 [dev-dependencies]

@@ -143,6 +143,12 @@ pub fn resolve(base: &str, reference: &str) -> String {
     out
 }
 
+/// The path of a URL, without query or fragment ("/" when it has none)
+pub fn path(url: &str) -> &str {
+    let path = parse_reference(url.trim()).path;
+    if path.is_empty() { "/" } else { path }
+}
+
 /// Scheme, host and port of an absolute URL, lowercased, e.g.
 /// `("https", "example.com", 443)`. Used for same-origin checks.
 pub fn origin(url: &str) -> Option<(String, String, u16)> {

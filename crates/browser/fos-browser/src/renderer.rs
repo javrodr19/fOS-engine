@@ -1,28 +1,27 @@
 //! Rendering Pipeline
 //!
-//! Integrates fos-engine components for rendering web pages.
-//!
 //! Rendering is split in two phases:
-//! 1. **Layout** walks the DOM once per page and viewport width, producing
-//!    positioned lines of text (a display list).
-//! 2. **Paint** draws only the lines that intersect the requested region.
+//! 1. **Layout** styles the DOM and lays it out with the box layout engine
+//!    (`fos_layout::engine`) into a fragment tree: positioned boxes and
+//!    shaped text, plus the page's link regions and anchors.
+//! 2. **Paint** draws the part of the fragment tree inside the requested
+//!    band (`crate::paint`).
 //!
 //! The layout is cached, so scrolling and re-rendering the same page only
-//! repaint the visible lines. The cache keeps just the compact display list,
-//! not the per-node styles it was built from. A layout built from a live
-//! DOM is keyed by the tree's revision, so any DOM mutation (from scripts,
-//! for example) is picked up by the next render.
+//! repaint. Styles are computed during box tree construction and kept only
+//! on the fragments that need them. A layout built from a live DOM is keyed
+//! by the tree's revision, so any DOM mutation (from scripts, for example)
+//! is picked up by the next render.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::hash::{Hash, Hasher};
-use fos_dom::{Document, NodeId, DomTree, DomRevision};
-use fos_css::computed::{ComputedStyle, Display, SizeValue, EdgeSizes};
-use fos_css::properties::LengthUnit;
-use fos_css::StyleResolver;
-use crate::page_styles::PageStyles;
+use std::sync::Arc;
+
+use crate::page_styles::{AncestorFilter, PageStyles};
+use fos_css::style::{Style, StyleContext};
+use fos_dom::{Document, DomRevision, DomTree, NodeId};
+use fos_layout::engine::{self as layout_engine, BoxFragment, BoxFragmentKind, FontContext, Fragment, FragmentTree, Rect};
 use fos_render::{Canvas, Color, TextRenderer};
-use fos_text::{FontId, LineBreaker};
 
 /// A clickable link region in the rendered page
 #[derive(Debug, Clone)]
@@ -68,49 +67,90 @@ pub struct RenderedPage {
     layout_generation: u64,
 }
 
-/// A run of text with uniform style within a line
-#[derive(Debug, Clone)]
-struct TextSegment {
-    text: String,
-    font_size: f32,
-    color: Color,
-    /// Link href if this is a link
-    href: Option<String>,
-    /// Element the text belongs to (for hit testing clicks)
-    node: NodeId,
-}
-
-/// A laid-out line of text, in document coordinates
-#[derive(Debug, Clone)]
-struct LaidOutLine {
-    /// Baseline y
-    y: f32,
-    /// Start x
-    x: f32,
-    segments: Vec<TextSegment>,
-}
-
-/// A horizontal rule (`<hr>`), in document coordinates
-#[derive(Debug, Clone, Copy)]
-struct Rule {
-    x: f32,
-    y: f32,
-    width: f32,
-}
-
-/// Display list for a page at one viewport width
-#[derive(Debug, Default)]
-struct PageLayout {
-    /// Lines in document order (ascending `y`)
-    lines: Vec<LaidOutLine>,
-    /// Horizontal rules in document order
-    rules: Vec<Rule>,
+/// A page laid out at one viewport size
+#[derive(Debug)]
+pub struct PageLayout {
+    fragments: FragmentTree,
+    /// Link regions in document coordinates, by top edge
+    links: Vec<(Rect, Arc<str>)>,
     /// Element ids and their document y positions
     anchors: Vec<AnchorPosition>,
+    /// The canvas color (the root's or body's background)
+    background: fos_css::properties::Color,
+    /// The element whose background is the canvas's
+    background_box: Option<NodeId>,
+    /// Some box is `position: fixed` (scrolling must repaint it)
+    has_fixed: bool,
+    /// The images the page's CSS uses (absolute URLs)
+    css_images: Vec<String>,
+    /// What relative CSS URLs (inline styles) resolve against
+    base: String,
+}
+
+impl PageLayout {
+    /// Every element's border boxes (inline elements have one per line)
+    /// and text rectangles, in document coordinates and tree order
+    pub fn boxes(&self) -> Vec<(NodeId, Rect)> {
+        self.fragments.element_rects()
+    }
+
+    /// The first box fragment of element `node` (for inspection)
+    pub fn fragment_of(&self, node: NodeId) -> Option<&BoxFragment> {
+        fn find(b: &BoxFragment, node: NodeId) -> Option<&BoxFragment> {
+            if b.node == node {
+                return Some(b);
+            }
+            b.children.iter().find_map(|c| match c {
+                Fragment::Box(cb) => find(cb, node),
+                Fragment::Text(_) => None,
+            })
+        }
+        find(self.fragments.root.as_ref()?, node)
+    }
+
+    /// [`Self::boxes`] where they are painted: transformed, fixed and
+    /// sticky boxes placed for page scroll `scroll` in a viewport
+    /// `view_h` tall, and scroll containers' content moved by their
+    /// offsets
+    pub fn painted_boxes(&self, scroll: f32, view_h: f32, offsets: &std::collections::HashMap<u32, (f32, f32)>) -> Vec<(NodeId, Rect)> {
+        self.fragments.painted_element_rects(scroll, view_h, &|n| offsets.get(&n.0).copied().unwrap_or((0.0, 0.0)))
+    }
+
+    /// Whether some box moves with the page scroll (fixed or sticky)
+    pub fn has_fixed(&self) -> bool {
+        self.has_fixed
+    }
+
     /// Height of the laid-out document
-    content_height: f32,
-    /// Largest font size used (bounds how far glyphs reach above a baseline)
-    max_font_size: f32,
+    pub fn content_height(&self) -> f32 {
+        self.fragments.document_height
+    }
+
+    /// The laid-out fragments
+    pub fn fragments(&self) -> &FragmentTree {
+        &self.fragments
+    }
+
+    /// Scroll metrics of every element with a box: visible (padding box)
+    /// size and content size
+    pub fn scroll_metrics(&self) -> std::collections::HashMap<u32, [f32; 4]> {
+        let mut out = std::collections::HashMap::new();
+        self.fragments.for_each(|f| {
+            if let Fragment::Box(b) = f {
+                if b.node.is_valid() && b.kind != BoxFragmentKind::InlinePart {
+                    let pad = b.padding_box();
+                    let (ew, eh) = b.scroll_extent.unwrap_or((pad.w, pad.h));
+                    out.entry(b.node.0).or_insert([pad.w, pad.h, ew, eh]);
+                }
+            }
+        });
+        out
+    }
+
+    /// The deepest element at document point (x, y)
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.fragments.hit_test(x, y)
+    }
 }
 
 /// What a cached layout was built from
@@ -128,7 +168,8 @@ struct CachedLayout {
     source: LayoutSource,
     /// Viewport width the layout was built for
     width: u32,
-    layout: PageLayout,
+    /// Shared with the page's scripts (element geometry)
+    layout: Arc<PageLayout>,
 }
 
 /// Page renderer - integrates HTML, CSS, layout, and painting
@@ -137,10 +178,10 @@ pub struct PageRenderer {
     viewport_width: u32,
     /// Viewport height
     viewport_height: u32,
-    /// Text renderer with font support
+    /// Glyph rasterization and caching
     text_renderer: TextRenderer,
-    /// Default font ID for text rendering
-    default_font: Option<FontId>,
+    /// Font matching, metrics and shaped words for layout
+    fonts: FontContext,
     /// Layout of the most recently rendered page
     cached: Option<CachedLayout>,
     /// Incremented for every new layout, to tell whether a rendered
@@ -148,52 +189,86 @@ pub struct PageRenderer {
     layout_generation: u64,
     /// The current page's external stylesheets
     stylesheets: crate::css_loader::Stylesheets,
+    /// The page's compiled CSS, by hash of its text and the viewport
+    /// (relayouts after DOM changes rarely change the CSS)
+    compiled_css: Option<(u64, Option<Arc<PageStyles>>)>,
+    /// Shadow trees' CSS compiled, by text (and viewport) hash: components
+    /// of one kind share theirs
+    shadow_css: HashMap<u64, Option<Arc<PageStyles>>>,
+    /// The scroll position last painted (where fixed boxes are)
+    scroll: f32,
+    /// The current page's decoded images
+    images: crate::image_loader::Images,
+    /// Inline `<svg>` elements, rasterized
+    svgs: crate::image_loader::SvgCache,
+    /// The page's web fonts (in `fonts`' database)
+    web_fonts: crate::font_loader::WebFonts,
+    /// What scripts drew on the page's canvas elements
+    canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
+    /// Scroll positions of the page's scroll containers
+    box_scroll: std::collections::HashMap<NodeId, (f32, f32)>,
 }
 
 impl PageRenderer {
     pub fn new(viewport_width: u32, viewport_height: u32) -> Self {
         let text_renderer = TextRenderer::new();
-        // Find a default font (prefer sans-serif fonts)
-        let default_font = text_renderer.find_font(&["DejaVu Sans", "Liberation Sans", "Arial", "Helvetica", "sans-serif"]);
-
-        if default_font.is_some() {
-            log::info!("Font loaded for text rendering");
-        } else {
-            log::warn!("No system font found, text rendering may fail");
+        if text_renderer.fonts.is_empty() {
+            log::warn!("No system font found, text will not be drawn");
         }
-
+        let fonts = FontContext::new(text_renderer.fonts.clone());
         Self {
             viewport_width,
             viewport_height,
             text_renderer,
-            default_font,
+            fonts,
             cached: None,
             layout_generation: 0,
             stylesheets: Default::default(),
+            compiled_css: None,
+            shadow_css: HashMap::new(),
+            scroll: 0.0,
+            images: Default::default(),
+            canvases: Default::default(),
+            svgs: Default::default(),
+            web_fonts: Default::default(),
+            box_scroll: Default::default(),
         }
     }
 
     /// Set viewport size
     pub fn set_viewport(&mut self, width: u32, height: u32) {
+        if height != self.viewport_height {
+            // Viewport units and percentages of the root depend on it
+            self.cached = None;
+        }
         self.viewport_width = width;
         self.viewport_height = height;
     }
 
-    /// Drop the cached layout and glyphs (e.g. on memory pressure)
-    pub fn clear_cache(&mut self) {
+    /// Lay out again on the next render (keeping caches)
+    pub fn invalidate_layout(&mut self) {
         self.cached = None;
-        self.text_renderer.clear_glyph_cache();
     }
 
-    /// Measure text width using the text renderer
+    /// Drop the cached layout, glyphs and shaped words (e.g. on memory
+    /// pressure)
+    pub fn clear_cache(&mut self) {
+        self.cached = None;
+        self.compiled_css = None;
+        self.canvases.clear();
+        self.box_scroll.clear();
+        self.text_renderer.clear_glyph_cache();
+        self.fonts = FontContext::new(self.text_renderer.fonts.clone());
+    }
+
+    /// Width of `text` in the default sans-serif font
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
-        if let Some(font_id) = self.default_font {
-            self.text_renderer.measure_text(text, font_id, font_size)
-        } else {
-            // Fallback: estimate width based on character count
-            let char_width = font_size * 0.5;
-            text.chars().count() as f32 * char_width
-        }
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_size = font_size;
+        i.font_family = Arc::from([Arc::from("sans-serif")]);
+        let font = self.fonts.resolve(&style);
+        self.fonts.shape(&font, text).width
     }
 
     /// Parse and render HTML to pixels with scroll offset. Prefer
@@ -241,7 +316,8 @@ impl PageRenderer {
             && previous.height == self.viewport_height
             && previous.pixels.len() == self.viewport_width as usize * self.viewport_height as usize
             && delta.fract() == 0.0
-            && delta.abs() < self.viewport_height as f32;
+            && delta.abs() < self.viewport_height as f32
+            && self.cached.as_ref().is_some_and(|c| !c.layout.has_fixed);
         if reusable {
             self.repaint_scrolled(previous, scroll_offset)
         } else {
@@ -250,33 +326,31 @@ impl PageRenderer {
         }
     }
 
-    /// Whether the cached layout reflects `document` as it is now
-    /// The element whose text is at `(x, y)` in document coordinates,
-    /// per the current layout
+    /// The element at `(x, y)` in document coordinates, per the current
+    /// layout
     pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
-        let cached = self.cached.take()?;
-        let mut found = None;
-        // Lines are sorted by baseline; text spans the line height above it
-        let first = cached.layout.lines.partition_point(|line| line.y < y);
-        for line in cached.layout.lines[first..].iter().take(4) {
-            let mut sx = line.x;
-            for segment in &line.segments {
-                let top = line.y - segment.font_size * 1.2;
-                let width = self.measure_text(&segment.text, segment.font_size);
-                if y >= top && y <= line.y + segment.font_size * 0.3 && x >= sx && x <= sx + width {
-                    found = Some(segment.node);
-                    break;
-                }
-                sx += width;
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-        self.cached = Some(cached);
-        found.filter(|n| n.is_valid())
+        let offsets = &self.box_scroll;
+        self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)))
     }
 
+    /// The `href` of the link under document point (x, y), seeing box
+    /// scrolling and fixed boxes
+    pub fn link_at(&mut self, document: &Document, x: f32, y: f32) -> Option<String> {
+        let tree = document.tree();
+        let mut node = self.node_at(x, y)?;
+        while node.is_valid() {
+            let n = tree.get(node)?;
+            if n.as_element().is_some_and(|e| tree.resolve(e.name.local) == "a") {
+                if let Some(href) = tree.get_attribute(node, "href") {
+                    return Some(href.to_string());
+                }
+            }
+            node = n.parent;
+        }
+        None
+    }
+
+    /// Whether the cached layout reflects `document` as it is now
     pub fn is_layout_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
     }
@@ -290,20 +364,23 @@ impl PageRenderer {
         // Free the old layout first, so two are never alive at once
         self.cached = None;
         let width = self.viewport_width;
-        let styler = Styler::new(self, document.tree(), self.page_stylesheet(document));
-        let layout = build_layout(document, &styler, width);
-        // Only the display list is kept
-        self.cached = Some(CachedLayout { source, width, layout });
+        let started = std::time::Instant::now();
+        let stylesheet = self.compiled_stylesheet(document);
+        let shadow = self.shadow_stylesheets(document);
+        let parsed = started.elapsed();
+        let layout = build_layout(document, stylesheet, &shadow, &self.images, &mut self.svgs, &mut self.fonts, (width as f32, self.viewport_height as f32));
+        log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
+        self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
         self.layout_generation += 1;
     }
 
     /// Paint the visible region of the cached layout
     fn paint_cached(&mut self, scroll_offset: f32) -> Option<RenderedPage> {
         let cached = self.cached.take()?;
-
-        let mut links = Vec::new();
-        let painted = self.paint(&cached.layout, scroll_offset, self.viewport_height, &mut links);
-        let content_height = cached.layout.content_height;
+        self.scroll = scroll_offset;
+        let painted = self.paint(&cached.layout, scroll_offset, scroll_offset, self.viewport_height);
+        let content_height = cached.layout.content_height();
+        let links = links_in(&cached.layout, scroll_offset, self.viewport_height as f32);
         let anchors = anchors_from(&cached.layout, scroll_offset);
         self.cached = Some(cached);
 
@@ -331,55 +408,224 @@ impl PageRenderer {
         let width = page.width as usize;
         let height = page.height as usize;
         let shift = delta.unsigned_abs() as usize;
-        // Rows [kept_top, kept_bottom) of the new buffer come from the old one
-        let (kept_top, band_top) = if delta > 0 {
+        let band_top = if delta > 0 {
             page.pixels.copy_within(shift * width.., 0);
-            (0, height - shift)
+            height - shift
         } else {
             page.pixels.copy_within(..(height - shift) * width, shift * width);
-            (shift, 0)
+            0
         };
-        let kept_bottom = kept_top + (height - shift);
 
-        let mut band_links = Vec::new();
         let band_origin = scroll_offset + band_top as f32;
-        let band = self.paint(&cached.layout, band_origin, shift as u32, &mut band_links);
+        self.scroll = scroll_offset;
+        let band = self.paint(&cached.layout, band_origin, scroll_offset, shift as u32);
         page.anchors = anchors_from(&cached.layout, scroll_offset);
+        page.links = links_in(&cached.layout, scroll_offset, page.height as f32);
         self.cached = Some(cached);
         page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
-
-        // Links: the old ones still in view, moved, plus the band's. A link
-        // crossing the band edge is in both lists.
-        let (kept_top, kept_bottom) = (kept_top as f32, kept_bottom as f32);
-        page.links.retain_mut(|link| {
-            link.y -= delta as f32;
-            link.y + link.height > kept_top && link.y < kept_bottom
-        });
-        for mut link in band_links {
-            link.y += band_top as f32;
-            let duplicate = page.links.iter().any(|l| {
-                l.href == link.href && l.x == link.x && (l.y - link.y).abs() < 0.5
-            });
-            if !duplicate {
-                page.links.push(link);
-            }
-        }
-
         page.origin = scroll_offset;
         Some(page)
     }
 
+    /// Take new canvas bitmaps (`None`: cleared); true if any changed. A
+    /// repaint shows them (the layout does not change).
+    pub fn update_canvases(&mut self, updates: Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)>) -> bool {
+        let changed = !updates.is_empty();
+        for (node, (w, h), pixmap) in updates {
+            match pixmap {
+                Some(pixmap) => {
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
+                }
+                None => {
+                    self.canvases.remove(&node);
+                }
+            }
+        }
+        if changed {
+            // Painted buffers are stale
+            self.layout_generation += 1;
+        }
+        changed
+    }
+
+    /// Forget the previous page's scroll positions and canvases
+    pub fn new_page(&mut self) {
+        self.box_scroll.clear();
+        self.canvases.clear();
+        self.cached = None;
+    }
+
+    /// Scroll the innermost scroll container at document point (x, y) that
+    /// can move by (dx, dy); false if none can (the page should scroll)
+    pub fn scroll_box_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        let Some(cached) = self.cached.as_ref() else { return false };
+        let offsets = &self.box_scroll;
+        let chain = cached.layout.fragments.scrollers_at(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)));
+        for (node, visible, extent) in chain {
+            let (ox, oy) = self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0));
+            let nx = (ox + dx).clamp(0.0, (extent.0 - visible.0).max(0.0)).round();
+            let ny = (oy + dy).clamp(0.0, (extent.1 - visible.1).max(0.0)).round();
+            if (nx, ny) != (ox, oy) {
+                self.box_scroll.insert(node, (nx, ny));
+                // Painted buffers are stale
+                self.layout_generation += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scroll a box to (x, y) (clamped to its content); false if it
+    /// does not scroll
+    pub fn set_box_scroll(&mut self, node: NodeId, x: f32, y: f32) -> bool {
+        let Some(m) = self.cached.as_ref().and_then(|c| c.layout.scroll_metrics().get(&node.0).copied()) else { return false };
+        let to = (x.clamp(0.0, (m[2] - m[0]).max(0.0)).round(), y.clamp(0.0, (m[3] - m[1]).max(0.0)).round());
+        if self.box_scroll(node) == to {
+            return false;
+        }
+        self.box_scroll.insert(node, to);
+        self.layout_generation += 1;
+        true
+    }
+
+    /// Every scrolled box's position (for scripts)
+    pub fn box_scrolls(&self) -> std::collections::HashMap<u32, (f32, f32)> {
+        self.box_scroll.iter().map(|(n, v)| (n.0, *v)).collect()
+    }
+
+    /// An element's scroll position (scrollLeft, scrollTop)
+    pub fn box_scroll(&self, node: NodeId) -> (f32, f32) {
+        self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// Images the current layout's CSS uses (backgrounds, masks)
+    /// The web fonts `document`'s CSS declares and uses
+    pub fn web_font_requests(&self, document: &Document) -> Vec<crate::font_loader::FontRequest> {
+        let css = self.extract_css_from_document(document);
+        let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
+        crate::font_loader::requests(&css, &media, &crate::css_loader::base_url(document))
+    }
+
+    pub fn web_fonts(&self) -> &crate::font_loader::WebFonts {
+        &self.web_fonts
+    }
+
+    /// Use `fonts` as the page's web fonts: they join a font database
+    /// over the system's, and the layout is redone
+    pub fn set_web_fonts(&mut self, fonts: crate::font_loader::WebFonts) {
+        if Arc::ptr_eq(&self.web_fonts, &fonts) {
+            return;
+        }
+        let mut db = fos_text::FontDatabase::overlay(fos_text::FontDatabase::shared());
+        for f in fonts.iter() {
+            let r = &f.request;
+            let style = if r.italic { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
+            if let Err(e) = db.add_web_font(&r.family, fos_text::FontWeight(r.weight), style, f.data.clone()) {
+                log::debug!("Web font {} unusable: {e}", r.url);
+            }
+        }
+        let db = Arc::new(db);
+        self.web_fonts = fonts;
+        self.text_renderer.fonts = db.clone();
+        self.text_renderer.clear_glyph_cache();
+        self.fonts = FontContext::new(db);
+        self.cached = None;
+    }
+
+    pub fn css_image_urls(&self) -> Vec<String> {
+        self.cached.as_ref().map(|c| c.layout.css_images.clone()).unwrap_or_default()
+    }
+
+    /// Use `images` for the page's images (fetched by the browser); the
+    /// layout is redone if they changed
+    pub fn set_images(&mut self, images: crate::image_loader::Images) {
+        if !Arc::ptr_eq(&self.images, &images) {
+            self.images = images;
+            self.cached = None;
+        }
+    }
+
+    /// The images in use (to keep what is still needed when reloading)
+    pub fn images(&self) -> &crate::image_loader::Images {
+        &self.images
+    }
+
+    /// The page's CSS compiled for matching, reused while its text and
+    /// the viewport stay the same
+    fn compiled_stylesheet(&mut self, document: &Document) -> Option<Arc<PageStyles>> {
+        let started = std::time::Instant::now();
+        let css_text = self.extract_css_from_document(document);
+        log::debug!("css: extracted {} bytes in {:?}", css_text.len(), started.elapsed());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        css_text.hash(&mut hasher);
+        (self.viewport_width, self.viewport_height).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((k, sheet)) = &self.compiled_css {
+            if *k == key {
+                return sheet.clone();
+            }
+        }
+        let sheet = self.compile(&css_text).map(Arc::new);
+        self.compiled_css = Some((key, sheet.clone()));
+        sheet
+    }
+
+    /// The CSS of each connected shadow tree (its `<style>` elements and
+    /// adopted sheets), compiled
+    fn shadow_stylesheets(&mut self, document: &Document) -> HashMap<NodeId, Arc<PageStyles>> {
+        let tree = document.tree();
+        let mut out = HashMap::new();
+        if !tree.has_shadow_roots() {
+            return out;
+        }
+        let roots: Vec<NodeId> = tree.shadow_roots().filter(|&(host, _)| tree.is_connected(host)).map(|(_, root)| root).collect();
+        if self.shadow_css.len() > 512 {
+            self.shadow_css.clear();
+        }
+        for root in roots {
+            let css = self.extract_css(document, root, document.shadow_adopted_css(root));
+            if css.trim().is_empty() {
+                continue;
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            css.hash(&mut hasher);
+            (self.viewport_width, self.viewport_height).hash(&mut hasher);
+            let key = hasher.finish();
+            let sheet = match self.shadow_css.get(&key) {
+                Some(sheet) => sheet.clone(),
+                None => {
+                    let sheet = self.compile(&css).map(Arc::new);
+                    self.shadow_css.insert(key, sheet.clone());
+                    sheet
+                }
+            };
+            if let Some(sheet) = sheet {
+                out.insert(root, sheet);
+            }
+        }
+        out
+    }
+
     /// Parse the page's own CSS (`<style>` elements) and compile it for
     /// matching
-    fn page_stylesheet(&self, document: &Document) -> Option<PageStyles> {
-        let css_text = self.extract_css_from_document(document);
+    #[cfg(test)]
+    fn page_stylesheet(&self, document: &Document) -> Option<Arc<PageStyles>> {
+        self.compile(&self.extract_css_from_document(document)).map(Arc::new)
+    }
+
+    fn compile(&self, css_text: &str) -> Option<PageStyles> {
         if css_text.is_empty() {
             return None;
         }
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
-        let styles = PageStyles::new(fos_css::parse_stylesheet_for(&css_text, media));
-        log::debug!("Parsed {} CSS rules from page", styles.rule_count());
+        let styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        log::debug!("Parsed {} CSS rules from page, buckets (id, class, tag+attr, universal) {:?}", styles.rule_count(), styles.bucket_sizes());
         Some(styles)
+    }
+
+    /// The current layout, for element geometry (`getBoundingClientRect`)
+    pub fn layout_snapshot(&self) -> Option<Arc<PageLayout>> {
+        self.cached.as_ref().map(|c| c.layout.clone())
     }
 
     /// Use `sheets` for the page's `<link rel="stylesheet">` elements
@@ -395,11 +641,17 @@ impl PageRenderer {
     /// document order (cascade order), skipping those whose `media`
     /// attribute does not match the viewport
     fn extract_css_from_document(&self, document: &Document) -> String {
+        self.extract_css(document, document.tree().root(), document.adopted_css())
+    }
+
+    /// The CSS of the tree under `root` (the document or a shadow root),
+    /// then its adopted sheets' (`adopted`)
+    fn extract_css(&self, document: &Document, root: NodeId, adopted: &str) -> String {
         let tree = document.tree();
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
         let mut base: Option<String> = None;
         let mut css = String::new();
-        fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
+        fos_dom::selector::walk_elements(tree, root, &mut |id| {
             let Some(e) = tree.get(id).and_then(|n| n.as_element()) else { return true };
             let tag = tree.resolve(e.name.local);
             let is_style = tag.eq_ignore_ascii_case("style");
@@ -413,12 +665,15 @@ impl PageRenderer {
                 }
             }
             if is_style {
+                let mut text = String::new();
                 for (_, child) in tree.children(id) {
-                    if let Some(text) = child.as_text() {
-                        css.push_str(text);
-                        css.push('\n');
+                    if let Some(t) = child.as_text() {
+                        text.push_str(t);
                     }
                 }
+                // A sheet scripts changed through the CSSOM (`insertRule`)
+                css.push_str(document.sheet_override(id, &text).unwrap_or(&text));
+                css.push('\n');
             } else if let Some(href) = tree.get_attribute(id, "href") {
                 let base = base.get_or_insert_with(|| crate::css_loader::base_url(document));
                 let url = fos_net::url_util::resolve(base, href.trim());
@@ -429,173 +684,18 @@ impl PageRenderer {
             }
             true
         });
+        css.push_str(adopted);
         css
     }
 
-    /// Compute styles using the StyleResolver (proper CSS cascade)
-    #[allow(dead_code)]
-    fn compute_styles_with_resolver(
-        &self,
-        tree: &DomTree,
-        node_id: NodeId,
-        styles: &mut HashMap<NodeId, ComputedStyle>,
-        resolver: &StyleResolver,
-    ) {
-        if !node_id.is_valid() {
-            return;
-        }
-
-        // Compute style for this node using the resolver
-        let style = resolver.compute_style(tree, node_id);
-        styles.insert(node_id, style);
-
-        // Recurse to children
-        for (child_id, _) in tree.children(node_id) {
-            self.compute_styles_with_resolver(tree, child_id, styles, resolver);
-        }
-    }
-
-    /// Compute an element's style: inherited values, browser defaults,
-    /// the page's matching rules, then its `style` attribute
-    fn compute_element_style(
-        &self,
-        tree: &DomTree,
-        node_id: NodeId,
-        element: &fos_dom::ElementData,
-        styles: Option<&PageStyles>,
-        inherited: &Inherited,
-        filter: Option<&crate::page_styles::AncestorFilter>,
-    ) -> ComputedStyle {
-        let mut style = ComputedStyle::default();
-        style.font_size = inherited.font_size;
-        style.parent_font_size = inherited.font_size;
-        style.font_weight = inherited.font_weight;
-        style.color = fos_css::properties::Color::rgba(inherited.color.r, inherited.color.g, inherited.color.b, inherited.color.a);
-        let tag_name = tree.resolve(element.name.local);
-
-        apply_default_styles(&mut style, tag_name, element, tree);
-        if let Some(styles) = styles {
-            styles.apply(tree, node_id, element, &mut style, filter);
-        }
-        for attr in element.attrs.iter() {
-            if tree.resolve(attr.name.local) == "style" {
-                for decl in fos_css::parse_declarations(&attr.value) {
-                    style.apply_declaration(&decl);
-                }
-            }
-        }
-        style
-    }
-
-    /// Paint the part of `layout` starting at document y `scroll_offset`.
-    ///
-    /// Only lines intersecting the canvas are shaped and drawn.
-    fn paint(&mut self, layout: &PageLayout, scroll_offset: f32, height: u32, links: &mut Vec<LinkRegion>) -> Option<Vec<u32>> {
-        let mut canvas = Canvas::filled(self.viewport_width, height, Color::WHITE)?;
-
-        if layout.lines.is_empty() && layout.rules.is_empty() {
-            // Clipped to the canvas like any text
-            self.paint_text(&mut canvas, "Page loaded but no visible content", 20.0, 50.0 - scroll_offset, Color::rgb(100, 100, 100), 16.0);
-            return Some(canvas.into_argb32());
-        }
-
-        let canvas_height = canvas.height() as f32;
-        // Glyphs extend at most ~2 font sizes above and below a baseline
-        let reach = layout.max_font_size.max(16.0) * 2.0;
-        let top = scroll_offset - reach;
-        let bottom = scroll_offset + canvas_height + reach;
-
-        let first = layout.lines.partition_point(|line| line.y < top);
-        for line in &layout.lines[first..] {
-            if line.y > bottom {
-                break;
-            }
-            let y = line.y - scroll_offset;
-            let mut x = line.x;
-            for segment in &line.segments {
-                // Painting returns the advance, so the text is shaped only once
-                let width = self.paint_text(&mut canvas, &segment.text, x, y, segment.color, segment.font_size);
-
-                // Text is drawn with its baseline at y, so the region spans
-                // the line above it. Lines just outside the canvas are painted
-                // for their overhang, but their links are not on it.
-                let height = segment.font_size * 1.2;
-                if let Some(href) = segment.href.as_ref().filter(|_| y > 0.0 && y - height < canvas_height) {
-                    links.push(LinkRegion {
-                        x,
-                        y: y - height,
-                        width,
-                        height,
-                        href: href.clone(),
-                    });
-                }
-
-                x += width;
-            }
-        }
-
-        let first_rule = layout.rules.partition_point(|rule| rule.y < top);
-        for rule in layout.rules[first_rule..].iter().take_while(|rule| rule.y <= bottom) {
-            canvas.fill_rect(rule.x, rule.y - scroll_offset, rule.width, 1.0, Color::rgb(128, 128, 128));
-        }
-
+    /// Paint the band of `layout` starting at document y `origin`,
+    /// `height` rows tall
+    fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
+        let bg = layout.background;
+        let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base).with_canvases(&self.canvases).with_box_scroll(&self.box_scroll);
+        painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
-    }
-
-    /// Text painting using TextRenderer with proper fonts.
-    ///
-    /// Returns the advance width of the painted text.
-    fn paint_text(
-        &mut self,
-        canvas: &mut Canvas,
-        text: &str,
-        x: f32,
-        y: f32,
-        color: Color,
-        font_size: f32,
-    ) -> f32 {
-        // Use TextRenderer if we have a font
-        if let Some(font_id) = self.default_font {
-            // Use the proper font rendering
-            return self.text_renderer.draw_text(canvas, text, x, y, font_id, font_size, color);
-        }
-
-        // No font available - use bitmap fallback
-        let scale = (font_size / 8.0).max(1.0);
-        let char_width = 6.0 * scale;
-        let char_height = 8.0 * scale;
-
-        let mut x_pos = x;
-
-        for c in text.chars() {
-            if c == '\n' {
-                continue;
-            }
-            if c == ' ' {
-                x_pos += char_width * 0.8;
-                continue;
-            }
-            if x_pos > canvas.width() as f32 {
-                break;
-            }
-
-            let pattern = get_char_pattern(c);
-
-            for (row, &bits) in pattern.iter().enumerate() {
-                for col in 0..8 {
-                    if (bits >> (7 - col)) & 1 == 1 {
-                        let px = x_pos + col as f32 * scale;
-                        let py = y - char_height + row as f32 * scale;
-                        let rect_size = scale.max(1.0);
-                        canvas.fill_rect(px, py, rect_size, rect_size, color);
-                    }
-                }
-            }
-
-            x_pos += char_width;
-        }
-
-        x_pos - x
     }
 }
 
@@ -610,662 +710,274 @@ fn page_key(html: &str, base_url: &str) -> u64 {
 
 /// Anchor positions relative to a buffer starting at document y `origin`
 fn anchors_from(layout: &PageLayout, origin: f32) -> Vec<AnchorPosition> {
-    layout.anchors.iter()
-        .map(|a| AnchorPosition { id: a.id.clone(), y: a.y - origin })
+    layout.anchors.iter().map(|a| AnchorPosition { id: a.id.clone(), y: a.y - origin }).collect()
+}
+
+/// Link regions visible in a buffer `height` rows tall at document y
+/// `origin`, in buffer coordinates
+fn links_in(layout: &PageLayout, origin: f32, height: f32) -> Vec<LinkRegion> {
+    layout
+        .links
+        .iter()
+        .filter(|(r, _)| r.bottom() > origin && r.y < origin + height && r.w > 0.0 && r.h > 0.0)
+        .map(|(r, href)| LinkRegion { x: r.x, y: r.y - origin, width: r.w, height: r.h, href: href.to_string() })
         .collect()
 }
 
-/// Computes element styles on demand while laying out.
-///
-/// Layout visits each element once and needs its style only while visiting
-/// it, so styles are never stored for the whole tree: memory stays
-/// proportional to the tree's depth, and elements layout skips (`<head>`,
-/// scripts, hidden subtrees) are never styled at all.
-struct Styler<'a> {
-    renderer: &'a PageRenderer,
-    tree: &'a DomTree,
-    stylesheet: Option<PageStyles>,
-    /// Ancestors of the element being laid out
-    ancestors: std::cell::RefCell<crate::page_styles::AncestorFilter>,
+/// Computes element styles while the box tree is built: the UA's
+/// defaults, the page's matching rules, presentational hints and `style`
+/// attributes. Styles live only as long as layout needs them.
+struct BrowserStyler<'a> {
+    stylesheet: Option<&'a PageStyles>,
+    /// Each shadow tree's rules, by shadow root
+    shadow_sheets: &'a HashMap<NodeId, Arc<PageStyles>>,
+    /// Ancestors of the elements being styled
+    ancestors: AncestorFilter,
+    /// `var()` and math resolutions shared across elements
+    resolved: fos_css::ResolveCache,
+    /// What lengths are computed against (the root's font size once known)
+    ctx: StyleContext,
+    root_styled: bool,
+    /// The document is in quirks mode
+    quirks: bool,
+    /// Loaded images, and the URL their sources resolve against
+    images: &'a crate::image_loader::Images,
+    base: String,
+    /// Rasterized inline SVGs
+    svgs: &'a mut crate::image_loader::SvgCache,
 }
 
-impl<'a> Styler<'a> {
-    /// Style of an element (`None` for other nodes)
-    fn new(renderer: &'a PageRenderer, tree: &'a DomTree, stylesheet: Option<PageStyles>) -> Self {
-        Self { renderer, tree, stylesheet, ancestors: Default::default() }
-    }
-
-    fn style(&self, node_id: NodeId, inherited: &Inherited) -> Option<ComputedStyle> {
-        let element = self.tree.get(node_id)?.as_element()?;
-        let filter = self.ancestors.borrow();
-        Some(self.renderer.compute_element_style(self.tree, node_id, element, self.stylesheet.as_ref(), inherited, Some(&filter)))
-    }
-
-    /// Descend into element `node`'s children
-    fn enter(&self, node: NodeId) {
-        if self.stylesheet.is_some() {
-            self.ancestors.borrow_mut().push(self.tree, node);
-        }
-    }
-
-    /// Come back up from the children of the element entered last
-    fn leave(&self) {
-        if self.stylesheet.is_some() {
-            self.ancestors.borrow_mut().pop();
-        }
-    }
-}
-
-/// The inherited properties layout tracks while descending the tree
-struct Inherited {
-    font_size: f32,
-    font_weight: u16,
-    color: Color,
-}
-
-/// Lay out the document body into lines for a viewport of `width` pixels
-fn build_layout(document: &Document, styler: &Styler<'_>, width: u32) -> PageLayout {
-    let tree = document.tree();
-    let body = document.body();
-
-    log::debug!("DOM tree size: {}, body valid: {}", tree.len(), body.is_valid());
-
-    // Style the body's ancestors first (usually just <html>): their rules
-    // set the inherited font and color, and they are the first entries of
-    // the ancestor filter
-    let mut chain = Vec::new();
-    let mut up = tree.get(body).map_or(NodeId::NONE, |n| n.parent);
-    while up.is_valid() {
-        chain.push(up);
-        up = tree.get(up).map_or(NodeId::NONE, |n| n.parent);
-    }
-    let mut inherited = Inherited { font_size: 16.0, font_weight: 400, color: Color::BLACK };
-    for &ancestor in chain.iter().rev() {
-        if let Some(style) = styler.style(ancestor, &inherited) {
-            let c = style.color;
-            inherited = Inherited { font_size: style.font_size, font_weight: style.font_weight, color: Color::rgba(c.r, c.g, c.b, c.a) };
-        }
-        styler.enter(ancestor);
-    }
-
-    let mut builder = LayoutBuilder {
-        tree,
-        styler,
-        // Leave margin for the right edge
-        line_buffer: LineBuffer::new(8.0, width as f32 - 30.0, inherited.font_size),
-        // Document y of the first line
-        y: 20.0,
-        layout: PageLayout::default(),
-    };
-
-    builder.line_buffer.current_color = inherited.color;
-    if body.is_valid() {
-        builder.layout_node(body);
-        builder.flush();
-    } else {
-        log::error!("Body element not valid!");
-    }
-
-    let mut layout = builder.layout;
-    layout.content_height = builder.y.max(0.0);
-    layout
-}
-
-/// Walks the DOM, accumulating inline text into lines
-struct LayoutBuilder<'a> {
-    tree: &'a DomTree,
-    styler: &'a Styler<'a>,
-    line_buffer: LineBuffer,
-    /// Current document y (baseline of the next line)
-    y: f32,
-    layout: PageLayout,
-}
-
-impl LayoutBuilder<'_> {
-    /// Move buffered text into laid-out lines
-    fn flush(&mut self) {
-        self.line_buffer.flush(&mut self.y, &mut self.layout);
-    }
-
-    /// Lay out a node and its children with inline/block handling
-    fn layout_node(&mut self, node_id: NodeId) {
-        let tree = self.tree;
-        let node = match tree.get(node_id) {
-            Some(n) => n,
-            None => return,
-        };
-
-        // Get style
-        let inherited = Inherited {
-            font_size: self.line_buffer.current_font_size,
-            font_weight: 400,
-            color: self.line_buffer.current_color,
-        };
-        let style = self.styler.style(node_id, &inherited);
-
-        // Check if hidden
-        if style.as_ref().is_some_and(|s| matches!(s.display, Display::None)) {
-            return;
-        }
-
-        // If text node, add to line buffer (collapsing whitespace)
-        if let Some(text) = node.as_text() {
-            let mut words = text.split_whitespace();
-            if let Some(first) = words.next() {
-                let mut collapsed = String::with_capacity(text.len());
-                collapsed.push_str(first);
-                for word in words {
-                    collapsed.push(' ');
-                    collapsed.push_str(word);
-                }
-
-                let font_size = self.line_buffer.current_font_size.max(8.0);
-                let text_color = self.line_buffer.current_color;
-                self.line_buffer.add_text(&collapsed, font_size, text_color, node.parent);
-            }
-            return;
-        }
-
-        // If element, handle block vs inline
-        let Some(element) = node.as_element() else { return };
-
-        // HTML tag names are already lowercase after parsing
-        let tag_name = tree.resolve(element.name.local);
-        let lowered;
-        let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
-            lowered = tag_name.to_ascii_lowercase();
-            &lowered
+impl layout_engine::Styler for BrowserStyler<'_> {
+    fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
+        let Some(element) = tree.get(node).and_then(|n| n.as_element()) else { return Style::inherit_from(parent) };
+        // Quirks mode: tables do not inherit fonts, white-space and
+        // text-align (the HTML standard's rendering quirk, as UA rules that
+        // author rules still override)
+        let quirk_parent;
+        let parent = if self.quirks && tree.resolve(element.name.local) == "table" {
+            let mut p = parent.clone();
+            let i = Arc::make_mut(&mut p.inherited);
+            let initial = &Style::initial_ref().inherited;
+            i.font_weight = initial.font_weight;
+            i.font_style = initial.font_style;
+            i.font_size = initial.font_size;
+            i.line_height = initial.line_height;
+            i.white_space = initial.white_space;
+            i.text_align = initial.text_align;
+            quirk_parent = p;
+            &quirk_parent
         } else {
-            tag_name
+            parent
         };
-
-        // Skip elements that never render
-        if matches!(tag, "script" | "style" | "noscript" | "template" | "head") {
-            return;
+        let mut style = Style::inherit_from(parent);
+        let inline: Vec<fos_css::Declaration> = element
+            .attrs
+            .iter()
+            .filter(|a| tree.resolve(a.name.local) == "style")
+            .flat_map(|a| fos_css::parse_declarations(&a.value))
+            .collect();
+        let filter = self.stylesheet.is_some().then_some(&self.ancestors);
+        let (own, scoped) = self.sheets_for(tree, node);
+        crate::page_styles::cascade(own, scoped, tree, node, element, filter, &inline, &mut style, parent, &self.ctx, &mut self.resolved);
+        if !self.root_styled {
+            // The root element's font size is what `rem` means
+            self.root_styled = true;
+            self.ctx.root_font_size = style.font_size();
         }
+        style
+    }
 
-        let is_block = matches!(tag,
-            "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" |
-            "ul" | "ol" | "li" | "section" | "article" | "header" | "footer" |
-            "main" | "nav" | "aside" | "figure" | "figcaption" | "blockquote" |
-            "pre" | "hr" | "br" | "table" | "tr" | "form" | "td" | "th");
-
-        let font_size = style.as_ref().map(|s| s.font_size).unwrap_or(self.line_buffer.current_font_size);
-
-        // Block elements flush the line buffer and add vertical space
-        if is_block {
-            self.flush();
-            // Better spacing based on element type
-            let margin_before = match tag {
-                "h1" => 20.0,
-                "h2" => 16.0,
-                "h3" | "h4" => 12.0,
-                "p" => 8.0,
-                "ul" | "ol" => 6.0,
-                "li" => 2.0,
-                "td" | "th" | "tr" => 2.0,
-                _ => font_size * 0.3,
-            };
-            self.y += margin_before;
+    fn image(&mut self, tree: &DomTree, node: NodeId) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        if self.images.is_empty() {
+            return None;
         }
+        let tag = tree.get(node).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))?;
+        let src = if tag == "img" { crate::image_loader::image_source(tree, node, self.ctx.viewport.0)? } else { tree.get_attribute(node, "src")?.to_string() };
+        let img = self.images.get(&fos_net::url_util::resolve(&self.base, &src))?;
+        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+    }
 
-        // Handle special elements
-        if tag == "br" {
-            self.flush();
-            return;
+    fn content_image(&mut self, url: &str) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        let img = self.images.get(url).or_else(|| self.images.get(&fos_net::url_util::resolve(&self.base, url)))?;
+        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+    }
+
+    fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {
+        let c = style.color();
+        // CSS fill and stroke beat presentation attributes: they go into
+        // the elements' style attributes
+        let mut paint = std::collections::HashMap::new();
+        if let Some(d) = svg_paint_decl(style) {
+            paint.insert(node, d);
         }
-
-        if tag == "hr" {
-            self.flush();
-            let line_buffer = &self.line_buffer;
-            self.layout.rules.push(Rule {
-                x: line_buffer.start_x,
-                y: self.y,
-                width: line_buffer.max_width - line_buffer.start_x - 20.0,
-            });
-            self.y += 10.0;
-            return;
+        if self.stylesheet.is_some() {
+            let mut budget = 2000;
+            self.svg_paint(tree, node, style, &mut paint, &mut budget);
         }
+        let refs = (!self.images.is_empty()).then_some(crate::image_loader::SvgRefs { images: self.images, base: &self.base });
+        let img = crate::image_loader::inline_svg(tree, node, [c.r, c.g, c.b, c.a], &paint, refs, self.svgs)?;
+        Some((img.natural, layout_engine::ImageHandle(img)))
+    }
 
-        let line_buffer = &mut self.line_buffer;
+    fn pseudo(&mut self, tree: &DomTree, node: NodeId, pe: fos_dom::PseudoElement, style: &Style) -> Option<Style> {
+        let element = tree.get(node)?.as_element()?;
+        let filter = self.stylesheet.is_some().then_some(&self.ancestors);
+        let (own, scoped) = self.sheets_for(tree, node);
+        crate::page_styles::pseudo_style(own, scoped, tree, node, element, pe, filter, style, &self.ctx, &mut self.resolved)
+    }
 
-        // Save current state for restoration
-        let saved_font_size = line_buffer.current_font_size;
-        let saved_color = line_buffer.current_color;
-        let saved_indent = line_buffer.indent_level;
-        let saved_href = line_buffer.current_href.clone();
-        let saved_list_counter = line_buffer.list_counter;
-
-        // Increment indent for lists and blockquotes
-        if tag == "ul" || tag == "ol" || tag == "blockquote" {
-            line_buffer.indent_level += 1;
-            line_buffer.current_x = line_buffer.effective_start_x();
+    fn enter(&mut self, tree: &DomTree, node: NodeId) {
+        if self.stylesheet.is_some() {
+            self.ancestors.push(tree, node);
         }
+    }
 
-        // Ordered lists start a counter at 1
-        if tag == "ol" {
-            line_buffer.list_counter = 1;
-        }
-        // Unordered lists reset counter to 0 (signals bullet mode)
-        if tag == "ul" {
-            line_buffer.list_counter = 0;
-        }
-
-        // Table cell handling - simple approach: cells are separated by |
-        if (tag == "td" || tag == "th") && line_buffer.current_x > line_buffer.effective_start_x() + 5.0 {
-            // Add cell separator if not first in row
-            let font_size = line_buffer.current_font_size;
-            line_buffer.add_text(" | ", font_size, Color::rgb(180, 180, 180), node_id);
-        }
-
-        // Table headers get slightly bold look (darker color)
-        if tag == "th" {
-            line_buffer.current_color = Color::rgb(40, 40, 40);
-        }
-
-        // List items get a bullet or number marker
-        if tag == "li" {
-            self.flush();
-            let line_buffer = &mut self.line_buffer;
-            // Add marker based on list type
-            let font_size = line_buffer.current_font_size;
-            let color = line_buffer.current_color;
-            if line_buffer.list_counter > 0 {
-                // Ordered list - show number
-                let marker = format!("{}. ", line_buffer.list_counter);
-                line_buffer.add_text(&marker, font_size, color, node_id);
-                line_buffer.list_counter += 1;
-            } else {
-                // Unordered list - show bullet
-                line_buffer.add_text("• ", font_size, color, node_id);
-            }
-        }
-
-        let line_buffer = &mut self.line_buffer;
-
-        // Inherited properties for the element's contents
-        if let Some(style) = &style {
-            line_buffer.current_font_size = style.font_size;
-            let c = style.color;
-            line_buffer.current_color = Color::rgba(c.r, c.g, c.b, c.a);
-        }
-
-        // Single pass over attributes: link target, anchor id
-        for attr in element.attrs.iter() {
-            match tree.resolve(attr.name.local) {
-                "href" if tag == "a" => {
-                    line_buffer.current_href = Some(attr.value.to_string());
-                }
-                "id" if !attr.value.is_empty() => {
-                    // Record element ID for anchor navigation
-                    self.layout.anchors.push(AnchorPosition {
-                        id: attr.value.to_string(),
-                        y: self.y,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Recurse into children
-        self.styler.enter(node_id);
-        for (child_id, _) in tree.children(node_id) {
-            self.layout_node(child_id);
-        }
-        self.styler.leave();
-
-        // Restore state
-        let line_buffer = &mut self.line_buffer;
-        line_buffer.current_font_size = saved_font_size;
-        line_buffer.current_color = saved_color;
-        line_buffer.indent_level = saved_indent;
-        line_buffer.current_href = saved_href;
-        line_buffer.list_counter = saved_list_counter;
-        line_buffer.current_x = line_buffer.effective_start_x();
-
-        // Block elements flush after and add space
-        if is_block {
-            self.flush();
-            // Better spacing based on element type
-            let margin_after = match tag {
-                "h1" => 12.0,
-                "h2" => 10.0,
-                "h3" | "h4" => 8.0,
-                "p" => 12.0,  // Paragraphs need good separation
-                "li" => 2.0,
-                _ => 4.0,
-            };
-            self.y += margin_after;
+    fn leave(&mut self) {
+        if self.stylesheet.is_some() {
+            self.ancestors.pop();
         }
     }
 }
 
-
-/// Line buffer for accumulating inline text
-struct LineBuffer {
-    /// Pending segments; `None` marks a line break
-    segments: Vec<Option<TextSegment>>,
-    start_x: f32,
-    current_x: f32,
-    max_width: f32,
-    current_font_size: f32,
-    current_color: Color,
-    /// Current indentation level (for lists, blockquotes)
-    indent_level: u32,
-    /// Current link href (if inside an <a> tag)
-    current_href: Option<String>,
-    /// Current list counter for <ol> (0 means unordered list or not in list)
-    list_counter: u32,
+/// A style's declared SVG `fill`/`stroke`, as CSS text
+fn svg_paint_decl(style: &Style) -> Option<String> {
+    let b = &style.box_;
+    let mut out = String::new();
+    if let Some(f) = &b.svg_fill {
+        out.push_str(&format!("fill:{f};"));
+    }
+    if let Some(s) = &b.svg_stroke {
+        out.push_str(&format!("stroke:{s};"));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
-impl LineBuffer {
-    fn new(start_x: f32, max_width: f32, font_size: f32) -> Self {
-        Self {
-            segments: Vec::new(),
-            start_x,
-            current_x: start_x,
-            max_width,
-            current_font_size: font_size,
-            current_color: Color::BLACK,
-            indent_level: 0,
-            current_href: None,
-            list_counter: 0,
+impl<'a> BrowserStyler<'a> {
+    /// The rules of `node`'s tree (the page's, or its shadow tree's), and
+    /// those of other trees that reach it
+    fn sheets_for(&self, tree: &DomTree, node: NodeId) -> (Option<&'a PageStyles>, crate::page_styles::Scoped<'a>) {
+        if !tree.has_shadow_roots() {
+            return (self.stylesheet, Default::default());
         }
+        let shadow_sheets: &'a HashMap<NodeId, Arc<PageStyles>> = self.shadow_sheets;
+        let page = self.stylesheet;
+        let sheet_of = |root: NodeId| -> Option<&'a PageStyles> {
+            if tree.shadow_host(root).is_some() { shadow_sheets.get(&root).map(|s| &**s) } else { page }
+        };
+        let root = tree.tree_root(node);
+        let own = sheet_of(root);
+        let host = tree.shadow_root(node).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
+        let parent = tree.get(node).map_or(NodeId::NONE, |n| n.parent);
+        let slotted = tree.shadow_root(parent).and_then(|r| shadow_sheets.get(&r)).map(|s| &**s);
+        let is_part = tree.shadow_host(root).is_some() && tree.get_attribute(node, "part").is_some();
+        let part = match tree.shadow_host(root) {
+            Some(h) if is_part => sheet_of(tree.tree_root(h)),
+            _ => None,
+        };
+        (own, crate::page_styles::Scoped { host, slotted, part, own_part: is_part })
     }
 
-    /// Get effective start x (including indentation)
-    fn effective_start_x(&self) -> f32 {
-        self.start_x + (self.indent_level as f32 * 20.0)
-    }
-
-    fn add_text_with_measure<F: Fn(&str, f32) -> f32>(&mut self, text: &str, font_size: f32, color: Color, node: NodeId, measure: F) {
-        let effective_start = self.effective_start_x();
-        let right_margin = 15.0;
-        let wrap_width = self.max_width - right_margin;
-
-        // Use proper text measurement for space width
-        let space_width = measure(" ", font_size);
-
-        // Initialize current_x if needed
-        if self.current_x < effective_start {
-            self.current_x = effective_start;
-        }
-
-        // Use LineBreaker for proper Unicode-aware line breaking
-        let available_width = wrap_width - self.current_x;
-        let lines = LineBreaker::break_lines(text, available_width.max(wrap_width * 0.5), |s| measure(s, font_size));
-
-        for (i, &(start, end)) in lines.iter().enumerate() {
-            let line_text = &text[start..end];
-            let trimmed = line_text.trim_end();
-
-            if trimmed.is_empty() {
-                continue;
+    /// Styles of the elements of an inline SVG: those with fill or stroke
+    /// declared (at most `budget` elements are styled)
+    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut std::collections::HashMap<NodeId, String>, budget: &mut u32) {
+        use layout_engine::Styler;
+        self.enter(tree, node);
+        let kids: Vec<NodeId> = tree.children(node).filter(|(_, n)| n.is_element()).map(|(id, _)| id).collect();
+        for child in kids {
+            if *budget == 0 {
+                break;
             }
-
-            // Check if this line needs wrapping from current position
-            let line_width = measure(trimmed, font_size);
-
-            if i > 0 || (self.current_x + line_width > wrap_width && self.current_x > effective_start) {
-                // Need to wrap - start new line
-                if !self.segments.is_empty() {
-                    self.segments.push(None);
-                }
-                self.current_x = effective_start;
+            *budget -= 1;
+            let cs = self.style(tree, child, style);
+            if let Some(d) = svg_paint_decl(&cs) {
+                out.insert(child, d);
             }
-
-            // Add the text segment
-            let mut segment_text = String::with_capacity(trimmed.len() + 1);
-            segment_text.push_str(trimmed);
-            segment_text.push(' ');
-            self.segments.push(Some(TextSegment {
-                text: segment_text,
-                font_size,
-                color,
-                href: self.current_href.clone(),
-                node,
-            }));
-
-            self.current_x += line_width + space_width;
+            self.svg_paint(tree, child, &cs, out, budget);
         }
-    }
-
-    // Keep fallback without measure function for backwards compatibility
-    fn add_text(&mut self, text: &str, font_size: f32, color: Color, node: NodeId) {
-        // Fallback using approximate character width
-        let char_width = font_size * 0.5;
-        self.add_text_with_measure(text, font_size, color, node, |s, _| s.chars().count() as f32 * char_width);
-    }
-
-    /// Emit the buffered text as lines starting at `y_cursor`
-    fn flush(&mut self, y_cursor: &mut f32, layout: &mut PageLayout) {
-        if self.segments.is_empty() {
-            return;
-        }
-
-        let effective_start = self.effective_start_x();
-        let line_height = self.current_font_size * 1.3;
-
-        let mut line = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
-        for segment in self.segments.drain(..) {
-            match segment {
-                Some(segment) => {
-                    layout.max_font_size = layout.max_font_size.max(segment.font_size);
-                    line.segments.push(segment);
-                }
-                None => {
-                    *y_cursor += line_height;
-                    let next = LaidOutLine { y: *y_cursor, x: effective_start, segments: Vec::new() };
-                    let done = std::mem::replace(&mut line, next);
-                    if !done.segments.is_empty() {
-                        layout.lines.push(done);
-                    }
-                }
-            }
-        }
-        if !line.segments.is_empty() {
-            layout.lines.push(line);
-        }
-
-        *y_cursor += line_height;
-        self.current_x = effective_start;
+        self.leave();
     }
 }
 
-/// Apply default user-agent styles based on element type
-fn apply_default_styles(style: &mut ComputedStyle, tag_name: &str, element: &fos_dom::ElementData, tree: &DomTree) {
-    let parent = style.font_size;
-    let lowered;
-    let tag: &str = if tag_name.bytes().any(|b| b.is_ascii_uppercase()) {
-        lowered = tag_name.to_ascii_lowercase();
-        &lowered
-    } else {
-        tag_name
+/// Lay out `document` in a viewport
+fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow_sheets: &HashMap<NodeId, Arc<PageStyles>>, images: &crate::image_loader::Images, svgs: &mut crate::image_loader::SvgCache, fonts: &mut FontContext, viewport: (f32, f32)) -> PageLayout {
+    let tree = document.tree();
+    let root = document.document_element();
+    let mut styler = BrowserStyler {
+        stylesheet: stylesheet.as_deref(),
+        shadow_sheets,
+        ancestors: AncestorFilter::default(),
+        resolved: Default::default(),
+        ctx: StyleContext { root_font_size: 16.0, viewport },
+        root_styled: false,
+        quirks: document.is_quirks(),
+        images,
+        base: if images.is_empty() { String::new() } else { crate::css_loader::base_url(document) },
+        svgs,
     };
+    let fragments = if root.is_valid() {
+        layout_engine::layout_document(tree, root, &mut styler, fonts, viewport)
+    } else {
+        FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 }
+    };
+    drop(styler);
 
-    match tag {
-        // Block elements
-        "div" | "p" | "article" | "section" | "main" | "header" | "footer" | "nav" |
-        "aside" | "figure" | "figcaption" | "address" | "blockquote" | "pre" => {
-            style.display = Display::Block;
-        }
-
-        // Headings
-        "h1" => {
-            style.display = Display::Block;
-            style.font_size = parent * 2.0;
-            style.font_weight = 700;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(21.44, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(21.44, LengthUnit::Px),
-                left: SizeValue::Length(0.0, LengthUnit::Px),
-            };
-        }
-        "h2" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.5;
-            style.font_weight = 700;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(19.92, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(19.92, LengthUnit::Px),
-                left: SizeValue::Length(0.0, LengthUnit::Px),
-            };
-        }
-        "h3" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.17;
-            style.font_weight = 700;
-        }
-        "h4" => {
-            style.display = Display::Block;
-            style.font_size = parent * 1.0;
-            style.font_weight = 700;
-        }
-        "h5" => {
-            style.display = Display::Block;
-            style.font_size = parent * 0.83;
-            style.font_weight = 700;
-        }
-        "h6" => {
-            style.display = Display::Block;
-            style.font_size = parent * 0.67;
-            style.font_weight = 700;
-        }
-
-        // Links (`:link`: with an href)
-        "a" => {
-            style.display = Display::Inline;
-            if element.attrs.iter().any(|a| tree.resolve(a.name.local) == "href") {
-                style.color = fos_css::properties::Color::rgb(51, 102, 204);
+    // Links and anchors
+    let mut links: Vec<(Rect, Arc<str>)> = Vec::new();
+    fn walk(tree: &DomTree, b: &BoxFragment, links: &mut Vec<(Rect, Arc<str>)>) {
+        if b.node.is_valid() {
+            let is_link = tree.get(b.node).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "a");
+            if is_link {
+                if let Some(href) = tree.get_attribute(b.node, "href") {
+                    // A block link's area is its box; an inline link's, each
+                    // line's part
+                    let r = if b.kind == BoxFragmentKind::InlinePart { b.border_box.union(&b.ink) } else { b.border_box };
+                    links.push((r, Arc::from(href)));
+                }
             }
         }
-
-        // Inline elements
-        "span" | "em" | "i" | "u" | "code" | "kbd" | "samp" => {
-            style.display = Display::Inline;
-        }
-        "small" | "sub" | "sup" => {
-            style.display = Display::Inline;
-            style.font_size = parent * 0.83;
-        }
-        "big" => {
-            style.display = Display::Inline;
-            style.font_size = parent * 1.2;
-        }
-
-        // Bold
-        "strong" | "b" => {
-            style.display = Display::Inline;
-            style.font_weight = 700;
-        }
-
-        // Lists
-        "ul" | "ol" => {
-            style.display = Display::Block;
-            style.padding = EdgeSizes {
-                top: SizeValue::Length(0.0, LengthUnit::Px),
-                right: SizeValue::Length(0.0, LengthUnit::Px),
-                bottom: SizeValue::Length(0.0, LengthUnit::Px),
-                left: SizeValue::Length(40.0, LengthUnit::Px),
-            };
-        }
-        "li" => {
-            style.display = Display::Block;
-        }
-
-        // Table
-        "table" => {
-            style.display = Display::Block;
-        }
-        "tr" => {
-            style.display = Display::Block;
-        }
-        "td" | "th" => {
-            style.display = Display::Inline;
-        }
-
-        // Images
-        "img" => {
-            style.display = Display::Inline;
-        }
-
-        // Body
-        "body" => {
-            style.display = Display::Block;
-            style.margin = EdgeSizes {
-                top: SizeValue::Length(8.0, LengthUnit::Px),
-                right: SizeValue::Length(8.0, LengthUnit::Px),
-                bottom: SizeValue::Length(8.0, LengthUnit::Px),
-                left: SizeValue::Length(8.0, LengthUnit::Px),
-            };
-        }
-
-        // HTML
-        "html" => {
-            style.display = Display::Block;
-        }
-
-        // Head - hidden
-        "head" | "title" | "script" | "style" | "meta" | "link" => {
-            style.display = Display::None;
-        }
-
-        _ => {
-            style.display = Display::Inline;
+        for c in &b.children {
+            if let Fragment::Box(cb) = c {
+                walk(tree, cb, links);
+            }
         }
     }
-}
-
-/// Get 8x8 bitmap pattern for a character (simple bitmap font)
-fn get_char_pattern(c: char) -> [u8; 8] {
-    match c.to_ascii_lowercase() {
-        'a' => [0b00111100, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'b' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b00000000],
-        'c' => [0b00111100, 0b01000010, 0b01000000, 0b01000000, 0b01000000, 0b01000010, 0b00111100, 0b00000000],
-        'd' => [0b01111000, 0b01000100, 0b01000010, 0b01000010, 0b01000010, 0b01000100, 0b01111000, 0b00000000],
-        'e' => [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01111110, 0b00000000],
-        'f' => [0b01111110, 0b01000000, 0b01000000, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000],
-        'g' => [0b00111100, 0b01000010, 0b01000000, 0b01001110, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'h' => [0b01000010, 0b01000010, 0b01000010, 0b01111110, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'i' => [0b00111100, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00111100, 0b00000000],
-        'j' => [0b00001110, 0b00000100, 0b00000100, 0b00000100, 0b00000100, 0b01000100, 0b00111000, 0b00000000],
-        'k' => [0b01000100, 0b01001000, 0b01010000, 0b01100000, 0b01010000, 0b01001000, 0b01000100, 0b00000000],
-        'l' => [0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01000000, 0b01111110, 0b00000000],
-        'm' => [0b01000010, 0b01100110, 0b01011010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00000000],
-        'n' => [0b01000010, 0b01100010, 0b01010010, 0b01001010, 0b01000110, 0b01000010, 0b01000010, 0b00000000],
-        'o' => [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'p' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01000000, 0b01000000, 0b01000000, 0b00000000],
-        'q' => [0b00111100, 0b01000010, 0b01000010, 0b01000010, 0b01001010, 0b01000100, 0b00111010, 0b00000000],
-        'r' => [0b01111100, 0b01000010, 0b01000010, 0b01111100, 0b01010000, 0b01001000, 0b01000100, 0b00000000],
-        's' => [0b00111100, 0b01000010, 0b01000000, 0b00111100, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        't' => [0b01111110, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000],
-        'u' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        'v' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b00100100, 0b00100100, 0b00011000, 0b00000000],
-        'w' => [0b01000010, 0b01000010, 0b01000010, 0b01000010, 0b01011010, 0b01100110, 0b01000010, 0b00000000],
-        'x' => [0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00100100, 0b01000010, 0b00000000],
-        'y' => [0b01000010, 0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b00000000],
-        'z' => [0b01111110, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01000000, 0b01111110, 0b00000000],
-        // Digits with distinct patterns
-        '0' => [0b00111100, 0b01000110, 0b01001010, 0b01010010, 0b01100010, 0b01000010, 0b00111100, 0b00000000],
-        '1' => [0b00011000, 0b00111000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b01111110, 0b00000000],
-        '2' => [0b00111100, 0b01000010, 0b00000010, 0b00001100, 0b00110000, 0b01000000, 0b01111110, 0b00000000],
-        '3' => [0b00111100, 0b01000010, 0b00000010, 0b00011100, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        '4' => [0b00000100, 0b00001100, 0b00010100, 0b00100100, 0b01111110, 0b00000100, 0b00000100, 0b00000000],
-        '5' => [0b01111110, 0b01000000, 0b01111100, 0b00000010, 0b00000010, 0b01000010, 0b00111100, 0b00000000],
-        '6' => [0b00011100, 0b00100000, 0b01000000, 0b01111100, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        '7' => [0b01111110, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00010000, 0b00010000, 0b00000000],
-        '8' => [0b00111100, 0b01000010, 0b01000010, 0b00111100, 0b01000010, 0b01000010, 0b00111100, 0b00000000],
-        '9' => [0b00111100, 0b01000010, 0b01000010, 0b00111110, 0b00000010, 0b00000100, 0b00111000, 0b00000000],
-        '.' => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00011000, 0b00011000, 0b00000000],
-        ',' => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00011000, 0b00011000, 0b00110000, 0b00000000],
-        ':' => [0b00000000, 0b00011000, 0b00011000, 0b00000000, 0b00011000, 0b00011000, 0b00000000, 0b00000000],
-        '-' => [0b00000000, 0b00000000, 0b00000000, 0b01111110, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
-        // Bullet for lists (small filled circle)
-        '•' => [0b00000000, 0b00000000, 0b00011000, 0b00111100, 0b00111100, 0b00011000, 0b00000000, 0b00000000],
-        _ => [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
+    if let Some(r) = &fragments.root {
+        walk(tree, r, &mut links);
     }
+    links.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
+
+    let mut anchors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (node, rect) in fragments.element_rects() {
+        if seen.insert(node) {
+            if let Some(id) = tree.get_attribute(node, "id").filter(|id| !id.is_empty()) {
+                anchors.push(AnchorPosition { id: id.to_string(), y: rect.y });
+            }
+        }
+    }
+
+    let body = document.body();
+    let (background, background_box) = crate::paint::canvas_background(&fragments, |b| b.node == body);
+    let mut has_fixed = false;
+    let base = crate::css_loader::base_url(document);
+    let mut css_images: Vec<String> = Vec::new();
+    fragments.for_each(|f| {
+        if let Fragment::Box(b) = f {
+            // Sticky boxes move with scrolling too: no scroll blitting
+            has_fixed |= matches!(b.style.box_.position, fos_css::style::Position::Fixed | fos_css::style::Position::Sticky);
+            let bg = &b.style.background;
+            // Background and mask images, and generated content's
+            let content = b.style.box_.content.iter().flat_map(|c| c.iter()).filter_map(|i| if let fos_css::style::ContentItem::Image(u) = i { Some(u) } else { None });
+            let urls = bg.images.iter().filter_map(|i| if let fos_css::style::Image::Url(u) = i { Some(u) } else { None }).chain(bg.mask.iter()).chain(content);
+            for u in urls {
+                let abs = fos_net::url_util::resolve(&base, u);
+                if !css_images.contains(&abs) && css_images.len() < 400 {
+                    css_images.push(abs);
+                }
+            }
+        }
+    });
+    PageLayout { fragments, links, anchors, background, background_box, has_fixed, css_images, base }
 }
 
 #[cfg(test)]
@@ -1413,17 +1125,408 @@ mod tests {
         assert!(past_end.links.is_empty());
     }
 
-    #[test]
-    fn test_layout_lines_are_ordered() {
-        let document = fos_html::parse_with_url(PAGE, "https://example.com/");
-        let renderer = PageRenderer::new(320, 240);
-        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
-        let layout = build_layout(&document, &styler, 320);
+    fn layout_of(document: &Document, width: f32) -> PageLayout {
+        let renderer = PageRenderer::new(width as u32, 240);
+        let sheet = renderer.page_stylesheet(document);
+        build_layout(document, sheet, &Default::default(), &Default::default(), &mut Default::default(), &mut FontContext::default(), (width, 240.0))
+    }
 
-        assert!(!layout.lines.is_empty());
-        assert!(layout.lines.windows(2).all(|w| w[0].y <= w[1].y));
-        assert_eq!(layout.rules.len(), 1);
-        assert!(layout.content_height >= layout.lines.last().unwrap().y);
+    /// The text fragments of the element whose text is `text`
+    fn texts<'a>(document: &Document, layout: &'a PageLayout, text: &str) -> Vec<&'a layout_engine::TextFragment> {
+        let tree = document.tree();
+        let mut owner = NodeId::NONE;
+        fos_dom::selector::walk_elements(tree, tree.root(), &mut |id| {
+            let own: String = tree.children(id).filter_map(|(_, n)| n.as_text()).collect();
+            if own.trim() == text {
+                owner = id;
+            }
+            true
+        });
+        let mut out = Vec::new();
+        fn walk<'a>(b: &'a BoxFragment, owner: NodeId, out: &mut Vec<&'a layout_engine::TextFragment>) {
+            for c in &b.children {
+                match c {
+                    Fragment::Text(t) if t.node == owner => out.push(t),
+                    Fragment::Box(cb) => walk(cb, owner, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(layout.fragments.root.as_ref().unwrap(), owner, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_layout_boxes_follow_the_document() {
+        let document = fos_html::parse_with_url(PAGE, "https://example.com/");
+        let layout = layout_of(&document, 320.0);
+        let boxes = layout.boxes();
+        assert!(!boxes.is_empty());
+        // Block boxes come in document order, top to bottom
+        let tree = document.tree();
+        let tops: Vec<f32> = boxes
+            .iter()
+            .filter(|(n, _)| tree.get(*n).and_then(|n| n.as_element()).is_some_and(|e| matches!(tree.resolve(e.name.local), "h1" | "p" | "ul")))
+            .map(|(_, r)| r.y)
+            .collect();
+        assert!(tops.len() >= 4 && tops.windows(2).all(|w| w[0] <= w[1]), "{tops:?}");
+        // The rule is a bordered block across the body
+        let hr = boxes.iter().find(|(n, _)| tree.get(*n).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "hr")).unwrap();
+        assert!(hr.1.w > 250.0 && hr.1.h >= 2.0, "{:?}", hr.1);
+        assert!(layout.content_height() >= tops[tops.len() - 1]);
+        assert!(layout.anchors.iter().any(|a| a.id == "end"));
+    }
+
+    #[test]
+    fn test_rounded_and_shaped_clips() {
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'><rect width='40' height='40' fill='red'/></svg>";
+        let html = format!(
+            r#"<html><body style="margin: 0"><div style="display: flex">
+            <img src="{svg}" style="width: 40px; height: 40px; border-radius: 50%">
+            <div style="width: 40px; height: 40px; border-radius: 50%; overflow: hidden"><div style="height: 40px; background: #f00"></div></div>
+            <div style="width: 40px; height: 40px; background: #f00; clip-path: circle(50%)"></div>
+            <div style="width: 40px; height: 40px; background: #f00; clip-path: polygon(50% 0, 100% 100%, 0 100%)"></div>
+            </div></body></html>"#
+        );
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 50);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 200 + x] == 0xffff0000;
+        for i in 0..4 {
+            let x0 = i * 40;
+            // Filled in the middle, cut at the top corners
+            assert!(red(x0 + 20, 30), "shape {i} center");
+            assert!(!red(x0 + 2, 2) && !red(x0 + 37, 2), "shape {i} corners");
+        }
+    }
+
+    #[test]
+    fn test_css_fill_on_inline_svg() {
+        // fill="none" on the root, CSS fill from a class (Tailwind's
+        // fill-[#..]); a child's own fill attribute still wins over the
+        // inherited value, and a CSS rule on a child beats its attribute
+        let html = r##"<html><head><style>.logo { fill: #f00 } .logo .b { fill: #0f0 }</style></head><body style="margin: 0">
+            <svg class="logo" width="30" height="10" viewBox="0 0 30 10" fill="none" style="display: block">
+            <rect x="0" width="10" height="10"/><rect x="10" width="10" height="10" fill="#00f"/><rect class="b" x="20" width="10" height="10" fill="#00f"/></svg>
+            </body></html>"##;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 20);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 40 + x];
+        assert_eq!(at(5, 5), 0xffff0000);
+        assert_eq!(at(15, 5), 0xff0000ff);
+        assert_eq!(at(25, 5), 0xff00ff00);
+    }
+
+    #[test]
+    fn test_shadow_trees_render_with_scoped_styles() {
+        // The page styles the host and its parts; the shadow tree styles
+        // itself, its host (:host) and slotted light children; light
+        // children without a slot are not rendered
+        let html = r#"<html><head><style>
+            x-card::part(base) { background: #ff0 }
+            .base { background: #f0f !important; height: 50px }
+            </style></head><body style="margin: 0">
+            <x-card id="h"><span slot="nowhere" style="display: block; height: 30px; background: #f00"></span><i style="height: 7px"></i></x-card>
+            <div style="height: 10px; background: #00f"></div></body></html>"#;
+        let mut document = fos_html::parse_with_url(html, "https://example.com/");
+        let host = document.get_element_by_id("h").unwrap();
+        let tree = document.tree_mut();
+        let root = tree.attach_shadow(host);
+        let style = tree.create_element("style");
+        let css = tree.create_text(":host { display: block; padding: 5px; background: #0f0 } .base { height: 20px; background: #f00 } ::slotted(i) { display: block; background: #000 }");
+        tree.append_child(style, css);
+        let base = tree.create_element("div");
+        tree.set_attribute(base, "class", "base");
+        tree.set_attribute(base, "part", "base");
+        let slot = tree.create_element("slot");
+        tree.append_child(root, style);
+        tree.append_child(root, base);
+        tree.append_child(root, slot);
+        let mut renderer = PageRenderer::new(100, 60);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |y: usize| page.pixels[y * 100 + 50] & 0xffffff;
+        assert_eq!(at(2), 0x00ff00, ":host padding");
+        assert_eq!(at(10), 0xffff00, "::part() from the page beats the shadow tree's rule");
+        assert_eq!(at(28), 0x000000, "slotted <i>, styled by ::slotted() and its own style");
+        assert_eq!(at(33), 0x00ff00, "host padding below");
+        assert_eq!(at(40), 0x0000ff, "content after the host");
+    }
+
+    #[test]
+    fn test_declarative_shadow_roots_render_without_scripts() {
+        let html = r#"<html><body style="margin: 0">
+            <x-box><template shadowrootmode="open"><style>:host { display: block; background: #0f0 } div { height: 10px }</style><div></div><slot></slot></template><p style="margin: 0; height: 10px; background: #00f"></p></x-box>
+            <template id="t"><div style="height: 50px; background: #f00"></div></template>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let tree = document.tree();
+        let host = tree.children(document.body()).map(|(c, _)| c).find(|&c| tree.get(c).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "x-box")).unwrap();
+        assert!(tree.shadow_root(host).is_some());
+        // The declarative template is gone; others keep their contents
+        assert_eq!(tree.children(host).filter(|(_, n)| n.is_element()).count(), 1);
+        let mut renderer = PageRenderer::new(100, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |y: usize| page.pixels[y * 100 + 50] & 0xffffff;
+        assert_eq!(at(5), 0x00ff00, "the shadow tree's div on the :host background");
+        assert_eq!(at(15), 0x0000ff, "the slotted <p>");
+        assert_eq!(at(25), 0xffffff, "nothing below");
+    }
+
+    #[test]
+    fn test_svg_use_of_external_sprite() {
+        // <use href="sprites.svg#id"> draws the symbol from the loaded
+        // sprite sheet, which the page's image URLs include
+        let html = r#"<html><body style="margin: 0"><svg width="20" height="20"><use href="/img/sprites.svg#sq" width="20" height="20"></use></svg></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/page");
+        assert_eq!(crate::image_loader::image_urls(&document, 100.0), vec!["https://example.com/img/sprites.svg".to_string()]);
+        let sprite = br##"<svg xmlns="http://www.w3.org/2000/svg"><symbol id="sq" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f00"/></symbol></svg>"##;
+        let img = crate::image_loader::decode(sprite);
+        let mut images = HashMap::new();
+        if let Some(img) = img {
+            images.insert("https://example.com/img/sprites.svg".to_string(), Arc::new(img));
+        }
+        let mut renderer = PageRenderer::new(40, 40);
+        renderer.set_images(Arc::new(images));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[10 * 40 + 10] & 0xffffff, 0xff0000);
+    }
+
+    #[test]
+    fn test_z_index_on_unpositioned_grid_and_flex_items() {
+        // Grid and flex items honor z-index without position: the first
+        // item, raised, paints over the later one sharing its area
+        for container in ["display: grid; grid-template-areas: 'a'", "display: flex"] {
+            let item = if container.contains("grid") { "grid-area: a;" } else { "flex: none; width: 20px;" };
+            let second = if container.contains("grid") { "grid-area: a;" } else { "flex: none; width: 20px; margin-left: -20px;" };
+            let html = format!(r#"<html><body style="margin: 0"><div style="{container}; width: 20px">
+                <div style="{item} height: 20px; background: #f00; z-index: 1"></div>
+                <div style="{second} height: 20px; background: #00f"></div></div></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 10] & 0xffffff, 0xff0000, "{container}");
+        }
+    }
+
+    #[test]
+    fn test_inline_opacity_covers_its_contents() {
+        // Opacity on an inline element fades the inline-blocks and blocks
+        // inside it (an undefined custom element under :not(:defined))
+        let cases = [
+            (r#"<x-a style="opacity: 0"><div style="height: 20px; background: #f00"></div></x-a>"#, 0xffffff),
+            (r#"<span style="opacity: 0"><span style="display: inline-block; width: 20px; height: 20px; background: #f00"></span></span>"#, 0xffffff),
+            (r#"<x-a style="opacity: 0.5"><div style="height: 20px; background: #000"></div></x-a>"#, 0x808080),
+            (r#"<span><span style="display: inline-block; width: 20px; height: 20px; background: #f00"></span></span>"#, 0xff0000),
+        ];
+        for (body, want) in cases {
+            let html = format!(r#"<html><body style="margin: 0">{body}</body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(100, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            let p = page.pixels[10 * 100 + 5] & 0xffffff;
+            let near = |a: u32, b: u32, sh: u32| ((a >> sh) & 0xff).abs_diff((b >> sh) & 0xff) <= 2;
+            assert!(near(p, want, 0) && near(p, want, 8) && near(p, want, 16), "{body}: {p:x}");
+        }
+    }
+
+    #[test]
+    fn test_filters_and_centered_ratio_boxes() {
+        // A blurred circle, centered by auto margins with its height from
+        // aspect-ratio (Tailwind's glow), and a darkened box
+        let html = r#"<html><body style="margin: 0">
+            <div style="position: relative; width: 200px; height: 100px">
+            <div style="position: absolute; inset: 0; width: 40px; aspect-ratio: 1; margin: auto; border-radius: 3.4e38px; background: #f00; filter: blur(4px)"></div></div>
+            <div style="height: 20px; background: #fff; filter: brightness(50%)"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 130);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        let red = |p: u32| (p >> 16) & 0xff;
+        let green = |p: u32| (p >> 8) & 0xff;
+        // Solid red at the center, softened at the circle's edge, and
+        // nothing at the box's corners or far away
+        assert!(red(at(100, 50)) > 0xf0 && green(at(100, 50)) < 0x10, "{:x}", at(100, 50));
+        let edge = at(120, 50);
+        assert!(green(edge) > 0x30 && green(edge) < 0xe0, "edge {edge:x}");
+        assert_eq!(at(70, 20) & 0xffffff, 0xffffff, "beyond the blur, outside the circle");
+        assert_eq!(at(10, 50) & 0xffffff, 0xffffff);
+        // brightness(50%): white becomes mid gray
+        let g = at(50, 110) & 0xff;
+        assert!((0x7c..=0x83).contains(&g), "{:x}", at(50, 110));
+    }
+
+    #[test]
+    fn test_background_clip() {
+        let html = r#"<html><body style="margin: 0">
+            <div style="font: bold 40px sans-serif; line-height: 40px; height: 40px; background: #f00; background-clip: text; color: transparent">MMMM</div>
+            <div style="width: 20px; height: 20px; border: 5px solid transparent; background: #00f; background-clip: padding-box"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 80);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // The background shows through the glyphs only
+        let red = (0..40).flat_map(|y| (0..120).map(move |x| (x, y))).filter(|&(x, y)| at(x, y) == 0xffff0000).count();
+        assert!(red > 100, "glyphs filled: {red}");
+        assert_ne!(at(195, 20), 0xffff0000, "no background beside the text");
+        // padding-box: none under the (transparent) border
+        assert_ne!(at(2, 42), 0xff0000ff);
+        assert_eq!(at(15, 55), 0xff0000ff);
+    }
+
+    #[test]
+    fn test_object_position() {
+        // 10×20: red on top, blue below; shown in 10×10 boxes with cover
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20'><rect width='10' height='10' fill='red'/><rect y='10' width='10' height='10' fill='blue'/></svg>";
+        let html = format!(
+            r#"<html><body style="margin: 0"><img src="{svg}" style="display: block; width: 10px; height: 10px; object-fit: cover; object-position: 100% 0"><img src="{svg}" style="display: block; width: 10px; height: 10px; object-fit: cover; object-position: left bottom"></body></html>"#
+        );
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(50, 30);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 50 + x];
+        // The top of the image in the first, the bottom in the second
+        assert_eq!(at(5, 2), 0xffff0000);
+        assert_eq!(at(5, 8), 0xffff0000);
+        assert_eq!(at(5, 12), 0xff0000ff);
+        assert_eq!(at(5, 18), 0xff0000ff);
+    }
+
+    #[test]
+    fn test_generated_content_images() {
+        let svg = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10' fill='red'/></svg>";
+        let html = format!(r#"<html><head><style>body, p {{ margin: 0 }} .i::before {{ content: url("{svg}") " " }}</style></head><body><p class=i>x</p></body></html>"#);
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 50);
+        let first = renderer.render_document(&document, 0.0).unwrap();
+        // Nothing drawn (and no room taken) before the image loads; its URL
+        // is among those to fetch
+        assert_ne!(first.pixels[5 * 200 + 5], 0xffff0000);
+        let urls = renderer.css_image_urls();
+        assert_eq!(urls, vec![svg.to_string()]);
+        let img = crate::image_loader::decode_data_url(&svg["data:".len()..]).expect("svg decodes");
+        renderer.set_images(Arc::new([(svg.to_string(), Arc::new(img))].into_iter().collect()));
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        // Red somewhere in the image's column (it sits on the baseline)
+        let reddish = |p: u32| (p >> 16) & 0xff > 0xe0 && (p >> 8) & 0xff < 0x60;
+        assert!((0..20).any(|y| reddish(page.pixels[y * 200 + 5])));
+    }
+
+    #[test]
+    fn test_clip_and_clip_path_inset_hide_boxes() {
+        let html = r#"<html><body style="margin: 0">
+            <div style="position: absolute; top: 0; left: 0; width: 40px; height: 40px; background: #f00; clip: rect(0 0 0 0)"></div>
+            <div style="position: absolute; top: 0; left: 50px; width: 40px; height: 40px; background: #f00; clip: rect(0, 20px, 40px, auto)"></div>
+            <div style="position: absolute; top: 50px; left: 0; width: 40px; height: 40px; background: #f00; clip-path: inset(50%)"></div>
+            <div style="position: absolute; top: 50px; left: 50px; width: 40px; height: 40px; background: #f00; clip-path: inset(0 0 0 20px round 4px)"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 200 + x] == 0xffff0000;
+        // rect(0 0 0 0) and inset(50%) hide everything
+        assert!(!red(20, 20) && !red(20, 70));
+        // rect(0, 20px, 40px, auto): the left half shows
+        assert!(red(55, 20) && !red(80, 20));
+        // inset(0 0 0 20px): the right half shows
+        assert!(!red(55, 70) && red(80, 70));
+    }
+
+    #[test]
+    fn test_fixed_boxes_stay_in_the_viewport() {
+        let mut html = String::from("<html><body><div style='position: fixed; top: 0; left: 0; width: 50px; height: 20px; background: #f00'></div>");
+        for i in 0..100 {
+            html.push_str(&format!("<p>line {i}</p>"));
+        }
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let top = renderer.render_document(&document, 0.0).unwrap();
+        let scrolled = renderer.render_document_scrolled(&document, 40.0, top).unwrap();
+        // Red (0xffff0000) at the viewport's top-left at both positions
+        assert_eq!(scrolled.pixels[5 * 200 + 5], 0xffff0000);
+        let far = renderer.render_document(&document, 1000.0).unwrap();
+        assert_eq!(far.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(far.pixels[50 * 200 + 5], 0xffff0000);
+        let fixed = renderer.node_at(10.0, 1010.0).unwrap();
+        assert_eq!(document.tree().get(fixed).and_then(|n| n.as_element()).map(|e| document.tree().resolve(e.name.local).to_string()).as_deref(), Some("div"));
+    }
+
+    #[test]
+    fn test_sticky_boxes_stick_within_their_parent() {
+        let html = "<html><body style='margin:0'><div style='height: 1000px'>\
+            <div id=h style='position: sticky; top: 0; height: 20px; background: #f00'></div>\
+            <div style='height: 500px'></div></div><div style='height: 2000px'></div></body></html>";
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let h = document.get_element_by_id("h").unwrap();
+        let mut renderer = PageRenderer::new(200, 100);
+        let top = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(top.pixels[5 * 200 + 5], 0xffff0000);
+        // Scrolled: pinned to the viewport's top, and hit there
+        let mid = renderer.render_document(&document, 300.0).unwrap();
+        assert_eq!(mid.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(mid.pixels[50 * 200 + 5], 0xffff0000);
+        assert_eq!(renderer.node_at(10.0, 305.0), Some(h));
+        // Past its parent's end it scrolls away with it
+        let past = renderer.render_document(&document, 1100.0).unwrap();
+        assert!(past.pixels.iter().all(|&p| p != 0xffff0000));
+        assert_ne!(renderer.node_at(10.0, 1105.0), Some(h));
+        // At the parent's end it sits on the parent's bottom edge
+        let end = renderer.render_document(&document, 990.0).unwrap();
+        assert_eq!(end.pixels[5 * 200 + 5], 0xffff0000);
+        assert_ne!(end.pixels[12 * 200 + 5], 0xffff0000);
+    }
+
+    #[test]
+    fn test_links_in_scrolled_boxes_are_hit_where_shown() {
+        let mut html = String::from("<html><body style='margin:0'><div style='height: 40px; width: 100px; overflow: auto'>");
+        for i in 0..20 {
+            html.push_str(&format!("<div style='height: 20px'><a href='/l{i}' style='display:block'>{i}</a></div>"));
+        }
+        html.push_str("</div></body></html>");
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(renderer.link_at(&document, 10.0, 25.0).as_deref(), Some("/l1"));
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 200.0));
+        assert_eq!(renderer.link_at(&document, 10.0, 25.0).as_deref(), Some("/l11"));
+        // Outside the box there is no link
+        assert_eq!(renderer.link_at(&document, 150.0, 25.0), None);
+    }
+
+    #[test]
+    fn test_scroll_containers_scroll_their_content() {
+        let mut html = String::from("<html><body style='margin:0'><div id=s style='height: 50px; width: 100px; overflow: auto'>");
+        for i in 0..20 {
+            html.push_str(&format!("<div style='height: 20px; background: {}'>{i}</div>", if i == 0 { "#f00" } else { "#00f" }));
+        }
+        html.push_str("</div><p>after</p></body></html>");
+        let document = fos_html::parse_with_url(&html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 100);
+        let before = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(before.pixels[5 * 200 + 5], 0xffff0000);
+        // Content below the box is clipped: the paragraph follows at 50px
+        let s = document.get_element_by_id("s").unwrap();
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 30.0));
+        assert_eq!(renderer.box_scroll(s), (0.0, 30.0));
+        let after = renderer.render_document(&document, 0.0).unwrap();
+        // Row 1 (blue) is now at the top
+        assert_eq!(after.pixels[5 * 200 + 5], 0xff0000ff);
+        // Clamped at the end (20 rows of 20px in a 50px box)
+        assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 10_000.0));
+        assert_eq!(renderer.box_scroll(s), (0.0, 350.0));
+        assert!(!renderer.scroll_box_at(10.0, 10.0, 0.0, 10.0));
+        // Outside the box nothing scrolls
+        assert!(!renderer.scroll_box_at(150.0, 10.0, 0.0, 10.0));
+        // Hit testing sees the scrolled content: the last row
+        let last = renderer.node_at(10.0, 45.0).unwrap();
+        let text: String = document.tree().children(last).filter_map(|(_, n)| n.as_text()).collect();
+        assert_eq!(text, "19");
     }
 
     #[test]
@@ -1434,33 +1537,224 @@ mod tests {
     }
 
     #[test]
+    fn test_web_fonts_are_used_by_family_name() {
+        let Ok(data) = std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf") else { return };
+        let html = r#"<html><head><style>
+            @font-face { font-family: Brand; src: url(brand.ttf) }
+            p { font-family: Brand, sans-serif }</style></head><body><p>web font</p></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(400, 200);
+        let reqs = renderer.web_font_requests(&document);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].url, "https://example.com/brand.ttf");
+        let font = |r: &mut PageRenderer| {
+            r.render_document(&document, 0.0).unwrap();
+            let layout = r.layout_snapshot().unwrap();
+            let mut family = String::new();
+            layout.fragments.for_each(|f| {
+                if let layout_engine::Fragment::Text(t) = f {
+                    family = t.font.id.and_then(|id| r.fonts.database().font(id)).map(|e| e.family.clone()).unwrap_or_default();
+                }
+            });
+            family
+        };
+        assert_ne!(font(&mut renderer), "Brand");
+        let loaded = crate::font_loader::LoadedFont { request: reqs[0].clone(), data };
+        renderer.set_web_fonts(Arc::new(vec![Arc::new(loaded)]));
+        assert_eq!(font(&mut renderer), "Brand");
+    }
+
+    #[test]
+    fn test_box_shadows() {
+        let html = r#"<html><body style="margin:0; background: white">
+            <div style="margin: 20px; width: 40px; height: 20px; background: white; box-shadow: 10px 10px 0 0 rgb(255, 0, 0)"></div>
+            <div style="margin: 20px; width: 40px; height: 40px; box-shadow: inset 0 0 0 5px rgb(0, 0, 255)"></div>
+            <div style="margin: 20px; width: 40px; height: 20px; box-shadow: 0 0 8px black"></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // A hard shadow offset down-right, not under the box
+        assert_eq!(px(65, 45), 0xffff0000);
+        assert_eq!(px(55, 35), 0xffffffff);
+        assert_ne!(px(25, 45), 0xffff0000);
+        // An inset ring 5px wide
+        let top = 60;
+        assert_eq!(px(22, top + 2), 0xff0000ff);
+        assert_ne!(px(40, top + 20), 0xff0000ff);
+        // A blurred shadow fades out around the box (third box: 20..60 x 120..140)
+        let gray = |p: u32| p & 0xff;
+        assert!(gray(px(40, 116)) < 0xff && gray(px(40, 116)) > 0x80, "{:x}", px(40, 116));
+        assert!(gray(px(40, 105)) == 0xff);
+    }
+
+    #[test]
+    fn test_transforms_paint_and_hit() {
+        let html = r#"<html><body style="margin:0">
+            <div style="position: relative; height: 100px">
+              <div id="c" style="position: absolute; left: 50%; top: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); background: red"></div>
+              <div id="r" style="position: absolute; left: 20px; top: 20px; width: 20px; height: 20px; transform: rotate(45deg); background: blue"></div>
+              <div id="s" style="margin-left: 150px; width: 10px; height: 10px; scale: 2; transform-origin: 0 0; background: lime"></div>
+            </div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let id = |s: &str| document.get_element_by_id(s);
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // Centered by translate(-50%, -50%): 90..110 x 40..60
+        assert_eq!(px(100, 50), 0xffff0000);
+        assert_eq!(px(91, 41), 0xffff0000);
+        assert_ne!(px(112, 50), 0xffff0000);
+        assert_eq!(renderer.node_at(92.0, 42.0), id("c"));
+        // Rotated: a diamond around (30, 30) reaching y = 16
+        assert_eq!(px(30, 30), 0xff0000ff);
+        assert_eq!(px(30, 18), 0xff0000ff);
+        assert_ne!(px(21, 21), 0xff0000ff);
+        assert_eq!(renderer.node_at(30.0, 17.5), id("r"));
+        assert_ne!(renderer.node_at(21.0, 21.0), id("r"));
+        // Scaled from its top-left corner to 20px
+        assert_eq!(px(168, 18), 0xff00ff00);
+        assert_eq!(renderer.node_at(168.0, 18.0), id("s"));
+    }
+
+    #[test]
+    fn test_inline_svg_is_drawn() {
+        let html = r#"<html><body style="margin:0; color: #f00">
+            <svg width="20" height="20" viewBox="0 0 10 10"><rect width="10" height="10" fill="currentColor"/></svg><br>
+            <svg viewBox="0 0 10 10" style="width: 40px; height: 40px; display: block; color: #00f"><path d="M0 0h10v10H0z" fill="currentColor"/></svg>
+            <a href="/x"><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="lime"/></svg></a>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // currentColor is the element's color; sizes come from attributes,
+        // or from CSS with the viewBox's aspect
+        assert_eq!(px(10, 10), 0xffff0000);
+        assert_ne!(px(25, 10), 0xffff0000);
+        let blue = (0..200).find(|&y| px(20, y) == 0xff0000ff).expect("blue svg");
+        assert!((0..40).all(|d| px(5, blue + d) == 0xff0000ff || d > 37));
+        // The same markup rasterizes once
+        let before = renderer.svgs.map.len();
+        renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(renderer.svgs.map.len(), before);
+    }
+
+    #[test]
+    fn test_marker_pseudo_element() {
+        let html = r#"<html><head><style>
+            ol li::marker { color: #f00 }
+            ul li::marker { content: "-> "; color: #00f }
+            .none::marker { content: none }
+            </style></head><body><ol><li>one</li></ol><ul><li>two</li><li class="none">hidden</li></ul><ol><li id="plain">x</li></ol></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let mut markers: Vec<(Color, f32)> = Vec::new();
+        layout.fragments.for_each(|f| {
+            if let layout_engine::Fragment::Box(b) = f {
+                if let Some(m) = &b.marker {
+                    markers.push((Color::rgba(m.color.r, m.color.g, m.color.b, m.color.a), m.rect.w));
+                }
+            }
+        });
+        assert_eq!(markers.len(), 3, "{markers:?}");
+        assert_eq!(markers[0].0, Color::rgb(255, 0, 0));
+        // content replaces the marker text: "-> " is wider than "1. "
+        assert_eq!(markers[1].0, Color::rgb(0, 0, 255));
+        assert!(markers[1].1 > markers[0].1, "{markers:?}");
+    }
+
+    #[test]
+    fn test_before_and_after_boxes() {
+        let html = r#"<html><head><style>
+            body { margin: 0 }
+            .x::before { content: "\201C AA"; color: #f00 }
+            .x::after { content: attr(data-n); color: #00f }
+            .cf::after { content: ""; display: block; clear: both }
+            .f { float: left; width: 20px; height: 50px }
+            .a { position: relative; height: 30px }
+            .a::before { content: ""; position: absolute; left: 0; top: 0; width: 10px; height: 10px; background: #0f0 }
+            .fl { display: flex }
+            .fl::before { content: "x"; width: 40px; color: #f0f }
+            </style></head><body>
+            <div class="a" id="a"></div>
+            <p class="x" data-n="ZZ">mid</p>
+            <div class="cf" id="cf"><div class="f"></div></div>
+            <div class="fl"><span>item</span></div>
+            <p><q>quoted</q></p>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let mut frags: Vec<(Color, f32, f32)> = Vec::new();
+        layout.fragments.for_each(|f| {
+            if let layout_engine::Fragment::Text(t) = f {
+                frags.push((Color::rgba(t.color.r, t.color.g, t.color.b, t.color.a), t.rect.x, t.rect.w));
+            }
+        });
+        let of = |c: Color| frags.iter().find(|f| f.0 == c).copied();
+        let (red, blue) = (of(Color::rgb(255, 0, 0)).expect("::before text"), of(Color::rgb(0, 0, 255)).expect("::after text"));
+        // Generated text belongs to its element: "mid" sits between
+        assert!(blue.1 > red.1 + red.2 + 10.0, "{red:?} {blue:?}");
+        // Flex containers get generated items, as wide as they say
+        let magenta = of(Color::rgb(255, 0, 255)).expect("flex ::before");
+        let item = texts(&document, &layout, "item")[0].rect;
+        assert!(item.x >= magenta.1 + 40.0 - 0.5, "{magenta:?} {item:?}");
+        // The clearfix contains its float
+        let cf = document.get_element_by_id("cf").unwrap();
+        let cf_rect = layout.fragments.element_rects().into_iter().find(|(n, _)| *n == cf).unwrap().1;
+        assert!(cf_rect.h >= 50.0, "{cf_rect:?}");
+        // Quotes around <q>
+        let quoted = texts(&document, &layout, "quoted");
+        assert!(!quoted.is_empty());
+
+        // An absolutely positioned ::before paints at its element's corner,
+        // and hits there are hits on the element
+        let mut renderer = PageRenderer::new(200, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[5 * 200 + 5], 0xff00ff00);
+        assert_eq!(renderer.node_at(5.0, 5.0), document.get_element_by_id("a"));
+    }
+
+    #[test]
     fn test_page_css_reaches_layout() {
         let html = r#"<html><head><style>
             .big { color: red; font-size: 32px }
             nav a { color: #008000 }
             .rel { font-size: 1.5em }
             @media (max-width: 100px) { .big { color: blue } }
+            html { font-size: 20px }
+            :root { --accent: #00f; --pad: 2px }
+            .var { color: var(--accent); font-size: calc(1rem + var(--pad)) }
+            .fallback { color: var(--missing, #f0f) }
             </style></head><body>
+            <p class="var">vars</p><p class="fallback">fallback</p>
             <p style="color: #00f">inline</p>
             <p class="big">big <span class="rel">rel</span></p>
             <nav><a href="/x">nav link</a></nav><a href="/y">plain link</a>
             <p style="display: none">hidden</p>
             </body></html>"#;
         let document = fos_html::parse_with_url(html, "https://example.com/");
-        let renderer = PageRenderer::new(640, 480);
-        let styler = Styler::new(&renderer, document.tree(), renderer.page_stylesheet(&document));
-        let layout = build_layout(&document, &styler, 640);
+        let layout = layout_of(&document, 640.0);
         let seg = |text: &str| {
-            layout.lines.iter().flat_map(|l| &l.segments).find(|s| s.text.trim() == text).unwrap_or_else(|| panic!("no segment {text}")).clone()
+            let t = texts(&document, &layout, text);
+            let t = t.first().unwrap_or_else(|| panic!("no text {text}"));
+            (Color::rgba(t.color.r, t.color.g, t.color.b, t.color.a), t.font.size)
         };
-        assert_eq!(seg("inline").color, Color::rgb(0, 0, 255));
-        assert_eq!(seg("big").color, Color::rgb(255, 0, 0));
-        assert_eq!(seg("big").font_size, 32.0);
+        let rgb = |r, g, b| Color::rgb(r, g, b);
+        assert_eq!(seg("inline").0, rgb(0, 0, 255));
+        assert_eq!(seg("big"), (rgb(255, 0, 0), 32.0));
         // Inherited color, em relative to the parent's size
-        assert_eq!(seg("rel").color, Color::rgb(255, 0, 0));
-        assert_eq!(seg("rel").font_size, 48.0);
-        assert_eq!(seg("nav link").color, Color::rgb(0, 128, 0));
-        assert_eq!(seg("plain link").color, Color::rgb(51, 102, 204));
-        assert!(layout.lines.iter().flat_map(|l| &l.segments).all(|s| s.text.trim() != "hidden"));
+        assert_eq!(seg("rel"), (rgb(255, 0, 0), 48.0));
+        assert_eq!(seg("nav link").0, rgb(0, 128, 0));
+        // The UA stylesheet's link color
+        assert_eq!(seg("plain link").0, rgb(0, 0, 238));
+        assert!(texts(&document, &layout, "hidden").is_empty());
+        // Custom properties from :root, calc() with rem of the root's 20px
+        assert_eq!(seg("vars"), (rgb(0, 0, 255), 22.0));
+        assert_eq!(seg("fallback").0, rgb(255, 0, 255));
+        // The root's font size is inherited
+        assert_eq!(seg("inline").1, 20.0);
     }
 }
+

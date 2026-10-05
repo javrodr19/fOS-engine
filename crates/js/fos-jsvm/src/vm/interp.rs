@@ -124,7 +124,7 @@ impl Vm {
                         let callee = r!($func);
                         let argc = $argc as usize;
                         let Some(o) = callee.as_object() else {
-                            let e = self.not_a_function(callee);
+                            let e = self.not_callable_at(unsafe { &*cp }, pc - 1, $func, callee);
                             break 'inner e;
                         };
                         match &o.get().kind {
@@ -144,6 +144,10 @@ impl Vm {
                                 w!($dst, v);
                             }
                             _ => {
+                                if !self.is_callable(callee) {
+                                    let e = self.not_callable_at(unsafe { &*cp }, pc - 1, $func, callee);
+                                    break 'inner e;
+                                }
                                 let this = r!($func + 1);
                                 let args: Vec<Value> = unsafe { std::slice::from_raw_parts(regs.add($func as usize + 2), argc) }.to_vec();
                                 self.frames.last_mut().unwrap().pc = pc as u32;
@@ -430,23 +434,34 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != 0 && i != i32::MIN => Value::int(-i),
-                            _ => Value::number(-tri!(self.to_number(x))),
+                            _ => tri!(self.unary_numeric(x, |n| -n, |b| b.neg())),
                         };
                         w!(dst, v);
                     }
-                    Insn::Plus { dst, src } | Insn::ToNumeric { dst, src } => {
+                    Insn::Plus { dst, src } => {
                         let x = r!(src);
                         let v = if x.is_number() { x } else { Value::number(tri!(self.to_number(x))) };
+                        w!(dst, v);
+                    }
+                    Insn::ToNumeric { dst, src } => {
+                        let x = r!(src);
+                        let v = if x.is_number() { x } else { tri!(self.unary_numeric(x, |n| n, |b| b.clone())) };
                         w!(dst, v);
                     }
                     Insn::Not { dst, src } => w!(dst, Value::bool(!ops::truthy(r!(src)))),
                     Insn::BitNot { dst, src } => {
                         let x = r!(src);
-                        let i = match x.as_int() {
-                            Some(i) => i,
-                            None => tri!(self.to_int32(x)),
+                        let v = match x.as_int() {
+                            Some(i) => Value::int(!i),
+                            None => match tri!(self.to_numeric(x)) {
+                                ops::Numeric::Number(n) => Value::int(!ops::f64_to_int32(n)),
+                                ops::Numeric::BigInt(b) => {
+                                    let r = b.get().not();
+                                    self.new_bigint(r)
+                                }
+                            },
                         };
-                        w!(dst, Value::int(!i));
+                        w!(dst, v);
                     }
                     Insn::Typeof { dst, src } => {
                         let atom = self.typeof_atom(r!(src));
@@ -456,7 +471,7 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != i32::MAX => Value::int(i + 1),
-                            _ => Value::number(tri!(self.to_number(x)) + 1.0),
+                            _ => tri!(self.unary_numeric(x, |n| n + 1.0, |b| b.add(&crate::bigint::BigInt::from_i64(1)))),
                         };
                         w!(dst, v);
                     }
@@ -464,7 +479,7 @@ impl Vm {
                         let x = r!(src);
                         let v = match x.as_int() {
                             Some(i) if i != i32::MIN => Value::int(i - 1),
-                            _ => Value::number(tri!(self.to_number(x)) - 1.0),
+                            _ => tri!(self.unary_numeric(x, |n| n - 1.0, |b| b.sub(&crate::bigint::BigInt::from_i64(1)))),
                         };
                         w!(dst, v);
                     }
@@ -623,7 +638,7 @@ impl Vm {
                                 _ => {}
                             }
                         }
-                        let r = tri!(self.get_prop_ic(v, cell));
+                        let r = tri!(self.get_prop_slow(v, cell, pc));
                         w!(dst, r);
                     }
                     Insn::SetProp { obj, src, ic } => {
@@ -649,7 +664,7 @@ impl Vm {
                             }
                         }
                         let strict = unsafe { (*proto).strict };
-                        tri!(self.set_prop_ic(v, val, cell, strict));
+                        tri!(self.set_prop_slow(v, val, cell, strict, pc));
                     }
                     Insn::DefineProp { obj, src, ic } => {
                         let o = r!(obj).as_object().unwrap();
@@ -680,7 +695,7 @@ impl Vm {
                                 continue;
                             }
                         }
-                        let r = tri!(self.get_elem(v, k));
+                        let r = tri!(self.get_elem_slow(v, k, pc));
                         w!(dst, r);
                     }
                     Insn::SetElem { obj, key, src } => {
@@ -700,7 +715,7 @@ impl Vm {
                                     crate::builtins::typedarray::ta_set(ob, i as u32, n);
                                     continue;
                                 }
-                            } else if i == ob.elements.len() && ob.extensible && !ob.is_prototype {
+                            } else if i == ob.elements.len() && ob.extensible && !ob.is_prototype && !ob.length_readonly {
                                 if let ObjectKind::Array { length } = &mut ob.kind {
                                     if *length as usize == i {
                                         *length += 1;
@@ -711,7 +726,7 @@ impl Vm {
                             }
                         }
                         let strict = unsafe { (*proto).strict };
-                        tri!(self.set_elem(v, k, val, strict));
+                        tri!(self.set_elem_slow(v, k, val, strict, pc));
                     }
                     Insn::DefineElem { obj, key, src } => {
                         let o = r!(obj).as_object().unwrap();
@@ -801,6 +816,11 @@ impl Vm {
                     }
 
                     // ---- functions ----
+                    Insn::DynamicImport { dst, spec, referrer } => {
+                        let (spec, referrer) = (r!(spec), r!(referrer));
+                        let p = self.dynamic_import(spec, referrer);
+                        w!(dst, Value::object(p));
+                    }
                     Insn::Closure { dst, idx } => {
                         let p = unsafe { (*cp).funcs[idx as usize].clone() };
                         let mut ups = Vec::with_capacity(p.upvals.len());
@@ -819,6 +839,11 @@ impl Vm {
                             }
                         }
                         w!(dst, Value::object(f));
+                    }
+                    Insn::SetFunctionName { func, key, prefix } => {
+                        let f = r!(func).as_object().unwrap();
+                        let k = tri!(self.to_property_key(r!(key)));
+                        self.set_function_name(f, k, prefix);
                     }
                     Insn::SetHomeObject { func, obj } => {
                         let f = r!(func).as_object().unwrap();
@@ -1066,6 +1091,7 @@ impl Vm {
             };
 
             // ---- exception handling ----
+            self.fix_error_stack(exc, pc);
             let mut fault = pc - 1;
             loop {
                 let f = self.frames.last().unwrap();
@@ -1140,6 +1166,78 @@ impl Vm {
         None
     }
 
+    // Property slow paths, out of line to keep the dispatch loop compact.
+    // They save the pc first, so getters and setters they run see this
+    // frame's location in stack traces.
+
+    #[cold]
+    #[inline(never)]
+    fn get_prop_slow(&mut self, v: Value, cell: &std::cell::Cell<Ic>, pc: usize) -> JsResult<Value> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.get_prop_ic(v, cell)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_prop_slow(&mut self, v: Value, val: Value, cell: &std::cell::Cell<Ic>, strict: bool, pc: usize) -> JsResult<()> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.set_prop_ic(v, val, cell, strict)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_elem_slow(&mut self, v: Value, k: Value, pc: usize) -> JsResult<Value> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.get_elem(v, k)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_elem_slow(&mut self, v: Value, k: Value, val: Value, strict: bool, pc: usize) -> JsResult<()> {
+        self.frames.last_mut().unwrap().pc = pc as u32;
+        self.set_elem(v, k, val, strict)
+    }
+
+    /// A unary numeric operator on a number or a BigInt
+    fn unary_numeric(&mut self, x: Value, num: impl Fn(f64) -> f64, big: impl Fn(&crate::bigint::BigInt) -> crate::bigint::BigInt) -> JsResult<Value> {
+        Ok(match self.to_numeric(x)? {
+            ops::Numeric::Number(n) => Value::number(num(n)),
+            ops::Numeric::BigInt(b) => {
+                let r = big(b.get());
+                self.new_bigint(r)
+            }
+        })
+    }
+
+    /// "x.y is not a function" for the call at `call_pc`, naming the
+    /// callee after the instruction that loaded it (work done only when
+    /// the error happens)
+    fn not_callable_at(&mut self, code: &Code, call_pc: usize, func: Reg, callee: Value) -> Value {
+        match self.reg_source(code, call_pc, func, 2) {
+            Some(name) => self.type_error(&format!("{name} is not a function")),
+            None => self.not_a_function(callee),
+        }
+    }
+
+    /// A name for what register `reg` holds at `pc`: the global or
+    /// property it was loaded from (`depth` levels of receivers)
+    fn reg_source(&self, code: &Code, pc: usize, reg: Reg, depth: u32) -> Option<String> {
+        let at = (pc.saturating_sub(256)..pc).rev().find(|&i| code.code[i].dst() == Some(reg))?;
+        let atom_name = |ic: u16| self.atoms.string(code.ics[ic as usize].get().atom).get().to_rust_string();
+        match code.code[at] {
+            Insn::GetGlobal { ic, .. } => Some(atom_name(ic)),
+            Insn::GetProp { obj, ic, .. } => {
+                let receiver = if depth > 0 { self.reg_source(code, at, obj, depth - 1) } else { None };
+                Some(match receiver {
+                    Some(r) => format!("{r}.{}", atom_name(ic)),
+                    None => atom_name(ic),
+                })
+            }
+            Insn::Mov { src, .. } if depth > 0 => self.reg_source(code, at, src, depth - 1),
+            _ => None,
+        }
+    }
+
     fn tdz_error(&mut self, name: crate::string::Atom) -> Value {
         if name == atoms::this_ {
             return self.reference_error("Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
@@ -1199,6 +1297,9 @@ impl Vm {
     }
 
     fn template_object(&mut self, site: &TemplateSite) -> Value {
+        if let Some(o) = site.object.get() {
+            return Value::object(o);
+        }
         let cooked: Vec<Value> = site
             .cooked
             .iter()
@@ -1211,6 +1312,9 @@ impl Vm {
         let strings = self.new_array(cooked);
         let raw = self.new_array(raw);
         self.define_value(strings, PropertyKey::Atom(atoms::raw), Value::object(raw), PropFlags::FROZEN);
+        crate::builtins::object::set_integrity(self, raw, true);
+        crate::builtins::object::set_integrity(self, strings, true);
+        site.object.set(Some(strings));
         Value::object(strings)
     }
 }

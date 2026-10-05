@@ -454,19 +454,55 @@ fn concat(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult
     Ok(Value::string(s))
 }
 
+/// `localeCompare(that, locales, options)`: en-US collation, honoring
+/// the `sensitivity`, `numeric` and `ignorePunctuation` options
 fn locale_compare(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    use crate::collate::{collate, CollateOptions, Sensitivity};
     let s = this_str(vm, this, "localeCompare")?;
     let t = vm.to_string(arg(args, 0))?;
-    let (a, b) = (s.get().to_rust_string(), t.get().to_rust_string());
-    Ok(Value::int(match a.cmp(&b) {
+    let mut o = CollateOptions::default();
+    let options = arg(args, 2);
+    if options.is_object() {
+        let sensitivity = vm.get_str(options, "sensitivity")?;
+        if !sensitivity.is_undefined() {
+            o.sensitivity = match vm.to_rust_string(sensitivity)?.as_str() {
+                "base" => Sensitivity::Base,
+                "accent" => Sensitivity::Accent,
+                "case" => Sensitivity::Case,
+                "variant" => Sensitivity::Variant,
+                other => return Err(vm.range_error(&format!("Value {other} out of range for Intl.Collator options property sensitivity"))),
+            };
+        }
+        o.numeric = crate::vm::truthy(vm.get_str(options, "numeric")?);
+        o.ignore_punctuation = crate::vm::truthy(vm.get_str(options, "ignorePunctuation")?);
+    }
+    let (a, b) = (s.get().units().to_vec(), t.get().units().to_vec());
+    Ok(Value::int(match collate(&a, &b, &o) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     }))
 }
 
-fn normalize(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    Ok(Value::string(this_str(vm, this, "normalize")?))
+/// `normalize(form)`: NFC/NFD (and NFKC/NFKD, the same here) for the
+/// Latin letters; other text is returned unchanged
+fn normalize(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let s = this_str(vm, this, "normalize")?;
+    let form = match arg(args, 0) {
+        Value::UNDEFINED => "NFC".to_string(),
+        f => vm.to_rust_string(f)?,
+    };
+    let decompose = match form.as_str() {
+        "NFC" | "NFKC" => false,
+        "NFD" | "NFKD" => true,
+        _ => return Err(vm.range_error("The normalization form should be one of NFC, NFD, NFKC, NFKD.")),
+    };
+    let units = s.get().units().to_vec();
+    if units.iter().all(|&u| u < 0xC0) {
+        return Ok(Value::string(s));
+    }
+    let out = if decompose { crate::collate::decompose(&units) } else { crate::collate::compose(&units) };
+    Ok(Value::string(vm.new_string_units(&out)))
 }
 
 fn split(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {

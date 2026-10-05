@@ -6,6 +6,9 @@ description = "Canvas 2D and WebGL APIs for fOS browser engine"
 
 [dependencies]
 thiserror = "1.0"
+# 2D rasterization (also used by the page renderer and glyph rasterizer)
+tiny-skia.workspace = true
+fos-text = { path = "../../engine/fos-text" }
 
 [dev-dependencies]
 

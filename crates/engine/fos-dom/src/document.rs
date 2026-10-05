@@ -14,6 +14,18 @@ pub struct Document {
     head_element: NodeId,
     /// Cached reference to <body> element
     body_element: NodeId,
+    /// The contents fragment of each `<template>` element (outside the tree)
+    template_contents: std::collections::HashMap<NodeId, NodeId>,
+    /// CSS of `<style>` elements whose sheets scripts changed through the
+    /// CSSOM (`insertRule`): (the element's text when it happened, the
+    /// sheet's CSS). The CSS applies while the element's text is unchanged.
+    sheet_overrides: std::collections::HashMap<NodeId, (String, String)>,
+    /// CSS of the document's adopted (constructed) style sheets
+    adopted_css: String,
+    /// CSS of each shadow root's adopted style sheets
+    shadow_adopted_css: std::collections::HashMap<NodeId, String>,
+    /// Parsed in quirks mode (no or a legacy doctype)
+    quirks: bool,
 }
 
 impl Document {
@@ -36,6 +48,11 @@ impl Document {
             html_element: html,
             head_element: head,
             body_element: body,
+            template_contents: Default::default(),
+            sheet_overrides: Default::default(),
+            adopted_css: String::new(),
+            shadow_adopted_css: Default::default(),
+            quirks: false,
         }
     }
     
@@ -47,9 +64,78 @@ impl Document {
             html_element: NodeId::NONE,
             head_element: NodeId::NONE,
             body_element: NodeId::NONE,
+            template_contents: Default::default(),
+            sheet_overrides: Default::default(),
+            adopted_css: String::new(),
+            shadow_adopted_css: Default::default(),
+            quirks: false,
         }
     }
     
+    /// The contents fragment of `<template>` element `template`
+    pub fn template_content(&self, template: NodeId) -> Option<NodeId> {
+        self.template_contents.get(&template).copied()
+    }
+
+    /// Set the contents fragment of `<template>` element `template`
+    pub fn set_template_content(&mut self, template: NodeId, fragment: NodeId) {
+        self.template_contents.insert(template, fragment);
+    }
+
+    /// The CSS a script gave `<style>` element `style` through the CSSOM,
+    /// if its text is still `text`
+    pub fn sheet_override(&self, style: NodeId, text: &str) -> Option<&str> {
+        self.sheet_overrides.get(&style).filter(|(source, _)| source == text).map(|(_, css)| css.as_str())
+    }
+
+    /// Record the CSS of `style`'s sheet (`None` drops it); styles and
+    /// layout are redone
+    pub fn set_sheet_override(&mut self, style: NodeId, text: String, css: Option<String>) {
+        match css {
+            Some(css) => {
+                self.sheet_overrides.insert(style, (text, css));
+            }
+            None => {
+                self.sheet_overrides.remove(&style);
+            }
+        }
+        self.tree.mark_mutated();
+    }
+
+    /// CSS of the adopted style sheets, applied after the page's own
+    pub fn adopted_css(&self) -> &str {
+        &self.adopted_css
+    }
+
+    /// Whether the document renders in quirks mode (`compatMode` is
+    /// "BackCompat")
+    pub fn is_quirks(&self) -> bool {
+        self.quirks
+    }
+
+    pub fn set_quirks(&mut self, quirks: bool) {
+        self.quirks = quirks;
+    }
+
+    /// CSS of shadow root `root`'s adopted style sheets
+    pub fn shadow_adopted_css(&self, root: NodeId) -> &str {
+        self.shadow_adopted_css.get(&root).map_or("", |s| s.as_str())
+    }
+
+    pub fn set_shadow_adopted_css(&mut self, root: NodeId, css: String) {
+        if css != self.shadow_adopted_css(root) {
+            self.shadow_adopted_css.insert(root, css);
+            self.tree.mark_mutated();
+        }
+    }
+
+    pub fn set_adopted_css(&mut self, css: String) {
+        if css != self.adopted_css {
+            self.adopted_css = css;
+            self.tree.mark_mutated();
+        }
+    }
+
     /// Finalize the document after parsing - finds html, head, body elements
     pub fn finalize(&mut self) {
         // Find <html> element (first child of root that is an element)

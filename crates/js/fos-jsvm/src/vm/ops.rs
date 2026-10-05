@@ -1,5 +1,6 @@
 //! Type conversions and operators
 
+use crate::bigint::BigInt;
 use crate::gc::Gc;
 use crate::number::{number_to_string, string_to_number};
 use crate::object::*;
@@ -57,6 +58,9 @@ pub fn truthy(v: Value) -> bool {
     if let Some(s) = v.as_string() {
         return !s.get().is_empty();
     }
+    if let Some(b) = v.as_bigint() {
+        return !b.get().is_zero();
+    }
     true
 }
 
@@ -77,6 +81,9 @@ pub fn strict_equals(a: Value, b: Value) -> bool {
     }
     if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
         return x.get().equals(y.get());
+    }
+    if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+        return x.get() == y.get();
     }
     false
 }
@@ -115,7 +122,32 @@ pub fn f64_to_int32(n: f64) -> i32 {
     m as u32 as i32
 }
 
+/// A numeric value: a number or a BigInt (ToNumeric)
+pub enum Numeric {
+    Number(f64),
+    BigInt(Gc<BigInt>),
+}
+
 impl Vm {
+    /// ToNumeric
+    pub fn to_numeric(&mut self, v: Value) -> JsResult<Numeric> {
+        if let Some(n) = v.as_number() {
+            return Ok(Numeric::Number(n));
+        }
+        if let Some(b) = v.as_bigint() {
+            return Ok(Numeric::BigInt(b));
+        }
+        let p = self.to_primitive(v, Hint::Number)?;
+        if let Some(b) = p.as_bigint() {
+            return Ok(Numeric::BigInt(b));
+        }
+        Ok(Numeric::Number(self.to_number(p)?))
+    }
+
+    fn mix_error(&mut self) -> Value {
+        self.type_error("Cannot mix BigInt and other types, use explicit conversions")
+    }
+
     pub fn to_number(&mut self, v: Value) -> JsResult<f64> {
         if let Some(n) = v.as_number() {
             return Ok(n);
@@ -134,6 +166,9 @@ impl Vm {
         }
         if v.is_symbol() {
             return Err(self.type_error("Cannot convert a Symbol value to a number"));
+        }
+        if v.is_bigint() {
+            return Err(self.type_error("Cannot convert a BigInt value to a number"));
         }
         let p = self.to_primitive(v, Hint::Number)?;
         self.to_number(p)
@@ -182,6 +217,10 @@ impl Vm {
         }
         if let Some(n) = v.as_number() {
             return Ok(self.number_to_js_string(n));
+        }
+        if let Some(b) = v.as_bigint() {
+            let text = b.get().to_string_radix(10);
+            return Ok(self.new_string(&text));
         }
         let atom = match v {
             Value::UNDEFINED | Value::HOLE => atoms::undefined,
@@ -246,6 +285,8 @@ impl Vm {
             (self.realm.boolean_proto, ObjectKind::Boolean(b))
         } else if let Some(s) = v.as_symbol() {
             (self.realm.symbol_proto, ObjectKind::Symbol(s))
+        } else if let Some(b) = v.as_bigint() {
+            (self.realm.bigint_proto, ObjectKind::BigInt(b))
         } else {
             return Err(self.type_error(&format!("Cannot convert {v:?} to object")));
         };
@@ -263,6 +304,8 @@ impl Vm {
             atoms::undefined
         } else if v.is_symbol() {
             atoms::symbol
+        } else if v.is_bigint() {
+            atoms::bigint
         } else if let Some(o) = v.as_object() {
             if o.get().is_callable() { atoms::function } else { atoms::object }
         } else {
@@ -276,6 +319,20 @@ impl Vm {
         }
         if a.is_nullish() || b.is_nullish() {
             return Ok(a.is_nullish() && b.is_nullish());
+        }
+        // BigInt against BigInt, number or string
+        if let Some(x) = a.as_bigint().or_else(|| b.as_bigint()) {
+            let other = if a.is_bigint() { b } else { a };
+            if let Some(y) = other.as_bigint() {
+                return Ok(x.get() == y.get());
+            }
+            if let Some(n) = other.as_number() {
+                return Ok(x.get().cmp_f64(n) == Some(std::cmp::Ordering::Equal));
+            }
+            if let Some(s) = other.as_string() {
+                let parsed = BigInt::parse(&s.get().to_rust_string());
+                return Ok(parsed.is_some_and(|y| &y == x.get()));
+            }
         }
         if (a.is_string() && b.is_string()) || (a.is_object() && b.is_object()) || (a.is_symbol() && b.is_symbol()) || (a.is_bool() && b.is_bool()) {
             return Ok(strict_equals(a, b));
@@ -315,12 +372,69 @@ impl Vm {
             let sb = self.to_string(pb)?;
             return Ok(Value::string(self.concat(sa, sb)));
         }
+        if pa.is_bigint() || pb.is_bigint() {
+            return match (pa.as_bigint(), pb.as_bigint()) {
+                (Some(x), Some(y)) => {
+                    let r = x.get().add(y.get());
+                    Ok(self.new_bigint(r))
+                }
+                _ => Err(self.mix_error()),
+            };
+        }
         let x = self.to_number(pa)?;
         let y = self.to_number(pb)?;
         Ok(Value::number(x + y))
     }
 
+    /// A binary operator on two BigInts
+    fn bigint_arith(&mut self, op: Arith, x: &BigInt, y: &BigInt) -> JsResult<Value> {
+        // Shifts past this many bits are certainly too large
+        const MAX_SHIFT: i64 = 1 << 30;
+        let shift = |y: &BigInt| y.to_i64().map(|s| s.clamp(-MAX_SHIFT - 1, MAX_SHIFT + 1)).unwrap_or(if y.is_negative() { -MAX_SHIFT - 1 } else { MAX_SHIFT + 1 });
+        let r = match op {
+            Arith::Sub => x.sub(y),
+            Arith::Mul => x.mul(y),
+            Arith::Div | Arith::Mod => match x.divrem(y) {
+                Some((q, r)) => if op == Arith::Div { q } else { r },
+                None => return Err(self.range_error("Division by zero")),
+            },
+            Arith::Exp => {
+                if y.is_negative() {
+                    return Err(self.range_error("Exponent must be non-negative"));
+                }
+                match x.pow(y) {
+                    Some(r) => r,
+                    None => return Err(self.range_error("Maximum BigInt size exceeded")),
+                }
+            }
+            Arith::BitAnd => x.and(y),
+            Arith::BitOr => x.or(y),
+            Arith::BitXor => x.xor(y),
+            Arith::Shl | Arith::Sar => {
+                let s = if op == Arith::Shl { shift(y) } else { -shift(y) };
+                if s > MAX_SHIFT {
+                    if x.is_zero() {
+                        return Ok(self.new_bigint(BigInt::zero()));
+                    }
+                    return Err(self.range_error("Maximum BigInt size exceeded"));
+                }
+                x.shl(s.max(-MAX_SHIFT - 1))
+            }
+            Arith::Shr => return Err(self.type_error("BigInts have no unsigned right shift, use >> instead")),
+        };
+        Ok(self.new_bigint(r))
+    }
+
     pub fn arith_slow(&mut self, op: Arith, a: Value, b: Value) -> JsResult<Value> {
+        if !(a.is_number() && b.is_number()) && (!a.is_primitive_number_like() || !b.is_primitive_number_like()) {
+            let x = self.to_numeric(a)?;
+            let y = self.to_numeric(b)?;
+            return match (x, y) {
+                (Numeric::BigInt(x), Numeric::BigInt(y)) => self.bigint_arith(op, x.get(), y.get()),
+                (Numeric::Number(x), Numeric::Number(y)) => self.arith_slow(op, Value::number(x), Value::number(y)),
+                _ => Err(self.mix_error()),
+            };
+        }
         match op {
             Arith::BitAnd | Arith::BitOr | Arith::BitXor | Arith::Shl | Arith::Sar | Arith::Shr => {
                 let x = self.to_int32(a)?;
@@ -361,6 +475,33 @@ impl Vm {
                 Cmp::Ge => ord.is_ge(),
             });
         }
+        if pa.is_bigint() || pb.is_bigint() {
+            use std::cmp::Ordering;
+            let numeric = |vm: &mut Vm, v: Value| -> JsResult<Result<BigInt, f64>> {
+                if let Some(b) = v.as_bigint() {
+                    return Ok(Ok(b.get().clone()));
+                }
+                if let Some(s) = v.as_string() {
+                    // An invalid string compares as NaN
+                    return Ok(BigInt::parse(&s.get().to_rust_string()).ok_or(f64::NAN));
+                }
+                Ok(Err(vm.to_number(v)?))
+            };
+            let (x, y) = (numeric(self, pa)?, numeric(self, pb)?);
+            let ord: Option<Ordering> = match (&x, &y) {
+                (Ok(x), Ok(y)) => Some(x.cmp(y)),
+                (Ok(x), Err(n)) => x.cmp_f64(*n),
+                (Err(n), Ok(y)) => y.cmp_f64(*n).map(Ordering::reverse),
+                (Err(m), Err(n)) => m.partial_cmp(n),
+            };
+            let Some(ord) = ord else { return Ok(false) };
+            return Ok(match op {
+                Cmp::Lt => ord.is_lt(),
+                Cmp::Le => ord.is_le(),
+                Cmp::Gt => ord.is_gt(),
+                Cmp::Ge => ord.is_ge(),
+            });
+        }
         let x = self.to_number(pa)?;
         let y = self.to_number(pb)?;
         Ok(match op {
@@ -385,7 +526,9 @@ impl Vm {
             return Err(self.type_error("Right-hand side of 'instanceof' is not an object"));
         };
         let custom = self.get(target, PropertyKey::Symbol(self.sym.has_instance))?;
-        if !custom.is_nullish() {
+        // Function.prototype's own: no call needed
+        let builtin = custom.as_object().is_some_and(|f| matches!(&f.get().kind, ObjectKind::Native(n) if std::ptr::fn_addr_eq(n.call, crate::builtins::function::has_instance as crate::vm::NativeFn)));
+        if !custom.is_nullish() && !builtin {
             let r = self.call(custom, target, &[v])?;
             return Ok(truthy(r));
         }
@@ -405,14 +548,22 @@ impl Vm {
         let Some(p) = p.as_object() else {
             return Err(self.type_error("Function has non-object prototype in instanceof check"));
         };
-        let mut cur = o.get().proto;
+        let mut cur = self.prototype_of(o)?;
         while let Some(c) = cur {
             if c == p {
                 return Ok(true);
             }
-            cur = c.get().proto;
+            cur = self.prototype_of(c)?;
         }
         Ok(false)
+    }
+
+    /// [[GetPrototypeOf]]: a proxy's comes from its handler (or target)
+    pub(crate) fn prototype_of(&mut self, o: Gc<JsObject>) -> JsResult<Option<Gc<JsObject>>> {
+        if crate::builtins::proxy::is_proxy(o) {
+            return Ok(self.proxy_get_prototype(o)?.as_object());
+        }
+        Ok(o.get().proto)
     }
 
     pub fn is_callable(&self, v: Value) -> bool {

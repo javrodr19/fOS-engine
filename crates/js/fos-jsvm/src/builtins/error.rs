@@ -16,6 +16,12 @@ pub(super) fn init(vm: &mut Vm) {
     let n = vm.str_value("Error");
     vm.def_value(base, "name", n, PropFlags::HIDDEN);
     vm.def_method(base, "toString", 0, to_string);
+    // `stack` is formatted from the captured frames on first read (as in
+    // SpiderMonkey, an accessor on the prototype): errors that are caught
+    // and dropped never pay for it
+    vm.def_accessor(base, "stack", stack_get, Some(stack_set));
+    vm.def_method(error_ctor, "captureStackTrace", 2, capture_stack_trace);
+    vm.def_value(error_ctor, "stackTraceLimit", Value::number(crate::vm::STACK_FRAMES as f64), PropFlags::DEFAULT);
     let subclasses = [
         ("TypeError", vm.realm.type_error_proto),
         ("RangeError", vm.realm.range_error_proto),
@@ -41,7 +47,8 @@ fn error_call(vm: &mut Vm, _this: Value, args: &[Value], callee: Gc<JsObject>) -
 fn error_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<JsObject>) -> JsResult<Value> {
     let nt = if new_target.is_undefined() { Value::object(callee) } else { new_target };
     let proto = vm.prototype_for(nt, |r| r.error_proto)?;
-    let o = vm.new_object_with(Some(proto), ObjectKind::Error);
+    let captured = vm.capture_stack();
+    let o = vm.new_object_with(Some(proto), ObjectKind::Error(captured));
     let msg = arg(args, 0);
     if !msg.is_undefined() {
         let s = vm.to_string(msg)?;
@@ -54,11 +61,6 @@ fn error_construct(vm: &mut Vm, new_target: Value, args: &[Value], callee: Gc<Js
             vm.define_value(o, PropertyKey::Atom(atoms::cause), cause, PropFlags::HIDDEN);
         }
     }
-    // V8's format: the error's string form, then one line per frame
-    let header = error_to_string(vm, Value::object(o)).unwrap_or_default();
-    let stack = format!("{header}\n{}", vm.stack_trace());
-    let stack = vm.str_value(&stack);
-    vm.define_value(o, PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
     Ok(Value::object(o))
 }
 
@@ -80,4 +82,59 @@ pub(crate) fn error_to_string(vm: &mut Vm, this: Value) -> JsResult<String> {
 fn to_string(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let s = error_to_string(vm, this)?;
     Ok(vm.str_value(&s))
+}
+
+/// The stack in V8's format: the error's string form, then one line per frame
+fn format_stack(vm: &mut Vm, error: Value, frames: &[(std::rc::Rc<crate::bytecode::FunctionProto>, u32)]) -> String {
+    let header = error_to_string(vm, error).unwrap_or_else(|_| "Error".into());
+    header + &vm.format_frames(frames)
+}
+
+fn stack_get(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(o) = this.as_object() else { return Ok(Value::UNDEFINED) };
+    let captured = match &mut o.get_mut().kind {
+        ObjectKind::Error(c) => c.take(),
+        _ => None,
+    };
+    let Some(captured) = captured else { return Ok(Value::UNDEFINED) };
+    let stack = format_stack(vm, this, &captured.frames);
+    let stack = vm.str_value(&stack);
+    vm.define_value(o, PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
+    Ok(stack)
+}
+
+fn stack_set(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    if let Some(o) = this.as_object() {
+        if let ObjectKind::Error(c) = &mut o.get_mut().kind {
+            *c = None;
+        }
+        vm.define_value(o, PropertyKey::Atom(atoms::stack), arg(args, 0), PropFlags::HIDDEN);
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `Error.captureStackTrace(object, constructorOpt)` (V8): gives `object`
+/// a `stack` of the current frames, leaving out those above and including
+/// the latest call to `constructorOpt`
+fn capture_stack_trace(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(o) = arg(args, 0).as_object() else {
+        return Err(vm.type_error("Invalid argument"));
+    };
+    let skip_to = arg(args, 1).as_object();
+    let mut frames: Vec<_> = Vec::new();
+    for f in vm.frames.iter().rev() {
+        if let ObjectKind::Function(c) = &f.func.get().kind {
+            frames.push((c.proto.clone(), f.pc, f.func));
+        }
+    }
+    if let Some(stop) = skip_to {
+        if let Some(i) = frames.iter().position(|f| f.2 == stop) {
+            frames.drain(..=i);
+        }
+    }
+    let frames: Vec<_> = frames.into_iter().take(crate::vm::STACK_FRAMES).map(|(p, pc, _)| (p, pc)).collect();
+    let stack = format_stack(vm, Value::object(o), &frames);
+    let stack = vm.str_value(&stack);
+    vm.define_value(o, PropertyKey::Atom(atoms::stack), stack, PropFlags::HIDDEN);
+    Ok(Value::UNDEFINED)
 }

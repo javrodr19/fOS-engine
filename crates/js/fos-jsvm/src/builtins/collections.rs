@@ -72,6 +72,9 @@ pub(crate) fn map_key(v: Value) -> MapKey {
         let canonical = if n == 0.0 { Value::int(0) } else { Value::number(n) };
         return MapKey::Bits(canonical.raw());
     }
+    if let Some(b) = v.as_bigint() {
+        return MapKey::BigInt(b.get().clone());
+    }
     MapKey::Bits(v.raw())
 }
 
@@ -147,7 +150,7 @@ fn data<'a>(vm: &mut Vm, this: Value, method: &str) -> JsResult<(&'a mut MapData
 }
 
 fn check_weak_key(vm: &mut Vm, weak: bool, k: Value) -> JsResult<()> {
-    if weak && !k.is_object() {
+    if weak && !vm.can_be_held_weakly(k) {
         return Err(vm.type_error("Invalid value used as weak map key"));
     }
     Ok(())

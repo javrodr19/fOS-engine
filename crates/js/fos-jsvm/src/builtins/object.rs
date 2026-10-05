@@ -188,17 +188,23 @@ pub(crate) fn define_from_descriptor(vm: &mut Vm, o: Gc<JsObject>, key: Property
                 if let Some(v) = desc.value {
                     vm.set_array_length(o, v)?;
                 }
+                if desc.writable == Some(false) {
+                    o.get_mut().length_readonly = true;
+                }
                 return Ok(true);
             }
             return Ok(false);
         }
-    } else if !o.get().extensible {
+    } else if !o.get().extensible || crate::vm::property::grows_readonly_length(o, key) {
         return Ok(false);
     }
     let base = old_flags.unwrap_or(PropFlags::NONE);
     let enumerable = desc.enumerable.unwrap_or(base.enumerable());
     let configurable = desc.configurable.unwrap_or(base.configurable());
-    if desc.get.is_some() || desc.set.is_some() {
+    // A generic descriptor ({ enumerable } alone) keeps an accessor an
+    // accessor, with its getter and setter
+    let generic = desc.get.is_none() && desc.set.is_none() && desc.value.is_none() && desc.writable.is_none();
+    if desc.get.is_some() || desc.set.is_some() || (generic && old_flags.is_some_and(|f| f.is_accessor())) {
         let mut flags = PropFlags::NONE.with(PropFlags::ENUMERABLE, enumerable).with(PropFlags::CONFIGURABLE, configurable);
         if old_flags.is_some_and(|f| !f.is_accessor()) {
             // Data -> accessor: replace
@@ -386,7 +392,7 @@ fn set_prototype_of(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) 
         return Err(vm.type_error("Object.setPrototypeOf called on null or undefined"));
     }
     if let Some(o) = target.as_object() {
-        if !set_proto(vm, o, p) {
+        if !vm.set_prototype(o, p)? {
             return Err(vm.type_error("Cyclic __proto__ value or non-extensible object"));
         }
     }
@@ -412,55 +418,109 @@ pub(crate) fn set_integrity(vm: &mut Vm, o: Gc<JsObject>, frozen: bool) {
     }
     let ob = o.get_mut();
     ob.extensible = false;
+    if frozen && ob.is_array() {
+        ob.length_readonly = true;
+    }
     // Inline caches never match dictionary objects, so cached stores
     // can't bypass the new attributes
     ob.to_dictionary(&vm.shapes);
 }
 
 fn freeze(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    let v = arg(args, 0);
-    if let Some(o) = v.as_object() {
-        set_integrity(vm, o, true);
-    }
-    Ok(v)
+    integrity(vm, arg(args, 0), true)
 }
 
 fn seal(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    let v = arg(args, 0);
+    integrity(vm, arg(args, 0), false)
+}
+
+fn integrity(vm: &mut Vm, v: Value, frozen: bool) -> JsResult<Value> {
     if let Some(o) = v.as_object() {
-        set_integrity(vm, o, false);
+        if super::proxy::is_proxy(o) {
+            if !proxy_set_integrity(vm, o, frozen)? {
+                return Err(vm.type_error("Cannot freeze or seal the proxy"));
+            }
+        } else {
+            set_integrity(vm, o, frozen);
+        }
     }
     Ok(v)
 }
 
-fn test_integrity(vm: &mut Vm, v: Value, frozen: bool) -> bool {
-    let Some(o) = v.as_object() else { return true };
-    if o.get().extensible {
-        return false;
+/// SetIntegrityLevel through a proxy's traps
+fn proxy_set_integrity(vm: &mut Vm, o: Gc<JsObject>, frozen: bool) -> JsResult<bool> {
+    if !vm.prevent_extensions(o)? {
+        return Ok(false);
     }
-    vm.own_keys(o).into_iter().all(|(_, f)| !f.configurable() && (!frozen || f.is_accessor() || !f.writable()))
+    for key in vm.proxy_own_keys(o)? {
+        let desc = vm.new_object();
+        vm.define_value(desc, PropertyKey::Atom(atoms::configurable), Value::FALSE, PropFlags::DEFAULT);
+        if frozen {
+            let current = vm.proxy_get_own_property(o, key)?;
+            if is_data_descriptor(vm, current)? {
+                vm.define_value(desc, PropertyKey::Atom(atoms::writable), Value::FALSE, PropFlags::DEFAULT);
+            }
+        }
+        if !vm.proxy_define(o, key, Value::object(desc))? {
+            return Err(vm.type_error("'defineProperty' on proxy: trap returned falsish"));
+        }
+    }
+    Ok(true)
+}
+
+fn is_data_descriptor(vm: &mut Vm, d: Value) -> JsResult<bool> {
+    let Some(d) = d.as_object() else { return Ok(false) };
+    Ok(vm.has_property(d, PropertyKey::Atom(atoms::value)) || vm.has_property(d, PropertyKey::Atom(atoms::writable)))
+}
+
+fn test_integrity(vm: &mut Vm, v: Value, frozen: bool) -> JsResult<bool> {
+    let Some(o) = v.as_object() else { return Ok(true) };
+    if super::proxy::is_proxy(o) {
+        // TestIntegrityLevel through the traps
+        if vm.is_extensible(o)? {
+            return Ok(false);
+        }
+        for key in vm.proxy_own_keys(o)? {
+            let d = vm.proxy_get_own_property(o, key)?;
+            let Some(obj) = d.as_object() else { continue };
+            if crate::vm::ops::truthy(vm.get(Value::object(obj), PropertyKey::Atom(atoms::configurable))?) {
+                return Ok(false);
+            }
+            if frozen && is_data_descriptor(vm, d)? && crate::vm::ops::truthy(vm.get(Value::object(obj), PropertyKey::Atom(atoms::writable))?) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if o.get().extensible {
+        return Ok(false);
+    }
+    Ok(vm.own_keys(o).into_iter().all(|(_, f)| !f.configurable() && (!frozen || f.is_accessor() || !f.writable())))
 }
 
 fn is_frozen(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    Ok(Value::bool(test_integrity(vm, arg(args, 0), true)))
+    Ok(Value::bool(test_integrity(vm, arg(args, 0), true)?))
 }
 
 fn is_sealed(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    Ok(Value::bool(test_integrity(vm, arg(args, 0), false)))
+    Ok(Value::bool(test_integrity(vm, arg(args, 0), false)?))
 }
 
 fn prevent_extensions(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let v = arg(args, 0);
     if let Some(o) = v.as_object() {
-        let ob = o.get_mut();
-        ob.extensible = false;
-        ob.to_dictionary(&vm.shapes);
+        if !vm.prevent_extensions(o)? {
+            return Err(vm.type_error("Cannot prevent extensions"));
+        }
     }
     Ok(v)
 }
 
-fn is_extensible(_vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    Ok(Value::bool(arg(args, 0).as_object().is_some_and(|o| o.get().extensible)))
+fn is_extensible(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    match arg(args, 0).as_object() {
+        Some(o) => Ok(Value::bool(vm.is_extensible(o)?)),
+        None => Ok(Value::FALSE),
+    }
 }
 
 fn from_entries(vm: &mut Vm, _this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -497,12 +557,12 @@ fn has_own_property(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -
 fn is_prototype_of(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(v) = arg(args, 0).as_object() else { return Ok(Value::FALSE) };
     let o = vm.to_object(this)?;
-    let mut cur = v.get().proto;
+    let mut cur = vm.prototype_of(v)?;
     while let Some(c) = cur {
         if c == o {
             return Ok(Value::TRUE);
         }
-        cur = c.get().proto;
+        cur = vm.prototype_of(c)?;
     }
     Ok(Value::FALSE)
 }
@@ -529,7 +589,7 @@ pub(crate) fn to_string(vm: &mut Vm, this: Value, _args: &[Value], _: Gc<JsObjec
         ObjectKind::Proxy(_) if super::array::is_array_value(Value::object(o)) => "Array",
         ObjectKind::Proxy(p) if p.callable => "Function",
         ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound(_) => "Function",
-        ObjectKind::Error => "Error",
+        ObjectKind::Error(_) => "Error",
         ObjectKind::Boolean(_) => "Boolean",
         ObjectKind::Number(_) => "Number",
         ObjectKind::String(_) => "String",

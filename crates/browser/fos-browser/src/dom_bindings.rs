@@ -28,6 +28,7 @@ const NODE_CLASS: u32 = 1;
 
 /// Local name of the detached elements standing in for DocumentFragments
 const FRAGMENT: &str = "#document-fragment";
+use fos_dom::SHADOW_ROOT;
 
 /// Severity of a console message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +78,35 @@ pub struct DomHost {
     /// Request id -> index in `vm.host_roots` of its completion callback
     fetch_callbacks: HashMap<u32, usize>,
     next_fetch_id: u32,
+    /// The page's current layout and where the viewport is
+    layout: Option<Arc<crate::renderer::PageLayout>>,
+    viewport: (f32, f32),
+    scroll: (f32, f32),
+    /// Element boxes from `layout` (built on the first query after a layout)
+    /// Element boxes where painted (scroll-dependent), and as laid out
+    pub(crate) boxes: Option<HashMap<u32, [f32; 4]>>,
+    layout_boxes: Option<HashMap<u32, [f32; 4]>>,
+    /// A scroll position a script asked for
+    pub scroll_request: Option<f32>,
+    /// Scroll containers' positions (mirrored from the renderer, updated
+    /// at once when scripts scroll them) and the scrolls scripts asked for
+    pub box_scroll: HashMap<u32, (f32, f32)>,
+    pub box_scroll_requests: Vec<(NodeId, f32, f32)>,
+    /// Per element: visible size and content size (from `layout`)
+    metrics: Option<HashMap<u32, [f32; 4]>>,
+    /// The browser's cookies (`document.cookie`; `fetch` shares them)
+    cookies: fos_net::SharedCookieJar,
+    /// The URL changed without a navigation (`history.pushState`)
+    pub url_changed: bool,
+    /// Prototypes of element interfaces by tag (`HTMLScriptElement` for
+    /// "script"; SVG elements under "svg:<tag>" and "svg:*")
+    tag_protos: HashMap<String, Gc<JsObject>>,
+    /// Canvas prototypes and the contexts of canvas elements
+    pub(crate) canvas: crate::canvas_bindings::CanvasHost,
 }
 
 impl DomHost {
-    pub fn new(doc: Arc<Mutex<Document>>, url: &str) -> Self {
+    pub fn new(doc: Arc<Mutex<Document>>, url: &str, cookies: fos_net::SharedCookieJar) -> Self {
         Self {
             doc,
             url: url.to_string(),
@@ -91,14 +117,27 @@ impl DomHost {
             free_slots: Vec::new(),
             console: Vec::new(),
             start: Instant::now(),
-            fetch: FetchPool::new(),
+            fetch: FetchPool::new(cookies.clone()),
             fetch_callbacks: HashMap::new(),
             next_fetch_id: 1,
+            layout: None,
+            viewport: (1024.0, 768.0),
+            tag_protos: HashMap::new(),
+            scroll: (0.0, 0.0),
+            boxes: None,
+            layout_boxes: None,
+            scroll_request: None,
+            box_scroll: HashMap::new(),
+            box_scroll_requests: Vec::new(),
+            metrics: None,
+            cookies,
+            url_changed: false,
+            canvas: Default::default(),
         }
     }
 }
 
-fn host(vm: &mut Vm) -> &mut DomHost {
+pub(crate) fn host(vm: &mut Vm) -> &mut DomHost {
     vm.host_mut::<DomHost>().expect("DOM host not installed")
 }
 
@@ -113,7 +152,7 @@ fn with_doc<R>(vm: &mut Vm, f: impl FnOnce(&mut Document) -> R) -> R {
     f(&mut d)
 }
 
-fn with_tree<R>(vm: &mut Vm, f: impl FnOnce(&mut DomTree) -> R) -> R {
+pub(crate) fn with_tree<R>(vm: &mut Vm, f: impl FnOnce(&mut DomTree) -> R) -> R {
     with_doc(vm, |d| f(d.tree_mut()))
 }
 
@@ -128,20 +167,72 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
         return vm.host_roots[slot];
     }
     let protos = host(vm).protos.expect("DOM not initialized");
-    let proto = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
-        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => protos.fragment,
-        Some(NodeData::Element(_)) => protos.element,
-        Some(NodeData::Text(_)) => protos.text,
-        Some(NodeData::Comment(_)) => protos.comment,
-        Some(NodeData::Document) => protos.document,
-        _ => protos.node,
+    let by_tag = !host(vm).tag_protos.is_empty();
+    let (proto, tag) = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => (protos.fragment, None),
+        // ShadowRoot.prototype comes from the bootstrap, by this name
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == SHADOW_ROOT => (protos.fragment, by_tag.then(|| SHADOW_ROOT.to_string())),
+        Some(NodeData::Element(e)) => (protos.element, by_tag.then(|| element_tag(t, e))),
+        Some(NodeData::Text(_)) => (protos.text, None),
+        Some(NodeData::Comment(_)) => (protos.comment, None),
+        Some(NodeData::Document) => (protos.document, None),
+        // DocumentType.prototype comes from the bootstrap, by this name
+        Some(NodeData::Doctype { .. }) => (protos.node, by_tag.then(|| "#doctype".to_string())),
+        _ => (protos.node, None),
     });
+    let proto = tag.and_then(|tag| tag_proto(&host(vm).tag_protos, &tag)).unwrap_or(proto);
     let o = vm.new_object_with(Some(proto), ObjectKind::Host { class: NODE_CLASS, id: id.0 as u64 });
     let v = Value::object(o);
     let slot = vm.host_roots.len();
     vm.host_roots.push(v);
     host(vm).wrappers.insert(id.0, slot);
     v
+}
+
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+
+/// An element's key in `tag_protos`: its tag, prefixed "svg:" for SVG
+pub(crate) fn element_tag(t: &fos_dom::DomTree, e: &fos_dom::ElementData) -> String {
+    let local = t.resolve(e.name.local);
+    if t.resolve(e.name.ns) == SVG_NS { format!("svg:{local}") } else { local.to_string() }
+}
+
+/// The interface prototype for an element's tag
+fn tag_proto(tag_protos: &HashMap<String, Gc<JsObject>>, tag: &str) -> Option<Gc<JsObject>> {
+    tag_protos.get(tag).or_else(|| if tag.starts_with("svg:") { tag_protos.get("svg:*") } else { None }).copied()
+}
+
+/// `__fosSetElementPrototype(tag, proto)`: elements with this tag get
+/// `proto` (an interface's prototype). Wrappers made earlier are updated.
+fn set_element_prototype(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let tag = arg_string(vm, args, 0)?;
+    let Some(proto) = arg(args, 1).as_object() else { return Ok(Value::UNDEFINED) };
+    vm.host_roots.push(Value::object(proto));
+    host(vm).tag_protos.insert(tag, proto);
+    let Some(protos) = host(vm).protos else { return Ok(Value::UNDEFINED) };
+    let wrappers: Vec<(u32, usize)> = host(vm).wrappers.iter().map(|(&k, &v)| (k, v)).collect();
+    for (node, slot) in wrappers {
+        let o = vm.host_roots[slot].as_object().unwrap();
+        if o.get().proto != Some(protos.element) {
+            continue;
+        }
+        let tag = with_tree(vm, |t| t.get(NodeId(node)).and_then(|n| n.as_element()).map(|e| element_tag(t, e)));
+        if let Some(p) = tag.and_then(|tag| tag_proto(&host(vm).tag_protos, &tag)) {
+            o.get_mut().proto = Some(p);
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn namespace_uri(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let id = this_node(vm, this)?;
+    let ns = with_tree(vm, |t| t.get(id).and_then(|n| n.as_element()).map(|e| t.resolve(e.name.ns).to_string()));
+    Ok(match ns {
+        // Elements made without a namespace by the HTML parser are HTML
+        Some(ns) if ns.is_empty() => string(vm, "http://www.w3.org/1999/xhtml"),
+        Some(ns) => string(vm, &ns),
+        None => Value::NULL,
+    })
 }
 
 fn wrap_all(vm: &mut Vm, ids: Vec<NodeId>) -> Value {
@@ -177,7 +268,7 @@ fn string(vm: &mut Vm, s: &str) -> Value {
     vm.str_value(s)
 }
 
-fn dom_error(vm: &mut Vm, name: &str, message: &str) -> Value {
+pub(crate) fn dom_error(vm: &mut Vm, name: &str, message: &str) -> Value {
     let e = vm.make_error(fos_jsvm::vm::ErrorKind::Error, message);
     if let Some(o) = e.as_object() {
         let n = vm.str_value(name);
@@ -198,7 +289,7 @@ fn is_element(t: &DomTree, id: NodeId) -> bool {
 }
 
 fn is_fragment(t: &DomTree, id: NodeId) -> bool {
-    t.get(id).and_then(|n| n.as_element()).is_some_and(|e| t.resolve(e.name.local) == FRAGMENT)
+    t.get(id).and_then(|n| n.as_element()).is_some_and(|e| matches!(t.resolve(e.name.local), FRAGMENT | SHADOW_ROOT))
 }
 
 fn children(t: &DomTree, id: NodeId) -> Vec<NodeId> {
@@ -263,7 +354,7 @@ fn nodes_from_args(vm: &mut Vm, args: &[Value]) -> JsResult<Vec<NodeId>> {
 fn node_type(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
     let n = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
-        Some(NodeData::Element(e)) if t.resolve(e.name.local) == FRAGMENT => 11,
+        Some(NodeData::Element(e)) if matches!(t.resolve(e.name.local), FRAGMENT | SHADOW_ROOT) => 11,
         Some(NodeData::Element(_)) => 1,
         Some(NodeData::Text(_)) => 3,
         Some(NodeData::ProcessingInstruction { .. }) => 7,
@@ -278,6 +369,7 @@ fn node_type(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult
 fn node_name(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
     let s = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
+        Some(NodeData::Element(e)) if t.resolve(e.name.local) == SHADOW_ROOT => FRAGMENT.into(),
         Some(NodeData::Element(e)) => t.resolve(e.name.local).to_ascii_uppercase(),
         Some(NodeData::Text(_)) => "#text".into(),
         Some(NodeData::Comment(_)) => "#comment".into(),
@@ -343,7 +435,7 @@ fn owner_document(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsR
 
 fn is_connected(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    Ok(Value::bool(with_tree(vm, |t| t.is_inclusive_descendant(id, NodeId::ROOT))))
+    Ok(Value::bool(with_tree(vm, |t| t.is_connected(id))))
 }
 
 fn text_content(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -481,14 +573,23 @@ fn clone_node(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsRe
     Ok(wrap(vm, copy))
 }
 
-fn get_root_node(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
-    let mut id = this_node(vm, this)?;
-    with_tree(vm, |t| {
-        while let Some(p) = t.get(id).map(|n| n.parent).filter(|p| p.is_valid()) {
-            id = p;
+/// `getRootNode({ composed })`: the tree's root (a shadow root, unless
+/// `composed`, which continues through hosts)
+fn get_root_node(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let id = this_node(vm, this)?;
+    // The bootstrap passes `options.composed` as a boolean
+    let composed = arg(args, 0).as_bool() == Some(true);
+    let root = with_tree(vm, |t| {
+        let mut root = t.tree_root(id);
+        while composed {
+            match t.shadow_host(root) {
+                Some(host) => root = t.tree_root(host),
+                None => break,
+            }
         }
+        root
     });
-    Ok(wrap(vm, id))
+    Ok(wrap(vm, root))
 }
 
 /// `append`, `prepend`, `before`, `after`, `replaceWith`
@@ -565,6 +666,7 @@ fn set_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> J
     let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
     let value = arg_string(vm, args, 1)?;
     with_tree(vm, |t| t.set_attribute(id, &name, &value));
+    crate::canvas_bindings::attribute_changed(vm, id, &name);
     Ok(Value::UNDEFINED)
 }
 
@@ -572,6 +674,7 @@ fn remove_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -
     let id = this_node(vm, this)?;
     let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
     with_tree(vm, |t| t.remove_attribute(id, &name));
+    crate::canvas_bindings::attribute_changed(vm, id, &name);
     Ok(Value::UNDEFINED)
 }
 
@@ -620,14 +723,33 @@ fn set_class_name(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> 
     attr_setter(vm, this, args, "class")
 }
 
+/// The node whose children `innerHTML` reads and replaces: a
+/// `<template>`'s contents fragment, otherwise the node itself
+fn inner_html_target(vm: &mut Vm, id: NodeId) -> NodeId {
+    let is_template = with_tree(vm, |t| t.get(id).and_then(|n| n.as_element()).is_some_and(|e| t.resolve(e.name.local) == "template" && t.resolve(e.name.ns) != SVG_NS));
+    if !is_template {
+        return id;
+    }
+    with_doc(vm, |d| match d.template_content(id) {
+        Some(f) => f,
+        None => {
+            let f = d.tree_mut().create_element(FRAGMENT);
+            d.set_template_content(id, f);
+            f
+        }
+    })
+}
+
 fn inner_html(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
+    let id = inner_html_target(vm, id);
     let s = with_tree(vm, |t| fos_html::get_inner_html(t, id));
     Ok(string(vm, &s))
 }
 
 fn set_inner_html(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
+    let id = inner_html_target(vm, id);
     let v = arg(args, 0);
     let html = if v.is_nullish() { String::new() } else { vm.to_rust_string(v)? };
     with_tree(vm, |t| fos_html::set_inner_html(t, id, &html));
@@ -979,7 +1101,20 @@ pub fn report_exception(vm: &mut Vm, e: Value) {
 // ---- console, misc ----
 
 fn console_message(vm: &mut Vm, args: &[Value], level: ConsoleLevel) -> JsResult<Value> {
-    let parts: Vec<String> = args.iter().map(|&a| vm.display(a)).collect();
+    // Errors print with their stack, as in browsers
+    let parts: Vec<String> = args
+        .iter()
+        .map(|&a| {
+            if let Some(o) = a.as_object().filter(|o| matches!(o.get().kind, ObjectKind::Error(_))) {
+                if let Ok(stack) = vm.get_str(Value::object(o), "stack") {
+                    if stack.is_string() {
+                        return vm.display(stack);
+                    }
+                }
+            }
+            vm.display(a)
+        })
+        .collect();
     let line = parts.join(" ");
     match level {
         ConsoleLevel::Error => log::error!("[console] {line}"),
@@ -1017,6 +1152,160 @@ fn console_debug(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsRe
 
 fn performance_now(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     Ok(Value::number(host(vm).start.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// `__fosSetURL(url)`: the document's URL changed (`history.pushState`);
+/// the caller checked it is same-origin
+fn set_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let url = arg_string(vm, args, 0)?;
+    let h = host(vm);
+    if crate::script_fetch::serialize_origin(&url) == crate::script_fetch::serialize_origin(&h.url) {
+        h.url = url;
+        h.url_changed = true;
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosDefineElement(name)`: a custom element name is now defined
+/// (for `:defined`)
+fn define_element(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let name = arg_string(vm, args, 0)?;
+    with_tree(vm, |t| t.define_custom_element(&name));
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosTemplateContent(template)`: the template's contents fragment
+fn template_content(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let fragment = with_doc(vm, |d| match d.template_content(id) {
+        Some(f) => f,
+        None => {
+            let f = d.tree_mut().create_element(FRAGMENT);
+            d.set_template_content(id, f);
+            f
+        }
+    });
+    Ok(wrap(vm, fragment))
+}
+
+/// `__fosSetSheetCSS(style, css)`: the CSS of a `<style>` element's sheet
+/// after CSSOM changes (null: back to its text), for rendering
+fn set_sheet_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let css = if arg(args, 1).is_nullish() { None } else { Some(arg_string(vm, args, 1)?) };
+    with_doc(vm, |d| {
+        let tree = d.tree();
+        let text: String = tree.children(id).filter_map(|(_, c)| c.as_text()).collect();
+        d.set_sheet_override(id, text, css);
+    });
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosAttachShadow(host)`: a new (or the existing) shadow root of `host`
+fn attach_shadow(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(host) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let root = with_tree(vm, |t| t.attach_shadow(host));
+    Ok(wrap(vm, root))
+}
+
+/// `__fosShadowRoot(host)`: `host`'s shadow root, whatever its mode
+fn shadow_root_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(host) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let root = with_tree(vm, |t| t.shadow_root(host)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, root))
+}
+
+/// `__fosShadowClosed(root)`: whether a declarative shadow root is closed
+fn shadow_closed(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::FALSE) };
+    Ok(Value::bool(with_tree(vm, |t| t.get_attribute(root, "mode") == Some("closed"))))
+}
+
+/// `__fosShadowHost(root)`: the host of shadow root `root`
+fn shadow_host_of(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let host = with_tree(vm, |t| t.shadow_host(root)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, host))
+}
+
+/// `__fosAssignedNodes(slot)`: the nodes assigned to a `<slot>`
+fn assigned_nodes(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(slot) = node_id(arg(args, 0)) else { return Ok(wrap_all(vm, Vec::new())) };
+    let ids = with_tree(vm, |t| t.assigned_nodes(slot));
+    Ok(wrap_all(vm, ids))
+}
+
+/// `__fosAssignedSlot(node)`: the slot a host's child is assigned to
+fn assigned_slot(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(node) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let slot = with_tree(vm, |t| t.assigned_slot(node)).unwrap_or(NodeId::NONE);
+    Ok(wrap(vm, slot))
+}
+
+/// `__fosSetShadowAdoptedCSS(root, css)`: the CSS of a shadow root's
+/// `adoptedStyleSheets`
+fn set_shadow_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(root) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let css = arg_string(vm, args, 1)?;
+    with_doc(vm, |d| d.set_shadow_adopted_css(root, css));
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosSetAdoptedCSS(css)`: the CSS of `document.adoptedStyleSheets`
+fn set_adopted_css(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let css = arg_string(vm, args, 0)?;
+    with_doc(vm, |d| d.set_adopted_css(css));
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosMatchMedia(query)`: whether a media query matches the viewport
+fn match_media(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let q = arg_string(vm, args, 0)?;
+    let (width, height) = host(vm).viewport;
+    Ok(Value::bool(fos_css::media_matches(&q, &fos_css::MediaContext { width, height })))
+}
+
+/// `__fosParseDocument(html)`: parse a whole HTML document (DOMParser) and
+/// return its `<html>` element, detached in the page's tree. Its scripts
+/// never run.
+fn parse_document(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let html = arg_string(vm, args, 0)?;
+    let parsed = fos_html::parse(&html);
+    let root = parsed.document_element();
+    if !root.is_valid() {
+        return Ok(Value::NULL);
+    }
+    let id = with_tree(vm, |t| t.import_node(parsed.tree(), root, true));
+    Ok(wrap(vm, id))
+}
+
+/// `__fosRandomBytes(n)`: an ArrayBuffer of `n` bytes from the OS's
+/// secure random source (`crypto.getRandomValues`, at most 64 KiB)
+fn random_bytes(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let n = vm.to_number(arg(args, 0))?;
+    if !(0.0..=65536.0).contains(&n) {
+        return Err(vm.range_error("random byte count out of range"));
+    }
+    let mut bytes = vec![0u8; n as usize];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return Err(vm.type_error("No secure random source is available"));
+    }
+    Ok(new_array_buffer(vm, bytes))
+}
+
+/// `__fosCookie()`: what `document.cookie` reads (no HttpOnly cookies)
+fn get_cookie(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let h = host(vm);
+    let cookies = h.cookies.lock().unwrap_or_else(|p| p.into_inner()).document_cookie(&h.url);
+    Ok(string(vm, &cookies))
+}
+
+/// `__fosSetCookie(value)`: assign to `document.cookie`
+fn set_cookie(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let value = arg_string(vm, args, 0)?;
+    let h = host(vm);
+    h.cookies.lock().unwrap_or_else(|p| p.into_inner()).set_document_cookie(&h.url, &value);
+    Ok(Value::UNDEFINED)
 }
 
 fn resolve_url(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -1246,9 +1535,152 @@ fn encode_text(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResu
     Ok(new_array_buffer(vm, s.into_bytes()))
 }
 
+// ---- geometry ----
+
+/// Tell the page about a new layout, the viewport size and its scroll
+/// position
+pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>, viewport: (f32, f32), scroll: (f32, f32)) {
+    let h = host(vm);
+    let same = match (&h.layout, &layout) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    // Fixed and sticky boxes move with the page scroll
+    let moved = h.scroll.1 != scroll.1 && h.layout.as_ref().is_some_and(|l| l.has_fixed());
+    if !same {
+        h.layout = layout;
+        h.boxes = None;
+        h.layout_boxes = None;
+        h.metrics = None;
+    } else if moved || h.viewport != viewport {
+        h.boxes = None;
+    }
+    h.viewport = viewport;
+    h.scroll = scroll;
+}
+
+/// Boxes of all rendered elements: the union of each element's own
+/// fragments (its border boxes and text), and for elements that generate
+/// none (`display: contents`) the union of their descendants'
+fn element_boxes(tree: &DomTree, rects: Vec<(NodeId, fos_layout::engine::Rect)>) -> HashMap<u32, [f32; 4]> {
+    fn union(boxes: &mut HashMap<u32, [f32; 4]>, n: u32, r: [f32; 4]) {
+        match boxes.get_mut(&n) {
+            Some(b) => {
+                let (x, y) = (b[0].min(r[0]), b[1].min(r[1]));
+                let (x1, y1) = ((b[0] + b[2]).max(r[0] + r[2]), (b[1] + b[3]).max(r[1] + r[3]));
+                *b = [x, y, x1 - x, y1 - y];
+            }
+            None => {
+                boxes.insert(n, r);
+            }
+        }
+    }
+    let mut boxes: HashMap<u32, [f32; 4]> = HashMap::with_capacity(rects.len());
+    for (node, r) in &rects {
+        union(&mut boxes, node.0, [r.x, r.y, r.w, r.h]);
+    }
+    let mut derived: HashMap<u32, [f32; 4]> = HashMap::new();
+    for (node, r) in &rects {
+        let mut n = tree.get(*node).map_or(NodeId::NONE, |p| p.parent);
+        while n.is_valid() && !boxes.contains_key(&n.0) {
+            union(&mut derived, n.0, [r.x, r.y, r.w, r.h]);
+            n = tree.get(n).map_or(NodeId::NONE, |p| p.parent);
+        }
+    }
+    boxes.extend(derived);
+    boxes
+}
+
+/// `__fosGeometry(node, painted)`: `[x, y, width, height]` in document
+/// coordinates, or null when the element is not rendered; `painted`
+/// boxes are where they are drawn (transformed, stuck, scrolled), others
+/// as laid out
+fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let painted = fos_jsvm::vm::truthy(arg(args, 1));
+    let Some(layout) = host(vm).layout.clone() else { return Ok(Value::NULL) };
+    if painted && host(vm).boxes.is_none() {
+        let (scroll, view_h, box_scroll) = (host(vm).scroll.1, host(vm).viewport.1, host(vm).box_scroll.clone());
+        let rects = layout.painted_boxes(scroll, view_h, &box_scroll);
+        let boxes = with_tree(vm, |t| element_boxes(t, rects));
+        host(vm).boxes = Some(boxes);
+    } else if !painted && host(vm).layout_boxes.is_none() {
+        let boxes = with_tree(vm, |t| element_boxes(t, layout.boxes()));
+        host(vm).layout_boxes = Some(boxes);
+    }
+    let h = host(vm);
+    let cache = if painted { &h.boxes } else { &h.layout_boxes };
+    let Some(b) = cache.as_ref().unwrap().get(&id.0).copied() else { return Ok(Value::NULL) };
+    let vals: Vec<Value> = b.iter().map(|&v: &f32| Value::number(v as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+fn metrics_of(vm: &mut Vm, id: NodeId) -> Option<[f32; 4]> {
+    let h = host(vm);
+    if h.metrics.is_none() {
+        let m = h.layout.as_ref()?.scroll_metrics();
+        h.metrics = Some(m);
+    }
+    h.metrics.as_ref()?.get(&id.0).copied()
+}
+
+/// `__fosScrollMetrics(el)`: `[scrollLeft, scrollTop, scrollWidth,
+/// scrollHeight, clientWidth, clientHeight]`, or null without a box
+fn scroll_metrics(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let Some(m) = metrics_of(vm, id) else { return Ok(Value::NULL) };
+    let (sx, sy) = host(vm).box_scroll.get(&id.0).copied().unwrap_or((0.0, 0.0));
+    let vals: Vec<Value> = [sx, sy, m[2], m[3], m[0], m[1]].iter().map(|&v| Value::number(v as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+/// `__fosSetBoxScroll(el, x, y)`: scroll an element's content (null keeps
+/// an axis)
+fn set_box_scroll(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::UNDEFINED) };
+    let Some(m) = metrics_of(vm, id) else { return Ok(Value::UNDEFINED) };
+    let (cx, cy) = host(vm).box_scroll.get(&id.0).copied().unwrap_or((0.0, 0.0));
+    let x = if arg(args, 1).is_null() { cx } else { vm.to_number(arg(args, 1))? as f32 };
+    let y = if arg(args, 2).is_null() { cy } else { vm.to_number(arg(args, 2))? as f32 };
+    let x = if x.is_finite() { x.clamp(0.0, (m[2] - m[0]).max(0.0)).round() } else { cx };
+    let y = if y.is_finite() { y.clamp(0.0, (m[3] - m[1]).max(0.0)).round() } else { cy };
+    let h = host(vm);
+    h.box_scroll.insert(id.0, (x, y));
+    h.boxes = None;
+    h.box_scroll_requests.push((id, x, y));
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosQuirks()`: whether the document is in quirks mode
+fn quirks(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    Ok(Value::bool(with_doc(vm, |d| d.is_quirks())))
+}
+
+/// `__fosViewport()`: `[width, height, scrollX, scrollY, documentHeight]`
+fn viewport(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let h = host(vm);
+    let doc_height = h.layout.as_ref().map_or(h.viewport.1, |l| l.content_height().max(h.viewport.1));
+    let v = [h.viewport.0, h.viewport.1, h.scroll.0, h.scroll.1, doc_height];
+    let vals: Vec<Value> = v.iter().map(|&x| Value::number(x as f64)).collect();
+    Ok(Value::object(vm.new_array(vals)))
+}
+
+/// `__fosScrollTo(y)`: ask the browser to scroll the page
+fn scroll_to(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let y = vm.to_number(arg(args, 0))?;
+    if y.is_finite() {
+        let h = host(vm);
+        let y = y.max(0.0) as f32;
+        h.scroll_request = Some(y);
+        h.scroll.1 = y;
+    }
+    Ok(Value::UNDEFINED)
+}
+
 // ---- installation ----
 
-fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
+pub(crate) fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
     let o = vm.new_object_with(Some(parent), ObjectKind::Ordinary);
     vm.host_roots.push(Value::object(o));
     o
@@ -1256,7 +1688,7 @@ fn proto_object(vm: &mut Vm, parent: Gc<JsObject>) -> Gc<JsObject> {
 
 /// An interface object (`Node`, `HTMLElement`, ...) with its prototype,
 /// installed as a global. Constructing one is not allowed, as in browsers.
-fn interface(vm: &mut Vm, name: &str, proto: Gc<JsObject>) {
+pub(crate) fn interface(vm: &mut Vm, name: &str, proto: Gc<JsObject>) {
     fn illegal(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
         Err(vm.type_error("Illegal constructor"))
     }
@@ -1279,8 +1711,8 @@ fn methods(vm: &mut Vm, o: Gc<JsObject>, list: &[(&str, u32, NativeFn)]) {
 }
 
 /// Install the DOM, `window` and friends into `vm` for `doc`
-pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()> {
-    vm.host = Some(Box::new(DomHost::new(doc, url)));
+pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_net::SharedCookieJar) -> JsResult<()> {
+    vm.host = Some(Box::new(DomHost::new(doc, url, cookies)));
     let object_proto = vm.realm.object_proto;
 
     let event_target = proto_object(vm, object_proto);
@@ -1364,6 +1796,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
     accessors(vm, element, &[
         ("tagName", tag_name, None),
         ("localName", local_name, None),
+        ("namespaceURI", namespace_uri, None),
         ("id", get_id, Some(set_id)),
         ("className", get_class_name, Some(set_class_name)),
         ("innerHTML", inner_html, Some(set_inner_html)),
@@ -1412,7 +1845,42 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
         ("btoa", 1, btoa),
         ("atob", 1, atob),
         ("__fosResolveURL", 2, resolve_url),
+        ("__fosCookie", 0, get_cookie),
+        ("__fosSetURL", 1, set_url),
+        ("__fosDefineElement", 1, define_element),
+        ("__fosRandomBytes", 1, random_bytes),
+        ("__fosTemplateContent", 1, template_content),
+        ("__fosSetElementPrototype", 2, set_element_prototype),
+        ("__fosSetSheetCSS", 2, set_sheet_css),
+        ("__fosSetAdoptedCSS", 1, set_adopted_css),
+        ("__fosSetShadowAdoptedCSS", 2, set_shadow_adopted_css),
+        ("__fosAttachShadow", 1, attach_shadow),
+        ("__fosShadowRoot", 1, shadow_root_of),
+        ("__fosShadowHost", 1, shadow_host_of),
+        ("__fosShadowClosed", 1, shadow_closed),
+        ("__fosAssignedNodes", 1, assigned_nodes),
+        ("__fosAssignedSlot", 1, assigned_slot),
+        ("__fosParseDocument", 1, parse_document),
+        ("__fosMatchMedia", 1, match_media),
+        ("__fosDigest", 2, crate::web_crypto::digest_native),
+        ("__fosHmac", 4, crate::web_crypto::hmac_native),
+        ("__fosAesGcm", 6, crate::web_crypto::aes_gcm_native),
+        ("__fosPbkdf2", 5, crate::web_crypto::pbkdf2_native),
+        ("__fosHkdf", 5, crate::web_crypto::hkdf_native),
+        ("__fosEcGenerate", 1, crate::web_crypto::ec_generate),
+        ("__fosEcImportPkcs8", 2, crate::web_crypto::ec_import_pkcs8),
+        ("__fosEcImportPrivate", 3, crate::web_crypto::ec_import_private),
+        ("__fosEcSign", 3, crate::web_crypto::ec_sign),
+        ("__fosEcVerify", 5, crate::web_crypto::ec_verify),
+        ("__fosEcSpki", 3, crate::web_crypto::ec_spki),
+        ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
+        ("__fosGeometry", 1, geometry),
+        ("__fosViewport", 0, viewport),
+        ("__fosQuirks", 0, quirks),
+        ("__fosScrollMetrics", 1, scroll_metrics),
+        ("__fosSetBoxScroll", 3, set_box_scroll),
+        ("__fosScrollTo", 1, scroll_to),
         ("__fosDecode", 2, decode_text),
         ("__fosEncode", 1, encode_text),
     ]);
@@ -1430,6 +1898,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str) -> JsResult<()
     methods(vm, performance, &[("now", 0, performance_now)]);
     vm.def_value(g, "performance", Value::object(performance), PropFlags::HIDDEN);
 
-    vm.eval(include_str!("dom_bootstrap.js"))?;
+    crate::canvas_bindings::install(vm);
+    vm.eval_named(include_str!("dom_bootstrap.js"), "fos://dom_bootstrap.js")?;
     Ok(())
 }

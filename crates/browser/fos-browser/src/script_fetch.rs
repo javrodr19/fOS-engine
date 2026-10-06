@@ -630,8 +630,16 @@ pub(crate) fn referrer_for(page_url: &str, target: &str) -> Option<String> {
     }
     let without_fragment = page_url.split('#').next().unwrap_or(page_url);
     if serialize_origin(page_url) == serialize_origin(target) {
-        // Credentials in the URL are never sent
-        Some(strip_userinfo(without_fragment))
+        // Credentials in the URL are never sent, and the URL is sent
+        // serialized (`https://a.com` as `https://a.com/`: servers check)
+        let url = strip_userinfo(without_fragment);
+        Some(match url.split_once("://") {
+            Some((scheme, rest)) if !rest[rest.find(['/', '?']).unwrap_or(rest.len())..].starts_with('/') => {
+                let end = rest.find('?').unwrap_or(rest.len());
+                format!("{scheme}://{}/{}", &rest[..end], &rest[end..])
+            }
+            _ => url,
+        })
     } else {
         Some(format!("{}/", serialize_origin(page_url)))
     }
@@ -776,6 +784,9 @@ mod tests {
     fn referrers() {
         assert_eq!(referrer_for("https://u:p@a.com/p?q#f", "https://a.com/x").as_deref(), Some("https://a.com/p?q"));
         assert_eq!(referrer_for("https://a.com/p", "https://b.com/x").as_deref(), Some("https://a.com/"));
+        assert_eq!(referrer_for("https://a.com", "https://a.com/x").as_deref(), Some("https://a.com/"));
+        assert_eq!(referrer_for("https://a.com?q", "https://a.com/x").as_deref(), Some("https://a.com/?q"));
+        assert_eq!(referrer_for("https://a.com?r=/x", "https://a.com/x").as_deref(), Some("https://a.com/?r=/x"));
         assert_eq!(referrer_for("https://a.com/p", "http://b.com/x"), None);
         assert_eq!(referrer_for("file:///x.html", "https://b.com/x"), None);
     }

@@ -22,6 +22,7 @@ tiny-skia.workspace = true
 thiserror.workspace = true
 rustc-hash = "2.1"
 brotli-decompressor = "6.0.1"
+ttf-parser = "0.25"
 flate2 = "1"
 wuff = { version = "0.2.9", default-features = false }
 

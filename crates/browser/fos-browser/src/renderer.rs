@@ -520,7 +520,7 @@ impl PageRenderer {
         for f in fonts.iter() {
             let r = &f.request;
             let style = if r.italic { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
-            if let Err(e) = db.add_web_font(&r.family, fos_text::FontWeight(r.weight), style, f.data.clone()) {
+            if let Err(e) = db.add_web_font_weights(&r.family, r.weights, style, f.data.clone()) {
                 log::debug!("Web font {} unusable: {e}", r.url);
             }
         }

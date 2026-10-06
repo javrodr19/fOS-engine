@@ -15,6 +15,9 @@ pub struct FontRequest {
     pub url: String,
     pub family: String,
     pub weight: u16,
+    /// The `font-weight` range of the `@font-face` rule (a variable face
+    /// serves each weight in it)
+    pub weights: (u16, u16),
     pub italic: bool,
 }
 
@@ -65,7 +68,7 @@ pub fn requests(css: &str, media: &fos_css::MediaContext, base: &str) -> Vec<Fon
         let url = if url.starts_with("data:") { url.to_string() } else { fos_net::url_util::resolve(base, url) };
         // Variable fonts covering 400 serve as regular
         let weight = if (face.weight.0..=face.weight.1).contains(&400) { 400 } else { face.weight.0 };
-        let req = FontRequest { url, family: face.family, weight, italic: face.italic };
+        let req = FontRequest { url, family: face.family, weight, weights: face.weight, italic: face.italic };
         if !out.contains(&req) {
             out.push(req);
         }
@@ -129,7 +132,7 @@ mod tests {
             body { font-family: Brand, sans-serif }"#;
         let reqs = requests(css, &media, "https://example.com/css/site.css");
         assert_eq!(reqs.len(), 2, "{reqs:?}");
-        assert_eq!(reqs[0], FontRequest { url: "https://example.com/css/b.woff2".into(), family: "Brand".into(), weight: 400, italic: false });
+        assert_eq!(reqs[0], FontRequest { url: "https://example.com/css/b.woff2".into(), family: "Brand".into(), weight: 400, weights: (300, 800), italic: false });
         assert!(reqs[1].italic && reqs[1].url.ends_with("/bi.woff"));
     }
 }

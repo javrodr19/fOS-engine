@@ -841,6 +841,57 @@ fn global_keyword(v: &str) -> Option<Keyword> {
     }
 }
 
+/// `value` with its `env()` references replaced: a desktop window has no
+/// safe-area, keyboard or title-bar insets, so those are `0px`; other
+/// variables take their fallback. `None` when one has neither (the
+/// declaration is invalid).
+fn substitute_env(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.to_ascii_lowercase().find("env(") {
+        let ident_before = rest[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+        if ident_before {
+            out.push_str(&rest[..i + 4]);
+            rest = &rest[i + 4..];
+            continue;
+        }
+        out.push_str(&rest[..i]);
+        let args_start = i + 4;
+        let mut depth = 1;
+        let mut end = None;
+        for (j, c) in rest[args_start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(args_start + j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let args = &rest[args_start..end];
+        let (var, fallback) = match split_top(args, b',').as_slice() {
+            [var] => (var.trim(), None),
+            [var, ..] => (var.trim(), Some(args[args.find(',')? + 1..].trim())),
+            [] => return None,
+        };
+        let var = var.to_ascii_lowercase();
+        let zero = ["safe-area-inset-", "safe-area-max-inset-", "keyboard-inset-", "titlebar-area-"].iter().any(|p| var.starts_with(p));
+        match (zero, fallback) {
+            (true, _) => out.push_str("0px"),
+            (false, Some(f)) => out.push_str(&substitute_env(f)?),
+            (false, None) => return None,
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>) {
     if !crate::longhand::is_known(name) {
         return;
@@ -848,6 +899,12 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
     // Values depending on custom properties or math functions are computed
     // per element, during the cascade
     let lower = value.to_ascii_lowercase();
+    if lower.contains("env(") {
+        if let Some(value) = substitute_env(value) {
+            convert(name, &value, important, out);
+        }
+        return;
+    }
     let has_var = lower.contains("var(");
     let has_math = ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&lower, f));
     // Math over a relative color's channels (`hsl(from red calc(h + 120)
@@ -866,7 +923,7 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
         return;
     }
     // `content` takes attr() itself
-    if lower.contains("env(") || (lower.contains("attr(") && name != "content") {
+    if lower.contains("attr(") && name != "content" {
         return;
     }
     crate::longhand::expand(name, value, important, out);
@@ -1448,6 +1505,19 @@ mod tests {
             let _ = media_matches(q, &ctx);
         }
         assert!(media_matches("screen and (min-width: 100px)", &ctx));
+    }
+
+    #[test]
+    fn env_variables() {
+        // Insets of a desktop window are zero; other variables take their
+        // fallback, and without one the declaration is invalid
+        let same = |a: &str, b: &str| assert_eq!(format!("{:?}", parse_declarations(a)), format!("{:?}", parse_declarations(b)), "{a}");
+        same("padding-left: env(safe-area-inset-left)", "padding-left: 0px");
+        same("padding: env(SAFE-AREA-INSET-TOP, 9px) 4px", "padding: 0px 4px");
+        same("margin-top: env(nope, env(nope2, 6px))", "margin-top: 6px");
+        same("padding-left: max(12px, env(safe-area-inset-left) - 12px)", "padding-left: max(12px, 0px - 12px)");
+        assert!(parse_declarations("margin-top: env(nope)").is_empty());
+        assert!(parse_declarations("margin-top: env(safe-area-inset-top").is_empty());
     }
 
     #[test]

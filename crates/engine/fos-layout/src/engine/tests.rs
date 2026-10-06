@@ -712,6 +712,24 @@ fn grid_areas_lines_and_spans() {
 }
 
 #[test]
+fn shrink_wrapped_grid_of_flexible_columns_fits_its_content() {
+    // A grid of minmax(0, 1fr) columns, shrink-wrapped (a centered flex
+    // column's item), is as wide as an item spanning them needs
+    let (mut tree, html, body) = doc();
+    let col = el(&mut tree, body, "div", "display: flex; flex-direction: column; align-items: center");
+    let grid = el(&mut tree, col, "div", "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr))");
+    let item = el(&mut tree, grid, "div", "grid-column: span 4; width: 200px; height: 10px");
+    let single = el(&mut tree, col, "div", "display: grid; grid-template-columns: 1fr 2fr");
+    let a = el(&mut tree, single, "div", "width: 30px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, grid).w, 200.0);
+    assert_eq!(rect_of(&t, item).w, 200.0);
+    // One item per track: each fr is what the largest needs per fr
+    assert_eq!(rect_of(&t, single).w, 90.0);
+    assert_eq!(rect_of(&t, a).w, 30.0);
+}
+
+#[test]
 fn grid_item_spanning_a_flexible_row_leaves_it_the_space() {
     // A card: a fixed height, an image spanning every row, a 50px row and
     // a flexible row for the body. The spanning image does not inflate

@@ -522,7 +522,14 @@ fn evaluate_math_functions(value: &str, ctx: &ResolveContext, percent_basis: Opt
         let open = start + value[start..].find('(')?;
         let close = matching_paren(value, open)?;
         out.push_str(&value[at..start]);
-        out.push_str(&evaluate_math(&value[start..=close], ctx, percent_basis)?);
+        // In a relative color, math over its channels (`calc(h + 120)`)
+        // stays for the color parser
+        let original = &value[start..=close];
+        match evaluate_math(original, ctx, percent_basis) {
+            Some(v) => out.push_str(&v),
+            None if value.to_ascii_lowercase().contains("(from ") => out.push_str(original),
+            None => return None,
+        }
         at = close + 1;
     }
     out.push_str(&value[at..]);
@@ -612,6 +619,17 @@ mod tests {
             PropertyValue::Length(Length { value, unit: LengthUnit::Px }) => Some(value),
             _ => None,
         })
+    }
+
+    #[test]
+    fn math_over_color_channels_stays_for_the_color_parser() {
+        // calc() that is not about lengths (a relative color's channels)
+        // reaches the property's own parser instead of voiding it
+        let m: HashMap<String, String> = [("--tint".to_string(), "#ff0000".to_string())].into();
+        let d = resolve_declaration("color", "hsl(from var(--tint) calc(h + 120) s l)", false, &ctx(Some(&m)));
+        assert!(matches!(d.first().map(|d| &d.value), Some(PropertyValue::Color(c)) if (c.r, c.g, c.b) == (0, 255, 0)), "{d:?}");
+        // Still rejected when nothing understands it
+        assert!(resolve_declaration("width", "calc(h + 1)", false, &ctx(None)).is_empty());
     }
 
     #[test]

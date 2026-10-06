@@ -24,6 +24,8 @@ struct CompiledSelector {
     specificity: Specificity,
     /// Index of the rule in the stylesheet (also its source order)
     rule: u32,
+    /// The rule's cascade layer rank (lower layers lose)
+    layer: u32,
     /// Key hashes the element's ancestors must carry
     ancestors: Box<[u32]>,
 }
@@ -243,6 +245,7 @@ impl PageStyles {
                     selector: list,
                     specificity: selector.specificity,
                     rule: rule_index as u32,
+                    layer: rule.layer,
                     ancestors,
                 });
             }
@@ -314,20 +317,20 @@ impl PageStyles {
         // The universal list is long and already sorted, so it is merged in
         // unsorted
         let universal = buckets.universal.iter().copied().filter(|i| candidates.binary_search(i).is_err());
-        let mut matched: Vec<(Specificity, u32)> = candidates
+        let mut matched: Vec<(u32, Specificity, u32)> = candidates
             .iter()
             .copied()
             .chain(universal)
             .map(|i| &self.selectors[i as usize])
             .filter(|c| filter.is_none_or(|f| c.ancestors.iter().all(|&h| f.may_contain(h))))
             .filter(|c| test(&c.selector))
-            .map(|c| (c.specificity, c.rule))
+            .map(|c| (c.layer, c.specificity, c.rule))
             .collect();
         matched.sort_unstable();
         // Several selectors of one rule may match: the rule applies once,
         // at its highest specificity
         let mut rules: Vec<u32> = Vec::with_capacity(matched.len());
-        for &(_, rule) in matched.iter().rev() {
+        for &(_, _, rule) in matched.iter().rev() {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -573,7 +576,13 @@ fn cascade_for(
         }
     }
     if let Some(s) = styles {
-        for &rule in &rules {
+        // Important declarations of lower layers win
+        let layer = |r: &u32| s.stylesheet.rules[*r as usize].layer;
+        let mut important = rules.clone();
+        if important.iter().any(|r| layer(r) != fos_css::Rule::UNLAYERED) {
+            important.sort_by_key(|r| std::cmp::Reverse(layer(r)));
+        }
+        for &rule in &important {
             ordered.extend(of(s, rule, true));
         }
     }

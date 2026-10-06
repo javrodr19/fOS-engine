@@ -1344,6 +1344,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade_layers() {
+        // Each case's winning declaration paints the box green
+        let cases = [
+            // Unlayered rules beat layered ones, wherever they are
+            "div { background: #0f0 } @layer a { div { background: #f00 } }",
+            // Layers rank in the order first named
+            "@layer a, b; @layer b { div { background: #0f0 } } @layer a { div { background: #f00 } }",
+            // Specificity does not cross layers
+            "@layer a, b; @layer a { #d { background: #f00 } } @layer b { div { background: #0f0 } }",
+            // Within a layer it does
+            "@layer a { #d { background: #0f0 } div { background: #f00 } }",
+            // A layer's own rules beat its sublayers'
+            "@layer a { div { background: #0f0 } @layer b { div { background: #f00 } } }",
+            "@layer a.b { div { background: #f00 } } @layer a { div { background: #0f0 } }",
+            // Important declarations: lower layers win, layered over unlayered
+            "@layer a { div { background: #0f0 !important } } div { background: #f00 !important }",
+            "@layer a, b; @layer a { div { background: #0f0 !important } } @layer b { div { background: #f00 !important } }",
+            // Anonymous layers rank in order too
+            "@layer { div { background: #f00 } } @layer { div { background: #0f0 } }",
+        ];
+        for css in cases {
+            let html = format!(r#"<html><head><style>{css}</style></head><body style="margin: 0"><div id="d" style="height: 20px"></div></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 20] & 0xffffff, 0x00ff00, "{css}");
+        }
+    }
+
+    #[test]
     fn test_shadow_elements_use_the_documents_keyframes() {
         // A shadow tree without the `@keyframes` its element names finds
         // them in the document's sheet; its own win

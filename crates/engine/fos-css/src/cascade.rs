@@ -200,6 +200,7 @@ impl StyleResolver {
             rules: vec![
                 // Block-level elements
                 Rule {
+                    layer: Rule::UNLAYERED,
                     selectors: vec![
                         Selector {
                             text: "div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, form, header, footer, section, article, nav, aside, main".into(),
@@ -218,6 +219,7 @@ impl StyleResolver {
                 },
                 // Inline elements
                 Rule {
+                    layer: Rule::UNLAYERED,
                     selectors: vec![
                         Selector {
                             text: "span, a, strong, em, b, i, u".into(),
@@ -236,6 +238,7 @@ impl StyleResolver {
                 },
                 // Hidden elements
                 Rule {
+                    layer: Rule::UNLAYERED,
                     selectors: vec![
                         Selector {
                             text: "head, script, style, link, meta, title".into(),

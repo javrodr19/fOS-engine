@@ -48,7 +48,9 @@ impl CssParser {
     /// Parse a CSS stylesheet (never fails: errors are skipped)
     pub fn parse(&self, css: &str) -> Result<Stylesheet, CssError> {
         let mut out = Stylesheet::new();
-        parse_rules(css, &self.media, &mut out.rules, &mut out.keyframes);
+        let mut layers = Layers::default();
+        parse_rules(css, &self.media, &mut out.rules, &mut out.keyframes, &mut layers);
+        layers.rank(&mut out.rules);
         Ok(out)
     }
 }
@@ -326,7 +328,80 @@ fn font_face(block: &str) -> Option<FontFace> {
 
 // ---- rules ----
 
-fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>, keyframes: &mut Vec<crate::Keyframes>) {
+/// Cascade layers met while parsing: their full names (`a.b`) in order of
+/// first appearance, and the one being parsed. Rules carry their layer's
+/// index plus one (zero outside layers) until [`Layers::rank`].
+#[derive(Default)]
+struct Layers {
+    names: Vec<String>,
+    current: Option<usize>,
+    anonymous: u32,
+}
+
+impl Layers {
+    /// The layer `name` (or an anonymous one) inside the current layer
+    fn declare(&mut self, name: Option<&str>) -> usize {
+        let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                self.anonymous += 1;
+                format!("#{}", self.anonymous)
+            }
+        };
+        let full = match self.current {
+            Some(parent) => format!("{}.{name}", self.names[parent]),
+            None => name,
+        };
+        // A dotted name declares its ancestors first
+        if let Some((parent, _)) = full.rsplit_once('.') {
+            if !self.names.iter().any(|n| n == parent) {
+                let saved = self.current.take();
+                self.declare(Some(parent));
+                self.current = saved;
+            }
+        }
+        match self.names.iter().position(|n| *n == full) {
+            Some(i) => i,
+            None => {
+                self.names.push(full);
+                self.names.len() - 1
+            }
+        }
+    }
+
+    /// Replace the rules' layer indices with ranks: a layer's sublayers
+    /// (in order) rank below its own rules, and layers below unlayered
+    /// rules
+    fn rank(&self, rules: &mut [Rule]) {
+        if self.names.is_empty() {
+            for r in rules {
+                r.layer = Rule::UNLAYERED;
+            }
+            return;
+        }
+        let parent = |i: usize| self.names[i].rsplit_once('.').and_then(|(p, _)| self.names.iter().position(|n| n == p));
+        let mut ranks = vec![0u32; self.names.len()];
+        let mut next = 0;
+        fn visit(i: Option<usize>, names: usize, parent: &dyn Fn(usize) -> Option<usize>, ranks: &mut [u32], next: &mut u32) {
+            for child in (0..names).filter(|&c| parent(c) == i) {
+                visit(Some(child), names, parent, ranks, next);
+            }
+            if let Some(i) = i {
+                ranks[i] = *next;
+                *next += 1;
+            }
+        }
+        visit(None, self.names.len(), &parent, &mut ranks, &mut next);
+        for r in rules {
+            r.layer = match r.layer {
+                0 => Rule::UNLAYERED,
+                i => ranks[i as usize - 1],
+            };
+        }
+    }
+}
+
+fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>, keyframes: &mut Vec<crate::Keyframes>, layers: &mut Layers) {
     let b = css.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -340,16 +415,33 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>, keyframes: 
             let end = find_top(b, name_end, b";{}");
             let prelude = &css[name_end..end];
             if end >= b.len() || b[end] != b'{' {
-                // A statement at-rule (@import, @charset, @namespace)
+                // A statement at-rule (@import, @charset, @namespace);
+                // `@layer a, b;` sets the order of layers
+                if name == "layer" {
+                    for layer in prelude.split(',') {
+                        layers.declare(Some(layer));
+                    }
+                }
                 i = end + 1;
                 continue;
             }
             let block_end = skip_token(b, end);
             let block = &css[end + 1..block_end.saturating_sub(1).max(end + 1)];
             match name.as_str() {
-                "media" if media_matches(prelude, media) => parse_rules(block, media, out, keyframes),
-                "supports" if supports(prelude) => parse_rules(block, media, out, keyframes),
-                "layer" | "container" | "scope" | "document" | "-moz-document" | "starting-style" => parse_rules(block, media, out, keyframes),
+                "media" if media_matches(prelude, media) => parse_rules(block, media, out, keyframes, layers),
+                "supports" if supports(prelude) => parse_rules(block, media, out, keyframes, layers),
+                "layer" => {
+                    let layer = layers.declare(Some(prelude).filter(|p| !p.trim().is_empty()));
+                    let (outer, first) = (layers.current.replace(layer), out.len());
+                    parse_rules(block, media, out, keyframes, layers);
+                    layers.current = outer;
+                    for r in &mut out[first..] {
+                        if r.layer == 0 {
+                            r.layer = layer as u32 + 1;
+                        }
+                    }
+                }
+                "container" | "scope" | "document" | "-moz-document" | "starting-style" => parse_rules(block, media, out, keyframes, layers),
                 "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => keyframes.extend(keyframes_rule(prelude, block)),
                 _ => {}
             }
@@ -471,7 +563,7 @@ fn style_rule(texts: &[String], block: &str, media: &MediaContext, out: &mut Vec
     let mut selectors = selectors;
     selectors.shrink_to_fit();
     if !declarations.is_empty() || (nested.is_empty() && nested_at.is_empty()) {
-        out.push(Rule { selectors, declarations });
+        out.push(Rule { selectors, declarations, layer: 0 });
     }
     if depth > 16 {
         return;

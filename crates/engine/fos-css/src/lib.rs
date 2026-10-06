@@ -212,6 +212,15 @@ impl Stylesheet {
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// Its cascade layer's rank: rules of lower layers lose to those of
+    /// higher ones (and win when `!important`); [`Rule::UNLAYERED`] above
+    /// all layers
+    pub layer: u32,
+}
+
+impl Rule {
+    /// The layer rank of rules outside any `@layer`
+    pub const UNLAYERED: u32 = u32::MAX;
 }
 
 /// CSS selector with parsed components

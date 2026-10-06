@@ -353,12 +353,10 @@ impl Layers {
             None => name,
         };
         // A dotted name declares its ancestors first
-        if let Some((parent, _)) = full.rsplit_once('.') {
-            if !self.names.iter().any(|n| n == parent) {
-                let saved = self.current.take();
-                self.declare(Some(parent));
-                self.current = saved;
-            }
+        if let Some((parent, _)) = full.rsplit_once('.').filter(|(p, _)| !self.names.iter().any(|n| n == p)) {
+            let saved = self.current.take();
+            self.declare(Some(parent));
+            self.current = saved;
         }
         match self.names.iter().position(|n| *n == full) {
             Some(i) => i,

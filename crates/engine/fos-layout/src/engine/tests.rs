@@ -550,10 +550,10 @@ fn absolute_boxes_without_insets_stay_at_their_static_position() {
 fn balanced_text_evens_out_its_lines() {
     // Without balancing the last line holds one word; balanced, the lines
     // are about as long, and still centered in the full width
-    let words = "aaaa bbbb cccc dddd eeee";
+    let words = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii";
     let line_widths = |balance: bool| {
         let (mut tree, html, body) = doc();
-        let style = if balance { "width: 170px; font-size: 16px; text-align: center; text-wrap: balance" } else { "width: 170px; font-size: 16px; text-align: center" };
+        let style = if balance { "width: 200px; font-size: 16px; text-align: center; text-wrap: balance" } else { "width: 200px; font-size: 16px; text-align: center" };
         let p = el(&mut tree, body, "p", style);
         text(&mut tree, p, words);
         let t = layout(&tree, html, 800.0);
@@ -578,9 +578,9 @@ fn balanced_text_evens_out_its_lines() {
     assert!(plain.len() >= 2, "{plain:?}");
     let spread = |l: &[(f32, f32)]| l.iter().map(|x| x.1).fold(0.0, f32::max) - l.iter().map(|x| x.1).fold(f32::MAX, f32::min);
     assert!(spread(&balanced) < spread(&plain), "{plain:?} {balanced:?}");
-    // Centered in the 170px box (which starts at 8px)
+    // Centered in the 200px box (which starts at 8px)
     for (x, w) in balanced {
-        assert!((x + w / 2.0 - (8.0 + 85.0)).abs() < 1.0, "{x} {w}");
+        assert!((x + w / 2.0 - (8.0 + 100.0)).abs() < 1.0, "{x} {w}");
     }
 }
 

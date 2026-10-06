@@ -1587,14 +1587,15 @@ mod tests {
         let document = fos_html::parse_with_url(&html, "https://example.com/");
         let mut renderer = PageRenderer::new(200, 100);
         let before = renderer.render_document(&document, 0.0).unwrap();
-        assert_eq!(before.pixels[5 * 200 + 5], 0xffff0000);
+        // Sampled right of the row's number
+        assert_eq!(before.pixels[5 * 200 + 80], 0xffff0000);
         // Content below the box is clipped: the paragraph follows at 50px
         let s = document.get_element_by_id("s").unwrap();
         assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 30.0));
         assert_eq!(renderer.box_scroll(s), (0.0, 30.0));
         let after = renderer.render_document(&document, 0.0).unwrap();
         // Row 1 (blue) is now at the top
-        assert_eq!(after.pixels[5 * 200 + 5], 0xff0000ff);
+        assert_eq!(after.pixels[5 * 200 + 80], 0xff0000ff);
         // Clamped at the end (20 rows of 20px in a 50px box)
         assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 10_000.0));
         assert_eq!(renderer.box_scroll(s), (0.0, 350.0));

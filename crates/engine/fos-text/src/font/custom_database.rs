@@ -450,7 +450,8 @@ impl CustomFontDatabase {
         for family in &query.families {
             let generic = resolve_generic_family(family);
             if generic.is_empty() {
-                if let Some(id) = self.best_in_family(family, query) {
+                let aliases = super::matching::metric_aliases(family);
+                if let Some(id) = std::iter::once(family.as_str()).chain(aliases.iter().copied()).find_map(|f| self.best_in_family(f, query)) {
                     return Some(id);
                 }
             } else {

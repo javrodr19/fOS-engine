@@ -176,6 +176,39 @@ impl CustomFontDatabase {
         Ok(self.add_faces(faces, FontSource::Memory(FaceData::owned(data)))[0])
     }
 
+    /// Add a web font whose `@font-face` rule gives the weight range
+    /// `weights` (`font-weight: 200 900`). A variable face with a weight
+    /// axis joins once per weight in the range (each hundred, or the
+    /// range's start), as a static instance at that weight; another face
+    /// joins once, as regular when the range covers 400.
+    pub fn add_web_font_weights(&mut self, family: &str, weights: (u16, u16), style: FontStyle, data: Vec<u8>) -> Result<Vec<FontId>> {
+        let data = if super::woff2::is_woff2(&data) || super::woff::is_woff(&data) { decode_web_font(&data)? } else { data };
+        let (lo, hi) = (weights.0.min(weights.1), weights.0.max(weights.1));
+        let Some(_) = super::instance::weight_axis(&data, 0) else {
+            let weight = if (lo..=hi).contains(&400) { 400 } else { lo };
+            return Ok(vec![self.add_web_font(family, FontWeight(weight), style, data)?]);
+        };
+        let mut wanted: Vec<u16> = (1..=9).map(|h| h * 100).filter(|w| (lo..=hi).contains(w)).collect();
+        if wanted.is_empty() {
+            wanted.push(lo);
+        }
+        // Instancing touches every glyph: large faces get the common weights
+        if super::instance::glyph_count(&data, 0) > 4000 && wanted.len() > 2 {
+            let near = |t: u16| wanted.iter().copied().min_by_key(|w| w.abs_diff(t));
+            let mut few: Vec<u16> = [near(400), near(700)].into_iter().flatten().collect();
+            few.dedup();
+            wanted = few;
+        }
+        let mut ids = Vec::new();
+        for w in wanted {
+            match super::instance::instance_at_weight(&data, 0, w as f32) {
+                Some(instance) => ids.push(self.add_web_font(family, FontWeight(w), style, instance)?),
+                None => ids.push(self.add_web_font(family, FontWeight(w), style, data.clone())?),
+            }
+        }
+        Ok(ids)
+    }
+
     /// Create with system fonts loaded
     pub fn with_system_fonts() -> Self {
         let mut db = Self::new();

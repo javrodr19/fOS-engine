@@ -445,6 +445,24 @@ fn flex_justify_and_align() {
 }
 
 #[test]
+fn flex_row_in_a_min_height_container_fills_it() {
+    // A single row with an automatic height takes the container's min
+    // height (less its padding): items stretch to it and center in it
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; min-height: 300px; padding: 20px 0 30px; box-sizing: border-box");
+    let a = el(&mut tree, row, "div", "width: 50px");
+    let b = el(&mut tree, row, "div", "width: 50px; height: 50px; align-self: center");
+    let capped = el(&mut tree, body, "div", "display: flex; max-height: 40px");
+    let c = el(&mut tree, capped, "div", "width: 50px; height: 100px; align-self: flex-end");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, row).h, 300.0);
+    assert_eq!((rect_of(&t, a).y, rect_of(&t, a).h), (28.0, 250.0));
+    assert_eq!(rect_of(&t, b).y, 28.0 + 100.0);
+    // A max height caps the row: the item overflows it from its end
+    assert_eq!(rect_of(&t, c).y, rect_of(&t, capped).y + 40.0 - 100.0);
+}
+
+#[test]
 fn flex_wraps_columns_and_reverses() {
     let (mut tree, html, body) = doc();
     let row = el(&mut tree, body, "div", "display: flex; flex-wrap: wrap; width: 250px; gap: 10px");

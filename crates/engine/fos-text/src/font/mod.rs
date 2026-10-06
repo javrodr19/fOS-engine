@@ -23,6 +23,7 @@ mod custom_database;
 mod face;
 mod matching;
 pub mod variable;
+pub mod instance;
 pub mod emoji;
 pub mod optimization;
 

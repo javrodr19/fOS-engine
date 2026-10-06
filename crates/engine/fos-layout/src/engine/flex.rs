@@ -75,7 +75,9 @@ fn align_of(item: &Style, container: &Style) -> AlignItems {
 
 /// Lay out a flex container's items in its content box (`width` wide,
 /// `height` tall when definite)
-pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, _cb_w: f32) -> FlexLayout {
+/// `height_bounds` are the container's min and max content heights, which
+/// bound a single row's cross size when its height is automatic
+pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, height_bounds: (f32, f32)) -> FlexLayout {
     let bx = &style.box_;
     let row = bx.flex_direction.is_row();
     // Rows run from the right in right-to-left containers
@@ -276,8 +278,16 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         }
     }
     if !wrap {
-        if let Some(c) = cross_size {
-            line_cross[0] = c;
+        match cross_size {
+            Some(c) => line_cross[0] = c,
+            // A single row's container clamps it (a row in a min-height
+            // container stretches its items to that height)
+            None if row => {
+                if let Some(lc) = line_cross.first_mut() {
+                    *lc = lc.min(height_bounds.1).max(height_bounds.0);
+                }
+            }
+            None => {}
         }
     } else if let Some(c) = cross_size {
         // align-content: stretch (and normal) share leftover space

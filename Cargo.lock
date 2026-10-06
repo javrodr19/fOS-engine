@@ -965,6 +965,7 @@ dependencies = [
  "rustc-hash",
  "thiserror 2.0.17",
  "tiny-skia",
+ "ttf-parser",
  "wuff",
 ]
 

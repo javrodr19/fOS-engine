@@ -82,6 +82,11 @@ pub struct DomHost {
     layout: Option<Arc<crate::renderer::PageLayout>>,
     viewport: (f32, f32),
     scroll: (f32, f32),
+    /// The browser has told the page its viewport (later changes resize it)
+    viewport_known: bool,
+    /// `scroll` and `resize` events owed to the page, fired as the next task
+    pub(crate) scroll_event: bool,
+    pub(crate) resize_event: bool,
     /// Element boxes from `layout` (built on the first query after a layout)
     /// Element boxes where painted (scroll-dependent), and as laid out
     pub(crate) boxes: Option<HashMap<u32, [f32; 4]>>,
@@ -124,6 +129,9 @@ impl DomHost {
             viewport: (1024.0, 768.0),
             tag_protos: HashMap::new(),
             scroll: (0.0, 0.0),
+            viewport_known: false,
+            scroll_event: false,
+            resize_event: false,
             boxes: None,
             layout_boxes: None,
             scroll_request: None,
@@ -1034,16 +1042,21 @@ fn clear_timer(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResu
 
 /// Whether any timer is scheduled
 pub fn has_timers(vm: &Vm) -> bool {
-    vm.host_ref::<DomHost>().is_some_and(|h| !h.timers.is_empty())
+    vm.host_ref::<DomHost>().is_some_and(|h| !h.timers.is_empty() || h.scroll_event || h.resize_event)
 }
 
 /// When the earliest timer is due
 pub fn next_timer_due(vm: &Vm) -> Option<Instant> {
-    vm.host_ref::<DomHost>()?.timers.iter().map(|t| t.due).min()
+    let h = vm.host_ref::<DomHost>()?;
+    if h.scroll_event || h.resize_event {
+        return Some(Instant::now());
+    }
+    h.timers.iter().map(|t| t.due).min()
 }
 
 /// Run the callbacks of the timers that are due; errors go to the console
 pub fn run_due_timers(vm: &mut Vm) {
+    fire_view_events(vm);
     let now = Instant::now();
     // Timers are run in due order; ones added by callbacks wait for the
     // next call, like a browser's next task
@@ -1079,6 +1092,25 @@ pub fn run_due_timers(vm: &mut Vm) {
             }
         };
         if let Err(e) = result {
+            report_exception(vm, e);
+        }
+    }
+}
+
+/// Fire the `scroll` (at the document, bubbling to the window) and
+/// `resize` (at the window) events owed since the view last changed
+fn fire_view_events(vm: &mut Vm) {
+    let h = host(vm);
+    let (scroll, resize) = (std::mem::take(&mut h.scroll_event), std::mem::take(&mut h.resize_event));
+    let global = Value::object(vm.global);
+    let Ok(dispatch) = vm.get_str(global, "__fosDispatch") else { return };
+    let targets = [(resize, global, "resize"), (scroll, vm.get_str(global, "document").unwrap_or(Value::UNDEFINED), "scroll")];
+    for (owed, target, ty) in targets {
+        if !owed || !target.is_object() {
+            continue;
+        }
+        let ty = vm.str_value(ty);
+        if let Err(e) = vm.call_from_host(dispatch, Value::UNDEFINED, &[target, ty]) {
             report_exception(vm, e);
         }
     }
@@ -1556,6 +1588,10 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
     } else if moved || h.viewport != viewport {
         h.boxes = None;
     }
+    // Views change between tasks: the page hears of it in the next one
+    h.scroll_event |= h.scroll != scroll;
+    h.resize_event |= h.viewport_known && h.viewport != viewport;
+    h.viewport_known = true;
     h.viewport = viewport;
     h.scroll = scroll;
 }

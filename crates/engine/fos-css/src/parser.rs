@@ -512,12 +512,50 @@ fn supports(prelude: &str) -> bool {
 
 /// Whether a media query list matches (an empty list matches everything)
 pub fn media_matches(query: &str, ctx: &MediaContext) -> bool {
-    let q = strip_comments(query).to_ascii_lowercase();
+    let q = spaced_keywords(&strip_comments(query).to_ascii_lowercase());
     let q = q.trim();
     if q.is_empty() {
         return true;
     }
     split_top(q, b',').into_iter().any(|one| single_query(one.trim(), ctx))
+}
+
+/// `q` with the keywords spaced from the parentheses they touch:
+/// minifiers write `(min-width:1069px)and (min-height:776px)` and
+/// `screen and(color)`
+fn spaced_keywords(q: &str) -> String {
+    let b = q.as_bytes();
+    let word_at = |i: usize| -> Option<usize> {
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-') {
+            return None;
+        }
+        ["and", "or", "not", "only"]
+            .iter()
+            .find(|w| b[i..].starts_with(w.as_bytes()) && b.get(i + w.len()).is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'-')))
+            .map(|w| w.len())
+    };
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        match word_at(i) {
+            Some(n) => {
+                if out.ends_with(')') {
+                    out.push(' ');
+                }
+                out.push_str(&q[i..i + n]);
+                if b.get(i + n) == Some(&b'(') {
+                    out.push(' ');
+                }
+                i += n;
+            }
+            None => {
+                let c = q[i..].chars().next().unwrap_or(' ');
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 fn single_query(q: &str, ctx: &MediaContext) -> bool {
@@ -803,6 +841,57 @@ fn global_keyword(v: &str) -> Option<Keyword> {
     }
 }
 
+/// `value` with its `env()` references replaced: a desktop window has no
+/// safe-area, keyboard or title-bar insets, so those are `0px`; other
+/// variables take their fallback. `None` when one has neither (the
+/// declaration is invalid).
+fn substitute_env(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.to_ascii_lowercase().find("env(") {
+        let ident_before = rest[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+        if ident_before {
+            out.push_str(&rest[..i + 4]);
+            rest = &rest[i + 4..];
+            continue;
+        }
+        out.push_str(&rest[..i]);
+        let args_start = i + 4;
+        let mut depth = 1;
+        let mut end = None;
+        for (j, c) in rest[args_start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(args_start + j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let args = &rest[args_start..end];
+        let (var, fallback) = match split_top(args, b',').as_slice() {
+            [var] => (var.trim(), None),
+            [var, ..] => (var.trim(), Some(args[args.find(',')? + 1..].trim())),
+            [] => return None,
+        };
+        let var = var.to_ascii_lowercase();
+        let zero = ["safe-area-inset-", "safe-area-max-inset-", "keyboard-inset-", "titlebar-area-"].iter().any(|p| var.starts_with(p));
+        match (zero, fallback) {
+            (true, _) => out.push_str("0px"),
+            (false, Some(f)) => out.push_str(&substitute_env(f)?),
+            (false, None) => return None,
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>) {
     if !crate::longhand::is_known(name) {
         return;
@@ -810,6 +899,12 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
     // Values depending on custom properties or math functions are computed
     // per element, during the cascade
     let lower = value.to_ascii_lowercase();
+    if lower.contains("env(") {
+        if let Some(value) = substitute_env(value) {
+            convert(name, &value, important, out);
+        }
+        return;
+    }
     let has_var = lower.contains("var(");
     let has_math = ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&lower, f));
     // Math over a relative color's channels (`hsl(from red calc(h + 120)
@@ -828,7 +923,7 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
         return;
     }
     // `content` takes attr() itself
-    if lower.contains("env(") || (lower.contains("attr(") && name != "content") {
+    if lower.contains("attr(") && name != "content" {
         return;
     }
     crate::longhand::expand(name, value, important, out);
@@ -1410,6 +1505,36 @@ mod tests {
             let _ = media_matches(q, &ctx);
         }
         assert!(media_matches("screen and (min-width: 100px)", &ctx));
+    }
+
+    #[test]
+    fn env_variables() {
+        // Insets of a desktop window are zero; other variables take their
+        // fallback, and without one the declaration is invalid
+        let same = |a: &str, b: &str| assert_eq!(format!("{:?}", parse_declarations(a)), format!("{:?}", parse_declarations(b)), "{a}");
+        same("padding-left: env(safe-area-inset-left)", "padding-left: 0px");
+        same("padding: env(SAFE-AREA-INSET-TOP, 9px) 4px", "padding: 0px 4px");
+        same("margin-top: env(nope, env(nope2, 6px))", "margin-top: 6px");
+        same("padding-left: max(12px, env(safe-area-inset-left) - 12px)", "padding-left: max(12px, 0px - 12px)");
+        assert!(parse_declarations("margin-top: env(nope)").is_empty());
+        assert!(parse_declarations("margin-top: env(safe-area-inset-top").is_empty());
+    }
+
+    #[test]
+    fn minified_media_queries() {
+        // Keywords may touch the parentheses around them
+        let ctx = MediaContext { width: 1280.0, height: 800.0 };
+        let cases = [
+            ("(min-width:1069px)and (min-height:776px)", true),
+            ("(min-width:1069px)and(min-height:900px)", false),
+            ("screen and(min-width:1000px)", true),
+            ("not all and(max-width:1000px)", true),
+            ("(max-width:100px)or (orientation:landscape)", true),
+            ("(orientation:landscape)", true),
+        ];
+        for (q, want) in cases {
+            assert_eq!(media_matches(q, &ctx), want, "{q}");
+        }
     }
 
     #[test]

@@ -1968,6 +1968,34 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_and_resizing_fire_events() {
+        // The page hears of scrolls (at the document, bubbling to the
+        // window) and viewport changes in its next task, once per change
+        let (mut rt, doc) = page(
+            r#"<html><body><div style="height: 3000px"></div><script>
+            window.log = [];
+            window.addEventListener('scroll', e => log.push('w:' + e.type + '@' + scrollY));
+            document.addEventListener('scroll', e => log.push('d:' + e.type + ':' + e.bubbles));
+            window.onresize = () => log.push('resize:' + innerWidth);
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        let mut sync = |rt: &mut PageJsRuntime, viewport: (f32, f32), y: f32| {
+            rt.set_layout(renderer.layout_snapshot(), viewport, (0.0, y));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        };
+        sync(&mut rt, (800.0, 600.0), 0.0);
+        assert_eq!(rt.eval("log.join()").unwrap(), "");
+        sync(&mut rt, (800.0, 600.0), 400.0);
+        assert_eq!(rt.eval("log.join()").unwrap(), "d:scroll:true,w:scroll@400");
+        sync(&mut rt, (800.0, 600.0), 400.0);
+        sync(&mut rt, (700.0, 600.0), 400.0);
+        assert_eq!(rt.eval("log.join()").unwrap(), "d:scroll:true,w:scroll@400,resize:700");
+    }
+
+    #[test]
     fn client_rects_are_where_boxes_are_painted() {
         let (mut rt, doc) = page(
             r#"<html><body style="margin: 0">

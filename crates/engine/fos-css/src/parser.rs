@@ -512,12 +512,50 @@ fn supports(prelude: &str) -> bool {
 
 /// Whether a media query list matches (an empty list matches everything)
 pub fn media_matches(query: &str, ctx: &MediaContext) -> bool {
-    let q = strip_comments(query).to_ascii_lowercase();
+    let q = spaced_keywords(&strip_comments(query).to_ascii_lowercase());
     let q = q.trim();
     if q.is_empty() {
         return true;
     }
     split_top(q, b',').into_iter().any(|one| single_query(one.trim(), ctx))
+}
+
+/// `q` with the keywords spaced from the parentheses they touch:
+/// minifiers write `(min-width:1069px)and (min-height:776px)` and
+/// `screen and(color)`
+fn spaced_keywords(q: &str) -> String {
+    let b = q.as_bytes();
+    let word_at = |i: usize| -> Option<usize> {
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-') {
+            return None;
+        }
+        ["and", "or", "not", "only"]
+            .iter()
+            .find(|w| b[i..].starts_with(w.as_bytes()) && b.get(i + w.len()).is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'-')))
+            .map(|w| w.len())
+    };
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        match word_at(i) {
+            Some(n) => {
+                if out.ends_with(')') {
+                    out.push(' ');
+                }
+                out.push_str(&q[i..i + n]);
+                if b.get(i + n) == Some(&b'(') {
+                    out.push(' ');
+                }
+                i += n;
+            }
+            None => {
+                let c = q[i..].chars().next().unwrap_or(' ');
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 fn single_query(q: &str, ctx: &MediaContext) -> bool {
@@ -1410,6 +1448,23 @@ mod tests {
             let _ = media_matches(q, &ctx);
         }
         assert!(media_matches("screen and (min-width: 100px)", &ctx));
+    }
+
+    #[test]
+    fn minified_media_queries() {
+        // Keywords may touch the parentheses around them
+        let ctx = MediaContext { width: 1280.0, height: 800.0 };
+        let cases = [
+            ("(min-width:1069px)and (min-height:776px)", true),
+            ("(min-width:1069px)and(min-height:900px)", false),
+            ("screen and(min-width:1000px)", true),
+            ("not all and(max-width:1000px)", true),
+            ("(max-width:100px)or (orientation:landscape)", true),
+            ("(orientation:landscape)", true),
+        ];
+        for (q, want) in cases {
+            assert_eq!(media_matches(q, &ctx), want, "{q}");
+        }
     }
 
     #[test]

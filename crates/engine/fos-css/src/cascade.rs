@@ -196,6 +196,7 @@ impl StyleResolver {
         use crate::properties::{PropertyId, PropertyValue, Keyword};
         
         Stylesheet {
+            keyframes: Vec::new(),
             rules: vec![
                 // Block-level elements
                 Rule {

@@ -48,7 +48,7 @@ impl CssParser {
     /// Parse a CSS stylesheet (never fails: errors are skipped)
     pub fn parse(&self, css: &str) -> Result<Stylesheet, CssError> {
         let mut out = Stylesheet::new();
-        parse_rules(css, &self.media, &mut out.rules);
+        parse_rules(css, &self.media, &mut out.rules, &mut out.keyframes);
         Ok(out)
     }
 }
@@ -326,7 +326,7 @@ fn font_face(block: &str) -> Option<FontFace> {
 
 // ---- rules ----
 
-fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
+fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>, keyframes: &mut Vec<crate::Keyframes>) {
     let b = css.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -347,9 +347,10 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
             let block_end = skip_token(b, end);
             let block = &css[end + 1..block_end.saturating_sub(1).max(end + 1)];
             match name.as_str() {
-                "media" if media_matches(prelude, media) => parse_rules(block, media, out),
-                "supports" if supports(prelude) => parse_rules(block, media, out),
-                "layer" | "container" | "scope" | "document" | "-moz-document" | "starting-style" => parse_rules(block, media, out),
+                "media" if media_matches(prelude, media) => parse_rules(block, media, out, keyframes),
+                "supports" if supports(prelude) => parse_rules(block, media, out, keyframes),
+                "layer" | "container" | "scope" | "document" | "-moz-document" | "starting-style" => parse_rules(block, media, out, keyframes),
+                "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => keyframes.extend(keyframes_rule(prelude, block)),
                 _ => {}
             }
             i = block_end;
@@ -380,6 +381,46 @@ fn parse_rules(css: &str, media: &MediaContext, out: &mut Vec<Rule>) {
 /// own, with `&` standing for each parent selector (or the parent as an
 /// ancestor when there is none); nested `@media`/`@supports` blocks apply
 /// to the parent's selectors
+/// An `@keyframes` rule's name and keyframes (`from`, `to`, percentages,
+/// comma lists of them)
+fn keyframes_rule(prelude: &str, block: &str) -> Option<crate::Keyframes> {
+    let name = prelude.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let b = block.as_bytes();
+    let mut frames: Vec<(f32, Vec<Declaration>)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        i = skip_ws_and_comments(b, i);
+        if i >= b.len() {
+            break;
+        }
+        let end = find_top(b, i, b"{}");
+        if end >= b.len() || b[end] != b'{' {
+            break;
+        }
+        let selectors = &block[i..end];
+        let block_end = skip_token(b, end);
+        let body = &block[end + 1..block_end.saturating_sub(1).max(end + 1)];
+        let declarations = parse_declarations(body);
+        for sel in selectors.split(',') {
+            let sel = sel.trim().to_ascii_lowercase();
+            let offset = match sel.as_str() {
+                "from" => Some(0.0),
+                "to" => Some(1.0),
+                p => p.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).map(|n| n / 100.0),
+            };
+            if let Some(offset) = offset.filter(|o| (0.0..=1.0).contains(o)) {
+                frames.push((offset, declarations.clone()));
+            }
+        }
+        i = block_end;
+    }
+    frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Some(crate::Keyframes { name, frames })
+}
+
 fn style_rule(texts: &[String], block: &str, media: &MediaContext, out: &mut Vec<Rule>, depth: u32) {
     let selectors: Vec<Selector> = texts
         .iter()

@@ -195,7 +195,7 @@ impl PageStyles {
             selectors: Vec::new(),
             elements: Buckets::default(),
             generated: Buckets::default(),
-            stylesheet: Stylesheet { rules: Vec::new() },
+            stylesheet: Stylesheet::new(),
             has_host: false,
             has_slotted: false,
             has_part: false,
@@ -335,7 +335,7 @@ impl PageStyles {
 }
 
 /// The browser's default styles (`ua.css`), compiled once
-static UA: LazyLock<PageStyles> = LazyLock::new(|| PageStyles::new(fos_css::parse_stylesheet(include_str!("ua.css")).unwrap_or(Stylesheet { rules: Vec::new() })));
+static UA: LazyLock<PageStyles> = LazyLock::new(|| PageStyles::new(fos_css::parse_stylesheet(include_str!("ua.css")).unwrap_or(Stylesheet::new())));
 
 /// Presentational attributes (`bgcolor`, `align`, `width`, ...) as
 /// declarations, which rank just above the UA's styles
@@ -561,6 +561,8 @@ fn cascade_for(
         }
     }
     ordered.extend(inline.iter().filter(|d| !d.important));
+    // Animations override normal declarations, below `!important` ones
+    let normal_end = ordered.len();
     // `!important` declarations: inner trees' win
     if let Some((s, rules)) = &outer {
         for &rule in rules {
@@ -583,6 +585,28 @@ fn cascade_for(
     }
     let sized = ordered.iter().any(|d| d.property == fos_css::properties::PropertyId::FontSize);
     style.cascade(&ordered, parent, ctx, cache);
+    // A page is shown settled: animations that end holding their last
+    // keyframe (fade-ins that start transparent) show that keyframe
+    if style.box_.animation.is_some() {
+        let frames: Vec<&fos_css::Declaration> = style
+            .settled_animations()
+            .iter()
+            .filter_map(|(name, offset)| {
+                let kf = styles.and_then(|s| s.stylesheet.keyframes(name))?;
+                kf.frames.iter().filter(|(o, _)| (o - offset).abs() < 1e-4).last().map(|(_, d)| d)
+            })
+            .flatten()
+            .filter(|d| !d.important)
+            .collect();
+        if !frames.is_empty() {
+            let mut with_frames: Vec<&fos_css::Declaration> = Vec::with_capacity(ordered.len() + frames.len());
+            with_frames.extend_from_slice(&ordered[..normal_end]);
+            with_frames.extend(frames);
+            with_frames.extend_from_slice(&ordered[normal_end..]);
+            *style = Style::inherit_from(parent);
+            style.cascade(&with_frames, parent, ctx, cache);
+        }
+    }
     // Browsers' monospace quirk: text switching to the generic monospace
     // family without a size of its own is drawn at 13/16 of its size
     let mono = |s: &Style| matches!(&*s.inherited.font_family, [f] if f.eq_ignore_ascii_case("monospace"));

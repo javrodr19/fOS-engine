@@ -1312,6 +1312,31 @@ mod tests {
     }
 
     #[test]
+    fn test_animations_show_their_settled_state() {
+        // Shown settled: an animation that ends holding its last keyframe
+        // (a fade-in from transparent) shows that keyframe; others leave
+        // the element's own style
+        let cases = [
+            ("opacity: 0; animation: fade-in 0.5s ease-out 0.2s forwards", 0xff0000),
+            ("opacity: 0; animation-name: fade-in; animation-duration: 1s; animation-fill-mode: both", 0xff0000),
+            ("opacity: 0; animation: fade-in 1s", 0xffffff),
+            ("opacity: 0; animation: fade-in 1s infinite forwards", 0xffffff),
+            ("opacity: 0; animation: fade-out 1s reverse forwards", 0xff0000),
+            ("animation: fade-out 1s forwards", 0xffffff),
+        ];
+        for (css, want) in cases {
+            let html = format!(r#"<html><head><style>
+                @keyframes fade-in {{ from {{ opacity: 0; transform: translateY(20px) }} to {{ opacity: 1; transform: none }} }}
+                @media screen {{ @keyframes fade-out {{ 0% {{ opacity: 1 }} 100% {{ opacity: 0 }} }} }}
+                </style></head><body style="margin: 0"><div style="height: 20px; background: #f00; {css}"></div></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 20] & 0xffffff, want, "{css}");
+        }
+    }
+
+    #[test]
     fn test_inline_opacity_covers_its_contents() {
         // Opacity on an inline element fades the inline-blocks and blocks
         // inside it (an undefined custom element under :not(:defined))

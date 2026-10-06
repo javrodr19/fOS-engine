@@ -711,6 +711,9 @@ pub struct BoxStyle {
     /// (inheritance is left to the SVG renderer)
     pub svg_fill: Option<Arc<str>>,
     pub svg_stroke: Option<Arc<str>>,
+    /// `animation-name`, `-fill-mode`, `-iteration-count` and `-direction`
+    /// (comma lists, as declared)
+    pub animation: Option<Arc<[Arc<str>; 4]>>,
     /// The individual `translate`, `rotate` (radians) and `scale`
     pub translate: Option<(Lp, Lp)>,
     pub rotate: Option<f32>,
@@ -775,6 +778,7 @@ impl Default for BoxStyle {
             filter_brightness: 1.0,
             svg_fill: None,
             svg_stroke: None,
+            animation: None,
             translate: None,
             rotate: None,
             scale: None,
@@ -990,6 +994,41 @@ impl Style {
     pub fn has_transform(&self) -> bool {
         let b = &self.box_;
         b.transform.is_some() || b.translate.is_some() || b.rotate.is_some() || b.scale.is_some()
+    }
+
+    /// The animations that end and hold their last frame (`forwards` or
+    /// `both`, a finite iteration count): each one's name and the keyframe
+    /// offset it ends on (1, or 0 when it ends running in reverse)
+    pub fn settled_animations(&self) -> Vec<(Arc<str>, f32)> {
+        let Some(lists) = self.box_.animation.as_deref() else { return Vec::new() };
+        let split = |s: &Arc<str>| s.split(',').map(|p| p.trim().to_string()).collect::<Vec<_>>();
+        let (names, fills, counts, dirs) = (split(&lists[0]), split(&lists[1]), split(&lists[2]), split(&lists[3]));
+        let pick = |list: &[String], i: usize| list.get(i % list.len().max(1)).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            if name.is_empty() || name.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let fill = pick(&fills, i).to_ascii_lowercase();
+            if fill != "forwards" && fill != "both" {
+                continue;
+            }
+            let Ok(count) = pick(&counts, i).parse::<f32>() else { continue };
+            if !count.is_finite() || count < 0.0 {
+                continue;
+            }
+            // Ends on an even iteration: alternate directions finish where
+            // they started
+            let even = (count.ceil() as i64) % 2 == 0;
+            let offset = match pick(&dirs, i).to_ascii_lowercase().as_str() {
+                "reverse" => 0.0,
+                "alternate" if even => 0.0,
+                "alternate-reverse" if !even => 0.0,
+                _ => 1.0,
+            };
+            out.push((Arc::from(name.trim_matches(|c| c == '"' || c == '\'')), offset));
+        }
+        out
     }
 
     pub fn is_out_of_flow(&self) -> bool {
@@ -1450,6 +1489,18 @@ impl Style {
                     _ => {}
                 }
             }
+            PropertyId::AnimationName | PropertyId::AnimationFillMode | PropertyId::AnimationIterationCount | PropertyId::AnimationDirection => {
+                let PropertyValue::Transform(text) = v else { return };
+                let i = match id {
+                    PropertyId::AnimationName => 0,
+                    PropertyId::AnimationFillMode => 1,
+                    PropertyId::AnimationIterationCount => 2,
+                    _ => 3,
+                };
+                let mut lists = self.box_.animation.as_deref().cloned().unwrap_or_else(|| [Arc::from("none"), Arc::from("none"), Arc::from("1"), Arc::from("normal")]);
+                lists[i] = text.clone();
+                set!(box_, [animation], Some(Arc::new(lists)));
+            }
             PropertyId::Filter => {
                 let PropertyValue::Transform(text) = v else { return };
                 let (mut blur, mut brightness, mut opacity) = (0.0f32, 1.0f32, 1.0f32);
@@ -1879,6 +1930,7 @@ impl Style {
                 copy!(box_, [filter_blur]);
                 copy!(box_, [filter_brightness]);
             }
+            PropertyId::AnimationName | PropertyId::AnimationFillMode | PropertyId::AnimationIterationCount | PropertyId::AnimationDirection => copy!(box_, [animation]),
             PropertyId::Translate => copy!(box_, [translate]),
             PropertyId::Rotate => copy!(box_, [rotate]),
             PropertyId::Scale => copy!(box_, [scale]),

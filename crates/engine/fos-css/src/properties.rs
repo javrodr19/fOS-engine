@@ -172,6 +172,10 @@ pub enum PropertyId {
     MaskSize,
     MaskPosition,
     MaskRepeat,
+    AnimationName,
+    AnimationFillMode,
+    AnimationIterationCount,
+    AnimationDirection,
 }
 
 impl PropertyId {

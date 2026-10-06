@@ -56,6 +56,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "background" => &[BackgroundColor, BackgroundImage, BackgroundRepeat, BackgroundPosition, BackgroundSize],
         "mask" => &[MaskImage, MaskRepeat, MaskPosition, MaskSize],
+        "animation" | "-webkit-animation" => &[AnimationName, AnimationFillMode, AnimationIterationCount, AnimationDirection],
         "font" => &[FontStyle, FontWeight, FontSize, LineHeight, FontFamily],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
@@ -261,6 +262,10 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "mask-size" => MaskSize,
         "mask-position" => MaskPosition,
         "mask-repeat" => MaskRepeat,
+        "animation-name" | "-webkit-animation-name" => AnimationName,
+        "animation-fill-mode" | "-webkit-animation-fill-mode" => AnimationFillMode,
+        "animation-iteration-count" | "-webkit-animation-iteration-count" => AnimationIterationCount,
+        "animation-direction" | "-webkit-animation-direction" => AnimationDirection,
         _ => return None,
     })
 }
@@ -292,6 +297,10 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
         return false;
     }
     let handled = match name {
+        "animation" | "-webkit-animation" => {
+            animation_shorthand(value, important, out);
+            true
+        }
         "grid-row" | "grid-column" | "grid-area" | "grid-template" | "grid" => {
             if let Some(parts) = crate::grid::expand_shorthand(name, value.trim()) {
                 if parts.iter().all(|(n, v)| crate::grid::valid(n, v)) {
@@ -537,6 +546,9 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::CounterIncrement => counters(raw, 1).map(|c| PropertyValue::Counters(Arc::from(c))),
         // Kept as text and resolved per element (lengths need its font)
         P::Clip | P::ClipPath | P::ObjectPosition | P::Filter => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
+        // Comma-separated lists, combined when the cascade settles
+        // animations (see `Style::settled_animations`)
+        P::AnimationName | P::AnimationFillMode | P::AnimationIterationCount | P::AnimationDirection => Some(PropertyValue::Transform(Arc::from(raw.trim()))),
         // Kept as text for the SVG renderer: none, a color, currentColor
         P::Fill | P::Stroke => {
             let t = raw.trim();
@@ -1807,5 +1819,58 @@ mod tests {
         assert!(parse("color: notacolor; flex: a b").is_empty());
         // Unknown properties are not longhands
         assert!(parse("animation-name: x").iter().all(|(id, _)| *id != PropertyId::Width));
+    }
+}
+
+/// `animation`: each comma-separated layer's name, fill mode, iteration
+/// count and direction (durations, delays, timing functions and play state
+/// are not needed to know how an animation ends)
+fn animation_shorthand(value: &str, important: bool, out: Out) {
+    let (mut names, mut fills, mut counts, mut dirs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for layer in crate::parser::split_top(value.trim(), b',') {
+        let (mut name, mut fill, mut count, mut dir) = ("none".to_string(), "none", "1".to_string(), "normal");
+        let mut name_seen = false;
+        for token in crate::parser::split_top(layer.trim(), b' ').into_iter().map(str::trim).filter(|t| !t.is_empty()) {
+            let lower = token.to_ascii_lowercase();
+            match lower.as_str() {
+                "none" | "forwards" | "backwards" | "both" if lower != "none" || name_seen => {
+                    fill = match lower.as_str() {
+                        "forwards" => "forwards",
+                        "backwards" => "backwards",
+                        "both" => "both",
+                        _ => "none",
+                    };
+                }
+                "normal" | "reverse" | "alternate" | "alternate-reverse" => {
+                    dir = match lower.as_str() {
+                        "reverse" => "reverse",
+                        "alternate" => "alternate",
+                        "alternate-reverse" => "alternate-reverse",
+                        _ => "normal",
+                    };
+                }
+                "infinite" => count = "infinite".into(),
+                "running" | "paused" | "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end" => {}
+                _ if token.contains('(') => {}
+                _ if lower.ends_with("ms") || lower.ends_with('s') && lower[..lower.len() - 1].parse::<f32>().is_ok() => {}
+                _ if lower.parse::<f32>().is_ok() => count = lower.clone(),
+                _ => {
+                    name = token.trim_matches(|c| c == '"' || c == '\'').to_string();
+                    name_seen = true;
+                }
+            }
+        }
+        names.push(name);
+        fills.push(fill);
+        counts.push(count);
+        dirs.push(dir);
+    }
+    for (id, list) in [
+        (PropertyId::AnimationName, names.join(", ")),
+        (PropertyId::AnimationFillMode, fills.join(", ")),
+        (PropertyId::AnimationIterationCount, counts.join(", ")),
+        (PropertyId::AnimationDirection, dirs.join(", ")),
+    ] {
+        push(out, id, PropertyValue::Transform(Arc::from(list.as_str())), important);
     }
 }

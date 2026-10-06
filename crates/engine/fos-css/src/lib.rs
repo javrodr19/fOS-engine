@@ -175,11 +175,26 @@ pub fn parse_stylesheet_for(css: &str, media: MediaContext) -> Stylesheet {
 #[derive(Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@keyframes` rules by name (a later rule of a name replaces an
+    /// earlier one)
+    pub keyframes: Vec<Keyframes>,
+}
+
+/// An `@keyframes` rule: its keyframes by offset (0 to 1), in order
+#[derive(Debug, Clone)]
+pub struct Keyframes {
+    pub name: String,
+    pub frames: Vec<(f32, Vec<Declaration>)>,
 }
 
 impl Stylesheet {
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self { rules: Vec::new(), keyframes: Vec::new() }
+    }
+
+    /// The `@keyframes` rule named `name`
+    pub fn keyframes(&self, name: &str) -> Option<&Keyframes> {
+        self.keyframes.iter().rev().find(|k| k.name == name)
     }
     
     /// Number of rules

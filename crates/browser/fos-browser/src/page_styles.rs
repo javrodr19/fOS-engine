@@ -187,6 +187,9 @@ pub struct Scoped<'a> {
     /// The element is a part in a shadow tree, so its tree's
     /// `:host::part()` rules apply too
     pub own_part: bool,
+    /// The sheets of the trees enclosing a shadow tree's element, nearest
+    /// first: where `@keyframes` its tree lacks are found
+    pub outer: [Option<&'a PageStyles>; 4],
 }
 
 impl PageStyles {
@@ -592,7 +595,7 @@ fn cascade_for(
             .settled_animations()
             .iter()
             .filter_map(|(name, offset)| {
-                let kf = styles.and_then(|s| s.stylesheet.keyframes(name))?;
+                let kf = std::iter::once(styles).chain(scoped.outer).flatten().find_map(|s| s.stylesheet.keyframes(name))?;
                 kf.frames.iter().filter(|(o, _)| (o - offset).abs() < 1e-4).last().map(|(_, d)| d)
             })
             .flatten()

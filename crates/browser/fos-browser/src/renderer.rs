@@ -874,7 +874,14 @@ impl<'a> BrowserStyler<'a> {
             Some(h) if is_part => sheet_of(tree.tree_root(h)),
             _ => None,
         };
-        (own, crate::page_styles::Scoped { host, slotted, part, own_part: is_part })
+        let mut outer = [None; 4];
+        let mut tree_root = root;
+        for slot in &mut outer {
+            let Some(h) = tree.shadow_host(tree_root) else { break };
+            tree_root = tree.tree_root(h);
+            *slot = sheet_of(tree_root);
+        }
+        (own, crate::page_styles::Scoped { host, slotted, part, own_part: is_part, outer })
     }
 
     /// Styles of the elements of an inline SVG: those with fill or stroke
@@ -1333,6 +1340,22 @@ mod tests {
             let mut renderer = PageRenderer::new(40, 40);
             let page = renderer.render_document(&document, 0.0).unwrap();
             assert_eq!(page.pixels[10 * 40 + 20] & 0xffffff, want, "{css}");
+        }
+    }
+
+    #[test]
+    fn test_shadow_elements_use_the_documents_keyframes() {
+        // A shadow tree without the `@keyframes` its element names finds
+        // them in the document's sheet; its own win
+        let cases = [("", 0xff0000), ("@keyframes fade-in { to { opacity: 0 } }", 0xffffff)];
+        for (own, want) in cases {
+            let html = format!(r#"<html><head><style>@keyframes fade-in {{ from {{ opacity: 0 }} to {{ opacity: 1 }} }}</style></head>
+                <body style="margin: 0"><x-a><template shadowrootmode="open"><style>{own}</style>
+                <div style="height: 20px; background: #f00; opacity: 0; animation: fade-in 1s forwards"></div></template></x-a></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 20] & 0xffffff, want, "{own}");
         }
     }
 

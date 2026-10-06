@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use fos_css::properties::Color;
-use fos_css::style::{Direction, Style, TextAlign, VerticalAlign, Visibility, WordBreak};
+use fos_css::style::{Direction, Style, TextAlign, TextWrapStyle, VerticalAlign, Visibility, WordBreak};
 use fos_dom::NodeId;
 
 use super::block::{clips, intrinsic_outer, layout_block_level, relative_offset, Laid, LayoutCtx, Sizing};
@@ -155,6 +155,38 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
 
 /// The end of the line starting at piece `start` (greedy: as many
 /// pieces as fit in `avail`, breaking at the last opportunity)
+/// Lines `pieces` take at width `avail` (counting stops past `limit`)
+fn line_count(pieces: &[Piece], avail: f32, indent: f32, limit: usize) -> usize {
+    let (mut start, mut n) = (0, 0);
+    while start < pieces.len() && n <= limit {
+        start = next_line(pieces, start, avail, if n == 0 { indent } else { 0.0 }).max(start + 1);
+        n += 1;
+    }
+    n
+}
+
+/// Most lines `text-wrap: balance` evens out (as in browsers)
+const BALANCED_LINES: usize = 6;
+
+/// The width to break balanced text at: the narrowest that keeps its
+/// line count, so its lines come out about equally long
+fn balanced_width(pieces: &[Piece], avail: f32, indent: f32) -> f32 {
+    let n = line_count(pieces, avail, indent, BALANCED_LINES);
+    if !(2..=BALANCED_LINES).contains(&n) {
+        return avail;
+    }
+    let (mut lo, mut hi) = (avail / n as f32, avail);
+    for _ in 0..12 {
+        let mid = (lo + hi) / 2.0;
+        if line_count(pieces, mid, indent, n) <= n {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
 fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
     let mut x = indent;
     let mut last_opportunity: Option<usize> = None;
@@ -294,6 +326,8 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     // Inline boxes open across line ends: (style, node)
     let mut carried: Vec<(u32, NodeId)> = Vec::new();
     let full_avail = avail;
+    // Balanced text breaks as if narrower (and aligns in the full width)
+    let wrap = if container.inherited.text_wrap == TextWrapStyle::Balance && ctx.floats.is_empty() { balanced_width(&pieces, avail, indent) } else { avail };
     let mut start = 0;
     let mut li = 0;
     loop {
@@ -320,7 +354,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             }
         }
         let a = start;
-        let b = next_line(&pieces, start, avail, first_indent).max((start + 1).min(pieces.len()));
+        let b = next_line(&pieces, start, avail.min(wrap), first_indent).max((start + 1).min(pieces.len()));
         start = b;
         li += 1;
         let line = &pieces[a..b];

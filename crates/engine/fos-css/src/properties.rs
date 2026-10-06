@@ -64,6 +64,7 @@ pub enum PropertyId {
     LineHeight,
     LetterSpacing,
     WhiteSpace,
+    TextWrapStyle,
     
     // Visual
     Overflow,
@@ -193,6 +194,7 @@ impl PropertyId {
                 | Self::TextIndent
                 | Self::TextTransform
                 | Self::WhiteSpace
+                | Self::TextWrapStyle
                 | Self::LetterSpacing
                 | Self::WordSpacing
                 | Self::Visibility
@@ -265,6 +267,7 @@ impl PropertyId {
             "line-height" => Self::LineHeight,
             "letter-spacing" => Self::LetterSpacing,
             "white-space" => Self::WhiteSpace,
+            "text-wrap-style" => Self::TextWrapStyle,
             
             "overflow" => Self::Overflow,
             "overflow-x" => Self::OverflowX,

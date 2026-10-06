@@ -547,6 +547,44 @@ fn absolute_boxes_without_insets_stay_at_their_static_position() {
 }
 
 #[test]
+fn balanced_text_evens_out_its_lines() {
+    // Without balancing the last line holds one word; balanced, the lines
+    // are about as long, and still centered in the full width
+    let words = "aaaa bbbb cccc dddd eeee";
+    let line_widths = |balance: bool| {
+        let (mut tree, html, body) = doc();
+        let style = if balance { "width: 170px; font-size: 16px; text-align: center; text-wrap: balance" } else { "width: 170px; font-size: 16px; text-align: center" };
+        let p = el(&mut tree, body, "p", style);
+        text(&mut tree, p, words);
+        let t = layout(&tree, html, 800.0);
+        let mut lines: Vec<(f32, f32, f32)> = Vec::new();
+        t.for_each(|f| {
+            if let Fragment::Text(tf) = f {
+                match lines.iter_mut().find(|l| (l.0 - tf.rect.y).abs() < 1.0) {
+                    Some(l) => {
+                        l.1 = l.1.min(tf.rect.x);
+                        l.2 = l.2.max(tf.rect.x + tf.rect.w);
+                    }
+                    None => lines.push((tf.rect.y, tf.rect.x, tf.rect.x + tf.rect.w)),
+                }
+            }
+        });
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        lines.into_iter().map(|l| (l.1, l.2 - l.1)).collect::<Vec<_>>()
+    };
+    let plain = line_widths(false);
+    let balanced = line_widths(true);
+    assert_eq!(plain.len(), balanced.len());
+    assert!(plain.len() >= 2, "{plain:?}");
+    let spread = |l: &[(f32, f32)]| l.iter().map(|x| x.1).fold(0.0, f32::max) - l.iter().map(|x| x.1).fold(f32::MAX, f32::min);
+    assert!(spread(&balanced) < spread(&plain), "{plain:?} {balanced:?}");
+    // Centered in the 170px box (which starts at 8px)
+    for (x, w) in balanced {
+        assert!((x + w / 2.0 - (8.0 + 85.0)).abs() < 1.0, "{x} {w}");
+    }
+}
+
+#[test]
 fn floats_sit_side_by_side_and_text_wraps_around_them() {
     let (mut tree, html, body) = doc();
     let c = el(&mut tree, body, "div", "width: 400px");

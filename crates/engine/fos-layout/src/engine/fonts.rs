@@ -106,6 +106,8 @@ pub struct FontContext {
     fallback: HashMap<char, Option<FontId>>,
     /// Faces to try for fallback, best first (built on first need)
     fallback_order: Option<Vec<FontId>>,
+    /// (face, weight, size) -> the face to draw (a variable face's instance)
+    instances: HashMap<(FontId, u16, u16), FontId>,
 }
 
 impl Default for FontContext {
@@ -116,7 +118,7 @@ impl Default for FontContext {
 
 impl FontContext {
     pub fn new(db: Arc<FontDatabase>) -> Self {
-        FontContext { db, shaper: TextShaper::new(), selection: HashMap::new(), metrics: HashMap::new(), words: HashMap::new(), word_count: 0, fallback: HashMap::new(), fallback_order: None }
+        FontContext { db, shaper: TextShaper::new(), selection: HashMap::new(), metrics: HashMap::new(), words: HashMap::new(), word_count: 0, fallback: HashMap::new(), fallback_order: None, instances: HashMap::new() }
     }
 
     pub fn database(&self) -> &Arc<FontDatabase> {
@@ -146,7 +148,7 @@ impl FontContext {
                     if key.2 && face.style == fos_text::FontStyle::Normal {
                         synthesis |= fos_text::SYNTH_OBLIQUE;
                     }
-                    if key.1 >= 600 && face.weight.0 < 600 {
+                    if key.1 >= 600 && face.weights.1 < 600 {
                         synthesis |= fos_text::SYNTH_BOLD;
                     }
                 }
@@ -154,6 +156,12 @@ impl FontContext {
                 (id, synthesis)
             }
         };
+        // A variable face is drawn through its instance at the weight and
+        // (font-optical-sizing: auto) the size asked for
+        let id = id.map(|id| {
+            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16);
+            *self.instances.entry(key).or_insert_with(|| self.db.instance(id, key.1, key.2))
+        });
         let metrics = id.map_or(FontMetrics::FALLBACK, |id| self.metrics_of(id));
         ResolvedFont { id, size: i.font_size, metrics, synthesis }
     }

@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{FontStyle, FontWeight, FontQuery, resolve_generic_family};
 use crate::{Result, TextError};
@@ -92,6 +93,12 @@ pub struct FontEntry {
     pub style: FontStyle,
     /// Font weight
     pub weight: FontWeight,
+    /// The weights the face serves: its own, or for a variable face the
+    /// range of its weight axis (or of its `@font-face` rule)
+    pub weights: (u16, u16),
+    /// Whether the face is a variable TrueType face, drawn through static
+    /// instances (see [`CustomFontDatabase::instance`])
+    pub variable: bool,
     /// Font data source
     pub source: FontSource,
     /// Index in font file (for TTC)
@@ -138,6 +145,27 @@ pub struct CustomFontDatabase {
     /// Faces this database extends (a page's web fonts over the system's):
     /// its ids come first and its families after this database's
     base: Option<Arc<CustomFontDatabase>>,
+    /// Static instances of variable faces, made on first use
+    instances: Instances,
+}
+
+/// Instances of variable faces: entries in fixed slots (so references to
+/// them stay valid while more are added), by face and axis coordinates
+struct Instances {
+    slots: Box<[OnceLock<FontEntry>]>,
+    next: AtomicUsize,
+    made: Mutex<HashMap<(FontId, u16, u16), FontId>>,
+}
+
+/// Most instances a database makes (each is a copy of its face)
+const MAX_INSTANCES: usize = 64;
+/// Instance ids carry this bit; the slot is in the bits below
+const INSTANCE_ID: u32 = 1 << 30;
+
+impl Default for Instances {
+    fn default() -> Self {
+        Self { slots: (0..MAX_INSTANCES).map(|_| OnceLock::new()).collect(), next: AtomicUsize::new(0), made: Mutex::new(HashMap::new()) }
+    }
 }
 
 impl CustomFontDatabase {
@@ -147,12 +175,13 @@ impl CustomFontDatabase {
             fonts: Vec::new(),
             by_family: HashMap::new(),
             base: None,
+            instances: Instances::default(),
         }
     }
 
     /// A database adding faces to `base` without copying it
     pub fn overlay(base: Arc<CustomFontDatabase>) -> Self {
-        Self { fonts: Vec::new(), by_family: HashMap::new(), base: Some(base) }
+        Self { fonts: Vec::new(), by_family: HashMap::new(), base: Some(base), instances: Instances::default() }
     }
 
     /// Ids below this belong to the base
@@ -177,36 +206,68 @@ impl CustomFontDatabase {
     }
 
     /// Add a web font whose `@font-face` rule gives the weight range
-    /// `weights` (`font-weight: 200 900`). A variable face with a weight
-    /// axis joins once per weight in the range (each hundred, or the
-    /// range's start), as a static instance at that weight; another face
-    /// joins once, as regular when the range covers 400.
-    pub fn add_web_font_weights(&mut self, family: &str, weights: (u16, u16), style: FontStyle, data: Vec<u8>) -> Result<Vec<FontId>> {
-        let data = if super::woff2::is_woff2(&data) || super::woff::is_woff(&data) { decode_web_font(&data)? } else { data };
+    /// `weights` (`font-weight: 200 900`). A variable face serves the
+    /// weights of the range its axis covers (through instances made on
+    /// demand); another face is regular when the range covers 400.
+    pub fn add_web_font_weights(&mut self, family: &str, weights: (u16, u16), style: FontStyle, data: Vec<u8>) -> Result<FontId> {
         let (lo, hi) = (weights.0.min(weights.1), weights.0.max(weights.1));
-        let Some(_) = super::instance::weight_axis(&data, 0) else {
-            let weight = if (lo..=hi).contains(&400) { 400 } else { lo };
-            return Ok(vec![self.add_web_font(family, FontWeight(weight), style, data)?]);
+        let weight = if (lo..=hi).contains(&400) { 400 } else { lo };
+        let id = self.add_web_font(family, FontWeight(weight), style, data)?;
+        let entry = self.fonts.last_mut().filter(|e| e.id == id).expect("just added");
+        if entry.variable {
+            entry.weights = (lo, hi);
+        }
+        Ok(id)
+    }
+
+    /// The face to draw `id` with at weight `weight` and optical size
+    /// `opsz` (CSS pixels): for a variable face, its static instance at
+    /// those coordinates (made on first use); otherwise `id` itself, as
+    /// when the instances run out
+    pub fn instance(&self, id: FontId, weight: u16, opsz: u16) -> FontId {
+        let Some(font) = self.font(id).filter(|f| f.variable) else { return id };
+        let Some(axes) = self.with_face_data(id, super::instance::axes) else { return id };
+        let has = |tag: &[u8; 4]| axes.iter().any(|a| &a.0 == tag);
+        let weight = weight.clamp(font.weights.0.min(font.weights.1), font.weights.1.max(font.weights.0));
+        let key = (id, if has(b"wght") { weight } else { 0 }, if has(b"opsz") { opsz } else { 0 });
+        if key.1 == 0 && key.2 == 0 {
+            return id;
+        }
+        let mut made = self.instances.made.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&made) = made.get(&key) {
+            return made;
+        }
+        let slot = self.instances.next.load(Ordering::Relaxed);
+        let coords = [(*b"wght", key.1 as f32), (*b"opsz", key.2 as f32)];
+        let coords: Vec<_> = coords.into_iter().filter(|(t, v)| has(t) && *v > 0.0).collect();
+        let instance = (slot < MAX_INSTANCES)
+            .then(|| self.with_face_data(id, |data, index| super::instance::instance(data, index, &coords)).flatten())
+            .flatten();
+        let Some(instance) = instance else {
+            made.insert(key, id);
+            return id;
         };
-        let mut wanted: Vec<u16> = (1..=9).map(|h| h * 100).filter(|w| (lo..=hi).contains(w)).collect();
-        if wanted.is_empty() {
-            wanted.push(lo);
+        let instance_id = FontId(INSTANCE_ID | slot as u32);
+        let entry = FontEntry {
+            id: instance_id,
+            family: font.family.clone(),
+            full_name: font.full_name.clone(),
+            postscript_name: font.postscript_name.clone(),
+            style: font.style,
+            weight: if has(b"wght") { FontWeight(weight) } else { font.weight },
+            weights: (weight, weight),
+            variable: false,
+            source: FontSource::Memory(FaceData::owned(instance)),
+            index: 0,
+            has_glyf: true,
+            data: OnceLock::new(),
+        };
+        if self.instances.slots[slot].set(entry).is_err() {
+            return id;
         }
-        // Instancing touches every glyph: large faces get the common weights
-        if super::instance::glyph_count(&data, 0) > 4000 && wanted.len() > 2 {
-            let near = |t: u16| wanted.iter().copied().min_by_key(|w| w.abs_diff(t));
-            let mut few: Vec<u16> = [near(400), near(700)].into_iter().flatten().collect();
-            few.dedup();
-            wanted = few;
-        }
-        let mut ids = Vec::new();
-        for w in wanted {
-            match super::instance::instance_at_weight(&data, 0, w as f32) {
-                Some(instance) => ids.push(self.add_web_font(family, FontWeight(w), style, instance)?),
-                None => ids.push(self.add_web_font(family, FontWeight(w), style, data.clone())?),
-            }
-        }
-        Ok(ids)
+        self.instances.next.store(slot + 1, Ordering::Relaxed);
+        made.insert(key, instance_id);
+        instance_id
     }
 
     /// Create with system fonts loaded
@@ -367,6 +428,8 @@ impl CustomFontDatabase {
                 postscript_name: meta.postscript_name,
                 style: meta.style,
                 weight: meta.weight,
+                weights: meta.weights.unwrap_or((meta.weight.0, meta.weight.0)),
+                variable: meta.weights.is_some(),
                 source: source.clone(),
                 index,
                 has_glyf: meta.has_glyf,
@@ -419,6 +482,9 @@ impl CustomFontDatabase {
 
     /// Get font by ID
     pub fn font(&self, id: FontId) -> Option<&FontEntry> {
+        if id.0 & INSTANCE_ID != 0 {
+            return self.instances.slots.get((id.0 & !INSTANCE_ID) as usize)?.get();
+        }
         let first = self.first_id();
         if id.0 < first {
             return self.base.as_ref()?.font(id);
@@ -471,7 +537,13 @@ impl Default for CustomFontDatabase {
 
 /// How well a face matches the requested weight/style (lower is better)
 fn face_score(font: &FontEntry, query: &FontQuery) -> u32 {
-    let mut score = (font.weight.0 as i32 - query.weight.0 as i32).unsigned_abs();
+    // A variable face serves every weight in its range
+    let (lo, hi) = font.weights;
+    let mut score = if (lo..=hi).contains(&query.weight.0) {
+        0
+    } else {
+        (font.weight.0 as i32 - query.weight.0 as i32).unsigned_abs().min(lo.abs_diff(query.weight.0) as u32).min(hi.abs_diff(query.weight.0) as u32)
+    };
     if font.style != query.style {
         score += 1_000;
     }
@@ -563,6 +635,9 @@ struct FaceMetadata {
     postscript_name: Option<String>,
     style: FontStyle,
     weight: FontWeight,
+    /// For a variable TrueType face, its weight axis's range (or its own
+    /// weight, without a weight axis)
+    weights: Option<(u16, u16)>,
     has_glyf: bool,
 }
 
@@ -607,6 +682,7 @@ fn read_face_metadata<R: ReadAt>(src: &mut R, face_offset: u64) -> Option<FaceMe
     let mut os2 = None;
     let mut head = None;
     let mut has_glyf = false;
+    let mut fvar = None;
     for record in records.chunks_exact(16) {
         // Table offsets are relative to the start of the file, even in collections
         let location = (be_u32(record, 8)? as u64, be_u32(record, 12)? as usize);
@@ -615,6 +691,7 @@ fn read_face_metadata<R: ReadAt>(src: &mut R, face_offset: u64) -> Option<FaceMe
             b"OS/2" => os2 = Some(location),
             b"head" => head = Some(location),
             b"glyf" => has_glyf = true,
+            b"fvar" => fvar = Some(location),
             _ => {}
         }
     }
@@ -671,13 +748,29 @@ fn read_face_metadata<R: ReadAt>(src: &mut R, face_offset: u64) -> Option<FaceMe
         return None;
     }
 
+    // A variable face's weight range is its weight axis's
+    let weights = fvar.filter(|_| has_glyf).map(|(offset, len)| {
+        src.read_at(offset, len.min(4096)).and_then(|fvar| fvar_weights(&fvar)).unwrap_or((weight, weight))
+    });
+
     Some(FaceMetadata {
+        weights,
         full_name: names.full_name.unwrap_or_else(|| families[0].clone()),
         families,
         postscript_name: names.postscript_name,
         style,
         weight: FontWeight(weight),
         has_glyf,
+    })
+}
+
+/// The range of the `wght` axis in an `fvar` table
+fn fvar_weights(fvar: &[u8]) -> Option<(u16, u16)> {
+    let (axes_offset, count, size) = (be_u16(fvar, 4)? as usize, be_u16(fvar, 8)? as usize, be_u16(fvar, 10)? as usize);
+    (0..count).find_map(|i| {
+        let axis = fvar.get(axes_offset + i * size..axes_offset + i * size + 20)?;
+        let fixed = |at: usize| be_u32(axis, at).map(|v| (v as i32 >> 16).clamp(1, 1000) as u16);
+        (&axis[0..4] == b"wght").then(|| Some((fixed(4)?, fixed(12)?))).flatten()
     })
 }
 
@@ -924,5 +1017,33 @@ mod tests {
         let mut data = font_bytes("X", 400, false, true);
         data.truncate(20);
         assert!(db.load_font_data(data).is_err());
+    }
+
+    #[test]
+    fn variable_faces_are_drawn_through_instances_at_the_weight_asked_for() {
+        let mut db = CustomFontDatabase::new();
+        let id = db.add_web_font_weights("Brand", (100, 900), FontStyle::Normal, crate::font::instance::tests::variable_square()).unwrap();
+        let face = db.font(id).unwrap();
+        assert!(face.variable);
+        assert_eq!(face.weights, (100, 900));
+        // The one variable face serves every weight in its range
+        assert_eq!(db.query(&FontQuery::new(&["Brand"]).weight(FontWeight(900))), Some(id));
+        let width = |db: &CustomFontDatabase, id| {
+            db.with_face_data(id, |data, index| {
+                let face = ttf_parser::Face::parse(data, index).unwrap();
+                (face.glyph_bounding_box(ttf_parser::GlyphId(1)).unwrap().x_max, face.is_variable())
+            })
+        };
+        let bold = db.instance(id, 900, 16);
+        assert_ne!(bold, id);
+        assert_eq!(width(&db, bold), Some((200, false)));
+        assert_eq!(db.font(bold).unwrap().weight, FontWeight(900));
+        // Made once; the face has no optical size axis, so sizes share it
+        assert_eq!(db.instance(id, 900, 40), bold);
+        assert_eq!(width(&db, db.instance(id, 650, 16)), Some((150, false)));
+        // Weights outside the face's range are clamped to it
+        let mut narrow = CustomFontDatabase::new();
+        let id = narrow.add_web_font_weights("Brand", (100, 650), FontStyle::Normal, crate::font::instance::tests::variable_square()).unwrap();
+        assert_eq!(width(&narrow, narrow.instance(id, 900, 16)), Some((150, false)));
     }
 }

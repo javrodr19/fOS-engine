@@ -65,6 +65,7 @@ pub enum PropertyId {
     LetterSpacing,
     WhiteSpace,
     TextWrapStyle,
+    CaptionSide,
     
     // Visual
     Overflow,
@@ -195,6 +196,7 @@ impl PropertyId {
                 | Self::TextTransform
                 | Self::WhiteSpace
                 | Self::TextWrapStyle
+                | Self::CaptionSide
                 | Self::LetterSpacing
                 | Self::WordSpacing
                 | Self::Visibility
@@ -268,6 +270,7 @@ impl PropertyId {
             "letter-spacing" => Self::LetterSpacing,
             "white-space" => Self::WhiteSpace,
             "text-wrap-style" => Self::TextWrapStyle,
+            "caption-side" => Self::CaptionSide,
             
             "overflow" => Self::Overflow,
             "overflow-x" => Self::OverflowX,

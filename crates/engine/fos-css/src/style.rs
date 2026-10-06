@@ -243,6 +243,7 @@ css_enum!(BoxSizing { ContentBox = "content-box", BorderBox = "border-box" });
 css_enum!(Overflow { Visible = "visible", Hidden = "hidden", Clip = "clip", Scroll = "scroll", Auto = "auto" });
 css_enum!(Visibility { Visible = "visible", Hidden = "hidden", Collapse = "collapse" });
 css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent", WebkitCenter = "-webkit-center" });
+css_enum!(CaptionSide { Top = "top", Bottom = "bottom" });
 css_enum!(TextWrapStyle { Auto = "auto", Balance = "balance", Pretty = "pretty", Stable = "stable" });
 css_enum!(WhiteSpace { Normal = "normal", Pre = "pre", Nowrap = "nowrap", PreWrap = "pre-wrap", PreLine = "pre-line", BreakSpaces = "break-spaces" });
 
@@ -449,6 +450,8 @@ pub struct InheritedStyle {
     pub white_space: WhiteSpace,
     /// `text-wrap-style` (`balance` evens out the lines)
     pub text_wrap: TextWrapStyle,
+    /// Where a table's captions go
+    pub caption_side: CaptionSide,
     pub letter_spacing: f32,
     pub word_spacing: f32,
     pub visibility: Visibility,
@@ -476,6 +479,7 @@ impl Default for InheritedStyle {
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             text_wrap: TextWrapStyle::Auto,
+            caption_side: CaptionSide::Top,
             letter_spacing: 0.0,
             word_spacing: 0.0,
             visibility: Visibility::Visible,
@@ -1819,6 +1823,7 @@ impl Style {
             PropertyId::TextTransform => set!(inherited, [text_transform], enum_of!(TextTransform)),
             PropertyId::WhiteSpace => set!(inherited, [white_space], enum_of!(WhiteSpace)),
             PropertyId::TextWrapStyle => set!(inherited, [text_wrap], enum_of!(TextWrapStyle)),
+            PropertyId::CaptionSide => set!(inherited, [caption_side], enum_of!(CaptionSide)),
             PropertyId::LetterSpacing | PropertyId::WordSpacing => {
                 let px = match v {
                     PropertyValue::Keyword(Keyword::Normal) => 0.0,
@@ -1995,6 +2000,7 @@ impl Style {
             PropertyId::TextTransform => copy!(inherited, [text_transform]),
             PropertyId::WhiteSpace => copy!(inherited, [white_space]),
             PropertyId::TextWrapStyle => copy!(inherited, [text_wrap]),
+            PropertyId::CaptionSide => copy!(inherited, [caption_side]),
             PropertyId::LetterSpacing => copy!(inherited, [letter_spacing]),
             PropertyId::WordSpacing => copy!(inherited, [word_spacing]),
             PropertyId::Visibility => copy!(inherited, [visibility]),

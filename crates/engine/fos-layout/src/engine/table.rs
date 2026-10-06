@@ -6,7 +6,7 @@ use fos_css::style::{BorderCollapse, LpAuto, Style, TableLayout, VerticalAlign};
 use fos_dom::NodeId;
 
 use super::block::{content_size, intrinsic_outer, layout_sized, Forced, LayoutCtx, Sizing};
-use super::box_tree::{TableBox, TableCell};
+use super::box_tree::{LayoutBox, TableBox, TableCell};
 use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect};
 
 /// Cells placed in the grid: (row, column, cell)
@@ -183,8 +183,9 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
 
     let mut frags = Vec::new();
     let mut y = 0.0f32;
-    // Captions above the grid
-    for c in &t.captions {
+    // Captions above the grid (caption-side: bottom ones below it)
+    let bottom = |c: &&LayoutBox| c.style.inherited.caption_side == fos_css::style::CaptionSide::Bottom;
+    for c in t.captions.iter().filter(|c| !bottom(c)) {
         let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
         let top = laid.mt.size();
         laid.frag.translate(0.0, y + top);
@@ -275,5 +276,13 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             frags.push(Fragment::Box(row));
         }
     }
-    TableLayoutResult { frags, height: grid_bottom, width: used_width }
+    let mut y = grid_bottom;
+    for c in t.captions.iter().filter(bottom) {
+        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
+        let top = laid.mt.size();
+        laid.frag.translate(0.0, y + top);
+        y += top + laid.frag.border_box.h + laid.mb.size();
+        frags.push(Fragment::Box(laid.frag));
+    }
+    TableLayoutResult { frags, height: y, width: used_width }
 }

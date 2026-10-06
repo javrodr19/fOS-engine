@@ -660,6 +660,23 @@ fn tables_size_columns_from_content() {
 }
 
 #[test]
+fn table_captions_go_on_their_side() {
+    // A figure laid out as a table, its caption below its image
+    // (Wikipedia's thumbnails); a top caption stays above
+    let (mut tree, html, body) = doc();
+    let figure = el(&mut tree, body, "figure", "display: table; margin: 0");
+    let image = el(&mut tree, figure, "div", "width: 100px; height: 50px");
+    let below = el(&mut tree, figure, "figcaption", "display: table-caption; caption-side: bottom; height: 20px");
+    let above = el(&mut tree, figure, "figcaption", "display: table-caption; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let (img, b, a) = (rect_of(&t, image), rect_of(&t, below), rect_of(&t, above));
+    assert_eq!(a.y, 8.0);
+    assert!(img.y >= a.bottom(), "{a:?} {img:?}");
+    assert!(b.y >= img.bottom(), "{img:?} {b:?}");
+    assert_eq!(rect_of(&t, figure).bottom(), b.bottom());
+}
+
+#[test]
 fn table_spans_and_widths() {
     let (mut tree, html, body) = doc();
     let table = el(&mut tree, body, "table", "display: table; width: 400px; border-spacing: 0");

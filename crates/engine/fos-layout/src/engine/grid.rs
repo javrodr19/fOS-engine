@@ -344,9 +344,11 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
         t.limit = t.limit.max(t.base);
     }
     // Spanning items: what they need beyond their tracks goes evenly to
-    // the intrinsic ones
+    // the intrinsic ones. Items spanning a flexible track are left to the
+    // flexible tracks (they would otherwise inflate the auto tracks a
+    // later `fr` track should have grown into)
     for (&(s, e), &(cmin, cmax)) in spans.iter().zip(contrib) {
-        if e - s < 2 {
+        if e - s < 2 || tracks[s..e].iter().any(|t| t.flex().is_some()) {
             continue;
         }
         let gaps = gap * (e - s - 1) as f32;

@@ -344,6 +344,10 @@ impl BrowserApp {
         if let Some(waker) = self.network_waker.clone() {
             page.set_network_waker(waker);
         }
+        // Scripts see the real viewport from the start (pages pick their
+        // layout from innerWidth and matchMedia while loading)
+        self.sync_page_geometry();
+        let Some(page) = self.current_page.as_mut() else { return };
         let network = &mut self.network;
         let page_url = page.url.clone();
         if let Err(e) = page.execute_scripts_with(&mut PageFetcher { network, page_url: &page_url }) {

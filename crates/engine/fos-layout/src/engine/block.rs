@@ -385,7 +385,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             lines.height
         }
         BoxKind::Flex(items) => {
-            let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, cb_w);
+            let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
+            let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = flex.frags;
             flex.height
         }

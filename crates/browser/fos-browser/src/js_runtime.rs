@@ -2000,6 +2000,17 @@ mod tests {
     }
 
     #[test]
+    fn feature_detection_sees_a_desktop_browser() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // No touch screen (Modernizr's test), and SVG's factories exist
+        assert_eq!(
+            rt.eval("['ontouchstart' in window, 'ontouchstart' in document.documentElement, typeof document.createElementNS('http://www.w3.org/2000/svg', 'svg').createSVGRect].join()").unwrap(),
+            "false,false,function"
+        );
+    }
+
+    #[test]
     fn computed_styles_from_the_cascade() {
         let (mut rt, doc) = page(
             r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }

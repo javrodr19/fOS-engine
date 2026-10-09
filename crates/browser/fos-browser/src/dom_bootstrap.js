@@ -243,8 +243,10 @@
   }
   const eventTypes = ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout',
     'mouseenter', 'mouseleave', 'contextmenu', 'wheel', 'keydown', 'keyup', 'keypress', 'input', 'change',
-    'submit', 'reset', 'focus', 'blur', 'load', 'error', 'scroll', 'resize', 'touchstart', 'touchend',
-    'touchmove', 'pointerdown', 'pointerup', 'pointermove', 'animationend', 'transitionend', 'select',
+    // No ontouch*: desktop browsers without a touch screen leave them out,
+    // and pages test for them to pick their touch layouts
+    'submit', 'reset', 'focus', 'blur', 'load', 'error', 'scroll', 'resize',
+    'pointerdown', 'pointerup', 'pointermove', 'animationend', 'transitionend', 'select',
     'DOMContentLoaded', 'beforeunload', 'unload', 'hashchange', 'popstate', 'message', 'toggle',
     'abort', 'timeout', 'loadstart', 'progress', 'loadend', 'readystatechange'];
   for (const type of eventTypes) {
@@ -888,6 +890,16 @@
   makeInterface('SVGElement', HTMLElement, 'svg:*');
   makeInterface('SVGGraphicsElement', SVGElement, '');
   makeInterface('SVGSVGElement', SVGGraphicsElement, 'svg:svg');
+  // Factories of SVG's geometry types (pages test for createSVGRect to
+  // detect SVG support)
+  Object.assign(global.SVGSVGElement.prototype, {
+    createSVGRect() { return new global.DOMRect(); },
+    createSVGPoint() { return new global.DOMPoint(); },
+    createSVGMatrix() { return new global.DOMMatrix(); },
+    createSVGNumber() { return { value: 0 }; },
+    createSVGLength() { return { value: 0, unitType: 1, valueInSpecifiedUnits: 0, valueAsString: '0' }; },
+    createSVGTransform() { return { type: 1, matrix: new global.DOMMatrix(), angle: 0 }; },
+  });
 
   // Reflected attributes of particular elements
   const reflectOn = (names, props, descriptor) => {

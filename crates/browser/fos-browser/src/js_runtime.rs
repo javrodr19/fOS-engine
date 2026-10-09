@@ -503,6 +503,45 @@ impl PageJsRuntime {
         r.and_then(|v| v.strip_prefix("navigate:").map(str::to_string))
     }
 
+    /// Fire a simple event of type `ty` at `node` (an iframe's `load`)
+    pub fn fire_event(&mut self, node: NodeId, ty: &str) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        let target = dom_bindings::wrap(vm, node);
+        dispatch(vm, target, ty);
+        self.after_task();
+    }
+
+    /// The messages the page posted to other windows since last asked
+    pub fn take_messages(&mut self) -> Vec<crate::frames::Message> {
+        self.vm.as_mut().map(|vm| std::mem::take(&mut dom_bindings::host(vm).outbox)).unwrap_or_default()
+    }
+
+    /// Dispatch a `message` event from another window: `data` serialized,
+    /// `origin` the sender's, `from` the iframe whose frame sent it (`None`:
+    /// the parent)
+    pub fn deliver_message(&mut self, data: String, origin: String, from: Option<NodeId>) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        dom_bindings::receive_message(vm, data, origin, from);
+        let deliver = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosDeliverMessages");
+        if let Ok(f) = deliver {
+            if let Err(e) = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]) {
+                dom_bindings::report_exception(vm, e);
+            }
+        }
+        self.after_task();
+    }
+
+    /// Make this page a frame's: `window.parent` and `top` become the
+    /// parent window, reached through messages
+    pub fn become_frame(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            let f = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosBecomeFrame");
+            if let Ok(f) = f {
+                let _ = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]);
+            }
+        }
+    }
+
     /// Execute arbitrary JavaScript code; returns its value as text
     pub fn eval(&mut self, code: &str) -> Result<String, JsError> {
         let vm = self.vm.as_mut().ok_or_else(|| "No JavaScript context".to_string())?;

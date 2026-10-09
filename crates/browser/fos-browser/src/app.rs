@@ -362,6 +362,7 @@ impl BrowserApp {
         self.refresh_if_dom_changed();
         self.load_images();
         self.sync_frames();
+        self.process_frame_tasks();
         self.follow_script_navigation();
 
         // Build accessibility tree and extract media from DOM
@@ -406,11 +407,22 @@ impl BrowserApp {
         }
     }
 
-    /// Run the frames' due timers and finished requests
+    /// Run the frames' due timers and finished requests, then hand
+    /// messages and `load` events between the page and its frames
     fn process_frame_tasks(&mut self) {
-        if !self.frames.is_empty() && self.frames.process_tasks(&mut self.network) {
-            self.show_frame_pictures();
+        if self.frames.is_empty() {
+            return;
         }
+        self.frames.process_tasks(&mut self.network);
+        let parent_ran = match self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
+            Some(rt) => self.frames.exchange(rt, &self.current_url),
+            None => false,
+        };
+        if parent_ran {
+            self.refresh_if_dom_changed();
+            self.follow_script_navigation();
+        }
+        self.show_frame_pictures();
     }
 
     /// Re-render if the DOM changed since it was laid out (e.g. by a script)

@@ -3469,6 +3469,61 @@
     return mql;
   }
 
+  // ---- other windows: the parent's, frames' ----
+  //
+  // Windows in other runtimes are reached through the browser: postMessage
+  // serializes the message, and what comes back arrives as `message`
+  // events whose `source` is the same proxy object.
+  function serializeMessage(message) {
+    let s;
+    try {
+      s = JSON.stringify(message === undefined ? null : message);
+    } catch (e) {
+      throw new DOMException(`Failed to execute 'postMessage' on 'Window': ${e.message}`, 'DataCloneError');
+    }
+    return s === undefined ? 'null' : s;
+  }
+  function messageTargetOrigin(targetOrigin) {
+    if (targetOrigin && typeof targetOrigin === 'object') targetOrigin = targetOrigin.targetOrigin;
+    targetOrigin = targetOrigin === undefined ? '/' : String(targetOrigin);
+    return targetOrigin === '/' ? global.location.origin : targetOrigin;
+  }
+  class RemoteWindow {
+    constructor(isParent, iframe) {
+      Object.defineProperties(this, { _isParent: { value: isParent }, _iframe: { value: iframe } });
+    }
+    postMessage(message, targetOrigin) {
+      __fosPostMessage(this._isParent, this._iframe, serializeMessage(message), messageTargetOrigin(targetOrigin));
+    }
+    get window() { return this; }
+    get self() { return this; }
+    get frames() { return this; }
+    get parent() { return this._isParent ? this : global; }
+    get top() { return this._isParent ? this : global.top; }
+    get closed() { return false; }
+    get length() { return 0; }
+    get opener() { return null; }
+    get location() { throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError'); }
+    get document() { throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError'); }
+    focus() {}
+    blur() {}
+    close() {}
+  }
+  const contentWindows = new WeakMap();
+  Object.defineProperties(global.HTMLIFrameElement.prototype, {
+    contentWindow: {
+      get() {
+        if (!this.isConnected) return null;
+        let w = contentWindows.get(this);
+        if (!w) contentWindows.set(this, w = new RemoteWindow(false, this));
+        return w;
+      },
+      enumerable: true, configurable: true,
+    },
+    // Frames are other runtimes: their documents are out of reach
+    contentDocument: { get() { return null; }, enumerable: true, configurable: true },
+  });
+
   let rafId = 0;
   const rafs = new Map();
   define(global, {
@@ -3542,6 +3597,22 @@
       document.dispatchEvent(new Event('readystatechange'));
     },
     __fosSetCurrentScript(s) { currentScript = s; },
+    // This window is a frame's: its parent is another runtime's
+    __fosBecomeFrame() {
+      const parentWindow = new RemoteWindow(true, null);
+      for (const k of ['parent', 'top']) Object.defineProperty(global, k, { value: parentWindow, writable: true, configurable: true });
+    },
+    // Messages from other windows, as `message` events
+    __fosDeliverMessages() {
+      for (const [json, origin, iframe] of __fosTakeInbox()) {
+        let data;
+        try { data = JSON.parse(json); } catch { continue; }
+        const source = iframe ? iframe.contentWindow : global.parent;
+        const ev = new MessageEvent('message', { data, origin, source });
+        ev.isTrusted = true;
+        global.dispatchEvent(ev);
+      }
+    },
   });
   global.location = new Location();
   global.origin = global.location.origin;

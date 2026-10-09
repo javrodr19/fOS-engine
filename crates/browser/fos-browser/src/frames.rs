@@ -20,6 +20,41 @@ const MAX_FRAMES: usize = 16;
 /// Largest frame rendered, per side
 const MAX_SIDE: u32 = 4096;
 
+/// A message one window posted to another (`postMessage`), its data
+/// serialized
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub to: MessageTarget,
+    pub data: String,
+    /// Where it may go: `*`, or an origin (or URL) the receiver must have
+    pub target_origin: String,
+}
+
+/// Where a message goes, from the sender's side
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageTarget {
+    /// The window containing the sender's frame
+    Parent,
+    /// The frame of one of the sender's iframes
+    Frame(NodeId),
+}
+
+/// The serialized origin of `url` (`null` for opaque ones: data:, about:)
+pub fn origin_of(url: &str) -> String {
+    match fos_net::url_util::origin(url) {
+        Some((scheme, host, port)) if matches!(scheme.as_str(), "http" | "https") => {
+            let default = if scheme == "https" { 443 } else { 80 };
+            if port == default { format!("{scheme}://{host}") } else { format!("{scheme}://{host}:{port}") }
+        }
+        _ => "null".to_string(),
+    }
+}
+
+/// Whether a message for `target_origin` may reach a window of `origin`
+fn origin_allows(target_origin: &str, origin: &str) -> bool {
+    target_origin == "*" || origin_of(target_origin) == origin
+}
+
 /// What a frame shows
 #[derive(Clone, Debug, PartialEq)]
 enum Source {
@@ -45,6 +80,8 @@ pub struct Frames {
     frames: Vec<Frame>,
     /// The iframes whose pictures the parent was given
     shown: Vec<NodeId>,
+    /// Iframes whose frames loaded since the parent heard (`load` events)
+    loaded: Vec<NodeId>,
 }
 
 /// Fetches a frame's scripts through the browser's network stack
@@ -133,6 +170,9 @@ impl Frame {
         if scripts {
             frame.page.set_cookie_jar(network.cookie_jar().clone());
             if frame.page.initialize_javascript().is_ok() {
+                if let Some(rt) = frame.page.js_runtime.as_mut() {
+                    rt.become_frame();
+                }
                 frame.sync_geometry();
                 let url = frame.page.url.clone();
                 if let Err(e) = frame.page.execute_scripts_with(&mut FrameScripts { network, page_url: &url }) {
@@ -200,6 +240,7 @@ impl Frames {
     pub fn clear(&mut self) {
         self.frames.clear();
         self.shown.clear();
+        self.loaded.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -252,6 +293,7 @@ impl Frames {
                     if let Some(frame) = Frame::load(network, &parent_url, node, source, scripts, size) {
                         log::info!("Frame {} loaded in {:?}", frame.page.url, started.elapsed());
                         self.frames.push(frame);
+                        self.loaded.push(node);
                     }
                 }
             }
@@ -278,6 +320,52 @@ impl Frames {
             }
         }
         changed
+    }
+
+    /// Fire the `load` events of iframes whose frames loaded, and deliver
+    /// the messages the parent (`parent`, its page at `parent_url`) and the
+    /// frames posted to each other. Whether the parent's scripts ran (its
+    /// DOM may have changed).
+    pub fn exchange(&mut self, parent: &mut crate::js_runtime::PageJsRuntime, parent_url: &str) -> bool {
+        let mut parent_ran = false;
+        for node in std::mem::take(&mut self.loaded) {
+            parent.fire_event(node, "load");
+            parent_ran = true;
+        }
+        let parent_origin = origin_of(parent_url);
+        // Replies may follow replies; a few rounds settle them
+        for _ in 0..8 {
+            let mut moved = false;
+            for m in parent.take_messages() {
+                let MessageTarget::Frame(node) = m.to else { continue };
+                let Some(frame) = self.frames.iter_mut().find(|f| f.element == node) else { continue };
+                let origin = origin_of(&frame.page.url);
+                if let (true, Some(rt)) = (origin_allows(&m.target_origin, &origin), frame.page.js_runtime.as_mut()) {
+                    rt.deliver_message(m.data, parent_origin.clone(), None);
+                    moved = true;
+                }
+            }
+            for frame in &mut self.frames {
+                let origin = origin_of(&frame.page.url);
+                let Some(rt) = frame.page.js_runtime.as_mut() else { continue };
+                for m in rt.take_messages() {
+                    if m.to == MessageTarget::Parent && origin_allows(&m.target_origin, &parent_origin) {
+                        parent.deliver_message(m.data, origin.clone(), Some(frame.element));
+                        parent_ran = true;
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        for frame in &mut self.frames {
+            if frame.changed() {
+                frame.dirty = true;
+            }
+        }
+        parent_ran
     }
 
     /// When a frame's next timer is due
@@ -352,5 +440,40 @@ mod tests {
         let pictures = frames.pictures();
         assert!(pictures.iter().any(|(_, _, p)| p.is_none()));
         assert_eq!(frames.frames().len(), 1);
+    }
+
+    #[test]
+    fn windows_exchange_messages() {
+        let html = r#"<html><body>
+            <iframe id=f width=100 height=50 srcdoc="<p id=p>waiting</p><script>
+              addEventListener('message', (e) => { document.getElementById('p').textContent = e.data.reply + ' from ' + e.origin + ' ' + (e.source === parent); });
+              parent.postMessage({ hello: 'frame', top: top === parent, self: parent !== window }, '*');
+              parent.postMessage('lost', 'https://elsewhere.example');
+            </script>"></iframe>
+            <script>
+              window.got = [];
+              const f = document.getElementById('f');
+              f.addEventListener('load', () => got.push('load'));
+              addEventListener('message', (e) => {
+                got.push(JSON.stringify(e.data), e.origin, e.source === f.contentWindow);
+                e.source.postMessage({ reply: 'hi' }, '*');
+              });
+            </script></body></html>"#;
+        let mut parent = Page::from_html("https://example.com/", html);
+        let mut network = NetworkManager::new();
+        parent.initialize_javascript().unwrap();
+        parent.execute_scripts_with(&mut FrameScripts { network: &mut network, page_url: "https://example.com/" }).unwrap();
+        let doc = parent.document().unwrap();
+        let mut renderer = PageRenderer::new(400, 300);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        let mut frames = Frames::default();
+        frames.sync(&mut network, &doc, &renderer.layout_snapshot().unwrap());
+        let rt = parent.js_runtime.as_mut().unwrap();
+        assert!(frames.exchange(rt, "https://example.com/"));
+        assert_eq!(rt.eval("got.join('|')").unwrap(), r#"load|{"hello":"frame","top":true,"self":true}|https://example.com|true"#);
+        let frame_rt = frames.frames_mut()[0].page.js_runtime.as_mut().unwrap();
+        assert_eq!(frame_rt.eval("document.getElementById('p').textContent").unwrap(), "hi from https://example.com true");
+        // The reply changed the frame: a new picture is owed
+        assert_eq!(frames.pictures().len(), 1);
     }
 }

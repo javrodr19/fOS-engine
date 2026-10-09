@@ -1270,6 +1270,43 @@
     });
   }
 
+  // getComputedStyle: a live, read-only CSSStyleDeclaration of an
+  // element's resolved values (the renderer's styles, through its layout)
+  let computedNames = null;
+  function makeComputedDeclaration(el, pseudo) {
+    const names = () => (el.isConnected ? (computedNames ??= __fosComputedStyleNames()) : []);
+    const value = (name) => __fosComputedStyle(el, pseudo, normalizeProperty(name)) ?? '';
+    const readOnly = (what) => () => {
+      throw new DOMException(`Failed to execute '${what}' on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.`, 'NoModificationAllowedError');
+    };
+    const methods = {
+      getPropertyValue: (name) => value(name),
+      getPropertyPriority: () => '',
+      setProperty: readOnly('setProperty'),
+      removeProperty: readOnly('removeProperty'),
+      item: (i) => names()[i] ?? '',
+    };
+    return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
+      get(target, key) {
+        if (key === Symbol.iterator) return function* () { yield* names(); };
+        if (typeof key === 'symbol') return target[key];
+        if (key in methods) return methods[key];
+        if (key === 'length') return names().length;
+        if (key === 'cssText') return '';
+        if (key === 'parentRule') return null;
+        if (key === 'constructor') return CSSStyleDeclaration;
+        if (/^\d+$/.test(key)) return names()[+key];
+        if (key === 'cssFloat') key = 'float';
+        return value(key.startsWith('--') ? key : camelToKebab(key));
+      },
+      set(_, key) {
+        if (typeof key === 'symbol') return true;
+        readOnly('setProperty')();
+      },
+      has(_, key) { return typeof key === 'string'; },
+    });
+  }
+
   const ruleTypes = {
     STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, PAGE_RULE: 6,
     KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9, NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11,
@@ -3417,7 +3454,10 @@
     requestIdleCallback(cb) { return setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1); },
     cancelIdleCallback(id) { clearTimeout(id); },
     matchMedia,
-    getComputedStyle(el) { return el.style; },
+    getComputedStyle(el, pseudo) {
+      if (!(el instanceof Element)) throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+      return makeComputedDeclaration(el, pseudo == null ? '' : String(pseudo));
+    },
     getSelection() { return { rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }; },
     scrollTo(x, y) { __fosScrollTo(typeof x === 'object' && x ? (+x.top || 0) : (+y || 0)); },
     scroll(x, y) { global.scrollTo(x, y); },

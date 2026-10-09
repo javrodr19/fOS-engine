@@ -1933,6 +1933,35 @@ mod tests {
     }
 
     #[test]
+    fn computed_styles_from_the_cascade() {
+        let (mut rt, doc) = page(
+            r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }
+            #hidden { display: none } #hidden span { color: blue; font-size: 2em } p::before { content: "hi"; color: green }</style></head>
+            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(400, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (400.0, 600.0), (0.0, 0.0));
+        let cases = [
+            ("const cs = (id, pe) => getComputedStyle(document.getElementById(id), pe); const h = cs('h'); [h.display, h.getPropertyValue('color'), h.fontSize, h['margin-left']].join()", "flex,rgb(255, 0, 0),32px,90px"),
+            // Used sizes of rendered boxes
+            ("[h.width, h.paddingTop, h.boxSizing].join()", "200px,10px,content-box"),
+            // Inside display: none; a flex item; a pseudo-element; a variable
+            ("[cs('s').color, cs('s').fontSize, cs('i').display, cs('p', '::before').content, cs('p', ':before').color].join()", "rgb(0, 0, 255),32px,block,\"hi\",rgb(0, 128, 0)"),
+            ("getComputedStyle(document.documentElement).getPropertyValue('--brand')", "#0a0"),
+            // Live: a style change shows at once
+            ("document.getElementById('h').style.color = 'rgb(1, 2, 3)'; h.color", "rgb(1, 2, 3)"),
+            // Detached elements have none; the declaration is read-only
+            ("[getComputedStyle(document.createElement('div')).color, h.length > 50, h instanceof CSSStyleDeclaration].join()", ",true,true"),
+            ("try { h.color = 'red'; 'set' } catch (e) { e.name }", "NoModificationAllowedError"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
+    }
+
+    #[test]
     fn element_geometry_from_layout() {
         let (mut rt, doc) = page(
             r#"<html><body><p id=a>first paragraph</p><p id=b>second <span id=s>inner</span> text</p>

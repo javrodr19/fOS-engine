@@ -51,6 +51,7 @@ pub mod view_transitions;
 pub mod predictive;
 
 pub mod values;
+pub mod resolved;
 pub mod style;
 pub mod grid;
 pub mod transform;

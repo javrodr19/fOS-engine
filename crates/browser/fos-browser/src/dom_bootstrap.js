@@ -2754,10 +2754,19 @@
         terminate: () => { try { readController.close(); } catch {} writable._error(new TypeError('The transform stream has been terminated')); },
         get desiredSize() { return readController.desiredSize; },
       };
+      // A transformer that throws errors both sides (readers stop waiting)
+      const guarded = (f) => {
+        try {
+          return Promise.resolve(f()).catch((e) => { controller.error(e); throw e; });
+        } catch (e) {
+          controller.error(e);
+          return Promise.reject(e);
+        }
+      };
       writable = new WritableStream({
         start: () => transformer.start && transformer.start.call(transformer, controller),
-        write: (chunk) => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk)),
-        close: () => Promise.resolve(transformer.flush && transformer.flush.call(transformer, controller)).then(() => { try { readController.close(); } catch {} }),
+        write: (chunk) => guarded(() => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk))),
+        close: () => guarded(() => transformer.flush && transformer.flush.call(transformer, controller)).then(() => { try { readController.close(); } catch {} }),
         abort: (reason) => readController.error(reason),
       }, writableStrategy);
       Object.defineProperties(this, { readable: { value: readable, enumerable: true }, writable: { value: writable, enumerable: true } });
@@ -2783,6 +2792,27 @@
     }
     get encoding() { return this._decoder.encoding; }
   }
+
+  // CompressionStream and DecompressionStream: a readable and a writable
+  // side around a native gzip, zlib (`deflate`) or raw deflate coder
+  function codecSides(self, name, format, decompress) {
+    format = String(format);
+    if (!['gzip', 'deflate', 'deflate-raw'].includes(format)) {
+      throw new TypeError(`Failed to construct '${name}': Unsupported compression format: '${format}'`);
+    }
+    const id = __fosCodecNew(format, decompress);
+    const out = (c, bytes) => { if (bytes.byteLength) c.enqueue(new Uint8Array(bytes)); };
+    const t = new TransformStream({
+      transform(chunk, c) {
+        if (!(chunk instanceof ArrayBuffer || ArrayBuffer.isView(chunk))) throw new TypeError(`The provided value is not of type '(ArrayBuffer or ArrayBufferView)'`);
+        out(c, __fosCodecWrite(id, chunk));
+      },
+      flush(c) { out(c, __fosCodecFinish(id)); },
+    });
+    Object.defineProperties(self, { readable: { value: t.readable, enumerable: true }, writable: { value: t.writable, enumerable: true } });
+  }
+  class CompressionStream { constructor(format) { codecSides(this, 'CompressionStream', format, false); } }
+  class DecompressionStream { constructor(format) { codecSides(this, 'DecompressionStream', format, true); } }
 
   // Byte-stream sources a body or blob gives: one chunk, then done
   const bytesStream = (getBytes) => new ReadableStream({
@@ -2957,8 +2987,31 @@
 
   // A body given to Request, Response or XMLHttpRequest: its bytes (or
   // string) and the content type it implies
+  // A body given as a ReadableStream: read in full when consumed
+  class StreamBody { constructor(stream) { this.stream = stream; } }
+  async function readAllBytes(stream) {
+    const reader = stream.getReader();
+    const parts = [];
+    let size = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const bytes = typeof value === 'string' ? new TextEncoder().encode(value)
+        : value instanceof ArrayBuffer ? new Uint8Array(value)
+        : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : null;
+      if (!bytes) throw new TypeError('Failed to read the body: chunks must be Uint8Arrays');
+      parts.push(bytes);
+      size += bytes.byteLength;
+    }
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.byteLength; }
+    return out.buffer;
+  }
   function extractBody(body) {
     if (body == null) return { data: null, type: null };
+    if (body instanceof ReadableStream) return { data: new StreamBody(body), type: null };
     if (typeof body === 'string') return { data: body, type: 'text/plain;charset=UTF-8' };
     if (body instanceof URLSearchParams) return { data: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
     if (body instanceof FormData) return body._encode();
@@ -2971,7 +3024,7 @@
     _consume() {
       if (this.bodyUsed) return Promise.reject(new TypeError('Failed to execute: body stream already read'));
       this.bodyUsed = true;
-      return Promise.resolve(this._body);
+      return this._body instanceof StreamBody ? readAllBytes(this._body.stream) : Promise.resolve(this._body);
     },
     text() { return this._consume().then(b => b == null ? '' : typeof b === 'string' ? b : __fosDecode(b, 'utf-8')); },
     json() { return this.text().then(t => JSON.parse(t)); },
@@ -2987,6 +3040,7 @@
     },
     get body() {
       if (this._body == null) return null;
+      if (this._body instanceof StreamBody) return this._body.stream;
       if (!this._stream) {
         this._stream = bytesStream(() => {
           if (this.bodyUsed) return null;
@@ -3058,6 +3112,11 @@
       const r = Object.create(Response.prototype);
       slots.set(r, { ...slotOf(this) });
       Object.assign(r, this, { headers: new Headers(this.headers), bodyUsed: false, _stream: undefined });
+      if (this._body instanceof StreamBody) {
+        const [a, b] = this._body.stream.tee();
+        this._body = new StreamBody(a);
+        r._body = new StreamBody(b);
+      }
       return r;
     }
     static error() {
@@ -3096,6 +3155,11 @@
       let settled = false;
       const onAbort = () => { if (!settled) { settled = true; reject(signal.reason); } };
       if (signal) signal.addEventListener('abort', onAbort);
+      // Streamed uploads go once read
+      if (req._body instanceof StreamBody) {
+        readAllBytes(req._body.stream).then((bytes) => fetch(new Request(req, { body: bytes, method: req.method })).then(resolve, reject), reject);
+        return;
+      }
       __fosFetch(req.method, req.url, [...req.headers], req._body, req.mode, req.credentials, req.redirect, (err, r) => {
         if (signal) signal.removeEventListener('abort', onAbort);
         if (settled) return;
@@ -3440,7 +3504,7 @@
     EventTarget: EventTargetCtor,
     fetch, Headers, Request, Response, Blob, File, FormData, ReadableStream,
     ReadableStreamDefaultReader, ReadableStreamDefaultController, WritableStream, WritableStreamDefaultWriter,
-    TransformStream, TextEncoderStream, TextDecoderStream, MessageChannel, MessagePort,
+    TransformStream, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, MessageChannel, MessagePort,
     XMLHttpRequest, XMLHttpRequestUpload, XMLHttpRequestEventTarget,
     TextEncoder, TextDecoder,
     MutationObserver: noopObserver, IntersectionObserver: noopObserver, ResizeObserver: noopObserver,

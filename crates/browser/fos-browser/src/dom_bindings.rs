@@ -102,6 +102,9 @@ pub struct DomHost {
     /// The style `getComputedStyle` last resolved: element, pseudo-element,
     /// the DOM revision it holds for, and the style with its box
     computed: Option<ComputedEntry>,
+    /// Coders of `CompressionStream`s and `DecompressionStream`s, by id
+    pub(crate) codecs: HashMap<u32, crate::compression_streams::Codec>,
+    pub(crate) next_codec: u32,
     /// The browser's cookies (`document.cookie`; `fetch` shares them)
     cookies: fos_net::SharedCookieJar,
     /// The URL changed without a navigation (`history.pushState`)
@@ -142,6 +145,8 @@ impl DomHost {
             box_scroll_requests: Vec::new(),
             metrics: None,
             computed: None,
+            codecs: HashMap::new(),
+            next_codec: 1,
             cookies,
             url_changed: false,
             canvas: Default::default(),
@@ -1960,6 +1965,9 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosViewport", 0, viewport),
         ("__fosQuirks", 0, quirks),
         ("__fosComputedStyle", 3, computed_style),
+        ("__fosCodecNew", 2, crate::compression_streams::codec_new),
+        ("__fosCodecWrite", 2, crate::compression_streams::codec_write),
+        ("__fosCodecFinish", 1, crate::compression_streams::codec_finish),
         ("__fosComputedStyleNames", 0, computed_style_names),
         ("__fosScrollMetrics", 1, scroll_metrics),
         ("__fosSetBoxScroll", 3, set_box_scroll),

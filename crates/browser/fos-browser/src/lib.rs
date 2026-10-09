@@ -59,6 +59,7 @@ pub mod accessibility;
 /// Media element handling (video, audio)
 pub mod media;
 pub mod web_crypto;
+pub mod compression_streams;
 /// Canvas 2D script bindings
 pub mod canvas_bindings;
 /// Security policies (CSP, CORS, sandbox)

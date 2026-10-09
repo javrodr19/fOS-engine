@@ -1933,6 +1933,34 @@ mod tests {
     }
 
     #[test]
+    fn compression_streams_and_stream_bodies() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><script>window.R = 'pending';
+            (async () => {
+              const text = 'hello hello hello';
+              const packed = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer();
+              const back = await new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+              const gz = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).bytes();
+              let bad = 'none';
+              try { new CompressionStream('brotli'); } catch (e) { bad = e.name; }
+              let corrupt = 'none';
+              try { await new Response(new Blob(['not deflate']).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer(); } catch (e) { corrupt = e.name; }
+              const r = new Response(new Blob([text]).stream());
+              window.R = [packed.byteLength, back, gz[0], gz[1], bad, corrupt, r.body instanceof ReadableStream, await r.clone().text()].join();
+            })();</script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        for _ in 0..50 {
+            if rt.eval("R").unwrap() != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("R").unwrap(), "10,hello hello hello,31,139,TypeError,TypeError,true,hello hello hello");
+    }
+
+    #[test]
     fn computed_styles_from_the_cascade() {
         let (mut rt, doc) = page(
             r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }

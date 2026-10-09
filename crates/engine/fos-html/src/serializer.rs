@@ -261,6 +261,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_inner_html_keeps_whitespace_text() {
+        // Highlighted code: the newlines between token spans are its lines
+        let mut document = crate::parse("<html><body><pre id=p></pre><div id=d></div></body></html>");
+        let (p, d) = (document.get_element_by_id("p").unwrap(), document.get_element_by_id("d").unwrap());
+        let tree = document.tree_mut();
+        set_inner_html(tree, p, "<span>a</span>\n<span>b</span>\n\n<span>c</span>");
+        assert_eq!(tree.children(p).count(), 5);
+        set_inner_html(tree, d, "<span>a</span>\n<span>b</span>");
+        assert_eq!(tree.children(d).count(), 3);
+    }
+
+    #[test]
     fn test_escape_text() {
         let mut output = String::new();
         escape_text("Hello <world> & \"friends\"", &mut output);

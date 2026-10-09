@@ -41,7 +41,9 @@ impl HtmlParser {
 /// result's `<html>` element holds the fragment's nodes
 pub(crate) fn parse_fragment(html: &str, context: &str) -> Document {
     let name = html5ever::QualName::new(None, html5ever::ns!(html), LocalName::from(context.to_ascii_lowercase()));
-    html5ever::parse_fragment(DomSink::new("about:blank"), Default::default(), name, Vec::new(), true).one(html)
+    // Scripts made the markup: every text node is theirs to see
+    let sink = DomSink { keep_whitespace: true, ..DomSink::new("about:blank") };
+    html5ever::parse_fragment(sink, Default::default(), name, Vec::new(), true).one(html)
 }
 
 impl Default for HtmlParser {
@@ -122,6 +124,9 @@ struct DomSink {
     /// MathML `annotation-xml` elements that are HTML integration points
     integration_points: RefCell<HashSet<NodeId>>,
     quirks_mode: Cell<QuirksMode>,
+    /// Keep inter-element whitespace (fragments for `innerHTML`, whose
+    /// text nodes scripts count and whose newlines may be preformatted)
+    keep_whitespace: bool,
 }
 
 impl DomSink {
@@ -133,6 +138,7 @@ impl DomSink {
             template_contents: RefCell::new(HashMap::new()),
             integration_points: RefCell::new(HashSet::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            keep_whitespace: false,
         }
     }
 
@@ -203,7 +209,7 @@ impl TreeSink for DomSink {
             while child.is_valid() {
                 let Some(n) = tree.get(child) else { break };
                 match &n.data {
-                    NodeData::Text(t) if is_inter_element_whitespace(&t.content) && whitespace_is_insignificant(&tree, child) => droppable.push(child),
+                    NodeData::Text(t) if !self.keep_whitespace && is_inter_element_whitespace(&t.content) && whitespace_is_insignificant(&tree, child) => droppable.push(child),
                     NodeData::Element(_) | NodeData::Document => stack.push(child),
                     _ => {}
                 }

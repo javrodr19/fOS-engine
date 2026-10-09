@@ -318,7 +318,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     let container = &ic.styles[0];
     let indent = container.inherited.text_indent.resolve(avail);
     let root_font = fonts[0];
-    let root_lh = container.inherited.line_height.resolve(root_font.size);
+    let root_lh = root_font.line_height(container.inherited.line_height);
     let align = container.inherited.text_align;
 
     let mut frags: Vec<Fragment> = Vec::new();
@@ -512,7 +512,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                         let st = atomic_styles[*i];
                         let h = laid.mt.size() + laid.frag.border_box.h + laid.mb.size();
                         let bl = atomic_baseline(&laid);
-                        let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, st.inherited.line_height.resolve(st.font_size()));
+                        let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, ctx.fonts.resolve(st).line_height(st.inherited.line_height));
                         top = top.min(shift - bl);
                         bottom = bottom.max(shift - bl + h);
                         // Inside its inline box (whose opacity, filter...
@@ -692,7 +692,7 @@ fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont]
     let st = &ic.styles[style as usize];
     let font = fonts[style as usize];
     let pfont = fonts[parent.style as usize];
-    let lh = st.inherited.line_height.resolve(font.size);
+    let lh = font.line_height(st.inherited.line_height);
     let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, font.ascent(), font.ascent() + font.descent(), lh);
     let (t, b) = half_leading_extents(&font, lh, shift);
     *top = top.min(t);

@@ -81,12 +81,23 @@ pub struct ResolvedFont {
 }
 
 impl ResolvedFont {
+    /// Above the baseline, in whole pixels as browsers round font metrics
     pub fn ascent(&self) -> f32 {
-        self.metrics.ascent * self.size
+        (self.metrics.ascent * self.size).round()
     }
 
+    /// Below the baseline, in whole pixels
     pub fn descent(&self) -> f32 {
-        self.metrics.descent * self.size
+        (self.metrics.descent * self.size).round()
+    }
+
+    /// `line-height` in pixels: `normal` is the font's own line spacing
+    /// (ascent, descent and line gap, each rounded)
+    pub fn line_height(&self, lh: fos_css::style::LineHeight) -> f32 {
+        match lh {
+            fos_css::style::LineHeight::Normal => self.ascent() + self.descent() + (self.metrics.line_gap * self.size).round(),
+            other => other.resolve(self.size),
+        }
     }
 }
 

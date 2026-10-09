@@ -608,7 +608,7 @@ pub fn relative_offset(style: &Style, cb_w: f32, cb_h: Option<f32>) -> (f32, f32
 /// A replaced element's default size when it has no natural one
 fn default_replaced_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced) -> (f32, f32) {
     let font = ctx.fonts.resolve(style);
-    let line = style.inherited.line_height.resolve(font.size).max(font.ascent() + font.descent());
+    let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
     match &r.what {
         ReplacedWhat::TextField(..) => (font.size * 11.25, line),
         ReplacedWhat::Select(text) => (ctx.fonts.shape(&font, text).width + font.size * 1.5, line),

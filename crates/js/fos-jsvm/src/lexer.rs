@@ -143,8 +143,14 @@ fn is_whitespace(c: char) -> bool {
         || (c > '\u{7f}' && c.is_whitespace() && !is_line_terminator(c))
 }
 
+/// ID_Start (with `$` and `_`): letters, and the Other_ID_Start symbols
+/// such as `℘` and `℮` that minifiers use for short names (the kana voicing
+/// marks are the ID_Start characters neither letters nor XID_Start)
 pub fn is_id_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '$' || c == '_' || (c > '\u{7f}' && c.is_alphabetic())
+    c.is_ascii_alphabetic()
+        || c == '$'
+        || c == '_'
+        || (c > '\u{7f}' && (c.is_alphabetic() || unicode_ident::is_xid_start(c) || matches!(c, '\u{309b}' | '\u{309c}')))
 }
 
 pub fn is_id_continue(c: char) -> bool {
@@ -153,7 +159,7 @@ pub fn is_id_continue(c: char) -> bool {
         || c == '_'
         || c == '\u{200c}'
         || c == '\u{200d}'
-        || (c > '\u{7f}' && (c.is_alphanumeric() || unicode_mark_or_connector(c)))
+        || (c > '\u{7f}' && (c.is_alphanumeric() || unicode_mark_or_connector(c) || unicode_ident::is_xid_continue(c)))
 }
 
 /// Rough check for combining marks and connector punctuation, which may
@@ -804,6 +810,17 @@ mod tests {
         assert_eq!(toks("10n 0xffn"), vec![Tok::BigInt("10".into()), Tok::BigInt("255".into())]);
         assert!(Lexer::new("3in").next_token().is_err());
         assert!(Lexer::new("1__0").next_token().is_err());
+    }
+
+    #[test]
+    fn test_unicode_identifiers() {
+        // Letters, Other_ID_Start symbols (as minifiers emit them), marks
+        // after the start
+        assert_eq!(toks("π ℘ ℮x a\u{301} ゛"), vec![
+            Tok::Ident("π".into()), Tok::Ident("℘".into()), Tok::Ident("℮x".into()),
+            Tok::Ident("a\u{301}".into()), Tok::Ident("゛".into()),
+        ]);
+        assert!(Lexer::new("€").next_token().is_err());
     }
 
     #[test]

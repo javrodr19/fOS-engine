@@ -891,6 +891,7 @@ name = "fos-jsvm"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",
+ "unicode-ident",
 ]
 
 [[package]]

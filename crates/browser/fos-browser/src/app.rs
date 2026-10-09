@@ -632,6 +632,8 @@ impl BrowserApp {
                 let start = self.render_start_y;
                 self.rerender_at(start);
                 self.ensure_render_covers_scroll();
+                // Frames follow their iframes' new sizes
+                self.sync_frames();
             }
         }
 
@@ -983,6 +985,19 @@ impl BrowserApp {
         // handlers run first and decide whether a link is followed
         let doc_x = hit_x;
         let doc_y = content_y as f32 + self.scroll_offset;
+        // Clicks in a frame belong to its document
+        if let Some(iframe) = self.renderer.node_at(doc_x, doc_y).filter(|n| self.frames.has_frame(*n)) {
+            let content = self.renderer.layout_snapshot().and_then(|l| l.content_box(iframe));
+            if let Some(c) = content {
+                let top = self.frames.click(&mut self.network, iframe, doc_x - c.x, doc_y - c.y);
+                self.process_frame_tasks();
+                self.show_frame_pictures();
+                if let Some(url) = top {
+                    self.follow_link(&url);
+                }
+                return;
+            }
+        }
         let has_js = self.current_page.as_ref().is_some_and(|p| p.js_runtime.is_some());
         if has_js {
             if let Some(node) = self.renderer.node_at(doc_x, doc_y) {

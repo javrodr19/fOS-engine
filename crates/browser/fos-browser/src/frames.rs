@@ -66,7 +66,11 @@ enum Source {
 pub struct Frame {
     /// The iframe in the parent document
     pub element: NodeId,
+    /// What the iframe's attributes asked for (a link followed in the
+    /// frame shows another document, until they change)
     source: Source,
+    parent_url: String,
+    scripts: bool,
     pub page: Page,
     renderer: PageRenderer,
     size: (u32, u32),
@@ -165,7 +169,7 @@ impl Frame {
         page.stylesheets = crate::css_loader::load_for_page(network, &page);
         let mut renderer = PageRenderer::new(size.0, size.1);
         renderer.set_stylesheets(page.stylesheets.clone());
-        let mut frame = Frame { element, source, page, renderer, size, dirty: true };
+        let mut frame = Frame { element, source, parent_url: parent_url.to_string(), page, renderer, size, scripts, dirty: true };
         frame.render_document();
         if scripts {
             frame.page.set_cookie_jar(network.cookie_jar().clone());
@@ -368,6 +372,73 @@ impl Frames {
         parent_ran
     }
 
+    /// Whether iframe `iframe` shows a frame
+    pub fn has_frame(&self, iframe: NodeId) -> bool {
+        self.frames.iter().any(|f| f.element == iframe)
+    }
+
+    /// A click at (x, y) in the frame of `iframe` (frame coordinates): its
+    /// document's handlers run, and a link followed loads in the frame, or
+    /// is returned for the tab to follow (`target` `_top`, `_parent` or
+    /// `_blank`)
+    pub fn click(&mut self, network: &mut NetworkManager, iframe: NodeId, x: f32, y: f32) -> Option<String> {
+        let index = self.frames.iter().position(|f| f.element == iframe)?;
+        let frame = &mut self.frames[index];
+        let node = frame.renderer.node_at(x, y)?;
+        let href = match frame.page.js_runtime.is_some() {
+            true => frame.page.dispatch_click(node),
+            // Without scripts, links still work
+            false => frame.page.document().and_then(|doc| {
+                let doc = doc.lock().unwrap();
+                let tree = doc.tree();
+                let mut n = node;
+                while n.is_valid() {
+                    if tree.get(n).and_then(|e| e.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "a") {
+                        if let Some(h) = tree.get_attribute(n, "href") {
+                            return Some(fos_net::url_util::resolve(&crate::css_loader::base_url(&doc), h));
+                        }
+                    }
+                    n = tree.get(n).map_or(NodeId::NONE, |e| e.parent);
+                }
+                None
+            }),
+        };
+        if frame.changed() {
+            frame.dirty = true;
+        }
+        let href = href?;
+        if href.trim_start().to_ascii_lowercase().starts_with("javascript:") {
+            return None;
+        }
+        // The link's target: another browsing context, or this frame
+        let target = frame.page.document().and_then(|doc| {
+            let doc = doc.lock().unwrap();
+            let tree = doc.tree();
+            let mut n = node;
+            while n.is_valid() {
+                if let Some(t) = tree.get_attribute(n, "target").filter(|_| tree.get_attribute(n, "href").is_some()) {
+                    return Some(t.to_ascii_lowercase());
+                }
+                n = tree.get(n).map_or(NodeId::NONE, |e| e.parent);
+            }
+            None
+        });
+        if matches!(target.as_deref(), Some("_top" | "_parent" | "_blank")) {
+            return Some(href);
+        }
+        // Same-document fragments only scroll (not modeled in frames)
+        if href.split('#').next() == frame.page.url.split('#').next() && href.contains('#') {
+            return None;
+        }
+        let (element, source, parent_url, scripts, size) = (frame.element, frame.source.clone(), frame.parent_url.clone(), frame.scripts, frame.size);
+        if let Some(mut next) = Frame::load(network, &parent_url, element, Source::Url(href), scripts, size) {
+            next.source = source;
+            self.frames[index] = next;
+            self.loaded.push(element);
+        }
+        None
+    }
+
     /// When a frame's next timer is due
     pub fn next_timer_due(&self) -> Option<Instant> {
         self.frames.iter().filter_map(|f| f.page.next_timer_due()).min()
@@ -475,5 +546,33 @@ mod tests {
         assert_eq!(frame_rt.eval("document.getElementById('p').textContent").unwrap(), "hi from https://example.com true");
         // The reply changed the frame: a new picture is owed
         assert_eq!(frames.pictures().len(), 1);
+    }
+
+    #[test]
+    fn clicks_reach_frames() {
+        let (doc, renderer) = page_with(
+            r#"<html><body style="margin: 0"><iframe id=f style="border: 0; display: block" width=300 height=150 srcdoc="<body style='margin: 0'>
+              <div id=b style='height: 30px' onclick='this.textContent = &quot;clicked&quot;'>button</div>
+              <a href='data:text/html,<p>next page' style='display: block; height: 30px'>in frame</a>
+              <a href='https://example.org/' target=_top style='display: block; height: 30px'>top</a>"></iframe></body></html>"#,
+        );
+        let mut network = NetworkManager::new();
+        let mut frames = Frames::default();
+        frames.sync(&mut network, &doc, &renderer.layout_snapshot().unwrap());
+        let iframe = frames.frames()[0].element;
+        frames.pictures();
+        // A click runs the frame's handlers and repaints it
+        assert_eq!(frames.click(&mut network, iframe, 10.0, 10.0), None);
+        let text = |frames: &mut Frames| frames.frames_mut()[0].page.js_runtime.as_mut().unwrap().eval("document.body.textContent.trim().split(/\\s+/)[0]").unwrap();
+        assert_eq!(text(&mut frames), "clicked");
+        assert_eq!(frames.pictures().len(), 1);
+        // A link with target _top is the tab's to follow
+        assert_eq!(frames.click(&mut network, iframe, 10.0, 75.0).as_deref(), Some("https://example.org/"));
+        // Another link loads in the frame, which keeps it across syncs
+        assert_eq!(frames.click(&mut network, iframe, 10.0, 45.0), None);
+        assert!(frames.frames()[0].page.url.starts_with("data:"));
+        assert_eq!(text(&mut frames), "next");
+        frames.sync(&mut network, &doc, &renderer.layout_snapshot().unwrap());
+        assert!(frames.frames()[0].page.url.starts_with("data:"));
     }
 }

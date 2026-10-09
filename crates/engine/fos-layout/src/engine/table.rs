@@ -5,7 +5,7 @@
 use fos_css::style::{BorderCollapse, LpAuto, Style, TableLayout, VerticalAlign};
 use fos_dom::NodeId;
 
-use super::block::{content_size, intrinsic_outer, layout_sized, Forced, LayoutCtx, Sizing};
+use super::block::{content_size, intrinsic_content, intrinsic_outer, layout_sized, Forced, LayoutCtx, Sizing};
 use super::box_tree::{LayoutBox, TableBox, TableCell};
 use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect};
 
@@ -63,23 +63,54 @@ fn spacing(style: &Style, t: &TableBox) -> (f32, f32) {
 }
 
 /// Per column min- and max-content widths (cell border boxes)
+/// How a column's width is given: by its cells' `width` (a length or a
+/// percentage of the table), or by their content
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ColumnKind {
+    Auto,
+    Fixed,
+    Percent(f32),
+}
+
+/// Each column's kind, from its single-column cells (a percentage wins,
+/// then the largest)
+fn column_kinds(g: &Grid) -> Vec<ColumnKind> {
+    let mut kinds = vec![ColumnKind::Auto; g.cols];
+    for &(_, c, cell) in &g.cells {
+        if cell.colspan != 1 {
+            continue;
+        }
+        if let LpAuto::Lp(l) = cell.b.style.box_.width {
+            kinds[c] = match (kinds[c], l.has_percent()) {
+                (ColumnKind::Percent(p), true) => ColumnKind::Percent(p.max(l.pct)),
+                (ColumnKind::Percent(p), false) => ColumnKind::Percent(p),
+                (_, true) => ColumnKind::Percent(l.pct),
+                (_, false) => ColumnKind::Fixed,
+            };
+        }
+    }
+    kinds
+}
+
 fn column_widths(ctx: &mut LayoutCtx, g: &Grid) -> (Vec<f32>, Vec<f32>) {
     let mut min = vec![0.0f32; g.cols];
     let mut max = vec![0.0f32; g.cols];
     let mut spanning = Vec::new();
     for &(_, c, cell) in &g.cells {
         let (cmin, cmax) = intrinsic_outer(ctx, &cell.b);
-        // A fixed width is a floor for both
-        let fixed = match cell.b.style.box_.width {
-            LpAuto::Lp(l) if !l.has_percent() => {
-                let b = &cell.b.style;
-                let bp = b.border.width[1] + b.border.width[3] + b.box_.padding[1].resolve(0.0) + b.box_.padding[3].resolve(0.0);
-                Some(content_size(b, l.px, bp) + bp)
-            }
+        // A fixed width is a floor for both; content wider than it (an
+        // image in a narrow cell) widens the cell
+        let b = &cell.b.style;
+        let bp = b.border.width[1] + b.border.width[3] + b.box_.padding[1].resolve(0.0) + b.box_.padding[3].resolve(0.0);
+        let fixed = match b.box_.width {
+            LpAuto::Lp(l) if !l.has_percent() => Some(content_size(b, l.px, bp) + bp),
             _ => None,
         };
         let (cmin, cmax) = match fixed {
-            Some(w) => (cmin.max(w), cmin.max(w)),
+            Some(w) => {
+                let w = w.max(intrinsic_content(ctx, &cell.b).0 + bp);
+                (w, w)
+            }
             None => (cmin, cmax.max(cmin)),
         };
         if cell.colspan == 1 {
@@ -158,13 +189,29 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
         let share = ((avail - fixed) / n_auto).max(0.0);
         w.into_iter().map(|x| x.unwrap_or(share)).collect()
     } else if avail >= sum_max {
-        // Extra space goes to columns in proportion to their max widths
-        let extra = if auto_width { 0.0 } else { avail - sum_max };
-        if sum_max > 0.0 {
-            max.iter().map(|m| m + extra * m / sum_max).collect()
-        } else {
-            vec![avail / g.cols.max(1) as f32; g.cols]
+        // Percentage columns take their share of the table; the rest of
+        // the extra space goes to auto columns in proportion to their max
+        // widths (to fixed columns only when there are none)
+        let kinds = column_kinds(&g);
+        let mut w = max.clone();
+        if !auto_width {
+            for (i, k) in kinds.iter().enumerate() {
+                if let ColumnKind::Percent(p) = k {
+                    w[i] = w[i].max(avail * p / 100.0);
+                }
+            }
         }
+        let extra = if auto_width { 0.0 } else { (avail - w.iter().sum::<f32>()).max(0.0) };
+        let takers: Vec<usize> = [ColumnKind::Auto, ColumnKind::Fixed]
+            .iter()
+            .map(|want| (0..g.cols).filter(|&i| kinds[i] == *want).collect::<Vec<_>>())
+            .find(|v| !v.is_empty())
+            .unwrap_or_else(|| (0..g.cols).collect());
+        let base: f32 = takers.iter().map(|&i| w[i]).sum();
+        for &i in &takers {
+            w[i] += if base > 0.0 { extra * w[i] / base } else { extra / takers.len() as f32 };
+        }
+        w
     } else if sum_max > sum_min {
         let f = (avail - sum_min) / (sum_max - sum_min);
         min.iter().zip(&max).map(|(a, b)| a + (b - a) * f).collect()

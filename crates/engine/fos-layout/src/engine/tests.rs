@@ -677,6 +677,25 @@ fn table_captions_go_on_their_side() {
 }
 
 #[test]
+fn table_extra_width_goes_to_auto_columns() {
+    // A 600px table: the fixed column keeps its width, the percentage one
+    // gets its share, and the auto one the rest
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; width: 600px; border-spacing: 0");
+    let tr = el(&mut tree, table, "tr", "display: table-row");
+    let fixed = el(&mut tree, tr, "td", "display: table-cell; width: 18px; padding: 0 4px 0 0");
+    text(&mut tree, fixed, "Y");
+    let auto = el(&mut tree, tr, "td", "display: table-cell; padding: 0");
+    text(&mut tree, auto, "Hacker News");
+    let pct = el(&mut tree, tr, "td", "display: table-cell; width: 25%; padding: 0");
+    text(&mut tree, pct, "login");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, fixed).w, 22.0);
+    assert_eq!(rect_of(&t, pct).w, 150.0);
+    assert_eq!(rect_of(&t, auto).w, 600.0 - 22.0 - 150.0);
+}
+
+#[test]
 fn table_spans_and_widths() {
     let (mut tree, html, body) = doc();
     let table = el(&mut tree, body, "table", "display: table; width: 400px; border-spacing: 0");

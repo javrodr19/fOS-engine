@@ -345,14 +345,16 @@ static UA: LazyLock<PageStyles> = LazyLock::new(|| PageStyles::new(fos_css::pars
 
 /// Presentational attributes (`bgcolor`, `align`, `width`, ...) as
 /// declarations, which rank just above the UA's styles
-fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::Declaration> {
+fn presentational_hints(tree: &DomTree, node: NodeId, element: &ElementData) -> Vec<fos_css::Declaration> {
     let tag = tree.resolve(element.name.local);
     let relevant = matches!(
         tag,
         "body" | "table" | "tr" | "td" | "th" | "font" | "img" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "caption" | "canvas" | "video"
             | "iframe" | "embed" | "object" | "col" | "hr" | "thead" | "tbody" | "tfoot" | "input" | "textarea" | "select" | "legend"
     );
-    if !relevant || element.attrs.is_empty() {
+    // A cell takes its table's cellpadding and border attributes
+    let cell_hints = if matches!(tag, "td" | "th") { table_cell_hints(tree, node) } else { String::new() };
+    if !relevant || (element.attrs.is_empty() && cell_hints.is_empty()) {
         return Vec::new();
     }
     // A dimension attribute: a number of pixels or a percentage
@@ -362,7 +364,7 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
         let n: f32 = v[..end].parse().ok()?;
         Some(if v[end..].starts_with('%') { format!("{n}%") } else { format!("{n}px") })
     };
-    let mut css = String::new();
+    let mut css = cell_hints;
     for a in element.attrs.iter() {
         let value = a.value.trim();
         match (tree.resolve(a.name.local), tag) {
@@ -457,6 +459,39 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
     }
 }
 
+/// What a table cell takes from its table's attributes: `cellpadding` (its
+/// padding) and a nonzero `border` (a 1px inset border)
+fn table_cell_hints(tree: &DomTree, cell: NodeId) -> String {
+    let tag_of = |n: NodeId| tree.get(n).and_then(|x| x.as_element()).map(|e| tree.resolve(e.name.local));
+    let mut n = tree.get(cell).map_or(NodeId::NONE, |x| x.parent);
+    // The row, its group (if any), then the table
+    for _ in 0..3 {
+        match tag_of(n) {
+            Some("table") => break,
+            Some("tr" | "tbody" | "thead" | "tfoot") => n = tree.get(n).map_or(NodeId::NONE, |x| x.parent),
+            _ => return String::new(),
+        }
+    }
+    if tag_of(n) != Some("table") {
+        return String::new();
+    }
+    let mut css = String::new();
+    if let Some(p) = tree.get_attribute(n, "cellpadding") {
+        let p = p.trim();
+        let end = p.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(p.len());
+        if let Ok(v) = p[..end].parse::<f32>() {
+            css += &if p[end..].starts_with('%') { format!("padding: {v}%;") } else { format!("padding: {v}px;") };
+        }
+    }
+    if let Some(b) = tree.get_attribute(n, "border") {
+        let width = b.trim().parse::<f32>().unwrap_or(if b.trim().is_empty() { 1.0 } else { 0.0 });
+        if width > 0.0 {
+            css += "border: 1px inset gray;";
+        }
+    }
+    css
+}
+
 /// Style element `node`, starting from `style` (its inherited values):
 /// the UA's rules, presentational hints, the page's matching rules (if
 /// there is a stylesheet) and the `style` attribute's declarations
@@ -525,7 +560,7 @@ fn cascade_for(
     };
     let rules_of = |s: &PageStyles, scope: MatchScope| rules_in(s, &[scope]);
     let ua_rules = rules_of(ua, MatchScope::Normal);
-    let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
+    let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, node, element) };
     // A part's own tree's `:host::part()` rules rank with the tree's others
     let own_scopes: &[MatchScope] = if scoped.own_part { &[MatchScope::Normal, MatchScope::HostPart] } else { &[MatchScope::Normal] };
     let rules = styles.map_or(Vec::new(), |s| rules_in(s, own_scopes));

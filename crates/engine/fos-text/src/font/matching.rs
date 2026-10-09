@@ -53,10 +53,24 @@ impl Default for FontQuery {
 }
 
 /// Resolve generic font family to system families
+/// Faces drawn in place of a common family a system lacks: free faces with
+/// the same metrics (as fontconfig substitutes them), so text takes the
+/// space a page was designed for
+pub fn metric_aliases(family: &str) -> &'static [&'static str] {
+    match family.to_lowercase().as_str() {
+        "arial" | "helvetica" => &["Liberation Sans", "Arimo"],
+        "times new roman" | "times" => &["Liberation Serif", "Tinos"],
+        "courier new" | "courier" => &["Liberation Mono", "Cousine"],
+        _ => &[],
+    }
+}
+
 pub fn resolve_generic_family(family: &str) -> &[&str] {
     match family.to_lowercase().as_str() {
-        "serif" => &["Times New Roman", "Times", "DejaVu Serif", "Noto Serif"],
-        "sans-serif" => &["Arial", "Helvetica", "DejaVu Sans", "Noto Sans", "Liberation Sans"],
+        // As browsers default to (Arial and Times New Roman, or their
+        // metric-compatible stand-ins)
+        "serif" => &["Times New Roman", "Times", "Liberation Serif", "Tinos", "DejaVu Serif", "Noto Serif"],
+        "sans-serif" => &["Arial", "Helvetica", "Liberation Sans", "Arimo", "DejaVu Sans", "Noto Sans"],
         "monospace" => &["Courier New", "Consolas", "DejaVu Sans Mono", "Noto Sans Mono"],
         "cursive" => &["Comic Sans MS", "Brush Script MT"],
         "fantasy" => &["Impact", "Papyrus"],

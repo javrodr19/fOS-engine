@@ -54,6 +54,7 @@ serde_json = "1.0"
 getrandom = "0.2"
 # crypto.subtle (the TLS stack already builds it)
 ring = "0.17"
+flate2 = "1"
 
 # Logging
 log = "0.4"

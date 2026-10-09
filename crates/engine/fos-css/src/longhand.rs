@@ -218,6 +218,9 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "text-indent" => TextIndent,
         "text-transform" => TextTransform,
         "white-space" => WhiteSpace,
+        // text-wrap's mode is white-space's business; its style is ours
+        "text-wrap" | "text-wrap-style" => TextWrapStyle,
+        "caption-side" => CaptionSide,
         "letter-spacing" => LetterSpacing,
         "word-spacing" => WordSpacing,
         "visibility" => Visibility,
@@ -632,6 +635,20 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         }
         P::TextTransform => enum_value::<TextTransform>(v.split_whitespace().next().unwrap_or("")),
         P::WhiteSpace => white_space(v),
+        P::CaptionSide => enum_value::<CaptionSide>(match v {
+            "block-start" => "top",
+            "block-end" => "bottom",
+            other => other,
+        }),
+        // text-wrap: the style among the mode and style it gives
+        P::TextWrapStyle => {
+            let words: Vec<&str> = v.split_whitespace().filter(|w| !matches!(*w, "wrap" | "nowrap")).collect();
+            match words.as_slice() {
+                [] => enum_value::<TextWrapStyle>("auto"),
+                [style] => enum_value::<TextWrapStyle>(style),
+                _ => None,
+            }
+        }
         P::LetterSpacing | P::WordSpacing => {
             if v == "normal" {
                 Some(PropertyValue::Keyword(Keyword::Normal))
@@ -675,7 +692,7 @@ macro_rules! css_enum_impl {
     };
 }
 css_enum_impl!(
-    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextTransform, FontStyle, BorderStyle, ListStyleType,
+    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
     ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
 );
@@ -1760,6 +1777,20 @@ mod tests {
         assert_eq!(s.inherited.letter_spacing, 2.0);
         assert_eq!(s.box_.text_decoration_line, decoration::UNDERLINE);
         assert_eq!(s.box_.text_decoration_style, TextDecorationStyle::Dotted);
+    }
+
+    #[test]
+    fn text_wrap_style() {
+        for (css, want) in [
+            ("text-wrap: balance", TextWrapStyle::Balance),
+            ("text-wrap: wrap balance", TextWrapStyle::Balance),
+            ("text-wrap-style: pretty", TextWrapStyle::Pretty),
+            ("text-wrap: nowrap", TextWrapStyle::Auto),
+            ("text-wrap: balance; text-wrap: wrap", TextWrapStyle::Auto),
+            ("text-wrap: balance pretty", TextWrapStyle::Auto),
+        ] {
+            assert_eq!(computed(css).inherited.text_wrap, want, "{css}");
+        }
     }
 
     #[test]

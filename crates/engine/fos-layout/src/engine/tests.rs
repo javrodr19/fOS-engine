@@ -547,6 +547,44 @@ fn absolute_boxes_without_insets_stay_at_their_static_position() {
 }
 
 #[test]
+fn balanced_text_evens_out_its_lines() {
+    // Without balancing the last line holds one word; balanced, the lines
+    // are about as long, and still centered in the full width
+    let words = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii";
+    let line_widths = |balance: bool| {
+        let (mut tree, html, body) = doc();
+        let style = if balance { "width: 200px; font-size: 16px; text-align: center; text-wrap: balance" } else { "width: 200px; font-size: 16px; text-align: center" };
+        let p = el(&mut tree, body, "p", style);
+        text(&mut tree, p, words);
+        let t = layout(&tree, html, 800.0);
+        let mut lines: Vec<(f32, f32, f32)> = Vec::new();
+        t.for_each(|f| {
+            if let Fragment::Text(tf) = f {
+                match lines.iter_mut().find(|l| (l.0 - tf.rect.y).abs() < 1.0) {
+                    Some(l) => {
+                        l.1 = l.1.min(tf.rect.x);
+                        l.2 = l.2.max(tf.rect.x + tf.rect.w);
+                    }
+                    None => lines.push((tf.rect.y, tf.rect.x, tf.rect.x + tf.rect.w)),
+                }
+            }
+        });
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        lines.into_iter().map(|l| (l.1, l.2 - l.1)).collect::<Vec<_>>()
+    };
+    let plain = line_widths(false);
+    let balanced = line_widths(true);
+    assert_eq!(plain.len(), balanced.len());
+    assert!(plain.len() >= 2, "{plain:?}");
+    let spread = |l: &[(f32, f32)]| l.iter().map(|x| x.1).fold(0.0, f32::max) - l.iter().map(|x| x.1).fold(f32::MAX, f32::min);
+    assert!(spread(&balanced) < spread(&plain), "{plain:?} {balanced:?}");
+    // Centered in the 200px box (which starts at 8px)
+    for (x, w) in balanced {
+        assert!((x + w / 2.0 - (8.0 + 100.0)).abs() < 1.0, "{x} {w}");
+    }
+}
+
+#[test]
 fn floats_sit_side_by_side_and_text_wraps_around_them() {
     let (mut tree, html, body) = doc();
     let c = el(&mut tree, body, "div", "width: 400px");
@@ -619,6 +657,42 @@ fn tables_size_columns_from_content() {
     let tr = rect_of(&t, table);
     assert!((tr.right() - r(1).right() - 2.0).abs() < 0.01);
     assert!(tr.w < 400.0);
+}
+
+#[test]
+fn table_captions_go_on_their_side() {
+    // A figure laid out as a table, its caption below its image
+    // (Wikipedia's thumbnails); a top caption stays above
+    let (mut tree, html, body) = doc();
+    let figure = el(&mut tree, body, "figure", "display: table; margin: 0");
+    let image = el(&mut tree, figure, "div", "width: 100px; height: 50px");
+    let below = el(&mut tree, figure, "figcaption", "display: table-caption; caption-side: bottom; height: 20px");
+    let above = el(&mut tree, figure, "figcaption", "display: table-caption; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let (img, b, a) = (rect_of(&t, image), rect_of(&t, below), rect_of(&t, above));
+    assert_eq!(a.y, 8.0);
+    assert!(img.y >= a.bottom(), "{a:?} {img:?}");
+    assert!(b.y >= img.bottom(), "{img:?} {b:?}");
+    assert_eq!(rect_of(&t, figure).bottom(), b.bottom());
+}
+
+#[test]
+fn table_extra_width_goes_to_auto_columns() {
+    // A 600px table: the fixed column keeps its width, the percentage one
+    // gets its share, and the auto one the rest
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; width: 600px; border-spacing: 0");
+    let tr = el(&mut tree, table, "tr", "display: table-row");
+    let fixed = el(&mut tree, tr, "td", "display: table-cell; width: 18px; padding: 0 4px 0 0");
+    text(&mut tree, fixed, "Y");
+    let auto = el(&mut tree, tr, "td", "display: table-cell; padding: 0");
+    text(&mut tree, auto, "Hacker News");
+    let pct = el(&mut tree, tr, "td", "display: table-cell; width: 25%; padding: 0");
+    text(&mut tree, pct, "login");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, fixed).w, 22.0);
+    assert_eq!(rect_of(&t, pct).w, 150.0);
+    assert_eq!(rect_of(&t, auto).w, 600.0 - 22.0 - 150.0);
 }
 
 #[test]
@@ -709,6 +783,24 @@ fn grid_areas_lines_and_spans() {
     // Stretched to the row that main made 80px tall
     assert_eq!(rect_of(&t, nav), Rect::new(8.0, 58.0, 100.0, 80.0));
     assert_eq!(rect_of(&t, foot), Rect::new(8.0, 138.0, 400.0, 20.0));
+}
+
+#[test]
+fn shrink_wrapped_grid_of_flexible_columns_fits_its_content() {
+    // A grid of minmax(0, 1fr) columns, shrink-wrapped (a centered flex
+    // column's item), is as wide as an item spanning them needs
+    let (mut tree, html, body) = doc();
+    let col = el(&mut tree, body, "div", "display: flex; flex-direction: column; align-items: center");
+    let grid = el(&mut tree, col, "div", "display: grid; grid-template-columns: repeat(4, minmax(0, 1fr))");
+    let item = el(&mut tree, grid, "div", "grid-column: span 4; width: 200px; height: 10px");
+    let single = el(&mut tree, col, "div", "display: grid; grid-template-columns: 1fr 2fr");
+    let a = el(&mut tree, single, "div", "width: 30px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, grid).w, 200.0);
+    assert_eq!(rect_of(&t, item).w, 200.0);
+    // One item per track: each fr is what the largest needs per fr
+    assert_eq!(rect_of(&t, single).w, 90.0);
+    assert_eq!(rect_of(&t, a).w, 30.0);
 }
 
 #[test]

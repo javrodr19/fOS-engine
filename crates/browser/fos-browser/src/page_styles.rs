@@ -24,6 +24,8 @@ struct CompiledSelector {
     specificity: Specificity,
     /// Index of the rule in the stylesheet (also its source order)
     rule: u32,
+    /// The rule's cascade layer rank (lower layers lose)
+    layer: u32,
     /// Key hashes the element's ancestors must carry
     ancestors: Box<[u32]>,
 }
@@ -243,6 +245,7 @@ impl PageStyles {
                     selector: list,
                     specificity: selector.specificity,
                     rule: rule_index as u32,
+                    layer: rule.layer,
                     ancestors,
                 });
             }
@@ -314,20 +317,20 @@ impl PageStyles {
         // The universal list is long and already sorted, so it is merged in
         // unsorted
         let universal = buckets.universal.iter().copied().filter(|i| candidates.binary_search(i).is_err());
-        let mut matched: Vec<(Specificity, u32)> = candidates
+        let mut matched: Vec<(u32, Specificity, u32)> = candidates
             .iter()
             .copied()
             .chain(universal)
             .map(|i| &self.selectors[i as usize])
             .filter(|c| filter.is_none_or(|f| c.ancestors.iter().all(|&h| f.may_contain(h))))
             .filter(|c| test(&c.selector))
-            .map(|c| (c.specificity, c.rule))
+            .map(|c| (c.layer, c.specificity, c.rule))
             .collect();
         matched.sort_unstable();
         // Several selectors of one rule may match: the rule applies once,
         // at its highest specificity
         let mut rules: Vec<u32> = Vec::with_capacity(matched.len());
-        for &(_, rule) in matched.iter().rev() {
+        for &(_, _, rule) in matched.iter().rev() {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -342,14 +345,16 @@ static UA: LazyLock<PageStyles> = LazyLock::new(|| PageStyles::new(fos_css::pars
 
 /// Presentational attributes (`bgcolor`, `align`, `width`, ...) as
 /// declarations, which rank just above the UA's styles
-fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::Declaration> {
+fn presentational_hints(tree: &DomTree, node: NodeId, element: &ElementData) -> Vec<fos_css::Declaration> {
     let tag = tree.resolve(element.name.local);
     let relevant = matches!(
         tag,
         "body" | "table" | "tr" | "td" | "th" | "font" | "img" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "caption" | "canvas" | "video"
             | "iframe" | "embed" | "object" | "col" | "hr" | "thead" | "tbody" | "tfoot" | "input" | "textarea" | "select" | "legend"
     );
-    if !relevant || element.attrs.is_empty() {
+    // A cell takes its table's cellpadding and border attributes
+    let cell_hints = if matches!(tag, "td" | "th") { table_cell_hints(tree, node) } else { String::new() };
+    if !relevant || (element.attrs.is_empty() && cell_hints.is_empty()) {
         return Vec::new();
     }
     // A dimension attribute: a number of pixels or a percentage
@@ -359,7 +364,7 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
         let n: f32 = v[..end].parse().ok()?;
         Some(if v[end..].starts_with('%') { format!("{n}%") } else { format!("{n}px") })
     };
-    let mut css = String::new();
+    let mut css = cell_hints;
     for a in element.attrs.iter() {
         let value = a.value.trim();
         match (tree.resolve(a.name.local), tag) {
@@ -454,6 +459,39 @@ fn presentational_hints(tree: &DomTree, element: &ElementData) -> Vec<fos_css::D
     }
 }
 
+/// What a table cell takes from its table's attributes: `cellpadding` (its
+/// padding) and a nonzero `border` (a 1px inset border)
+fn table_cell_hints(tree: &DomTree, cell: NodeId) -> String {
+    let tag_of = |n: NodeId| tree.get(n).and_then(|x| x.as_element()).map(|e| tree.resolve(e.name.local));
+    let mut n = tree.get(cell).map_or(NodeId::NONE, |x| x.parent);
+    // The row, its group (if any), then the table
+    for _ in 0..3 {
+        match tag_of(n) {
+            Some("table") => break,
+            Some("tr" | "tbody" | "thead" | "tfoot") => n = tree.get(n).map_or(NodeId::NONE, |x| x.parent),
+            _ => return String::new(),
+        }
+    }
+    if tag_of(n) != Some("table") {
+        return String::new();
+    }
+    let mut css = String::new();
+    if let Some(p) = tree.get_attribute(n, "cellpadding") {
+        let p = p.trim();
+        let end = p.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(p.len());
+        if let Ok(v) = p[..end].parse::<f32>() {
+            css += &if p[end..].starts_with('%') { format!("padding: {v}%;") } else { format!("padding: {v}px;") };
+        }
+    }
+    if let Some(b) = tree.get_attribute(n, "border") {
+        let width = b.trim().parse::<f32>().unwrap_or(if b.trim().is_empty() { 1.0 } else { 0.0 });
+        if width > 0.0 {
+            css += "border: 1px inset gray;";
+        }
+    }
+    css
+}
+
 /// Style element `node`, starting from `style` (its inherited values):
 /// the UA's rules, presentational hints, the page's matching rules (if
 /// there is a stylesheet) and the `style` attribute's declarations
@@ -522,7 +560,7 @@ fn cascade_for(
     };
     let rules_of = |s: &PageStyles, scope: MatchScope| rules_in(s, &[scope]);
     let ua_rules = rules_of(ua, MatchScope::Normal);
-    let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, element) };
+    let hints = if pe.is_some() { Vec::new() } else { presentational_hints(tree, node, element) };
     // A part's own tree's `:host::part()` rules rank with the tree's others
     let own_scopes: &[MatchScope] = if scoped.own_part { &[MatchScope::Normal, MatchScope::HostPart] } else { &[MatchScope::Normal] };
     let rules = styles.map_or(Vec::new(), |s| rules_in(s, own_scopes));
@@ -573,7 +611,13 @@ fn cascade_for(
         }
     }
     if let Some(s) = styles {
-        for &rule in &rules {
+        // Important declarations of lower layers win
+        let layer = |r: &u32| s.stylesheet.rules[*r as usize].layer;
+        let mut important = rules.clone();
+        if important.iter().any(|r| layer(r) != fos_css::Rule::UNLAYERED) {
+            important.sort_by_key(|r| std::cmp::Reverse(layer(r)));
+        }
+        for &rule in &important {
             ordered.extend(of(s, rule, true));
         }
     }

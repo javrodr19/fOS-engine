@@ -503,6 +503,45 @@ impl PageJsRuntime {
         r.and_then(|v| v.strip_prefix("navigate:").map(str::to_string))
     }
 
+    /// Fire a simple event of type `ty` at `node` (an iframe's `load`)
+    pub fn fire_event(&mut self, node: NodeId, ty: &str) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        let target = dom_bindings::wrap(vm, node);
+        dispatch(vm, target, ty);
+        self.after_task();
+    }
+
+    /// The messages the page posted to other windows since last asked
+    pub fn take_messages(&mut self) -> Vec<crate::frames::Message> {
+        self.vm.as_mut().map(|vm| std::mem::take(&mut dom_bindings::host(vm).outbox)).unwrap_or_default()
+    }
+
+    /// Dispatch a `message` event from another window: `data` serialized,
+    /// `origin` the sender's, `from` the iframe whose frame sent it (`None`:
+    /// the parent)
+    pub fn deliver_message(&mut self, data: String, origin: String, from: Option<NodeId>) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        dom_bindings::receive_message(vm, data, origin, from);
+        let deliver = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosDeliverMessages");
+        if let Ok(f) = deliver {
+            if let Err(e) = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]) {
+                dom_bindings::report_exception(vm, e);
+            }
+        }
+        self.after_task();
+    }
+
+    /// Make this page a frame's: `window.parent` and `top` become the
+    /// parent window, reached through messages
+    pub fn become_frame(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            let f = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosBecomeFrame");
+            if let Ok(f) = f {
+                let _ = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]);
+            }
+        }
+    }
+
     /// Execute arbitrary JavaScript code; returns its value as text
     pub fn eval(&mut self, code: &str) -> Result<String, JsError> {
         let vm = self.vm.as_mut().ok_or_else(|| "No JavaScript context".to_string())?;
@@ -1930,6 +1969,74 @@ mod tests {
                 [errs.join(), s.cssRules[0].cssText, el.style.getPropertyPriority('margin-top'), el.style.backgroundImage, el.style.length, el.style instanceof CSSStyleDeclaration].join('|')").unwrap(),
             "SyntaxError,IndexSizeError,IndexSizeError,NotAllowedError,NotAllowedError|.unused { color: green }|important|url(\"data:image/png;base64,AA==\")|2|true"
         );
+    }
+
+    #[test]
+    fn compression_streams_and_stream_bodies() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><script>window.R = 'pending';
+            (async () => {
+              const text = 'hello hello hello';
+              const packed = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer();
+              const back = await new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+              const gz = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).bytes();
+              let bad = 'none';
+              try { new CompressionStream('brotli'); } catch (e) { bad = e.name; }
+              let corrupt = 'none';
+              try { await new Response(new Blob(['not deflate']).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer(); } catch (e) { corrupt = e.name; }
+              const r = new Response(new Blob([text]).stream());
+              window.R = [packed.byteLength, back, gz[0], gz[1], bad, corrupt, r.body instanceof ReadableStream, await r.clone().text()].join();
+            })();</script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        for _ in 0..50 {
+            if rt.eval("R").unwrap() != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("R").unwrap(), "10,hello hello hello,31,139,TypeError,TypeError,true,hello hello hello");
+    }
+
+    #[test]
+    fn feature_detection_sees_a_desktop_browser() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // No touch screen (Modernizr's test), and SVG's factories exist
+        assert_eq!(
+            rt.eval("['ontouchstart' in window, 'ontouchstart' in document.documentElement, typeof document.createElementNS('http://www.w3.org/2000/svg', 'svg').createSVGRect].join()").unwrap(),
+            "false,false,function"
+        );
+    }
+
+    #[test]
+    fn computed_styles_from_the_cascade() {
+        let (mut rt, doc) = page(
+            r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }
+            #hidden { display: none } #hidden span { color: blue; font-size: 2em } p::before { content: "hi"; color: green }</style></head>
+            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(400, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (400.0, 600.0), (0.0, 0.0));
+        let cases = [
+            ("const cs = (id, pe) => getComputedStyle(document.getElementById(id), pe); const h = cs('h'); [h.display, h.getPropertyValue('color'), h.fontSize, h['margin-left']].join()", "flex,rgb(255, 0, 0),32px,90px"),
+            // Used sizes of rendered boxes
+            ("[h.width, h.paddingTop, h.boxSizing].join()", "200px,10px,content-box"),
+            // Inside display: none; a flex item; a pseudo-element; a variable
+            ("[cs('s').color, cs('s').fontSize, cs('i').display, cs('p', '::before').content, cs('p', ':before').color].join()", "rgb(0, 0, 255),32px,block,\"hi\",rgb(0, 128, 0)"),
+            ("getComputedStyle(document.documentElement).getPropertyValue('--brand')", "#0a0"),
+            // Live: a style change shows at once
+            ("document.getElementById('h').style.color = 'rgb(1, 2, 3)'; h.color", "rgb(1, 2, 3)"),
+            // Detached elements have none; the declaration is read-only
+            ("[getComputedStyle(document.createElement('div')).color, h.length > 50, h instanceof CSSStyleDeclaration].join()", ",true,true"),
+            ("try { h.color = 'red'; 'set' } catch (e) { e.name }", "NoModificationAllowedError"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
     }
 
     #[test]

@@ -421,7 +421,17 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
                 }
                 fr
             }
-            None => tracks.iter().enumerate().filter_map(|(i, t)| t.flex().map(|f| max_seen[i].max(t.base) / f.max(1.0))).fold(0.0, f32::max),
+            None => {
+                let single = tracks.iter().enumerate().filter_map(|(i, t)| t.flex().map(|f| max_seen[i].max(t.base) / f.max(1.0))).fold(0.0, f32::max);
+                // Items spanning flexible tracks: what they need beyond
+                // their other tracks, per fr of the flexible ones
+                let spanning = spans.iter().zip(contrib).filter(|((s, e), _)| e - s > 1).filter_map(|(&(s, e), &(_, cmax))| {
+                    let flex: f32 = tracks[s..e].iter().filter_map(|t| t.flex()).sum();
+                    let fixed: f32 = tracks[s..e].iter().filter(|t| t.flex().is_none()).map(|t| t.base).sum();
+                    (flex > 0.0).then(|| (cmax - fixed - gap * (e - s - 1) as f32).max(0.0) / flex.max(1.0))
+                });
+                spanning.fold(single, f32::max)
+            }
         };
         for t in tracks.iter_mut() {
             if let Some(f) = t.flex() {

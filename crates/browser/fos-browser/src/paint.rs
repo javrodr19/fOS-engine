@@ -380,8 +380,11 @@ impl<'a> Painter<'a> {
     }
 
     fn culled(&self, b: &BoxFragment, clip: Clip) -> bool {
+        // Glyphs may overhang their lines a little (font metrics are
+        // rounded to whole pixels, and antialiasing spreads them)
+        const SLACK: f32 = 4.0;
         let ink = self.dev(b.ink);
-        ink.bottom() < clip.0[1] || ink.y > clip.0[3]
+        ink.bottom() + SLACK < clip.0[1] || ink.y - SLACK > clip.0[3]
     }
 
     /// Clip for a box and its contents: `clip` and `clip-path: inset()`
@@ -1389,7 +1392,9 @@ impl<'a> Painter<'a> {
             return;
         }
         let color = if self.only_text { render_color(fos_css::properties::Color::BLACK, 1.0) } else { render_color(t.color, alpha) };
-        let baseline = t.baseline - self.origin;
+        // Baselines snap to whole document pixels, so a line lands on the
+        // same rows whatever the buffer's (whole-pixel) origin
+        let baseline = t.baseline.round() - self.origin;
         let pixel_clip = clip.pixels();
         for (word, x) in &t.words {
             let Some(font) = word.font else { continue };
@@ -1410,9 +1415,10 @@ impl<'a> Painter<'a> {
         }
         if t.decoration != 0 {
             let size = t.font.size;
-            let thickness = (size / 14.0).max(1.0);
+            // Whole pixels, as the baseline: crisp and the same in any band
+            let thickness = (size / 14.0).round().max(1.0);
             let dc = skia_color(t.decoration_color, alpha);
-            let line = |y: f32, painter: &mut Self| painter.fill_rect(Rect::new(r.x, y, r.w, thickness), dc, clip);
+            let line = |y: f32, painter: &mut Self| painter.fill_rect(Rect::new(r.x, y.round(), r.w, thickness), dc, clip);
             if t.decoration & decoration::UNDERLINE != 0 {
                 line(baseline + (t.font.descent() * 0.45).max(1.0), self);
             }

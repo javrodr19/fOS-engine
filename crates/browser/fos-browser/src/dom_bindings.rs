@@ -99,6 +99,18 @@ pub struct DomHost {
     pub box_scroll_requests: Vec<(NodeId, f32, f32)>,
     /// Per element: visible size and content size (from `layout`)
     metrics: Option<HashMap<u32, [f32; 4]>>,
+    /// The style `getComputedStyle` last resolved: element, pseudo-element,
+    /// the DOM revision it holds for, and the style with its box
+    computed: Option<ComputedEntry>,
+    /// Messages posted to other windows, for the browser to deliver
+    pub(crate) outbox: Vec<crate::frames::Message>,
+    /// Messages from other windows awaiting dispatch: data (JSON), the
+    /// sender's origin, and the iframe whose frame sent it (`None`: the
+    /// parent)
+    inbox: Vec<(String, String, Option<NodeId>)>,
+    /// Coders of `CompressionStream`s and `DecompressionStream`s, by id
+    pub(crate) codecs: HashMap<u32, crate::compression_streams::Codec>,
+    pub(crate) next_codec: u32,
     /// The browser's cookies (`document.cookie`; `fetch` shares them)
     cookies: fos_net::SharedCookieJar,
     /// The URL changed without a navigation (`history.pushState`)
@@ -138,6 +150,11 @@ impl DomHost {
             box_scroll: HashMap::new(),
             box_scroll_requests: Vec::new(),
             metrics: None,
+            computed: None,
+            outbox: Vec::new(),
+            inbox: Vec::new(),
+            codecs: HashMap::new(),
+            next_codec: 1,
             cookies,
             url_changed: false,
             canvas: Default::default(),
@@ -1585,6 +1602,7 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
         h.boxes = None;
         h.layout_boxes = None;
         h.metrics = None;
+        h.computed = None;
     } else if moved || h.viewport != viewport {
         h.boxes = None;
     }
@@ -1686,6 +1704,86 @@ fn set_box_scroll(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsR
     h.boxes = None;
     h.box_scroll_requests.push((id, x, y));
     Ok(Value::UNDEFINED)
+}
+
+type ComputedEntry = (NodeId, u8, fos_dom::DomRevision, Option<(fos_css::style::Style, Option<fos_css::resolved::UsedBox>)>);
+
+/// `__fosComputedStyle(el, pseudo, name)`: the resolved value of property
+/// `name` (lowercase, or a `--custom` one) of an element, or of its
+/// `::before`, `::after` or `::marker` (`pseudo` names it, or is empty);
+/// null for an element outside the document or a property not modeled
+fn computed_style(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    use fos_dom::PseudoElement;
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let pseudo = if arg(args, 1).is_undefined() || arg(args, 1).is_null() { String::new() } else { arg_string(vm, args, 1)? };
+    let name = arg_string(vm, args, 2)?;
+    let (pe, key) = match pseudo.trim_start_matches(':').to_ascii_lowercase().as_str() {
+        "before" => (Some(PseudoElement::Before), 1),
+        "after" => (Some(PseudoElement::After), 2),
+        "marker" => (Some(PseudoElement::Marker), 3),
+        _ => (None, 0),
+    };
+    let Some(layout) = host(vm).layout.clone() else { return Ok(Value::NULL) };
+    let revision = with_tree(vm, |t| t.revision());
+    let fresh = matches!(&host(vm).computed, Some((n, k, r, _)) if *n == id && *k == key && *r == revision);
+    if !fresh {
+        let resolved = with_tree(vm, |t| layout.resolved_style(t, id, pe));
+        host(vm).computed = Some((id, key, revision, resolved));
+    }
+    let value = match &host(vm).computed {
+        Some((_, _, _, Some((style, used)))) => style.resolved_value(&name, used.as_ref()),
+        _ => None,
+    };
+    Ok(match value {
+        Some(v) => string(vm, &v),
+        None => Value::NULL,
+    })
+}
+
+/// `__fosComputedStyleNames()`: the properties a computed style lists
+fn computed_style_names(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let names: Vec<Value> = fos_css::resolved::PROPERTIES.iter().map(|n| string(vm, n)).collect();
+    Ok(Value::object(vm.new_array(names)))
+}
+
+/// `__fosPostMessage(toParent, iframe, data, targetOrigin)`: queue a
+/// message (serialized) for another window: the parent, or the frame of
+/// an iframe of this document
+fn post_message(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let to = if fos_jsvm::vm::truthy(arg(args, 0)) {
+        crate::frames::MessageTarget::Parent
+    } else {
+        match node_id(arg(args, 1)) {
+            Some(n) => crate::frames::MessageTarget::Frame(n),
+            None => return Ok(Value::UNDEFINED),
+        }
+    };
+    let data = arg_string(vm, args, 2)?;
+    let target_origin = arg_string(vm, args, 3)?;
+    let h = host(vm);
+    if h.outbox.len() < 1000 {
+        h.outbox.push(crate::frames::Message { to, data, target_origin });
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosTakeInbox()`: the messages awaiting dispatch, as `[data, origin,
+/// iframe or null]` triples
+fn take_inbox(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let inbox = std::mem::take(&mut host(vm).inbox);
+    let mut out = Vec::with_capacity(inbox.len());
+    for (data, origin, from) in inbox {
+        let data = string(vm, &data);
+        let origin = string(vm, &origin);
+        let from = from.map_or(Value::NULL, |n| wrap(vm, n));
+        out.push(Value::object(vm.new_array(vec![data, origin, from])));
+    }
+    Ok(Value::object(vm.new_array(out)))
+}
+
+/// Queue a message from another window for the page's scripts
+pub(crate) fn receive_message(vm: &mut Vm, data: String, origin: String, from: Option<NodeId>) {
+    host(vm).inbox.push((data, origin, from));
 }
 
 /// `__fosQuirks()`: whether the document is in quirks mode
@@ -1914,6 +2012,13 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosGeometry", 1, geometry),
         ("__fosViewport", 0, viewport),
         ("__fosQuirks", 0, quirks),
+        ("__fosComputedStyle", 3, computed_style),
+        ("__fosPostMessage", 4, post_message),
+        ("__fosTakeInbox", 0, take_inbox),
+        ("__fosCodecNew", 2, crate::compression_streams::codec_new),
+        ("__fosCodecWrite", 2, crate::compression_streams::codec_write),
+        ("__fosCodecFinish", 1, crate::compression_streams::codec_finish),
+        ("__fosComputedStyleNames", 0, computed_style_names),
         ("__fosScrollMetrics", 1, scroll_metrics),
         ("__fosSetBoxScroll", 3, set_box_scroll),
         ("__fosScrollTo", 1, scroll_to),

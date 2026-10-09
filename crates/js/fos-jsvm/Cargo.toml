@@ -8,3 +8,4 @@ description = "JavaScript engine core for fOS: parser, bytecode compiler, regist
 
 [dependencies]
 rustc-hash = "2.1"
+unicode-ident = "1.0"

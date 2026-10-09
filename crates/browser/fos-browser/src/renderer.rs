@@ -85,9 +85,217 @@ pub struct PageLayout {
     css_images: Vec<String>,
     /// What relative CSS URLs (inline styles) resolve against
     base: String,
+    /// What restyling an element after layout needs (`getComputedStyle`)
+    styling: Styling,
+    /// Each element's first box, indexed on first need
+    box_index: std::sync::OnceLock<HashMap<NodeId, ElementBox>>,
+}
+
+/// The rules and context a layout styled its elements with
+struct Styling {
+    sheet: Option<Arc<PageStyles>>,
+    shadow: HashMap<NodeId, Arc<PageStyles>>,
+    ctx: StyleContext,
+    quirks: bool,
+}
+
+impl std::fmt::Debug for Styling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Styling").field("ctx", &self.ctx).field("quirks", &self.quirks).finish_non_exhaustive()
+    }
+}
+
+/// An element's first box: its style and geometry (document coordinates)
+#[derive(Debug)]
+struct ElementBox {
+    style: Style,
+    rect: Rect,
+    border: [f32; 4],
+    padding: [f32; 4],
+    inline: bool,
+}
+
+/// The parent of `node` in the flattened tree: a shadow root's host, a
+/// slotted element's slot
+fn flat_parent(tree: &DomTree, node: NodeId) -> NodeId {
+    let parent = tree.get(node).map_or(NodeId::NONE, |n| n.parent);
+    if let Some(host) = tree.shadow_host(parent) {
+        return host;
+    }
+    if tree.shadow_root(parent).is_some() {
+        return tree.assigned_slot(node).unwrap_or(parent);
+    }
+    parent
 }
 
 impl PageLayout {
+    fn box_index(&self) -> &HashMap<NodeId, ElementBox> {
+        self.box_index.get_or_init(|| {
+            let mut index = HashMap::new();
+            fn walk(b: &BoxFragment, index: &mut HashMap<NodeId, ElementBox>) {
+                if b.node.is_valid() && b.kind != BoxFragmentKind::Placeholder {
+                    index.entry(b.node).or_insert_with(|| ElementBox {
+                        style: b.style.clone(),
+                        rect: b.border_box,
+                        border: b.border,
+                        padding: b.padding,
+                        inline: b.kind == BoxFragmentKind::InlinePart,
+                    });
+                }
+                for c in &b.children {
+                    if let Fragment::Box(cb) = c {
+                        walk(cb, index);
+                    }
+                }
+            }
+            if let Some(root) = &self.fragments.root {
+                walk(root, &mut index);
+            }
+            index
+        })
+    }
+
+    /// The content box of element `node`'s first box (document
+    /// coordinates), if it is rendered
+    pub fn content_box(&self, node: NodeId) -> Option<Rect> {
+        let e = self.box_index().get(&node)?;
+        Some(Rect::new(
+            e.rect.x + e.border[3] + e.padding[3],
+            e.rect.y + e.border[0] + e.padding[0],
+            (e.rect.w - e.border[1] - e.border[3] - e.padding[1] - e.padding[3]).max(0.0),
+            (e.rect.h - e.border[0] - e.border[2] - e.padding[0] - e.padding[2]).max(0.0),
+        ))
+    }
+
+    /// The computed style of element `node` (or of its `::before` or
+    /// `::after`) in the document as it is now, and the box layout gave it
+    /// if it is rendered: what `getComputedStyle` reports. Ancestors keep
+    /// the styles they were laid out with; the element is restyled, so
+    /// changes to it show at once. `None` for elements outside the document.
+    pub fn resolved_style(&self, tree: &DomTree, node: NodeId, pseudo: Option<fos_dom::PseudoElement>) -> Option<(Style, Option<fos_css::resolved::UsedBox>)> {
+        use fos_css::style::{Display, Float, Position};
+        tree.get(node)?.as_element()?;
+        if !tree.is_connected(node) {
+            return None;
+        }
+        let index = self.box_index();
+        let mut chain = Vec::new();
+        let mut n = flat_parent(tree, node);
+        while n.is_valid() && tree.get(n).is_some_and(|x| x.as_element().is_some()) {
+            chain.push(n);
+            n = flat_parent(tree, n);
+        }
+        let images = crate::image_loader::Images::default();
+        let mut svgs = crate::image_loader::SvgCache::default();
+        let mut styler = BrowserStyler {
+            stylesheet: self.styling.sheet.as_deref(),
+            shadow_sheets: &self.styling.shadow,
+            ancestors: AncestorFilter::default(),
+            resolved: Default::default(),
+            ctx: self.styling.ctx,
+            root_styled: true,
+            quirks: self.styling.quirks,
+            images: &images,
+            base: String::new(),
+            svgs: &mut svgs,
+        };
+        // As the box tree does: the root, floats, absolutely positioned
+        // boxes and flex and grid items are blocks
+        let restyle = |styler: &mut BrowserStyler, n: NodeId, parent: &Style, root: bool| {
+            use layout_engine::Styler;
+            let mut s = styler.style(tree, n, parent);
+            let d = s.display();
+            let blockify = root
+                || matches!(parent.display(), Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid)
+                || s.box_.float != Float::None
+                || matches!(s.box_.position, Position::Absolute | Position::Fixed);
+            if blockify && !matches!(d, Display::None | Display::Contents) && d.blockified() != d {
+                Arc::make_mut(&mut s.box_).display = d.blockified();
+            }
+            s
+        };
+        let mut parent = Style::default();
+        for (i, &a) in chain.iter().rev().enumerate() {
+            parent = match index.get(&a) {
+                Some(b) => b.style.clone(),
+                None => restyle(&mut styler, a, &parent, i == 0),
+            };
+            layout_engine::Styler::enter(&mut styler, tree, a);
+        }
+        let style = restyle(&mut styler, node, &parent, chain.is_empty());
+        let (style, own) = match pseudo {
+            None => (style, index.get(&node)),
+            Some(pe) => {
+                let after = pe == fos_dom::PseudoElement::After;
+                let ps = layout_engine::Styler::pseudo(&mut styler, tree, node, pe, &style).unwrap_or_else(|| Style::inherit_from(&style));
+                (ps, index.get(&node.generated(after)))
+            }
+        };
+        let used = own.filter(|_| style.display() != Display::None).map(|b| {
+            // What percentages and auto margins resolve against: the
+            // parent's content box (positioned boxes: their containing
+            // block's padding box)
+            let content = |e: &ElementBox| Rect::new(
+                e.rect.x + e.border[3] + e.padding[3],
+                e.rect.y + e.border[0] + e.padding[0],
+                (e.rect.w - e.border[1] - e.border[3] - e.padding[1] - e.padding[3]).max(0.0),
+                (e.rect.h - e.border[0] - e.border[2] - e.padding[0] - e.padding[2]).max(0.0),
+            );
+            let padding_box = |e: &ElementBox| Rect::new(e.rect.x + e.border[3], e.rect.y + e.border[0], (e.rect.w - e.border[1] - e.border[3]).max(0.0), (e.rect.h - e.border[0] - e.border[2]).max(0.0));
+            let position = style.box_.position;
+            let cb = match position {
+                Position::Fixed => Rect::new(0.0, 0.0, self.styling.ctx.viewport.0, self.styling.ctx.viewport.1),
+                Position::Absolute => chain
+                    .iter()
+                    .filter_map(|a| index.get(a))
+                    .find(|e| e.style.box_.position != Position::Static || e.style.box_.transform.is_some())
+                    .map_or(Rect::new(0.0, 0.0, self.styling.ctx.viewport.0, self.styling.ctx.viewport.1), padding_box),
+                _ => chain.iter().find_map(|a| index.get(a)).map_or(Rect::new(0.0, 0.0, self.styling.ctx.viewport.0, self.styling.ctx.viewport.1), content),
+            };
+            let bx = &style.box_;
+            let mut margin = [0.0f32; 4];
+            if !b.inline {
+                for (k, m) in bx.margin.iter().enumerate() {
+                    if let fos_css::style::LpAuto::Lp(l) = m {
+                        margin[k] = l.resolve(cb.w);
+                    }
+                }
+                // Auto side margins take the rest of the line
+                let auto = |k: usize| bx.margin[k] == fos_css::style::LpAuto::Auto;
+                if position == Position::Static || position == Position::Relative {
+                    let free = (cb.w - b.rect.w - margin[1] - margin[3]).max(0.0);
+                    match (auto(1), auto(3)) {
+                        (true, true) => (margin[1], margin[3]) = (free / 2.0, free / 2.0),
+                        (true, false) => margin[1] = free,
+                        (false, true) => margin[3] = free,
+                        _ => {}
+                    }
+                }
+            }
+            let inset = match position {
+                Position::Static => None,
+                Position::Relative | Position::Sticky => {
+                    let side = |k: usize, basis: f32| match bx.inset[k] {
+                        fos_css::style::LpAuto::Lp(l) => Some(l.resolve(basis)),
+                        fos_css::style::LpAuto::Auto => None,
+                    };
+                    let (t, r, bt, l) = (side(0, cb.h), side(1, cb.w), side(2, cb.h), side(3, cb.w));
+                    let top = t.or(bt.map(|v| -v)).unwrap_or(0.0);
+                    let left = l.or(r.map(|v| -v)).unwrap_or(0.0);
+                    Some([top, r.unwrap_or(-left), bt.unwrap_or(-top), left])
+                }
+                Position::Absolute | Position::Fixed => Some([
+                    b.rect.y - margin[0] - cb.y,
+                    cb.right() - (b.rect.right() + margin[1]),
+                    cb.bottom() - (b.rect.bottom() + margin[2]),
+                    b.rect.x - margin[3] - cb.x,
+                ]),
+            };
+            fos_css::resolved::UsedBox { border_box: (b.rect.w, b.rect.h), border: b.border, padding: b.padding, margin, inset, sized: !b.inline }
+        });
+        Some((style, used))
+    }
+
     /// Every element's border boxes (inline elements have one per line)
     /// and text rectangles, in document coordinates and tree order
     pub fn boxes(&self) -> Vec<(NodeId, Rect)> {
@@ -926,6 +1134,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
     } else {
         FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 }
     };
+    let ctx = styler.ctx;
     drop(styler);
 
     // Links and anchors
@@ -984,7 +1193,8 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
             }
         }
     });
-    PageLayout { fragments, links, anchors, background, background_box, has_fixed, css_images, base }
+    let styling = Styling { sheet: stylesheet, shadow: shadow_sheets.clone(), ctx, quirks: document.is_quirks() };
+    PageLayout { fragments, links, anchors, background, background_box, has_fixed, css_images, base, styling, box_index: Default::default() }
 }
 
 #[cfg(test)]
@@ -1344,6 +1554,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade_layers() {
+        // Each case's winning declaration paints the box green
+        let cases = [
+            // Unlayered rules beat layered ones, wherever they are
+            "div { background: #0f0 } @layer a { div { background: #f00 } }",
+            // Layers rank in the order first named
+            "@layer a, b; @layer b { div { background: #0f0 } } @layer a { div { background: #f00 } }",
+            // Specificity does not cross layers
+            "@layer a, b; @layer a { #d { background: #f00 } } @layer b { div { background: #0f0 } }",
+            // Within a layer it does
+            "@layer a { #d { background: #0f0 } div { background: #f00 } }",
+            // A layer's own rules beat its sublayers'
+            "@layer a { div { background: #0f0 } @layer b { div { background: #f00 } } }",
+            "@layer a.b { div { background: #f00 } } @layer a { div { background: #0f0 } }",
+            // Important declarations: lower layers win, layered over unlayered
+            "@layer a { div { background: #0f0 !important } } div { background: #f00 !important }",
+            "@layer a, b; @layer a { div { background: #0f0 !important } } @layer b { div { background: #f00 !important } }",
+            // Anonymous layers rank in order too
+            "@layer { div { background: #f00 } } @layer { div { background: #0f0 } }",
+        ];
+        for css in cases {
+            let html = format!(r#"<html><head><style>{css}</style></head><body style="margin: 0"><div id="d" style="height: 20px"></div></body></html>"#);
+            let document = fos_html::parse_with_url(&html, "https://example.com/");
+            let mut renderer = PageRenderer::new(40, 40);
+            let page = renderer.render_document(&document, 0.0).unwrap();
+            assert_eq!(page.pixels[10 * 40 + 20] & 0xffffff, 0x00ff00, "{css}");
+        }
+    }
+
+    #[test]
     fn test_shadow_elements_use_the_documents_keyframes() {
         // A shadow tree without the `@keyframes` its element names finds
         // them in the document's sheet; its own win
@@ -1557,14 +1797,15 @@ mod tests {
         let document = fos_html::parse_with_url(&html, "https://example.com/");
         let mut renderer = PageRenderer::new(200, 100);
         let before = renderer.render_document(&document, 0.0).unwrap();
-        assert_eq!(before.pixels[5 * 200 + 5], 0xffff0000);
+        // Sampled right of the row's number
+        assert_eq!(before.pixels[5 * 200 + 80], 0xffff0000);
         // Content below the box is clipped: the paragraph follows at 50px
         let s = document.get_element_by_id("s").unwrap();
         assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 30.0));
         assert_eq!(renderer.box_scroll(s), (0.0, 30.0));
         let after = renderer.render_document(&document, 0.0).unwrap();
         // Row 1 (blue) is now at the top
-        assert_eq!(after.pixels[5 * 200 + 5], 0xff0000ff);
+        assert_eq!(after.pixels[5 * 200 + 80], 0xff0000ff);
         // Clamped at the end (20 rows of 20px in a 50px box)
         assert!(renderer.scroll_box_at(10.0, 10.0, 0.0, 10_000.0));
         assert_eq!(renderer.box_scroll(s), (0.0, 350.0));

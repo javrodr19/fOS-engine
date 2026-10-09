@@ -1,0 +1,356 @@
+//! Nested browsing contexts: the documents `<iframe>`s show
+//!
+//! Each rendered iframe of a page gets its own document, stylesheets,
+//! images, fonts and (unless sandboxed without `allow-scripts`) script
+//! runtime, rendered at the size the parent's layout gave the frame. Its
+//! picture is painted into the iframe's box like a canvas's.
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use fos_canvas::tiny_skia::Pixmap;
+use fos_dom::{Document, DomTree, NodeId};
+
+use crate::network::NetworkManager;
+use crate::page::Page;
+use crate::renderer::{PageLayout, PageRenderer};
+
+/// Most frames a page shows (each is a document with its own runtime)
+const MAX_FRAMES: usize = 16;
+/// Largest frame rendered, per side
+const MAX_SIDE: u32 = 4096;
+
+/// What a frame shows
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    Url(String),
+    Srcdoc(String),
+}
+
+/// A document shown in an iframe
+pub struct Frame {
+    /// The iframe in the parent document
+    pub element: NodeId,
+    source: Source,
+    pub page: Page,
+    renderer: PageRenderer,
+    size: (u32, u32),
+    /// A new picture is owed to the parent
+    dirty: bool,
+}
+
+/// A page's frames
+#[derive(Default)]
+pub struct Frames {
+    frames: Vec<Frame>,
+    /// The iframes whose pictures the parent was given
+    shown: Vec<NodeId>,
+}
+
+/// Fetches a frame's scripts through the browser's network stack
+pub struct FrameScripts<'a> {
+    pub network: &'a mut NetworkManager,
+    pub page_url: &'a str,
+}
+
+impl crate::js_runtime::ScriptSource for FrameScripts<'_> {
+    fn fetch(&mut self, url: &str) -> Option<String> {
+        let r = self.network.fetch(url, Some(self.page_url)).ok()?;
+        Some(crate::charset::decode_html(r.body, Some(&r.content_type)))
+    }
+
+    fn fetch_many(&mut self, urls: &[String]) -> Vec<Option<String>> {
+        self.network
+            .fetch_many(urls, Some(self.page_url))
+            .into_iter()
+            .map(|r| r.ok().map(|r| crate::charset::decode_html(r.body, Some(&r.content_type))))
+            .collect()
+    }
+}
+
+/// The iframes of `tree` (in its shadow trees too), in tree order
+fn iframes(tree: &DomTree) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut roots = vec![tree.root()];
+    roots.extend(tree.shadow_roots().filter(|&(host, _)| tree.is_connected(host)).map(|(_, root)| root));
+    for root in roots {
+        fos_dom::selector::walk_elements(tree, root, &mut |id| {
+            if tree.get(id).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "iframe") {
+                out.push(id);
+            }
+            true
+        });
+    }
+    out
+}
+
+/// What iframe `node` should show (None: nothing, as `about:blank`)
+fn source_of(tree: &DomTree, node: NodeId, base: &str) -> Option<Source> {
+    if let Some(doc) = tree.get_attribute(node, "srcdoc") {
+        return Some(Source::Srcdoc(doc.to_string()));
+    }
+    let src = tree.get_attribute(node, "src")?.trim();
+    if src.is_empty() || src.eq_ignore_ascii_case("about:blank") {
+        return None;
+    }
+    let url = fos_net::url_util::resolve(base, src);
+    let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https" | "data").then_some(Source::Url(url))
+}
+
+/// Whether a frame's scripts may run (`sandbox` without `allow-scripts`
+/// forbids them)
+fn scripts_allowed(tree: &DomTree, node: NodeId) -> bool {
+    match tree.get_attribute(node, "sandbox") {
+        Some(tokens) => tokens.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("allow-scripts")),
+        None => true,
+    }
+}
+
+impl Frame {
+    fn load(network: &mut NetworkManager, parent_url: &str, element: NodeId, source: Source, scripts: bool, size: (u32, u32)) -> Option<Frame> {
+        let mut page = match &source {
+            // A srcdoc document's URLs resolve against its parent's
+            Source::Srcdoc(html) => Page::from_html(parent_url, html.clone()),
+            Source::Url(url) if url.len() > 5 && url[..5].eq_ignore_ascii_case("data:") => {
+                let rest = &url[5..];
+                let bytes = crate::image_loader::data_url_bytes(rest)?;
+                let mime = rest.split([',', ';']).next().unwrap_or("").trim();
+                let html = crate::charset::decode_html(bytes, Some(if mime.is_empty() { "text/plain" } else { mime }));
+                let html = if mime.is_empty() || mime.contains("html") { html } else { format!("<pre>{}</pre>", html.replace('&', "&amp;").replace('<', "&lt;")) };
+                Page::from_html(url, html)
+            }
+            Source::Url(url) => {
+                let fetched = network.fetch_frame_document(url, parent_url).ok()?;
+                Page::from_html(&fetched.url, fetched.html)
+            }
+        };
+        page.stylesheets = crate::css_loader::load_for_page(network, &page);
+        let mut renderer = PageRenderer::new(size.0, size.1);
+        renderer.set_stylesheets(page.stylesheets.clone());
+        let mut frame = Frame { element, source, page, renderer, size, dirty: true };
+        frame.render_document();
+        if scripts {
+            frame.page.set_cookie_jar(network.cookie_jar().clone());
+            if frame.page.initialize_javascript().is_ok() {
+                frame.sync_geometry();
+                let url = frame.page.url.clone();
+                if let Err(e) = frame.page.execute_scripts_with(&mut FrameScripts { network, page_url: &url }) {
+                    log::warn!("Frame {url}: {e}");
+                }
+            }
+        }
+        frame.load_resources(network);
+        Some(frame)
+    }
+
+    /// Fetch the images and web fonts the frame's document uses
+    fn load_resources(&mut self, network: &mut NetworkManager) {
+        let Some(doc) = self.page.document() else { return };
+        let wanted = self.renderer.web_font_requests(&doc.lock().unwrap());
+        if !wanted.is_empty() {
+            let fonts = crate::font_loader::load(network, &self.page.url, &wanted, &self.renderer.web_fonts().clone());
+            self.renderer.set_web_fonts(fonts);
+        }
+        self.render_document();
+        let css = self.renderer.css_image_urls();
+        let images = crate::image_loader::load_for_page(network, &self.page, self.size.0 as f32, &Default::default(), &css);
+        if !images.is_empty() {
+            self.renderer.set_images(images);
+        }
+        self.dirty = true;
+    }
+
+    fn render_document(&mut self) {
+        let Some(doc) = self.page.document() else { return };
+        self.renderer.render_document(&doc.lock().unwrap(), 0.0);
+        self.sync_geometry();
+    }
+
+    /// Tell the frame's scripts its layout and viewport
+    fn sync_geometry(&mut self) {
+        let layout = self.renderer.layout_snapshot();
+        let size = (self.size.0 as f32, self.size.1 as f32);
+        if let Some(rt) = self.page.js_runtime.as_mut() {
+            rt.set_layout(layout, size, (0.0, 0.0));
+        }
+    }
+
+    /// The frame's picture: its viewport, rendered
+    fn picture(&mut self) -> Option<Pixmap> {
+        let doc = self.page.document()?;
+        self.renderer.set_viewport(self.size.0, self.size.1);
+        let shot = self.renderer.render_document(&doc.lock().unwrap(), 0.0)?;
+        self.sync_geometry();
+        let mut pixmap = Pixmap::new(shot.width, shot.height)?;
+        for (out, p) in pixmap.data_mut().chunks_exact_mut(4).zip(&shot.pixels) {
+            out.copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
+        }
+        Some(pixmap)
+    }
+
+    /// Whether its DOM changed since it was rendered
+    fn changed(&self) -> bool {
+        self.page.document().is_some_and(|doc| !self.renderer.is_layout_current(&doc.lock().unwrap()))
+    }
+}
+
+impl Frames {
+    /// No frames (a new page)
+    pub fn clear(&mut self) {
+        self.frames.clear();
+        self.shown.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// The frames, in the parent's tree order
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
+    pub fn frames_mut(&mut self) -> &mut [Frame] {
+        &mut self.frames
+    }
+
+    /// Bring the frames in line with `document`'s rendered iframes, sized
+    /// as `layout` laid them out: load new and changed ones, resize, drop
+    /// removed ones. Whether a frame's picture is owed to the parent.
+    pub fn sync(&mut self, network: &mut NetworkManager, document: &Arc<Mutex<Document>>, layout: &PageLayout) -> bool {
+        let (wanted, parent_url) = {
+            let doc = document.lock().unwrap();
+            let tree = doc.tree();
+            let base = crate::css_loader::base_url(&doc);
+            let wanted: Vec<(NodeId, Option<Source>, bool, (u32, u32))> = iframes(tree)
+                .into_iter()
+                .filter_map(|node| {
+                    let rect = layout.content_box(node)?;
+                    let size = (rect.w.round() as u32, rect.h.round() as u32);
+                    (size.0 > 0 && size.1 > 0).then(|| (node, source_of(tree, node, &base), scripts_allowed(tree, node), (size.0.min(MAX_SIDE), size.1.min(MAX_SIDE))))
+                })
+                .take(MAX_FRAMES)
+                .collect();
+            (wanted, base)
+        };
+        let before = self.frames.len();
+        self.frames.retain(|f| wanted.iter().any(|(node, source, _, _)| *node == f.element && source.as_ref() == Some(&f.source)));
+        let mut owed = self.frames.len() != before;
+        for (node, source, scripts, size) in wanted {
+            let Some(source) = source else { continue };
+            match self.frames.iter_mut().find(|f| f.element == node) {
+                Some(frame) => {
+                    if frame.size != size {
+                        frame.size = size;
+                        frame.renderer.set_viewport(size.0, size.1);
+                        frame.dirty = true;
+                    }
+                }
+                None => {
+                    let started = Instant::now();
+                    if let Some(frame) = Frame::load(network, &parent_url, node, source, scripts, size) {
+                        log::info!("Frame {} loaded in {:?}", frame.page.url, started.elapsed());
+                        self.frames.push(frame);
+                    }
+                }
+            }
+        }
+        owed |= self.frames.iter().any(|f| f.dirty);
+        owed
+    }
+
+    /// Run the frames' due timers and finished requests. Whether a frame's
+    /// document changed.
+    pub fn process_tasks(&mut self, network: &mut NetworkManager) -> bool {
+        let mut changed = false;
+        for frame in &mut self.frames {
+            let url = frame.page.url.clone();
+            if frame.page.next_timer_due().is_some_and(|due| due <= Instant::now()) {
+                let _ = frame.page.process_timers_with(&mut FrameScripts { network, page_url: &url });
+            }
+            if frame.page.has_pending_network() {
+                let _ = frame.page.process_network_with(&mut FrameScripts { network, page_url: &url });
+            }
+            if frame.changed() {
+                frame.dirty = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// When a frame's next timer is due
+    pub fn next_timer_due(&self) -> Option<Instant> {
+        self.frames.iter().filter_map(|f| f.page.next_timer_due()).min()
+    }
+
+    /// The pictures of the frames that changed, by iframe element, and
+    /// `None` for frames that went away (updates for the parent
+    /// renderer's bitmaps)
+    pub fn pictures(&mut self) -> Vec<(NodeId, (u32, u32), Option<Pixmap>)> {
+        let frames = &self.frames;
+        let mut out: Vec<(NodeId, (u32, u32), Option<Pixmap>)> =
+            self.shown.iter().filter(|n| !frames.iter().any(|f| f.element == **n)).map(|&n| (n, (0, 0), None)).collect();
+        for f in self.frames.iter_mut().filter(|f| f.dirty) {
+            f.dirty = false;
+            out.push((f.element, f.size, f.picture()));
+        }
+        self.shown = self.frames.iter().map(|f| f.element).collect();
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_with(html: &str) -> (Arc<Mutex<Document>>, PageRenderer) {
+        let doc = Arc::new(Mutex::new(fos_html::parse_with_url(html, "https://example.com/")));
+        let mut renderer = PageRenderer::new(400, 300);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        (doc, renderer)
+    }
+
+    #[test]
+    fn frames_show_their_documents() {
+        let (doc, mut renderer) = page_with(
+            r#"<html><body style="margin: 0">
+            <iframe id=a style="border: 0; display: block" width=200 height=100 srcdoc="<body style='margin: 0; background: rgb(0, 255, 0)'><p id=p>x</p><script>document.body.style.background = 'rgb(0, 0, 255)'</script>"></iframe>
+            <iframe id=b sandbox style="border: 0; display: block" width=200 height=100 srcdoc="<body style='margin: 0; background: rgb(0, 255, 0)'><script>document.body.style.background = 'rgb(0, 0, 255)'</script>"></iframe>
+            <iframe id=c style="display: none" srcdoc="<p>hidden"></iframe>
+            <iframe id=d width=50 height=50></iframe>
+            </body></html>"#,
+        );
+        let mut network = NetworkManager::new();
+        let mut frames = Frames::default();
+        let layout = renderer.layout_snapshot().unwrap();
+        assert!(frames.sync(&mut network, &doc, &layout));
+        // Unrendered and blank iframes get no frame
+        assert_eq!(frames.frames().len(), 2);
+        let pictures = frames.pictures();
+        assert_eq!(pictures.len(), 2);
+        assert!(renderer.update_canvases(pictures));
+        let page = renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 400 + x] & 0xffffff;
+        // The script ran in the first frame; the sandboxed one has none
+        assert_eq!(px(150, 50), 0x0000ff);
+        assert_eq!(px(150, 150), 0x00ff00);
+        // Nothing new until something changes
+        assert!(!frames.sync(&mut network, &doc, &layout));
+        assert!(frames.pictures().is_empty());
+
+        // A removed iframe's picture goes
+        {
+            let mut d = doc.lock().unwrap();
+            let a = d.get_element_by_id("a").unwrap();
+            d.tree_mut().remove(a);
+        }
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        let layout = renderer.layout_snapshot().unwrap();
+        assert!(frames.sync(&mut network, &doc, &layout));
+        let pictures = frames.pictures();
+        assert!(pictures.iter().any(|(_, _, p)| p.is_none()));
+        assert_eq!(frames.frames().len(), 1);
+    }
+}

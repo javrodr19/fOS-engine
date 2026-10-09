@@ -155,6 +155,18 @@ impl PageLayout {
         })
     }
 
+    /// The content box of element `node`'s first box (document
+    /// coordinates), if it is rendered
+    pub fn content_box(&self, node: NodeId) -> Option<Rect> {
+        let e = self.box_index().get(&node)?;
+        Some(Rect::new(
+            e.rect.x + e.border[3] + e.padding[3],
+            e.rect.y + e.border[0] + e.padding[0],
+            (e.rect.w - e.border[1] - e.border[3] - e.padding[1] - e.padding[3]).max(0.0),
+            (e.rect.h - e.border[0] - e.border[2] - e.padding[0] - e.padding[2]).max(0.0),
+        ))
+    }
+
     /// The computed style of element `node` (or of its `::before` or
     /// `::after`) in the document as it is now, and the box layout gave it
     /// if it is rendered: what `getComputedStyle` reports. Ancestors keep

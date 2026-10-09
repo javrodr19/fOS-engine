@@ -84,6 +84,8 @@ struct BrowserApp {
     renderer: PageRenderer,
     /// Current rendered page (cached)
     rendered_page: Option<RenderedPage>,
+    /// The documents the page's iframes show
+    frames: crate::frames::Frames,
     /// Initial URL
     initial_url: String,
     /// Window dimensions
@@ -139,6 +141,7 @@ impl BrowserApp {
             loader: Loader::new(),
             renderer: PageRenderer::new(800, 600),
             rendered_page: None,
+            frames: Default::default(),
             initial_url,
             width: 1024,
             height: 768,
@@ -277,6 +280,7 @@ impl BrowserApp {
         // painting without them would show the page unstyled first
         page.stylesheets = self.load_stylesheets(&page);
         self.renderer.new_page();
+        self.frames.clear();
         self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
@@ -357,6 +361,7 @@ impl BrowserApp {
 
         self.refresh_if_dom_changed();
         self.load_images();
+        self.sync_frames();
         self.follow_script_navigation();
 
         // Build accessibility tree and extract media from DOM
@@ -383,6 +388,31 @@ impl BrowserApp {
         self.current_page.as_ref().and_then(Page::document)
     }
 
+    /// Load the frames of iframes added (or pointed elsewhere) since the
+    /// last check, and show the pictures of frames that changed
+    fn sync_frames(&mut self) {
+        let Some(doc) = self.current_document() else { return };
+        let Some(layout) = self.renderer.layout_snapshot() else { return };
+        if self.frames.sync(&mut self.network, &doc, &layout) {
+            self.show_frame_pictures();
+        }
+    }
+
+    fn show_frame_pictures(&mut self) {
+        let pictures = self.frames.pictures();
+        if self.renderer.update_canvases(pictures) {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
+    }
+
+    /// Run the frames' due timers and finished requests
+    fn process_frame_tasks(&mut self) {
+        if !self.frames.is_empty() && self.frames.process_tasks(&mut self.network) {
+            self.show_frame_pictures();
+        }
+    }
+
     /// Re-render if the DOM changed since it was laid out (e.g. by a script)
     fn refresh_if_dom_changed(&mut self) {
         // What scripts drew on canvases
@@ -398,8 +428,9 @@ impl BrowserApp {
             self.rerender_at(self.render_start_y);
             self.ensure_render_covers_scroll();
             self.request_redraw();
-            // Scripts may have added images
+            // Scripts may have added images and frames
             self.load_images();
+            self.sync_frames();
         }
     }
 
@@ -1172,10 +1203,16 @@ impl ApplicationHandler for BrowserApp {
         // Deliver finished network requests, then run due timers
         self.process_js_network();
         self.process_js_timers();
+        self.process_frame_tasks();
 
         // Wake up for the next timer tick only while timers are pending;
         // otherwise sleep until the next input event (zero idle CPU)
-        match self.current_page.as_ref().and_then(Page::next_timer_due) {
+        let page_due = self.current_page.as_ref().and_then(Page::next_timer_due);
+        let due = match (page_due, self.frames.next_timer_due()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match due {
             // Timers never fire more often than every TIMER_TICK, which
             // keeps a page spinning on `setTimeout(f, 0)` from pegging a core
             Some(due) => {

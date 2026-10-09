@@ -649,8 +649,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
     let content = frag.content_box();
     let paint = match &r.what {
         ReplacedWhat::Image => r.image.clone().map_or(ReplacedPaint::Empty, ReplacedPaint::Image),
-        ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg => ReplacedPaint::Bitmap,
-        ReplacedWhat::Frame => ReplacedPaint::Empty,
+        // Frames show their documents' pictures, supplied like canvases'
+        ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg | ReplacedWhat::Frame => ReplacedPaint::Bitmap,
         ReplacedWhat::Check { radio, checked } => ReplacedPaint::Check { radio: *radio, checked: *checked },
         ReplacedWhat::TextField(text, placeholder) => {
             if !text.is_empty() {

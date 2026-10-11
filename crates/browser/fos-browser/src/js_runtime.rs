@@ -2000,6 +2000,35 @@ mod tests {
     }
 
     #[test]
+    fn transitions_end_on_time() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><div id=a></div><div id=b></div><div id=c></div><script>
+              window.ends = [];
+              const a = document.getElementById('a'), b = document.getElementById('b'), c = document.getElementById('c');
+              for (const el of [a, b, c]) el.addEventListener('transitionend', (e) => ends.push(e.target.id + ':' + e.propertyName));
+              // As Masonry moves items: transition first, then the target
+              a.style.transitionProperty = 'transform, opacity';
+              a.style.transitionDuration = '0.02s';
+              a.style.transform = 'translate3d(10px, 0, 0)';
+              a.style.left = '5px';
+              // No duration: nothing to wait for
+              b.style.transform = 'scale(2)';
+              // The shorthand, and a change made again before the end
+              c.style.transition = 'opacity 20ms ease';
+              c.style.opacity = '0.5';
+              c.style.opacity = '0';
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("ends.length").unwrap(), "0");
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("ends.sort().join()").unwrap(), "a:transform,c:opacity");
+    }
+
+    #[test]
     fn feature_detection_sees_a_desktop_browser() {
         let (mut rt, _doc) = page("<html><body></body></html>");
         rt.execute_scripts(&mut |_: &str| None).unwrap();

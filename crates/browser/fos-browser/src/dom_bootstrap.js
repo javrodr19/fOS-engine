@@ -483,12 +483,60 @@
   // style: a CSSStyleDeclaration over the `style` attribute
   const camelToKebab = s => s.startsWith('--') ? s : s.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, '-$1-');
   const styles = new WeakMap();
+  // Transitions are not animated: a change to a transitioning property
+  // takes effect at once, and `transitionend` fires when the transition
+  // would have ended (libraries wait for it to finish their work)
+  const transitionTimers = new WeakMap();
+  const isTime = (t) => /^-?[\d.]+m?s$/i.test(t);
+  const seconds = (v) => { v = String(v).trim(); const n = parseFloat(v); return isNaN(n) ? 0 : /ms$/i.test(v) ? n / 1000 : n; };
+  function transitionsOf(map) {
+    const props = map.get('transition-property'), durations = map.get('transition-duration'), delays = map.get('transition-delay');
+    const list = [];
+    if (props !== undefined || durations !== undefined) {
+      const d = (durations ?? '0s').split(',').map(seconds);
+      const l = (delays ?? '0s').split(',').map(seconds);
+      (props ?? 'all').split(',').forEach((name, i) => list.push({ property: name.trim(), duration: d[i % d.length], delay: l[i % l.length] }));
+    } else if (map.has('transition')) {
+      for (const part of map.get('transition').split(/,(?![^(]*\))/)) {
+        const tokens = part.trim().split(/\s+/);
+        const times = tokens.filter(isTime).map(seconds);
+        const name = tokens.find((t) => !isTime(t) && !/^(ease|linear|step|cubic-bezier|steps|initial|inherit)/i.test(t)) ?? 'all';
+        list.push({ property: name, duration: times[0] ?? 0, delay: times[1] ?? 0 });
+      }
+    }
+    return list;
+  }
+  function transitionChanged(el, beforeText, afterText) {
+    if (!/transition/i.test(afterText)) return;
+    const after = parseDeclarations(afterText);
+    const list = transitionsOf(after).filter((t) => t.duration > 0);
+    if (!list.length) return;
+    const before = parseDeclarations(beforeText);
+    const names = new Set([...after.keys(), ...before.keys()]);
+    for (const name of names) {
+      if (name.startsWith('transition') || before.get(name) === after.get(name)) continue;
+      const bare = name.replace(/^-(webkit|moz|ms)-/, '');
+      const t = list.find((x) => x.property === 'all' || x.property.replace(/^-(webkit|moz|ms)-/, '') === bare);
+      if (!t) continue;
+      let timers = transitionTimers.get(el);
+      if (!timers) transitionTimers.set(el, timers = new Map());
+      clearTimeout(timers.get(name));
+      timers.set(name, setTimeout(() => {
+        timers.delete(name);
+        el.dispatchEvent(new TransitionEvent('transitionend', { propertyName: name, elapsedTime: t.duration, bubbles: true }));
+      }, (t.duration + t.delay) * 1000));
+    }
+  }
   Object.defineProperty(E, 'style', {
     get() {
       let s = styles.get(this);
       if (!s) {
         const el = this;
-        s = makeDeclaration(() => el.getAttribute('style'), (t) => { if (t) el.setAttribute('style', t); else el.removeAttribute('style'); });
+        s = makeDeclaration(() => el.getAttribute('style'), (t) => {
+          const before = el.getAttribute('style') || '';
+          if (t) el.setAttribute('style', t); else el.removeAttribute('style');
+          transitionChanged(el, before, t || '');
+        });
         styles.set(this, s);
       }
       return s;

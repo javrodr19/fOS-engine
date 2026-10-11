@@ -223,7 +223,7 @@ impl FontContext {
         match shaped {
             Some(run) if run.glyphs.iter().any(|g| g.glyph_id == 0) && !text.trim().is_empty() => self.shape_with_fallback(font, text, run),
             Some(run) => {
-                let (glyphs, width) = positioned(&run, 0.0);
+                let (glyphs, width) = positioned(&run, 0.0, self.whole_pixels(font.id));
                 ShapedWord { font: font.id, size, width, glyphs: glyphs.into(), fallback: Box::new([]) }
             }
             // No font: an estimate, so layout still works
@@ -274,6 +274,13 @@ impl FontContext {
     }
 
     /// Shape `text` in runs: characters the face lacks in a fallback face
+    /// Whether glyphs of face `id` advance by whole pixels: web fonts do,
+    /// as in Chromium on Linux, which positions them without subpixel
+    /// precision (system fonts keep fractional advances)
+    fn whole_pixels(&self, id: Option<FontId>) -> bool {
+        id.and_then(|id| self.db.font(id)).is_some_and(|f| f.web)
+    }
+
     fn shape_with_fallback(&mut self, font: &ResolvedFont, text: &str, first: fos_text::ShapedRun) -> ShapedWord {
         let missing: std::collections::HashSet<u32> = first.glyphs.iter().filter(|g| g.glyph_id == 0).map(|g| g.cluster).collect();
         // Runs of characters by face
@@ -294,7 +301,7 @@ impl FontContext {
             if face != last_face {
                 fallback.push((glyphs.len() as u32, if face == font.id { None } else { face }));
             }
-            let (g, w) = positioned(&run, x);
+            let (g, w) = positioned(&run, x, self.whole_pixels(face));
             glyphs.extend(g);
             x = w;
         }
@@ -345,7 +352,9 @@ pub fn is_complex(c: char) -> bool {
     matches!(c as u32, 0x0590..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
 }
 
-fn positioned(run: &fos_text::ShapedRun, x0: f32) -> (Vec<Glyph>, f32) {
+/// Glyphs of `run` placed from `x0`, and where the run ends; with
+/// `whole_pixels`, each glyph's advance (kerning included) is rounded
+fn positioned(run: &fos_text::ShapedRun, x0: f32, whole_pixels: bool) -> (Vec<Glyph>, f32) {
     let scale = run.scale();
     let mut x = x0;
     let glyphs = run
@@ -353,6 +362,7 @@ fn positioned(run: &fos_text::ShapedRun, x0: f32) -> (Vec<Glyph>, f32) {
         .iter()
         .map(|g| {
             let advance = g.x_advance as f32 * scale;
+            let advance = if whole_pixels { advance.round() } else { advance };
             let glyph = Glyph { id: g.glyph_id, x: x + g.x_offset as f32 * scale, y: g.y_offset as f32 * scale, advance };
             x += advance;
             glyph

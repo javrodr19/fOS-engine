@@ -107,6 +107,8 @@ pub struct FontEntry {
     /// supports these, so matching prefers them over CFF-only faces, which
     /// would otherwise render as invisible text.
     pub has_glyf: bool,
+    /// A page's web font (or an instance of one), not a system font
+    pub web: bool,
     /// Face data for file-backed fonts, loaded on first use
     data: OnceLock<Option<FaceData>>,
 }
@@ -202,7 +204,9 @@ impl CustomFontDatabase {
         meta.families = vec![family.to_string()];
         meta.weight = weight;
         meta.style = style;
-        Ok(self.add_faces(faces, FontSource::Memory(FaceData::owned(data)))[0])
+        let id = self.add_faces(faces, FontSource::Memory(FaceData::owned(data)))[0];
+        self.mark_web(id);
+        Ok(id)
     }
 
     /// Add a web font whose `@font-face` rule gives the weight range
@@ -260,6 +264,7 @@ impl CustomFontDatabase {
             source: FontSource::Memory(FaceData::owned(instance)),
             index: 0,
             has_glyf: true,
+            web: font.web,
             data: OnceLock::new(),
         };
         if self.instances.slots[slot].set(entry).is_err() {
@@ -406,6 +411,13 @@ impl CustomFontDatabase {
         Ok(self.add_faces(faces, FontSource::Memory(FaceData::owned(data))))
     }
 
+    fn mark_web(&mut self, id: FontId) {
+        let first = self.first_id();
+        if let Some(entry) = id.0.checked_sub(first).and_then(|i| self.fonts.get_mut(i as usize)) {
+            entry.web = true;
+        }
+    }
+
     fn add_faces(&mut self, faces: Vec<(u32, FaceMetadata)>, source: FontSource) -> Vec<FontId> {
         let mut ids = Vec::with_capacity(faces.len());
 
@@ -433,6 +445,7 @@ impl CustomFontDatabase {
                 source: source.clone(),
                 index,
                 has_glyf: meta.has_glyf,
+                web: false,
                 data: OnceLock::new(),
             });
             ids.push(id);

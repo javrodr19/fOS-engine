@@ -132,13 +132,10 @@ impl Coverage {
                     .map(|i| i as u16)
             }
             CoverageData::RangeArray(ranges) => {
-                // Binary search on ranges
-                for range in ranges {
-                    if glyph_id >= range.start_glyph && glyph_id <= range.end_glyph {
-                        return Some(range.start_coverage_index + (glyph_id - range.start_glyph));
-                    }
-                }
-                None
+                // Ranges are sorted by start glyph
+                let i = ranges.partition_point(|r| r.start_glyph <= glyph_id).checked_sub(1)?;
+                let range = &ranges[i];
+                (glyph_id <= range.end_glyph).then(|| range.start_coverage_index.wrapping_add(glyph_id - range.start_glyph))
             }
         }
     }
@@ -204,16 +201,14 @@ impl ClassDef {
     pub fn get(&self, glyph_id: u16) -> u16 {
         match &self.data {
             ClassDefData::Format1 { start_glyph, class_values } => {
-                let idx = glyph_id.saturating_sub(*start_glyph) as usize;
-                class_values.get(idx).copied().unwrap_or(0)
+                // Glyphs outside the array are class 0
+                let Some(idx) = glyph_id.checked_sub(*start_glyph) else { return 0 };
+                class_values.get(idx as usize).copied().unwrap_or(0)
             }
             ClassDefData::Format2(ranges) => {
-                for range in ranges {
-                    if glyph_id >= range.start_glyph && glyph_id <= range.end_glyph {
-                        return range.class;
-                    }
-                }
-                0
+                // Ranges are sorted by start glyph
+                let Some(i) = ranges.partition_point(|r| r.start_glyph <= glyph_id).checked_sub(1) else { return 0 };
+                if glyph_id <= ranges[i].end_glyph { ranges[i].class } else { 0 }
             }
         }
     }

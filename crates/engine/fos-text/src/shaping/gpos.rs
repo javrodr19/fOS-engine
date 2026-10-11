@@ -267,7 +267,7 @@ impl PairPos {
     
     fn parse_format1(data: &[u8], value_format1: u16, value_format2: u16) -> Option<PairPosData> {
         let mut reader = FontReader::new(data);
-        reader.skip(10).ok()?; // Skip header already read
+        reader.skip(8).ok()?; // Format, coverage and the value formats, read above
         
         let pair_set_count = reader.read_u16().ok()?;
         let mut pair_set_offsets = Vec::with_capacity(pair_set_count as usize);
@@ -297,7 +297,7 @@ impl PairPos {
     
     fn parse_format2(data: &[u8], value_format1: u16, value_format2: u16) -> Option<PairPosData> {
         let mut reader = FontReader::new(data);
-        reader.skip(10).ok()?; // Skip header already read
+        reader.skip(8).ok()?; // Format, coverage and the value formats, read above
         
         let class_def1_offset = reader.read_u16().ok()?;
         let class_def2_offset = reader.read_u16().ok()?;
@@ -338,13 +338,9 @@ impl PairPos {
                 let coverage_idx = self.coverage.get(first.0)? as usize;
                 let pair_set = pair_sets.get(coverage_idx)?;
                 
-                // Binary search for second glyph
-                for pair in pair_set {
-                    if pair.second_glyph == second.0 {
-                        return Some((pair.value1, pair.value2));
-                    }
-                }
-                None
+                // Pairs are sorted by second glyph
+                let i = pair_set.binary_search_by_key(&second.0, |p| p.second_glyph).ok()?;
+                Some((pair_set[i].value1, pair_set[i].value2))
             }
             PairPosData::Format2 { class_def1, class_def2, class1_records, .. } => {
                 let class1 = class_def1.get(first.0) as usize;
@@ -886,6 +882,36 @@ impl<'a> GposTable<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn be(words: &[i32]) -> Vec<u8> {
+        words.iter().flat_map(|&w| (w as i16 as u16).to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn pair_kerning_formats() {
+        // Format 1: glyph 10 then 20 or 30
+        let f1 = be(&[1, 12, 4, 0, 1, 18, /* coverage */ 1, 1, 10, /* pair set */ 2, 20, -50, 30, -70]);
+        let pairs = PairPos::parse(&f1).expect("format 1");
+        assert_eq!(pairs.apply(GlyphId(10), GlyphId(30)).map(|v| v.0.x_advance), Some(-70));
+        assert_eq!(pairs.apply(GlyphId(10), GlyphId(20)).map(|v| v.0.x_advance), Some(-50));
+        assert!(pairs.apply(GlyphId(10), GlyphId(25)).is_none());
+        assert!(pairs.apply(GlyphId(11), GlyphId(20)).is_none());
+        // Format 2: classes of glyphs 5-9 (6 and 7 in class 1) and 40-45
+        let f2 = be(&[
+            2, 24, 4, 0, 34, 50, 2, 2, /* values */ 0, -10, 0, -25,
+            /* coverage */ 2, 1, 5, 9, 0,
+            /* class def 1 */ 1, 5, 5, 0, 1, 1, 0, 0,
+            /* class def 2 */ 2, 1, 40, 45, 1,
+        ]);
+        let classes = PairPos::parse(&f2).expect("format 2");
+        assert_eq!(classes.apply(GlyphId(6), GlyphId(42)).map(|v| v.0.x_advance), Some(-25));
+        assert_eq!(classes.apply(GlyphId(5), GlyphId(42)).map(|v| v.0.x_advance), Some(-10));
+        assert_eq!(classes.apply(GlyphId(6), GlyphId(39)).map(|v| v.0.x_advance), Some(0));
+        assert!(classes.apply(GlyphId(4), GlyphId(42)).is_none());
+        // Glyphs before a format 1 class array are class 0
+        let def = crate::shaping::gsub::ClassDef::parse(&be(&[1, 5, 2, 3, 4])).unwrap();
+        assert_eq!((def.get(3), def.get(5), def.get(6), def.get(7)), (0, 3, 4, 0));
+    }
     
     #[test]
     fn test_lookup_type_conversion() {

@@ -39,7 +39,7 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
         }
         BoxKind::Inline(content) => {
             for item in &content.items {
-                if let super::box_tree::InlineItem::Atomic(a) = item {
+                if let super::box_tree::InlineItem::Atomic(a) | super::box_tree::InlineItem::OutOfFlow(a) = item {
                     collect(a, map);
                 }
             }

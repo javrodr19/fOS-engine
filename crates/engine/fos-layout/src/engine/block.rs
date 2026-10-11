@@ -471,6 +471,40 @@ struct Flow {
     through: bool,
 }
 
+/// The order to lay `children` out in: their own, except that floats
+/// right after a run of text that fits on one line beside them come
+/// first. A float sits at the line it is in, and the line flows beside it
+/// (floats are block children here, after the text before them).
+fn flow_order(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32) -> Vec<usize> {
+    use fos_css::style::Clear;
+    let text_run = |b: &LayoutBox| !b.node.is_valid() && matches!(&b.kind, BoxKind::Inline(c) if !c.items.iter().any(|i| matches!(i, super::box_tree::InlineItem::Break)));
+    let float = |b: &LayoutBox| b.style.box_.float != Float::None && b.style.box_.clear == Clear::None && !b.style.is_out_of_flow();
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    if !children.windows(2).any(|w| text_run(&w[0]) && float(&w[1])) {
+        return order;
+    }
+    order.clear();
+    let mut i = 0;
+    while i < children.len() {
+        if text_run(&children[i]) {
+            let end = i + 1 + children[i + 1..].iter().take_while(|c| float(c)).count();
+            if end > i + 1 {
+                let text = intrinsic_content(ctx, &children[i]).1;
+                let floats: f32 = children[i + 1..end].iter().map(|f| intrinsic_outer(ctx, f).1).sum();
+                if text + floats <= width {
+                    order.extend(i + 1..end);
+                    order.push(i);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        order.push(i);
+        i += 1;
+    }
+    order
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), center: bool) -> Flow {
     let mut frags = Vec::with_capacity(children.len());
@@ -478,7 +512,8 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
     let mut pending = Margin::default();
     let mut top = Margin::default();
     let mut placed = false;
-    for child in children {
+    let order = flow_order(ctx, children, width);
+    for child in order.iter().map(|&i| &children[i]) {
         if child.style.is_out_of_flow() {
             // Positioned later, from its static position
             frags.push(Fragment::Box(placeholder(child, Rect::new(0.0, y + pending.size(), 0.0, 0.0))));
@@ -733,8 +768,10 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
         BoxKind::Block(children) => {
             use fos_css::style::{Clear, Float};
             let (mut min, mut max) = (0.0f32, 0.0f32);
-            // Floats in a row sit side by side at max-content
-            let mut float_row = 0.0f32;
+            // Floats in a row sit side by side at max-content, and beside
+            // the inline content around them (the runs of text between
+            // floats are one inline formatting context's)
+            let (mut float_row, mut inline_row) = (0.0f32, 0.0f32);
             for c in children {
                 if c.style.is_out_of_flow() {
                     continue;
@@ -743,15 +780,20 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
                 min = min.max(cmin);
                 if c.style.box_.float != Float::None {
                     if c.style.box_.clear != Clear::None {
-                        float_row = 0.0;
+                        (float_row, inline_row) = (0.0, 0.0);
                     }
                     float_row += cmax;
-                    max = max.max(float_row);
+                    max = max.max(float_row + inline_row);
+                } else if !c.node.is_valid() && matches!(c.kind, BoxKind::Inline(_)) {
+                    inline_row += cmax;
+                    max = max.max(float_row + inline_row);
                 } else if cmax > 0.0 {
-                    // (empty boxes between floats, like the pieces of an
-                    // inline element split around them, end no row)
-                    float_row = 0.0;
-                    max = max.max(cmax);
+                    // A box that avoids floats sits beside them; others go
+                    // below. (Empty boxes between floats, like the pieces of
+                    // an inline element split around them, end no row.)
+                    let beside = if c.is_bfc_root() { float_row } else { 0.0 };
+                    max = max.max(beside + cmax);
+                    (float_row, inline_row) = (0.0, 0.0);
                 }
             }
             (min, max)

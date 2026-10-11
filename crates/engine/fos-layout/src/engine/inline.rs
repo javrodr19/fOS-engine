@@ -13,8 +13,8 @@ use fos_css::properties::Color;
 use fos_css::style::{Direction, Style, TextAlign, TextWrapStyle, VerticalAlign, Visibility, WordBreak};
 use fos_dom::NodeId;
 
-use super::block::{clips, intrinsic_outer, layout_block_level, relative_offset, Laid, LayoutCtx, Sizing};
-use super::box_tree::{InlineContent, InlineItem};
+use super::block::{clips, intrinsic_outer, layout_block_level, placeholder, relative_offset, Laid, LayoutCtx, Sizing};
+use super::box_tree::{InlineContent, InlineItem, LayoutBox};
 use super::fonts::{Glyph, ResolvedFont, ShapedWord};
 use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect, TextFragment};
 
@@ -30,6 +30,8 @@ enum PieceKind {
     Open { style: u32, node: NodeId },
     Close,
     Atomic(usize),
+    /// An absolutely positioned box's place (no room taken)
+    OutOfFlow(usize),
     Break,
 }
 
@@ -68,6 +70,7 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
     let mut opportunity = false;
     let mut stack: Vec<u32> = Vec::new();
     let mut atomic = 0;
+    let mut out_of_flow = 0;
     for item in &ic.items {
         match item {
             InlineItem::Text { start, end, style, node } => {
@@ -144,6 +147,10 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                 atomic += 1;
                 opportunity = wraps;
             }
+            InlineItem::OutOfFlow(_) => {
+                out.push(Piece { kind: PieceKind::OutOfFlow(out_of_flow), width: 0.0, break_before: false, at: 0 });
+                out_of_flow += 1;
+            }
             InlineItem::Break => {
                 out.push(Piece { kind: PieceKind::Break, width: 0.0, break_before: false, at: 0 });
                 opportunity = false;
@@ -215,6 +222,7 @@ fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
                 content = true;
             }
             PieceKind::Open { .. } | PieceKind::Close => x += p.width,
+            PieceKind::OutOfFlow(_) => {}
         }
         i += 1;
     }
@@ -310,6 +318,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }
     }
     let atomic_styles: Vec<&Style> = ic.items.iter().filter_map(|i| if let InlineItem::Atomic(b) = i { Some(&b.style) } else { None }).collect();
+    let out_of_flow: Vec<&LayoutBox> = ic.items.iter().filter_map(|i| if let InlineItem::OutOfFlow(b) = i { Some(&**b) } else { None }).collect();
     let widths: Vec<f32> = atomics.iter().map(|a| a.as_ref().map_or(0.0, |a| a.margin_box_width())).collect();
     let rtl = ic.styles[0].inherited.direction == Direction::Rtl;
     let levels = bidi_levels(&ic.text, rtl);
@@ -343,7 +352,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             let bottom = top + root_lh.max(1.0);
             let (l, r) = ctx.floats.available(top, bottom, base.0, base.0 + full_avail);
             if r - l < full_avail {
-                if first_run_width(&pieces, start) + first_indent > r - l {
+                if first_run_width(&pieces, start) + first_indent > r - l + 0.01 {
                     if let Some(next) = ctx.floats.next_bottom(top, bottom).filter(|&n| n > top) {
                         y = next - base.1;
                         continue;
@@ -400,6 +409,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     end = x;
                     has_content |= p.width > 0.0;
                 }
+                PieceKind::OutOfFlow(_) => {}
                 PieceKind::Break => has_content = true,
             }
         }
@@ -421,6 +431,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         let extra = if justify { free / opportunities as f32 } else { 0.0 };
 
         // Pass 2: fragments, relative to the line's root baseline
+        // (absolutely positioned boxes' places: index, x before and after
+        // the pending space, and the content pieces placed before them)
+        let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
+        let mut placed_content = 0usize;
         let mut stack: Vec<OpenBox> = vec![OpenBox {
             style: 0,
             node: NodeId::NONE,
@@ -501,6 +515,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     x += word.width;
                     content = true;
+                    placed_content += 1;
                 }
                 PieceKind::Atomic(i) => {
                     x += pending + extra * pending_n as f32;
@@ -524,6 +539,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     x += p.width;
                     content = true;
+                    placed_content += 1;
                 }
                 PieceKind::Open { style, node } => {
                     if content {
@@ -538,6 +554,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     x += p.width;
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
+                PieceKind::OutOfFlow(i) => placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content)),
                 PieceKind::Break => {}
             }
         }
@@ -545,11 +562,23 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             close_box(&mut stack, ic, &fonts, x, false, avail);
         }
         let root = stack.pop().expect("root box");
+        // The space before an absolutely positioned box is before it when
+        // content follows on the line (at the line's end, it is dropped)
+        let placed = placed.into_iter().map(|(i, x0, x1, n)| (i, if placed_content > n { x1 } else { x0 }));
+        // An absolutely positioned box's static position: where it stands
+        // in the line, or below the line if it was block-level
+        let static_rect = |i: usize, x: f32, line_top: f32, line_bottom: f32| {
+            let b = out_of_flow[i];
+            let at = if b.style.box_.inline_origin { Rect::new(x, line_top, 0.0, 0.0) } else { Rect::new(0.0, line_bottom, 0.0, 0.0) };
+            Fragment::Box(placeholder(b, at))
+        };
         if !has_content {
+            frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, y, y)));
             continue;
         }
         let baseline = y - top;
         let mut line_frags = root.children;
+        line_frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, top, bottom)));
         for f in &mut line_frags {
             f.translate(0.0, baseline);
         }
@@ -732,6 +761,11 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         scroll_extent: None,
     };
     frag.update_ink();
+    // `position: relative` moves the box and its content, not the line
+    let rel = relative_offset(st, cb_w, None);
+    if rel != (0.0, 0.0) {
+        frag.translate(rel.0, rel.1);
+    }
     let parent = stack.last_mut().expect("root box");
     parent.children.push(Fragment::Box(frag));
     parent.last_text = None;
@@ -772,6 +806,7 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                         pending += p.width;
                     }
                 }
+                PieceKind::OutOfFlow(_) => {}
                 _ => {
                     x += pending + p.width;
                     pending = 0.0;

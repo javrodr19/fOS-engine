@@ -730,6 +730,9 @@ pub struct BoxStyle {
     /// `None` is currentcolor
     pub text_decoration_color: Option<Color>,
     pub text_decoration_style: TextDecorationStyle,
+    /// An absolutely positioned box whose `display` was inline-level
+    /// before it was blockified: its static position is in its line
+    pub inline_origin: bool,
 }
 
 impl Default for BoxStyle {
@@ -793,6 +796,7 @@ impl Default for BoxStyle {
             text_decoration_line: 0,
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
+            inline_origin: false,
         }
     }
 }
@@ -1146,6 +1150,7 @@ impl Style {
             let blockified = bx.display.blockified();
             if blockified != bx.display || (out_of_flow && bx.float != Float::None) {
                 let bx = Arc::make_mut(&mut self.box_);
+                bx.inline_origin |= out_of_flow && bx.display.is_inline_level();
                 bx.display = blockified;
                 if out_of_flow {
                     bx.float = Float::None;

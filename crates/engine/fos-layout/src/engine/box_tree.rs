@@ -229,6 +229,9 @@ pub enum InlineItem {
     Close,
     /// inline-block, inline replaced elements...
     Atomic(Box<LayoutBox>),
+    /// An absolutely positioned box amid the content: it takes no room on
+    /// the line, and is placed from where it stands in it
+    OutOfFlow(Box<LayoutBox>),
     /// `<br>`, or a preserved newline
     Break,
 }
@@ -239,7 +242,7 @@ impl InlineContent {
         self.items.iter().all(|i| match i {
             InlineItem::Text { start, end, .. } => self.text[*start..*end].trim_matches(' ').is_empty(),
             InlineItem::Open { .. } | InlineItem::Close => true,
-            InlineItem::Atomic(_) | InlineItem::Break => false,
+            InlineItem::Atomic(_) | InlineItem::Break | InlineItem::OutOfFlow(_) => false,
         }) && !self.items.iter().any(|i| matches!(i, InlineItem::Open { style, .. } if has_edges(&self.styles[*style as usize])))
     }
 }
@@ -344,6 +347,12 @@ impl InlineBuilder {
     fn atomic(&mut self, b: LayoutBox) {
         self.content.items.push(InlineItem::Atomic(Box::new(b)));
         self.after_space = false;
+    }
+
+    /// An absolutely positioned box: white space on either side of it
+    /// collapses as if it were not there
+    fn out_of_flow(&mut self, b: LayoutBox) {
+        self.content.items.push(InlineItem::OutOfFlow(Box::new(b)));
     }
 
     fn forced_break(&mut self) {
@@ -713,6 +722,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             } else if display.is_inline_level() || (replaced && display == Display::Inline) {
                 let b = self.element_box(child, style, false);
                 c.inline.atomic(b);
+            } else if style.is_out_of_flow() && !c.inline.content.is_blank() {
+                // Amid inline content, which it does not split
+                let mut style = style;
+                fade(&mut style, c.inline.open_opacity());
+                let b = self.element_box(child, style, true);
+                c.inline.out_of_flow(b);
             } else {
                 // Block-level (tables, grids and out-of-flow boxes are laid
                 // out as blocks for now)

@@ -515,6 +515,32 @@ pub fn cascade(
     cache: &mut fos_css::ResolveCache,
 ) {
     cascade_for(styles, scoped, tree, node, element, None, filter, inline, style, parent, ctx, cache);
+    form_control_display(tree, element, style);
+}
+
+/// Form controls are atomic: an inline (or table-part) one is an inline
+/// block, and a table or list item a block, as in browsers (`button {
+/// display: inline }` lays out, and computes, as `inline-block`)
+fn form_control_display(tree: &DomTree, element: &ElementData, style: &mut Style) {
+    use fos_css::style::Display;
+    let to = match style.display() {
+        Display::Inline
+        | Display::InlineTable
+        | Display::TableRowGroup
+        | Display::TableHeaderGroup
+        | Display::TableFooterGroup
+        | Display::TableRow
+        | Display::TableColumnGroup
+        | Display::TableColumn
+        | Display::TableCell
+        | Display::TableCaption => Display::InlineBlock,
+        Display::ListItem | Display::Table => Display::Block,
+        _ => return,
+    };
+    let html = matches!(tree.resolve(element.name.ns), "" | "http://www.w3.org/1999/xhtml");
+    if html && matches!(tree.resolve(element.name.local), "button" | "input" | "select" | "textarea" | "meter" | "progress") {
+        std::sync::Arc::make_mut(&mut style.box_).display = to;
+    }
 }
 
 /// The style of pseudo-element `pe` of element `node` (whose style is
@@ -734,6 +760,18 @@ mod tests {
         assert_eq!(style_of(css, html, "in").font_size(), 20.0);
         assert_eq!(style_of(css, html, "p").box_.margin[0], LpAuto::Lp(Lp::px(12.0)));
         assert_eq!(style_of(css, html, "out").box_.width, LpAuto::Lp(Lp { px: -32.0, pct: 100.0 }));
+    }
+
+    #[test]
+    fn inline_form_controls_are_inline_blocks() {
+        use fos_css::style::Display;
+        let html = r#"<html><body><button id="b">x</button><select id="s"></select><span id="i">y</span><input id="t"></body></html>"#;
+        let css = "button, select, span { display: inline } #t { display: table-row }";
+        assert_eq!(style_of(css, html, "b").display(), Display::InlineBlock);
+        assert_eq!(style_of(css, html, "s").display(), Display::InlineBlock);
+        assert_eq!(style_of(css, html, "i").display(), Display::Inline);
+        assert_eq!(style_of(css, html, "t").display(), Display::InlineBlock);
+        assert_eq!(style_of("button { display: table }", html, "b").display(), Display::Block);
     }
 
     #[test]

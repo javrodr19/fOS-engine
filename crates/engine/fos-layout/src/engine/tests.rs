@@ -677,6 +677,78 @@ fn table_captions_go_on_their_side() {
 }
 
 #[test]
+fn floats_share_max_content_with_inline_content() {
+    let (mut tree, html, body) = doc();
+    // Text then a float: side by side in a shrink-to-fit float
+    let a = el(&mut tree, body, "div", "float: right");
+    let link = el(&mut tree, a, "a", "");
+    text(&mut tree, link, "Donate");
+    el(&mut tree, a, "div", "float: right; width: 300px; height: 50px");
+    // A float beside a box that avoids floats, but above a plain block
+    let b = el(&mut tree, body, "div", "float: left; clear: both");
+    el(&mut tree, b, "div", "float: left; width: 100px; height: 20px");
+    el(&mut tree, b, "div", "overflow: hidden; width: 50px; height: 20px");
+    let c = el(&mut tree, body, "div", "float: left; clear: both");
+    el(&mut tree, c, "div", "float: left; width: 100px; height: 20px");
+    el(&mut tree, c, "div", "width: 50px; height: 20px");
+    let t = layout(&tree, html, 800.0);
+    let donate = rects_of(&t, link)[0].w;
+    assert!((rect_of(&t, a).w - (300.0 + donate)).abs() < 0.5, "{:?}", rect_of(&t, a));
+    assert_eq!(rect_of(&t, b).w, 150.0);
+    assert_eq!(rect_of(&t, c).w, 100.0);
+}
+
+#[test]
+fn absolute_boxes_stay_in_their_line() {
+    let (mut tree, html, body) = doc();
+    // An absolutely positioned label between inline blocks does not
+    // split their line, and the spaces around it collapse to one
+    let p = el(&mut tree, body, "div", "float: left");
+    let a = el(&mut tree, p, "span", "display: inline-block; width: 40px; height: 10px");
+    text(&mut tree, p, " ");
+    let label = el(&mut tree, p, "label", "position: absolute");
+    text(&mut tree, label, "L");
+    text(&mut tree, p, " ");
+    let b = el(&mut tree, p, "span", "display: inline-block; width: 100px; height: 10px");
+    // A block-level one starts below its line
+    let q = el(&mut tree, body, "div", "clear: both");
+    text(&mut tree, q, "words ");
+    let block = el(&mut tree, q, "div", "position: absolute");
+    text(&mut tree, block, "B");
+    text(&mut tree, q, " more");
+    let t = layout(&tree, html, 800.0);
+    let (ra, rb, rl) = (rect_of(&t, a), rect_of(&t, b), rect_of(&t, label));
+    assert_eq!(ra.y, rb.y);
+    let gap = rb.x - ra.right();
+    assert!(gap > 2.0 && gap < 8.0, "one space between: {gap}");
+    assert!((rl.x - (ra.right() + gap)).abs() < 0.5 && rl.y <= ra.y, "{rl:?}");
+    assert!((rect_of(&t, p).w - (140.0 + gap)).abs() < 0.5);
+    let (rq, rbl) = (rect_of(&t, q), rect_of(&t, block));
+    assert_eq!(rbl.x, rq.x);
+    assert!(rbl.y >= rq.y + rq.h - 0.5, "{rbl:?} {rq:?}");
+}
+
+#[test]
+fn relative_inline_boxes_move_with_their_text() {
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "");
+    text(&mut tree, p, "before ");
+    let span = el(&mut tree, p, "span", "position: relative; top: 10px; left: 5px; padding: 2px");
+    text(&mut tree, span, "moved");
+    text(&mut tree, p, " after");
+    let still = el(&mut tree, body, "div", "");
+    text(&mut tree, still, "before ");
+    let plain = el(&mut tree, still, "span", "padding: 2px");
+    text(&mut tree, plain, "moved");
+    text(&mut tree, still, " after");
+    let t = layout(&tree, html, 800.0);
+    let (a, b) = (rect_of(&t, span), rect_of(&t, plain));
+    assert_eq!((a.x - b.x, a.y - (b.y - rect_of(&t, still).y + rect_of(&t, p).y)), (5.0, 10.0));
+    // The line is laid out as if it had not moved
+    assert_eq!(rect_of(&t, p).h, rect_of(&t, still).h);
+}
+
+#[test]
 fn table_extra_width_goes_to_auto_columns() {
     // A 600px table: the fixed column keeps its width, the percentage one
     // gets its share, and the auto one the rest

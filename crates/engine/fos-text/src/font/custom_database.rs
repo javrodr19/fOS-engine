@@ -746,7 +746,10 @@ fn read_face_metadata<R: ReadAt>(src: &mut R, face_offset: u64) -> Option<FaceMe
         }
     }
     if families.is_empty() {
-        return None;
+        // Web fonts may carry no family name (their `@font-face` rule
+        // gives them one): go by the full or PostScript name
+        let name = names.full_name.as_deref().or(names.postscript_name.as_deref()).map(str::trim).filter(|n| !n.is_empty())?;
+        families.push(name.to_string());
     }
 
     // A variable face's weight range is its weight axis's

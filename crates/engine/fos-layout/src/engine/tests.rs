@@ -812,6 +812,20 @@ fn quirks_mode_line_height() {
 }
 
 #[test]
+fn flex_items_shrink_by_their_inner_base_sizes() {
+    // Two 400px items in 400px: the padded one's inner base is 300px, so
+    // it gives up 300/700 of the 400px overflow, the other 400/700
+    let (mut tree, html, body) = doc();
+    let row = el(&mut tree, body, "div", "display: flex; width: 400px");
+    let plain = el(&mut tree, row, "div", "width: 400px; box-sizing: border-box; height: 5px");
+    let padded = el(&mut tree, row, "div", "width: 400px; box-sizing: border-box; padding-left: 100px; height: 5px");
+    let t = layout(&tree, html, 800.0);
+    let (a, b) = (rect_of(&t, plain).w, rect_of(&t, padded).w);
+    assert!((a - (400.0 - 400.0 * 400.0 / 700.0)).abs() < 0.01, "{a}");
+    assert!((b - (400.0 - 400.0 * 300.0 / 700.0)).abs() < 0.01, "{b}");
+}
+
+#[test]
 fn table_extra_width_goes_to_auto_columns() {
     // A 600px table: the fixed column keeps its width, the percentage one
     // gets its share, and the auto one the rest

@@ -15,6 +15,10 @@ use fos_dom::{DomTree, NodeId};
 pub trait Styler {
     /// The element's computed style, as a child of `parent`
     fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style;
+    /// The document is in quirks mode
+    fn quirks(&self) -> bool {
+        false
+    }
     /// The builder descends into / comes back from an element's children
     fn enter(&mut self, _tree: &DomTree, _node: NodeId) {}
     fn leave(&mut self) {}

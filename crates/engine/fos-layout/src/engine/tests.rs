@@ -749,6 +749,69 @@ fn relative_inline_boxes_move_with_their_text() {
 }
 
 #[test]
+fn cells_align_their_content_by_its_height() {
+    // A cell's height is a minimum: content taller than it is centered in
+    // the row by its own height, and a tall cell centers short content
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; border-spacing: 0");
+    let tr = el(&mut tree, table, "tr", "display: table-row");
+    let short = el(&mut tree, tr, "td", "display: table-cell; height: 4px; padding: 0; vertical-align: middle; line-height: 16px");
+    let a = el(&mut tree, short, "span", "");
+    text(&mut tree, a, "a");
+    let tall = el(&mut tree, tr, "td", "display: table-cell; height: 40px; padding: 0; vertical-align: middle; line-height: 20px");
+    let b = el(&mut tree, tall, "span", "");
+    text(&mut tree, b, "b");
+    let t = layout(&tree, html, 800.0);
+    let row = rect_of(&t, tr);
+    assert_eq!(row.h, 40.0);
+    assert_eq!((rect_of(&t, short).h, rect_of(&t, tall).h), (40.0, 40.0));
+    // 16px of line centered in 40 (12 above), 20px of line likewise (10)
+    let (ra, rb) = (rect_of(&t, a), rect_of(&t, b));
+    assert!(ra.y - row.y > 12.0 - 2.0 && ra.y - row.y < 12.0 + 4.0, "{ra:?} {row:?}");
+    assert!(rb.y - row.y > 10.0 - 2.0 && rb.y - row.y < 10.0 + 4.0, "{rb:?} {row:?}");
+}
+
+/// [`TestStyler`] for a document in quirks mode
+struct QuirksStyler;
+
+impl Styler for QuirksStyler {
+    fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
+        TestStyler.style(tree, node, parent)
+    }
+
+    fn quirks(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn quirks_mode_line_height() {
+    let page = || {
+        let (mut tree, html, body) = doc();
+        // Text only inside a span: the block's own line height (its strut)
+        // does not count in quirks mode
+        let p = el(&mut tree, body, "div", "line-height: 40px");
+        let span = el(&mut tree, p, "span", "line-height: 10px");
+        text(&mut tree, span, "x");
+        // Nor around a lone inline block (an image in a table cell)
+        let q = el(&mut tree, body, "div", "line-height: 40px");
+        el(&mut tree, q, "span", "display: inline-block; width: 5px; height: 12px");
+        // Text directly in the block keeps it
+        let r = el(&mut tree, body, "div", "line-height: 40px");
+        text(&mut tree, r, "y");
+        (tree, html, p, q, r)
+    };
+    let (tree, html, p, q, r) = page();
+    let mut fonts = FontContext::default();
+    let quirks = layout_document(&tree, html, &mut QuirksStyler, &mut fonts, (800.0, 600.0));
+    assert_eq!(rect_of(&quirks, p).h, 10.0);
+    assert!(rect_of(&quirks, q).h <= 13.0, "{:?}", rect_of(&quirks, q));
+    assert_eq!(rect_of(&quirks, r).h, 40.0);
+    let standard = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&standard, p).h, rect_of(&standard, q).h, rect_of(&standard, r).h), (40.0, 40.0, 40.0));
+}
+
+#[test]
 fn table_extra_width_goes_to_auto_columns() {
     // A 600px table: the fixed column keeps its width, the percentage one
     // gets its share, and the auto one the rest

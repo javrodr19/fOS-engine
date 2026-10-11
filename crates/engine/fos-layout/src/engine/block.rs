@@ -28,11 +28,13 @@ pub struct LayoutCtx<'a> {
     /// The box about to be laid out is in a block whose text-align is
     /// -webkit-center (<center>, align=center): it is centered
     pub center_in_parent: bool,
+    /// The document is in quirks mode
+    pub quirks: bool,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, quirks: false }
     }
 }
 
@@ -217,6 +219,9 @@ pub struct Laid {
     pub through: bool,
     pub ml: f32,
     pub mr: f32,
+    /// The height of the box's content as laid out, whatever height the
+    /// box was given (table cells align their content by it)
+    pub content_h: f32,
 }
 
 impl Laid {
@@ -448,7 +453,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let own_top = Margin::new(e.margin[0].unwrap_or(0.0));
     let own_bottom = Margin::new(e.margin[2].unwrap_or(0.0));
     if through {
-        Laid { frag, mt: own_top.adjoin(own_bottom).adjoin(escaped_top), mb: Margin::default(), through: true, ml, mr }
+        Laid { frag, mt: own_top.adjoin(own_bottom).adjoin(escaped_top), mb: Margin::default(), through: true, ml, mr, content_h }
     } else {
         Laid {
             frag,
@@ -457,6 +462,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             through: false,
             ml,
             mr,
+            content_h,
         }
     }
 }
@@ -705,7 +711,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
     frag.update_ink();
     let mt = Margin::new(e.margin[0].unwrap_or(0.0));
     let mb = Margin::new(e.margin[2].unwrap_or(0.0));
-    Laid { frag, mt, mb, through: false, ml, mr }
+    let content_h = frag.content_box().h;
+    Laid { frag, mt, mb, through: false, ml, mr, content_h }
 }
 
 /// One line of a form control's text, vertically centered and clipped to

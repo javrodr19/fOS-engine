@@ -246,23 +246,29 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
         let end = (c + span).min(g.cols);
         cols[c..end].iter().sum::<f32>() + hs * (end - c).saturating_sub(1) as f32
     };
-    let mut laid_cells: Vec<(usize, usize, usize, BoxFragment)> = Vec::with_capacity(g.cells.len());
+    // (row, column, rows spanned, fragment, height its content takes)
+    let mut laid_cells: Vec<(usize, usize, usize, BoxFragment, f32)> = Vec::with_capacity(g.cells.len());
     let mut row_h: Vec<f32> = t.rows.iter().map(|r| r.style.box_.height.resolve(0.0).unwrap_or(0.0)).collect();
     for &(r, c, cell) in &g.cells {
         let w = span_width(c, cell.colspan as usize);
         let laid = layout_sized(ctx, &cell.b, w, None, Sizing::Shrink, false, Forced { width: Some(w), height: None, root: true });
         let rs = (cell.rowspan as usize).min(t.rows.len() - r);
+        // A cell's height is a minimum: its content never overflows it
+        let f = &laid.frag;
+        let content = laid.content_h + f.border[0] + f.border[2] + f.padding[0] + f.padding[2];
+        let h = f.border_box.h.max(content);
         if rs == 1 {
-            row_h[r] = row_h[r].max(laid.frag.border_box.h);
+            row_h[r] = row_h[r].max(h);
         }
-        laid_cells.push((r, c, rs, laid.frag));
+        laid_cells.push((r, c, rs, laid.frag, content));
     }
     // Row-spanning cells make their last row taller when needed
-    for (r, _, rs, f) in &laid_cells {
+    for (r, _, rs, f, content) in &laid_cells {
         if *rs > 1 {
             let have: f32 = row_h[*r..r + rs].iter().sum::<f32>() + vs * (rs - 1) as f32;
-            if f.border_box.h > have {
-                row_h[r + rs - 1] += f.border_box.h - have;
+            let need = f.border_box.h.max(*content);
+            if need > have {
+                row_h[r + rs - 1] += need - have;
             }
         }
     }
@@ -293,23 +299,22 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             scroll_extent: None,
         })
         .collect();
-    for (r, c, rs, mut f) in laid_cells {
+    for (r, c, rs, mut f, content) in laid_cells {
         let h: f32 = row_h[r..r + rs].iter().sum::<f32>() + vs * (rs - 1) as f32;
-        // The cell fills its rows; its content aligns vertically
-        let free = h - f.border_box.h;
+        // The cell fills its rows; its content aligns vertically in it (by
+        // the content's own height, whatever height the cell asks for)
+        let free = h - content;
         let shift = match f.style.box_.vertical_align {
             VerticalAlign::Middle => free / 2.0,
             VerticalAlign::Bottom | VerticalAlign::TextBottom => free,
             _ => 0.0,
         };
-        if free > 0.0 {
-            if shift > 0.0 {
-                for ch in &mut f.children {
-                    ch.translate(0.0, shift);
-                }
+        if shift > 0.0 {
+            for ch in &mut f.children {
+                ch.translate(0.0, shift);
             }
-            f.border_box.h = h;
         }
+        f.border_box.h = f.border_box.h.max(h);
         f.translate(col_x[c] - f.border_box.x, row_y[r] - f.border_box.y);
         f.update_ink();
         rows[r].children.push(Fragment::Box(f));

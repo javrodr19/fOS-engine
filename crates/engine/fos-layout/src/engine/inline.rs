@@ -268,12 +268,18 @@ struct OpenBox {
     /// The style of the last text fragment in `children`, to extend it
     last_text: Option<(u32, NodeId)>,
     decoration: (u8, Color),
+    /// In quirks mode, the line height (top and bottom) the box gives the
+    /// line once text goes directly in it
+    extents: Option<(f32, f32)>,
 }
 
 fn half_leading_extents(font: &ResolvedFont, line_height: f32, shift: f32) -> (f32, f32) {
     let (a, d) = (font.ascent(), font.descent());
-    let half = (line_height - (a + d)) / 2.0;
-    (shift - a - half, shift + d + half)
+    // As Blink: the leading above the text is half of it, floored to a
+    // whole pixel; the rest goes below
+    let leading = line_height - (a + d);
+    let above = (leading / 2.0).floor();
+    (shift - a - above, shift + d + (leading - above))
 }
 
 /// The baseline shift of a box with `font` inside a parent box with
@@ -435,6 +441,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // the pending space, and the content pieces placed before them)
         let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
         let mut placed_content = 0usize;
+        let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
+        // The line height quirk: in quirks mode, an inline box (the root one
+        // too) adds its line height to the line only when text goes in it
+        let quirks = ctx.quirks;
         let mut stack: Vec<OpenBox> = vec![OpenBox {
             style: 0,
             node: NodeId::NONE,
@@ -444,9 +454,9 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             children: Vec::new(),
             last_text: None,
             decoration: ic.decoration,
+            extents: quirks.then_some((root_top, root_bottom)),
         }];
-        let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
-        let (mut top, mut bottom) = (root_top, root_bottom);
+        let (mut top, mut bottom) = if quirks { (f32::INFINITY, f32::NEG_INFINITY) } else { (root_top, root_bottom) };
         let mut x = start_x + offset;
         let order = visual_order(line, &carried, levels.as_deref(), rtl);
         // Boxes still open at the line's end continue on the next
@@ -470,7 +480,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             let p = match v {
                 Visual::Piece(i) => &line[i],
                 Visual::OpenCarried(style, node) => {
-                    open_box(&mut stack, ic, &fonts, style, node, x, false, &mut top, &mut bottom);
+                    open_box(&mut stack, ic, &fonts, style, node, x, false, quirks, &mut top, &mut bottom);
                     continue;
                 }
                 Visual::CloseOpen => {
@@ -492,6 +502,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     pending = 0.0;
                     pending_n = 0;
                     let top_box = stack.last_mut().expect("root box");
+                    if let Some((t, b)) = top_box.extents.take() {
+                        top = top.min(t);
+                        bottom = bottom.max(b);
+                    }
                     let font = fonts[*style as usize];
                     let st = &ic.styles[*style as usize];
                     let extend = top_box.last_text == Some((*style, *node));
@@ -547,7 +561,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     pending = 0.0;
                     pending_n = 0;
-                    open_box(&mut stack, ic, &fonts, *style, *node, x, true, &mut top, &mut bottom);
+                    open_box(&mut stack, ic, &fonts, *style, *node, x, true, quirks, &mut top, &mut bottom);
                     x += p.width;
                 }
                 PieceKind::Close => {
@@ -555,8 +569,18 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
                 PieceKind::OutOfFlow(i) => placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content)),
-                PieceKind::Break => {}
+                // A line break counts as text
+                PieceKind::Break => {
+                    if let Some((t, b)) = stack.last_mut().and_then(|o| o.extents.take()) {
+                        top = top.min(t);
+                        bottom = bottom.max(b);
+                    }
+                }
             }
+        }
+        if top > bottom {
+            // Nothing gave the line a height
+            (top, bottom) = (root_top, root_bottom);
         }
         while stack.len() > 1 {
             close_box(&mut stack, ic, &fonts, x, false, avail);
@@ -716,7 +740,8 @@ fn visual_order(line: &[Piece], carried: &[(u32, NodeId)], levels: Option<&[u8]>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont], style: u32, node: NodeId, x: f32, has_start: bool, top: &mut f32, bottom: &mut f32) {
+#[allow(clippy::too_many_arguments)]
+fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont], style: u32, node: NodeId, x: f32, has_start: bool, quirks: bool, top: &mut f32, bottom: &mut f32) {
     let parent = stack.last().expect("root box");
     let st = &ic.styles[style as usize];
     let font = fonts[style as usize];
@@ -724,11 +749,18 @@ fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont]
     let lh = font.line_height(st.inherited.line_height);
     let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, font.ascent(), font.ascent() + font.descent(), lh);
     let (t, b) = half_leading_extents(&font, lh, shift);
-    *top = top.min(t);
-    *bottom = bottom.max(b);
+    // (in quirks mode, boxes with vertical borders or padding count at once)
+    let edges = st.border.width[0] + st.border.width[2] + st.box_.padding[0].resolve(0.0) + st.box_.padding[2].resolve(0.0);
+    let extents = if quirks && edges <= 0.0 {
+        Some((t, b))
+    } else {
+        *top = top.min(t);
+        *bottom = bottom.max(b);
+        None
+    };
     let own = st.box_.text_decoration_line;
     let decoration = if own != 0 { (parent.decoration.0 | own, st.box_.text_decoration_color.unwrap_or(st.color())) } else { parent.decoration };
-    stack.push(OpenBox { style, node, shift, x, has_start, children: Vec::new(), last_text: None, decoration });
+    stack.push(OpenBox { style, node, shift, x, has_start, children: Vec::new(), last_text: None, decoration, extents });
 }
 
 /// Close the innermost inline box at `x` (the end of its margin box) into

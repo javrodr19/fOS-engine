@@ -1025,6 +1025,10 @@ struct BrowserStyler<'a> {
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
+    fn quirks(&self) -> bool {
+        self.quirks
+    }
+
     fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
         let Some(element) = tree.get(node).and_then(|n| n.as_element()) else { return Style::inherit_from(parent) };
         // Quirks mode: tables do not inherit fonts, white-space and

@@ -110,6 +110,28 @@ fn pick_srcset(srcset: &str, viewport_w: f32) -> Option<String> {
 }
 
 /// The absolute URLs of the document's images, in document order
+/// The `<img>` elements whose images are in `images`, with their URLs
+pub fn loaded_img_elements(document: &Document, images: &Images, viewport_w: f32) -> Vec<(NodeId, String)> {
+    let tree = document.tree();
+    let base = crate::css_loader::base_url(document);
+    let mut out = Vec::new();
+    let mut roots = vec![tree.root()];
+    roots.extend(tree.shadow_roots().filter(|&(host, _)| tree.is_connected(host)).map(|(_, root)| root));
+    for root in roots {
+        fos_dom::selector::walk_elements(tree, root, &mut |id| {
+            let is_img = tree.get(id).and_then(|n| n.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "img");
+            if let Some(src) = is_img.then(|| image_source(tree, id, viewport_w)).flatten() {
+                let url = fos_net::url_util::resolve(&base, src.trim());
+                if images.contains_key(&url) {
+                    out.push((id, url));
+                }
+            }
+            true
+        });
+    }
+    out
+}
+
 pub fn image_urls(document: &Document, viewport_w: f32) -> Vec<String> {
     let tree = document.tree();
     let base = crate::css_loader::base_url(document);
@@ -482,6 +504,17 @@ fn percent_decode(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_images_are_found_by_element() {
+        let doc = fos_html::parse_with_url(r#"<html><body><img id=a src="a.png"><img id=b src="b.png"><img id=c srcset="c.png 1x"><p>x</p></body></html>"#, "https://example.com/");
+        let image = Arc::new(LoadedImage { natural: (1.0, 1.0), pixmap: Pixmap::new(1, 1).unwrap(), svg_source: None });
+        let images: Images = Arc::new(["https://example.com/a.png", "https://example.com/c.png"].into_iter().map(|u| (u.to_string(), image.clone())).collect());
+        let found = loaded_img_elements(&doc, &images, 800.0);
+        let ids: Vec<&str> = found.iter().filter_map(|(n, _)| doc.tree().get_attribute(*n, "id")).collect();
+        assert_eq!(ids, ["a", "c"]);
+        assert_eq!(found[1].1, "https://example.com/c.png");
+    }
 
     #[test]
     fn svg_text_is_drawn() {

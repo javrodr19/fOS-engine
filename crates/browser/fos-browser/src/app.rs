@@ -86,6 +86,12 @@ struct BrowserApp {
     rendered_page: Option<RenderedPage>,
     /// The documents the page's iframes show
     frames: crate::frames::Frames,
+    /// `<img>` elements told their image loaded, and which (a new `src`
+    /// loads again)
+    image_loads: std::collections::HashMap<fos_dom::NodeId, String>,
+    /// `load` events for images are being fired (their handlers may load
+    /// more images; those fire next time)
+    firing_image_loads: bool,
     /// Initial URL
     initial_url: String,
     /// Window dimensions
@@ -142,6 +148,8 @@ impl BrowserApp {
             renderer: PageRenderer::new(800, 600),
             rendered_page: None,
             frames: Default::default(),
+            image_loads: Default::default(),
+            firing_image_loads: false,
             initial_url,
             width: 1024,
             height: 768,
@@ -281,6 +289,7 @@ impl BrowserApp {
         page.stylesheets = self.load_stylesheets(&page);
         self.renderer.new_page();
         self.frames.clear();
+        self.image_loads.clear();
         self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
@@ -313,6 +322,32 @@ impl BrowserApp {
             self.ensure_render_covers_scroll();
             self.request_redraw();
         }
+        self.fire_image_loads();
+    }
+
+    /// Fire `load` at the `<img>` elements whose images arrived since they
+    /// were last told
+    fn fire_image_loads(&mut self) {
+        if self.firing_image_loads {
+            return;
+        }
+        let Some(doc) = self.current_document() else { return };
+        let images = self.renderer.images();
+        let loaded = crate::image_loader::loaded_img_elements(&lock_document(&doc), &images, self.content_width() as f32);
+        let new: Vec<_> = loaded.into_iter().filter(|(node, url)| self.image_loads.get(node) != Some(url)).collect();
+        let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) else { return };
+        if new.is_empty() {
+            return;
+        }
+        self.firing_image_loads = true;
+        for (node, url) in new {
+            self.image_loads.insert(node, url);
+            rt.fire_event(node, "load");
+        }
+        // Handlers may have changed the page
+        self.refresh_if_dom_changed();
+        self.follow_script_navigation();
+        self.firing_image_loads = false;
     }
 
     /// Fetch the web fonts the page's CSS uses; text is redrawn in them

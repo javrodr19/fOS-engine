@@ -143,13 +143,14 @@ impl FontContext {
         let (id, synthesis) = match self.selection.get(&key) {
             Some(sel) => *sel,
             None => {
-                let families: Vec<&str> = i.font_family.iter().map(|f| match &**f {
-                    // Generic names the font database knows by other names
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" => "sans-serif",
-                    "ui-serif" => "serif",
-                    "ui-monospace" => "monospace",
-                    other => other,
-                }).collect();
+                // As in Chromium on Linux: names of fonts that are not
+                // installed (and of Apple's system fonts) match nothing, and
+                // when nothing in the list does, the standard font, serif,
+                // is used
+                let mut families: Vec<&str> = i.font_family.iter().map(|f| &**f).collect();
+                if families.last() != Some(&"serif") {
+                    families.push("serif");
+                }
                 let style = if key.2 { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
                 let query = FontQuery::new(&families).weight(fos_text::FontWeight(i.font_weight)).style(style);
                 let id = self.db.query(&query);
@@ -374,6 +375,21 @@ fn positioned(run: &fos_text::ShapedRun, x0: f32, whole_pixels: bool) -> (Vec<Gl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_families_fall_back_to_serif() {
+        let mut fonts = FontContext::default();
+        let mut face = |families: &[&str]| {
+            let mut style = Style::default();
+            std::sync::Arc::make_mut(&mut style.inherited).font_family = families.iter().map(|f| Arc::from(*f)).collect();
+            fonts.resolve(&style).id
+        };
+        let serif = face(&["serif"]);
+        assert_eq!(face(&["no such font"]), serif);
+        assert_eq!(face(&["-apple-system", "BlinkMacSystemFont"]), serif);
+        // Apple's names are skipped, not taken for sans-serif
+        assert_eq!(face(&["-apple-system", "monospace"]), face(&["monospace"]));
+    }
 
     #[test]
     fn missing_characters_come_from_fallback_faces() {

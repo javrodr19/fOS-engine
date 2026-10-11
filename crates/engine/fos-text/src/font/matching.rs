@@ -74,7 +74,8 @@ pub fn resolve_generic_family(family: &str) -> &[&str] {
         "monospace" => &["Courier New", "Consolas", "DejaVu Sans Mono", "Noto Sans Mono"],
         "cursive" => &["Comic Sans MS", "Brush Script MT"],
         "fantasy" => &["Impact", "Papyrus"],
-        "system-ui" => &["Segoe UI", "San Francisco", "Ubuntu", "Cantarell"],
+        // The desktop's own interface font, or fontconfig's sans default
+        "system-ui" => &["Segoe UI", "San Francisco", "Ubuntu", "Cantarell", "DejaVu Sans", "Noto Sans", "Liberation Sans", "Arial"],
         "ui-serif" => &["Georgia", "Times New Roman"],
         "ui-sans-serif" => &["Segoe UI", "SF Pro", "Roboto"],
         "ui-monospace" => &["SF Mono", "Consolas", "Menlo"],

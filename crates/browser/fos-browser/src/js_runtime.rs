@@ -2050,6 +2050,22 @@ mod tests {
     }
 
     #[test]
+    fn images_report_their_natural_size() {
+        let (mut rt, doc) = page(r#"<html><body><img id=a src="logo.png"><img id=b src="missing.png"><img id=c></body></html>"#);
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        let pixmap = fos_canvas::tiny_skia::Pixmap::new(4, 2).unwrap();
+        let image = Arc::new(crate::image_loader::LoadedImage { natural: (40.0, 20.0), pixmap, svg_source: None });
+        let images: crate::image_loader::Images = Arc::new([("https://example.com/dir/logo.png".to_string(), image)].into_iter().collect());
+        renderer.set_images(images);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layouter(renderer.layouter());
+        assert_eq!(
+            rt.eval("['a', 'b', 'c'].map(id => { const i = document.getElementById(id); return [i.naturalWidth, i.naturalHeight, i.complete, i.currentSrc].join(' '); }).join('|')").unwrap(),
+            "40 20 true https://example.com/dir/logo.png|0 0 false https://example.com/dir/missing.png|0 0 true "
+        );
+    }
+
+    #[test]
     fn transitions_end_on_time() {
         let (mut rt, _doc) = page(
             r#"<html><body><div id=a></div><div id=b></div><div id=c></div><script>

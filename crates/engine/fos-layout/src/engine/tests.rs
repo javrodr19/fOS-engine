@@ -826,6 +826,22 @@ fn flex_items_shrink_by_their_inner_base_sizes() {
 }
 
 #[test]
+fn images_keep_their_ratio_under_two_limits() {
+    // Too wide and too tall: the tighter limit sets both sizes
+    let (mut tree, html, body) = doc();
+    let tall = el(&mut tree, body, "img", "display: block; max-width: 150px; max-height: 64px");
+    tree.set_attribute(tall, "data-natural", "2119x2500");
+    let wide = el(&mut tree, body, "img", "display: block; max-width: 150px; max-height: 64px");
+    tree.set_attribute(wide, "data-natural", "3000x400");
+    let t = layout(&tree, html, 800.0);
+    let (a, b) = (rect_of(&t, tall), rect_of(&t, wide));
+    assert_eq!(a.h, 64.0);
+    assert!((a.w - 64.0 * 2119.0 / 2500.0).abs() < 0.01, "{a:?}");
+    assert_eq!(b.w, 150.0);
+    assert!((b.h - 20.0).abs() < 0.01, "{b:?}");
+}
+
+#[test]
 fn table_extra_width_goes_to_auto_columns() {
     // A 600px table: the fixed column keeps its width, the percentage one
     // gets its share, and the auto one the rest

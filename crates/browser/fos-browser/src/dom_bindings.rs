@@ -1743,6 +1743,26 @@ fn metrics_of(vm: &mut Vm, id: NodeId) -> Option<[f32; 4]> {
     h.metrics.as_ref()?.get(&id.0).copied()
 }
 
+/// `__fosImageSource(img)`: the URL an `<img>` shows (from `srcset` or
+/// `src`) and, once it is loaded, its natural width and height; null
+/// without a source
+fn image_source(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let viewport_w = host(vm).viewport.0;
+    let url = with_doc(vm, |d| {
+        let src = crate::image_loader::image_source(d.tree(), id, viewport_w)?;
+        Some(fos_net::url_util::resolve(&crate::css_loader::base_url(d), src.trim()))
+    });
+    let Some(url) = url else { return Ok(Value::NULL) };
+    let natural = host(vm).layouter.clone().and_then(|l| l.try_borrow().ok().and_then(|l| l.image_natural(&url)));
+    let mut vals = vec![string(vm, &url)];
+    if let Some((w, h)) = natural {
+        vals.push(Value::number(w as f64));
+        vals.push(Value::number(h as f64));
+    }
+    Ok(Value::object(vm.new_array(vals)))
+}
+
 /// `__fosScrollMetrics(el)`: `[scrollLeft, scrollTop, scrollWidth,
 /// scrollHeight, clientWidth, clientHeight]`, or null without a box
 fn scroll_metrics(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
@@ -2075,6 +2095,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),
+        ("__fosImageSource", 1, image_source),
         ("__fosViewport", 0, viewport),
         ("__fosQuirks", 0, quirks),
         ("__fosComputedStyle", 3, computed_style),

@@ -444,6 +444,11 @@ impl Layouter {
         self.snapshot()
     }
 
+    /// The natural size of the loaded image at `url`
+    pub fn image_natural(&self, url: &str) -> Option<(f32, f32)> {
+        self.images.get(url).map(|i| i.natural)
+    }
+
     /// Whether the latest layout reflects `document` as it is now
     pub fn is_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))

@@ -3569,6 +3569,14 @@
     blur() {}
     close() {}
   }
+  // What an <img> shows, and its natural size once loaded
+  Object.defineProperties(global.HTMLImageElement.prototype, {
+    currentSrc: { get() { const r = __fosImageSource(this); return r ? r[0] : ''; }, enumerable: true, configurable: true },
+    naturalWidth: { get() { const r = __fosImageSource(this); return r && r.length > 1 ? Math.round(r[1]) : 0; }, enumerable: true, configurable: true },
+    naturalHeight: { get() { const r = __fosImageSource(this); return r && r.length > 1 ? Math.round(r[2]) : 0; }, enumerable: true, configurable: true },
+    complete: { get() { const r = __fosImageSource(this); return !r || r.length > 1; }, enumerable: true, configurable: true },
+  });
+
   const contentWindows = new WeakMap();
   Object.defineProperties(global.HTMLIFrameElement.prototype, {
     contentWindow: {

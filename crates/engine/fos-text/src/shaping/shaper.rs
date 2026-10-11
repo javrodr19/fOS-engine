@@ -303,6 +303,7 @@ impl TextShaper {
                     cluster: i as u32,
                     char_code: c,
                     x_advance,
+                    x_kerning: 0,
                     y_advance: 0,
                     x_offset: 0,
                     y_offset: 0,
@@ -369,6 +370,7 @@ impl TextShaper {
                 x_offset: g.x_offset,
                 y_offset: g.y_offset,
                 x_advance: g.x_advance,
+                x_kerning: g.x_kerning,
                 y_advance: g.y_advance,
                 cluster: g.cluster,
             })
@@ -499,6 +501,7 @@ impl TextShaper {
             let adjustment = kerning.iter().find_map(|pair| pair.apply(first, second));
             if let Some((value, _)) = adjustment {
                 glyphs[i - 1].x_advance += value.x_advance as i32;
+                glyphs[i - 1].x_kerning += value.x_advance as i32;
             }
         }
     }
@@ -517,6 +520,8 @@ struct GlyphInfo {
     cluster: u32,
     char_code: char,
     x_advance: i32,
+    /// What kerning added to `x_advance`
+    x_kerning: i32,
     y_advance: i32,
     x_offset: i32,
     y_offset: i32,

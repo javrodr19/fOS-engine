@@ -362,8 +362,13 @@ fn positioned(run: &fos_text::ShapedRun, x0: f32, whole_pixels: bool) -> (Vec<Gl
         .glyphs
         .iter()
         .map(|g| {
-            let advance = g.x_advance as f32 * scale;
-            let advance = if whole_pixels { advance.round() } else { advance };
+            // (whole pixels: the glyph's own advance and its kerning are
+            // each rounded, as Chromium's hinted advances and kerning are)
+            let advance = if whole_pixels {
+                ((g.x_advance - g.x_kerning) as f32 * scale).round() + (g.x_kerning as f32 * scale).round()
+            } else {
+                g.x_advance as f32 * scale
+            };
             let glyph = Glyph { id: g.glyph_id, x: x + g.x_offset as f32 * scale, y: g.y_offset as f32 * scale, advance };
             x += advance;
             glyph

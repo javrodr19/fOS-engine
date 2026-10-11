@@ -1449,8 +1449,14 @@ fn url(v: &str) -> Option<Arc<str>> {
     } else {
         return None;
     };
-    let inner = inner.trim().trim_matches(|c| c == '"' || c == '\'');
-    Some(Arc::from(inner))
+    let inner = inner.trim();
+    // Escapes resolved (`\"` in a quoted SVG data URL is a quote)
+    let text = match inner.as_bytes().first() {
+        Some(&q @ (b'"' | b'\'')) => css_string(inner, 1, q)?.0,
+        _ if inner.contains('\\') => css_string(inner, 0, 0)?.0,
+        _ => inner.to_string(),
+    };
+    Some(Arc::from(text))
 }
 
 fn background_images(raw: &str) -> Option<Vec<Image>> {
@@ -1827,6 +1833,16 @@ mod tests {
         let plain = Style::inherit_from(&parent);
         assert!(Arc::ptr_eq(&plain.inherited, &parent.inherited));
         assert!(Arc::ptr_eq(&plain.box_, &Style::default().box_));
+    }
+
+    #[test]
+    fn urls_resolve_escapes() {
+        let s = computed(r#"background-image: url("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\"/>")"#);
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == r#"data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>"#));
+        let s = computed(r"background-image: url(a\(1\).png)");
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == "a(1).png"));
+        let s = computed("background-image: url('b.png')");
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == "b.png"));
     }
 
     #[test]

@@ -13,8 +13,10 @@
 //! by the tree's revision, so any DOM mutation (from scripts, for example)
 //! is picked up by the next render.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::page_styles::{AncestorFilter, PageStyles};
@@ -153,6 +155,11 @@ impl PageLayout {
             }
             index
         })
+    }
+
+    /// Whether element `node` has a box (is rendered)
+    pub fn has_box(&self, node: NodeId) -> bool {
+        self.box_index().contains_key(&node)
     }
 
     /// The content box of element `node`'s first box (document
@@ -296,10 +303,11 @@ impl PageLayout {
         Some((style, used))
     }
 
-    /// Every element's border boxes (inline elements have one per line)
-    /// and text rectangles, in document coordinates and tree order
+    /// Every element's border boxes (inline elements have one per line),
+    /// and the rectangles of text outside any box of its element, in
+    /// document coordinates and tree order
     pub fn boxes(&self) -> Vec<(NodeId, Rect)> {
-        self.fragments.element_rects()
+        self.fragments.element_geometry()
     }
 
     /// The first box fragment of element `node` (for inspection)
@@ -380,21 +388,19 @@ struct CachedLayout {
     layout: Arc<PageLayout>,
 }
 
-/// Page renderer - integrates HTML, CSS, layout, and painting
-pub struct PageRenderer {
-    /// Viewport width
+/// What laying a page out takes (its CSS, images, fonts and the
+/// viewport) and its latest layout. The page's scripts share it: reading
+/// geometry after changing the DOM lays the page out then, as browsers do,
+/// and the next render paints that layout.
+pub struct Layouter {
     viewport_width: u32,
-    /// Viewport height
     viewport_height: u32,
-    /// Glyph rasterization and caching
-    text_renderer: TextRenderer,
     /// Font matching, metrics and shaped words for layout
     fonts: FontContext,
-    /// Layout of the most recently rendered page
+    /// The latest layout
     cached: Option<CachedLayout>,
-    /// Incremented for every new layout, to tell whether a rendered
-    /// buffer was painted from the current one
-    layout_generation: u64,
+    /// Incremented for every new layout
+    generation: u64,
     /// The current page's external stylesheets
     stylesheets: crate::css_loader::Stylesheets,
     /// The page's compiled CSS, by hash of its text and the viewport
@@ -403,164 +409,48 @@ pub struct PageRenderer {
     /// Shadow trees' CSS compiled, by text (and viewport) hash: components
     /// of one kind share theirs
     shadow_css: HashMap<u64, Option<Arc<PageStyles>>>,
-    /// The scroll position last painted (where fixed boxes are)
-    scroll: f32,
     /// The current page's decoded images
     images: crate::image_loader::Images,
     /// Inline `<svg>` elements, rasterized
     svgs: crate::image_loader::SvgCache,
-    /// The page's web fonts (in `fonts`' database)
-    web_fonts: crate::font_loader::WebFonts,
-    /// What scripts drew on the page's canvas elements
-    canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
-    /// Scroll positions of the page's scroll containers
-    box_scroll: std::collections::HashMap<NodeId, (f32, f32)>,
 }
 
-impl PageRenderer {
-    pub fn new(viewport_width: u32, viewport_height: u32) -> Self {
-        let text_renderer = TextRenderer::new();
-        if text_renderer.fonts.is_empty() {
-            log::warn!("No system font found, text will not be drawn");
-        }
-        let fonts = FontContext::new(text_renderer.fonts.clone());
+/// A page's [`Layouter`], shared by its renderer and its scripts
+pub type SharedLayouter = Rc<RefCell<Layouter>>;
+
+impl Layouter {
+    fn new(fonts: FontContext, viewport_width: u32, viewport_height: u32) -> Self {
         Self {
             viewport_width,
             viewport_height,
-            text_renderer,
             fonts,
             cached: None,
-            layout_generation: 0,
+            generation: 0,
             stylesheets: Default::default(),
             compiled_css: None,
             shadow_css: HashMap::new(),
-            scroll: 0.0,
             images: Default::default(),
-            canvases: Default::default(),
             svgs: Default::default(),
-            web_fonts: Default::default(),
-            box_scroll: Default::default(),
         }
     }
 
-    /// Set viewport size
-    pub fn set_viewport(&mut self, width: u32, height: u32) {
-        if height != self.viewport_height {
-            // Viewport units and percentages of the root depend on it
-            self.cached = None;
-        }
-        self.viewport_width = width;
-        self.viewport_height = height;
-    }
-
-    /// Lay out again on the next render (keeping caches)
-    pub fn invalidate_layout(&mut self) {
-        self.cached = None;
-    }
-
-    /// Drop the cached layout, glyphs and shaped words (e.g. on memory
-    /// pressure)
-    pub fn clear_cache(&mut self) {
-        self.cached = None;
-        self.compiled_css = None;
-        self.canvases.clear();
-        self.box_scroll.clear();
-        self.text_renderer.clear_glyph_cache();
-        self.fonts = FontContext::new(self.text_renderer.fonts.clone());
-    }
-
-    /// Width of `text` in the default sans-serif font
-    pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
-        let mut style = Style::default();
-        let i = Arc::make_mut(&mut style.inherited);
-        i.font_size = font_size;
-        i.font_family = Arc::from([Arc::from("sans-serif")]);
-        let font = self.fonts.resolve(&style);
-        self.fonts.shape(&font, text).width
-    }
-
-    /// Parse and render HTML to pixels with scroll offset. Prefer
-    /// [`Self::render_document`] when the page is already parsed.
-    pub fn render_html(&mut self, html: &str, base_url: &str, scroll_offset: f32) -> Option<RenderedPage> {
-        let source = LayoutSource::Html(page_key(html, base_url));
-        if !self.has_layout(source) {
-            let document = fos_html::parse_with_url(html, base_url);
-            self.lay_out(source, &document);
-        }
-        self.paint_cached(scroll_offset)
-    }
-
-    /// Render a parsed document to pixels with scroll offset.
-    ///
-    /// The layout is rebuilt only when the DOM changed since the last
-    /// render, or the viewport width did; otherwise this only repaints.
-    pub fn render_document(&mut self, document: &Document, scroll_offset: f32) -> Option<RenderedPage> {
+    /// The layout of `document` as it is now, laid out if it changed since
+    /// the last layout
+    pub fn layout_of(&mut self, document: &Document) -> Option<Arc<PageLayout>> {
         let source = LayoutSource::Dom(document.tree().revision());
         if !self.has_layout(source) {
             self.lay_out(source, document);
         }
-        self.paint_cached(scroll_offset)
+        self.snapshot()
     }
 
-    /// Render like [`Self::render_document`], reusing `previous` (a render
-    /// of the same layout at another scroll offset) when the viewport has
-    /// only moved: rows still in view are moved, and only the newly exposed
-    /// rows are painted. Falls back to a full render when the buffers are
-    /// not compatible (new layout, new size, fractional or large scroll).
-    pub fn render_document_scrolled(
-        &mut self,
-        document: &Document,
-        scroll_offset: f32,
-        previous: RenderedPage,
-    ) -> Option<RenderedPage> {
-        let source = LayoutSource::Dom(document.tree().revision());
-        if !self.has_layout(source) {
-            self.lay_out(source, document);
-        }
-
-        let delta = scroll_offset - previous.origin;
-        let reusable = previous.layout_generation == self.layout_generation
-            && previous.width == self.viewport_width
-            && previous.height == self.viewport_height
-            && previous.pixels.len() == self.viewport_width as usize * self.viewport_height as usize
-            && delta.fract() == 0.0
-            && delta.abs() < self.viewport_height as f32
-            && self.cached.as_ref().is_some_and(|c| !c.layout.has_fixed);
-        if reusable {
-            self.repaint_scrolled(previous, scroll_offset)
-        } else {
-            drop(previous);
-            self.paint_cached(scroll_offset)
-        }
-    }
-
-    /// The element at `(x, y)` in document coordinates, per the current
-    /// layout
-    pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
-        let offsets = &self.box_scroll;
-        self.cached.as_ref()?.layout.fragments.hit_test_scrolled(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)))
-    }
-
-    /// The `href` of the link under document point (x, y), seeing box
-    /// scrolling and fixed boxes
-    pub fn link_at(&mut self, document: &Document, x: f32, y: f32) -> Option<String> {
-        let tree = document.tree();
-        let mut node = self.node_at(x, y)?;
-        while node.is_valid() {
-            let n = tree.get(node)?;
-            if n.as_element().is_some_and(|e| tree.resolve(e.name.local) == "a") {
-                if let Some(href) = tree.get_attribute(node, "href") {
-                    return Some(href.to_string());
-                }
-            }
-            node = n.parent;
-        }
-        None
-    }
-
-    /// Whether the cached layout reflects `document` as it is now
-    pub fn is_layout_current(&self, document: &Document) -> bool {
+    /// Whether the latest layout reflects `document` as it is now
+    pub fn is_current(&self, document: &Document) -> bool {
         self.has_layout(LayoutSource::Dom(document.tree().revision()))
+    }
+
+    fn snapshot(&self) -> Option<Arc<PageLayout>> {
+        self.cached.as_ref().map(|c| c.layout.clone())
     }
 
     fn has_layout(&self, source: LayoutSource) -> bool {
@@ -579,183 +469,7 @@ impl PageRenderer {
         let layout = build_layout(document, stylesheet, &shadow, &self.images, &mut self.svgs, &mut self.fonts, (width as f32, self.viewport_height as f32));
         log::debug!("layout: css {:?}, styles + layout {:?}", parsed, started.elapsed() - parsed);
         self.cached = Some(CachedLayout { source, width, layout: Arc::new(layout) });
-        self.layout_generation += 1;
-    }
-
-    /// Paint the visible region of the cached layout
-    fn paint_cached(&mut self, scroll_offset: f32) -> Option<RenderedPage> {
-        let cached = self.cached.take()?;
-        self.scroll = scroll_offset;
-        let painted = self.paint(&cached.layout, scroll_offset, scroll_offset, self.viewport_height);
-        let content_height = cached.layout.content_height();
-        let links = links_in(&cached.layout, scroll_offset, self.viewport_height as f32);
-        let anchors = anchors_from(&cached.layout, scroll_offset);
-        self.cached = Some(cached);
-
-        Some(RenderedPage {
-            pixels: painted?,
-            width: self.viewport_width,
-            height: self.viewport_height,
-            content_height,
-            links,
-            anchors,
-            origin: scroll_offset,
-            layout_generation: self.layout_generation,
-        })
-    }
-
-    /// Move `page` (painted from the cached layout) to `scroll_offset`,
-    /// less than a buffer height away, painting only the exposed rows
-    fn repaint_scrolled(&mut self, mut page: RenderedPage, scroll_offset: f32) -> Option<RenderedPage> {
-        let delta = (scroll_offset - page.origin) as i64;
-        if delta == 0 {
-            return Some(page);
-        }
-        let cached = self.cached.take()?;
-
-        let width = page.width as usize;
-        let height = page.height as usize;
-        let shift = delta.unsigned_abs() as usize;
-        let band_top = if delta > 0 {
-            page.pixels.copy_within(shift * width.., 0);
-            height - shift
-        } else {
-            page.pixels.copy_within(..(height - shift) * width, shift * width);
-            0
-        };
-
-        let band_origin = scroll_offset + band_top as f32;
-        self.scroll = scroll_offset;
-        let band = self.paint(&cached.layout, band_origin, scroll_offset, shift as u32);
-        page.anchors = anchors_from(&cached.layout, scroll_offset);
-        page.links = links_in(&cached.layout, scroll_offset, page.height as f32);
-        self.cached = Some(cached);
-        page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
-        page.origin = scroll_offset;
-        Some(page)
-    }
-
-    /// Take new canvas bitmaps (`None`: cleared); true if any changed. A
-    /// repaint shows them (the layout does not change).
-    pub fn update_canvases(&mut self, updates: Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)>) -> bool {
-        let changed = !updates.is_empty();
-        for (node, (w, h), pixmap) in updates {
-            match pixmap {
-                Some(pixmap) => {
-                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
-                }
-                None => {
-                    self.canvases.remove(&node);
-                }
-            }
-        }
-        if changed {
-            // Painted buffers are stale
-            self.layout_generation += 1;
-        }
-        changed
-    }
-
-    /// Forget the previous page's scroll positions and canvases
-    pub fn new_page(&mut self) {
-        self.box_scroll.clear();
-        self.canvases.clear();
-        self.cached = None;
-    }
-
-    /// Scroll the innermost scroll container at document point (x, y) that
-    /// can move by (dx, dy); false if none can (the page should scroll)
-    pub fn scroll_box_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
-        let Some(cached) = self.cached.as_ref() else { return false };
-        let offsets = &self.box_scroll;
-        let chain = cached.layout.fragments.scrollers_at(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)));
-        for (node, visible, extent) in chain {
-            let (ox, oy) = self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0));
-            let nx = (ox + dx).clamp(0.0, (extent.0 - visible.0).max(0.0)).round();
-            let ny = (oy + dy).clamp(0.0, (extent.1 - visible.1).max(0.0)).round();
-            if (nx, ny) != (ox, oy) {
-                self.box_scroll.insert(node, (nx, ny));
-                // Painted buffers are stale
-                self.layout_generation += 1;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Scroll a box to (x, y) (clamped to its content); false if it
-    /// does not scroll
-    pub fn set_box_scroll(&mut self, node: NodeId, x: f32, y: f32) -> bool {
-        let Some(m) = self.cached.as_ref().and_then(|c| c.layout.scroll_metrics().get(&node.0).copied()) else { return false };
-        let to = (x.clamp(0.0, (m[2] - m[0]).max(0.0)).round(), y.clamp(0.0, (m[3] - m[1]).max(0.0)).round());
-        if self.box_scroll(node) == to {
-            return false;
-        }
-        self.box_scroll.insert(node, to);
-        self.layout_generation += 1;
-        true
-    }
-
-    /// Every scrolled box's position (for scripts)
-    pub fn box_scrolls(&self) -> std::collections::HashMap<u32, (f32, f32)> {
-        self.box_scroll.iter().map(|(n, v)| (n.0, *v)).collect()
-    }
-
-    /// An element's scroll position (scrollLeft, scrollTop)
-    pub fn box_scroll(&self, node: NodeId) -> (f32, f32) {
-        self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0))
-    }
-
-    /// Images the current layout's CSS uses (backgrounds, masks)
-    /// The web fonts `document`'s CSS declares and uses
-    pub fn web_font_requests(&self, document: &Document) -> Vec<crate::font_loader::FontRequest> {
-        let css = self.extract_css_from_document(document);
-        let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
-        crate::font_loader::requests(&css, &media, &crate::css_loader::base_url(document))
-    }
-
-    pub fn web_fonts(&self) -> &crate::font_loader::WebFonts {
-        &self.web_fonts
-    }
-
-    /// Use `fonts` as the page's web fonts: they join a font database
-    /// over the system's, and the layout is redone
-    pub fn set_web_fonts(&mut self, fonts: crate::font_loader::WebFonts) {
-        if Arc::ptr_eq(&self.web_fonts, &fonts) {
-            return;
-        }
-        let mut db = fos_text::FontDatabase::overlay(fos_text::FontDatabase::shared());
-        for f in fonts.iter() {
-            let r = &f.request;
-            let style = if r.italic { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
-            if let Err(e) = db.add_web_font_weights(&r.family, r.weights, style, f.data.clone()) {
-                log::debug!("Web font {} unusable: {e}", r.url);
-            }
-        }
-        let db = Arc::new(db);
-        self.web_fonts = fonts;
-        self.text_renderer.fonts = db.clone();
-        self.text_renderer.clear_glyph_cache();
-        self.fonts = FontContext::new(db);
-        self.cached = None;
-    }
-
-    pub fn css_image_urls(&self) -> Vec<String> {
-        self.cached.as_ref().map(|c| c.layout.css_images.clone()).unwrap_or_default()
-    }
-
-    /// Use `images` for the page's images (fetched by the browser); the
-    /// layout is redone if they changed
-    pub fn set_images(&mut self, images: crate::image_loader::Images) {
-        if !Arc::ptr_eq(&self.images, &images) {
-            self.images = images;
-            self.cached = None;
-        }
-    }
-
-    /// The images in use (to keep what is still needed when reloading)
-    pub fn images(&self) -> &crate::image_loader::Images {
-        &self.images
+        self.generation += 1;
     }
 
     /// The page's CSS compiled for matching, reused while its text and
@@ -814,13 +528,6 @@ impl PageRenderer {
         out
     }
 
-    /// Parse the page's own CSS (`<style>` elements) and compile it for
-    /// matching
-    #[cfg(test)]
-    fn page_stylesheet(&self, document: &Document) -> Option<Arc<PageStyles>> {
-        self.compile(&self.extract_css_from_document(document)).map(Arc::new)
-    }
-
     fn compile(&self, css_text: &str) -> Option<PageStyles> {
         if css_text.is_empty() {
             return None;
@@ -829,20 +536,6 @@ impl PageRenderer {
         let styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
         log::debug!("Parsed {} CSS rules from page, buckets (id, class, tag+attr, universal) {:?}", styles.rule_count(), styles.bucket_sizes());
         Some(styles)
-    }
-
-    /// The current layout, for element geometry (`getBoundingClientRect`)
-    pub fn layout_snapshot(&self) -> Option<Arc<PageLayout>> {
-        self.cached.as_ref().map(|c| c.layout.clone())
-    }
-
-    /// Use `sheets` for the page's `<link rel="stylesheet">` elements
-    /// (fetched by the browser); the layout is redone if they changed
-    pub fn set_stylesheets(&mut self, sheets: crate::css_loader::Stylesheets) {
-        if !Arc::ptr_eq(&self.stylesheets, &sheets) {
-            self.stylesheets = sheets;
-            self.cached = None;
-        }
     }
 
     /// The page's CSS: `<style>` contents and fetched `<link>` sheets, in
@@ -895,13 +588,389 @@ impl PageRenderer {
         css.push_str(adopted);
         css
     }
+}
+
+/// Page renderer - integrates HTML, CSS, layout, and painting
+pub struct PageRenderer {
+    /// Styles and lays out pages; shared with the page's scripts
+    layouter: SharedLayouter,
+    /// Glyph rasterization and caching
+    text_renderer: TextRenderer,
+    /// Incremented when painted buffers go stale without a new layout
+    /// (canvases drawn, boxes scrolled)
+    paint_generation: u64,
+    /// The scroll position last painted (where fixed boxes are)
+    scroll: f32,
+    /// The page's web fonts (in the layouter's font database)
+    web_fonts: crate::font_loader::WebFonts,
+    /// What scripts drew on the page's canvas elements
+    canvases: std::collections::HashMap<NodeId, Arc<crate::image_loader::LoadedImage>>,
+    /// Scroll positions of the page's scroll containers
+    box_scroll: std::collections::HashMap<NodeId, (f32, f32)>,
+}
+
+impl PageRenderer {
+    pub fn new(viewport_width: u32, viewport_height: u32) -> Self {
+        let text_renderer = TextRenderer::new();
+        if text_renderer.fonts.is_empty() {
+            log::warn!("No system font found, text will not be drawn");
+        }
+        let fonts = FontContext::new(text_renderer.fonts.clone());
+        Self {
+            layouter: Rc::new(RefCell::new(Layouter::new(fonts, viewport_width, viewport_height))),
+            text_renderer,
+            paint_generation: 0,
+            scroll: 0.0,
+            canvases: Default::default(),
+            web_fonts: Default::default(),
+            box_scroll: Default::default(),
+        }
+    }
+
+    /// The layouter, for the page's scripts to lay the page out when they
+    /// read geometry
+    pub fn layouter(&self) -> SharedLayouter {
+        self.layouter.clone()
+    }
+
+    fn viewport(&self) -> (u32, u32) {
+        let l = self.layouter.borrow();
+        (l.viewport_width, l.viewport_height)
+    }
+
+    /// Which layout and paint state buffers were painted from: painted
+    /// buffers are stale once it changes
+    fn generation(&self) -> u64 {
+        self.layouter.borrow().generation + self.paint_generation
+    }
+
+    /// Set viewport size
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        let mut l = self.layouter.borrow_mut();
+        if height != l.viewport_height {
+            // Viewport units and percentages of the root depend on it
+            l.cached = None;
+        }
+        l.viewport_width = width;
+        l.viewport_height = height;
+    }
+
+    /// Lay out again on the next render (keeping caches)
+    pub fn invalidate_layout(&mut self) {
+        self.layouter.borrow_mut().cached = None;
+    }
+
+    /// Drop the cached layout, glyphs and shaped words (e.g. on memory
+    /// pressure)
+    pub fn clear_cache(&mut self) {
+        {
+            let mut l = self.layouter.borrow_mut();
+            l.cached = None;
+            l.compiled_css = None;
+            l.fonts = FontContext::new(self.text_renderer.fonts.clone());
+        }
+        self.canvases.clear();
+        self.box_scroll.clear();
+        self.text_renderer.clear_glyph_cache();
+    }
+
+    /// Width of `text` in the default sans-serif font
+    pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_size = font_size;
+        i.font_family = Arc::from([Arc::from("sans-serif")]);
+        let mut l = self.layouter.borrow_mut();
+        let font = l.fonts.resolve(&style);
+        l.fonts.shape(&font, text).width
+    }
+
+    /// Parse and render HTML to pixels with scroll offset. Prefer
+    /// [`Self::render_document`] when the page is already parsed.
+    pub fn render_html(&mut self, html: &str, base_url: &str, scroll_offset: f32) -> Option<RenderedPage> {
+        let source = LayoutSource::Html(page_key(html, base_url));
+        {
+            let mut l = self.layouter.borrow_mut();
+            if !l.has_layout(source) {
+                let document = fos_html::parse_with_url(html, base_url);
+                l.lay_out(source, &document);
+            }
+        }
+        self.paint_cached(scroll_offset)
+    }
+
+    /// Render a parsed document to pixels with scroll offset.
+    ///
+    /// The layout is rebuilt only when the DOM changed since the last
+    /// render, or the viewport width did; otherwise this only repaints.
+    pub fn render_document(&mut self, document: &Document, scroll_offset: f32) -> Option<RenderedPage> {
+        self.layouter.borrow_mut().layout_of(document);
+        self.paint_cached(scroll_offset)
+    }
+
+    /// Render like [`Self::render_document`], reusing `previous` (a render
+    /// of the same layout at another scroll offset) when the viewport has
+    /// only moved: rows still in view are moved, and only the newly exposed
+    /// rows are painted. Falls back to a full render when the buffers are
+    /// not compatible (new layout, new size, fractional or large scroll).
+    pub fn render_document_scrolled(
+        &mut self,
+        document: &Document,
+        scroll_offset: f32,
+        previous: RenderedPage,
+    ) -> Option<RenderedPage> {
+        let layout = self.layouter.borrow_mut().layout_of(document);
+        let (width, height) = self.viewport();
+
+        let delta = scroll_offset - previous.origin;
+        let reusable = previous.layout_generation == self.generation()
+            && previous.width == width
+            && previous.height == height
+            && previous.pixels.len() == width as usize * height as usize
+            && delta.fract() == 0.0
+            && delta.abs() < height as f32
+            && layout.is_some_and(|l| !l.has_fixed);
+        if reusable {
+            self.repaint_scrolled(previous, scroll_offset)
+        } else {
+            drop(previous);
+            self.paint_cached(scroll_offset)
+        }
+    }
+
+    /// The element at `(x, y)` in document coordinates, per the current
+    /// layout
+    pub fn node_at(&mut self, x: f32, y: f32) -> Option<NodeId> {
+        let offsets = &self.box_scroll;
+        self.layout_snapshot()?.fragments.hit_test_scrolled(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)))
+    }
+
+    /// The `href` of the link under document point (x, y), seeing box
+    /// scrolling and fixed boxes
+    pub fn link_at(&mut self, document: &Document, x: f32, y: f32) -> Option<String> {
+        let tree = document.tree();
+        let mut node = self.node_at(x, y)?;
+        while node.is_valid() {
+            let n = tree.get(node)?;
+            if n.as_element().is_some_and(|e| tree.resolve(e.name.local) == "a") {
+                if let Some(href) = tree.get_attribute(node, "href") {
+                    return Some(href.to_string());
+                }
+            }
+            node = n.parent;
+        }
+        None
+    }
+
+    /// Whether the cached layout reflects `document` as it is now
+    pub fn is_layout_current(&self, document: &Document) -> bool {
+        self.layouter.borrow().is_current(document)
+    }
+
+    /// Paint the visible region of the cached layout
+    fn paint_cached(&mut self, scroll_offset: f32) -> Option<RenderedPage> {
+        let layout = self.layout_snapshot()?;
+        let (width, height) = self.viewport();
+        self.scroll = scroll_offset;
+        let painted = self.paint(&layout, scroll_offset, scroll_offset, height);
+        Some(RenderedPage {
+            pixels: painted?,
+            width,
+            height,
+            content_height: layout.content_height(),
+            links: links_in(&layout, scroll_offset, height as f32),
+            anchors: anchors_from(&layout, scroll_offset),
+            origin: scroll_offset,
+            layout_generation: self.generation(),
+        })
+    }
+
+    /// Move `page` (painted from the cached layout) to `scroll_offset`,
+    /// less than a buffer height away, painting only the exposed rows
+    fn repaint_scrolled(&mut self, mut page: RenderedPage, scroll_offset: f32) -> Option<RenderedPage> {
+        let delta = (scroll_offset - page.origin) as i64;
+        if delta == 0 {
+            return Some(page);
+        }
+        let layout = self.layout_snapshot()?;
+
+        let width = page.width as usize;
+        let height = page.height as usize;
+        let shift = delta.unsigned_abs() as usize;
+        let band_top = if delta > 0 {
+            page.pixels.copy_within(shift * width.., 0);
+            height - shift
+        } else {
+            page.pixels.copy_within(..(height - shift) * width, shift * width);
+            0
+        };
+
+        let band_origin = scroll_offset + band_top as f32;
+        self.scroll = scroll_offset;
+        let band = self.paint(&layout, band_origin, scroll_offset, shift as u32);
+        page.anchors = anchors_from(&layout, scroll_offset);
+        page.links = links_in(&layout, scroll_offset, page.height as f32);
+        page.pixels[band_top * width..(band_top + shift) * width].copy_from_slice(&band?);
+        page.origin = scroll_offset;
+        Some(page)
+    }
+
+    /// Take new canvas bitmaps (`None`: cleared); true if any changed. A
+    /// repaint shows them (the layout does not change).
+    pub fn update_canvases(&mut self, updates: Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)>) -> bool {
+        let changed = !updates.is_empty();
+        for (node, (w, h), pixmap) in updates {
+            match pixmap {
+                Some(pixmap) => {
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
+                }
+                None => {
+                    self.canvases.remove(&node);
+                }
+            }
+        }
+        if changed {
+            // Painted buffers are stale
+            self.paint_generation += 1;
+        }
+        changed
+    }
+
+    /// Forget the previous page's scroll positions and canvases
+    pub fn new_page(&mut self) {
+        self.box_scroll.clear();
+        self.canvases.clear();
+        self.layouter.borrow_mut().cached = None;
+    }
+
+    /// Scroll the innermost scroll container at document point (x, y) that
+    /// can move by (dx, dy); false if none can (the page should scroll)
+    pub fn scroll_box_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        let Some(layout) = self.layout_snapshot() else { return false };
+        let offsets = &self.box_scroll;
+        let chain = layout.fragments.scrollers_at(x, y, self.scroll, &|n| offsets.get(&n).copied().unwrap_or((0.0, 0.0)));
+        for (node, visible, extent) in chain {
+            let (ox, oy) = self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0));
+            let nx = (ox + dx).clamp(0.0, (extent.0 - visible.0).max(0.0)).round();
+            let ny = (oy + dy).clamp(0.0, (extent.1 - visible.1).max(0.0)).round();
+            if (nx, ny) != (ox, oy) {
+                self.box_scroll.insert(node, (nx, ny));
+                // Painted buffers are stale
+                self.paint_generation += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scroll a box to (x, y) (clamped to its content); false if it
+    /// does not scroll
+    pub fn set_box_scroll(&mut self, node: NodeId, x: f32, y: f32) -> bool {
+        let Some(m) = self.layout_snapshot().and_then(|l| l.scroll_metrics().get(&node.0).copied()) else { return false };
+        let to = (x.clamp(0.0, (m[2] - m[0]).max(0.0)).round(), y.clamp(0.0, (m[3] - m[1]).max(0.0)).round());
+        if self.box_scroll(node) == to {
+            return false;
+        }
+        self.box_scroll.insert(node, to);
+        self.paint_generation += 1;
+        true
+    }
+
+    /// Every scrolled box's position (for scripts)
+    pub fn box_scrolls(&self) -> std::collections::HashMap<u32, (f32, f32)> {
+        self.box_scroll.iter().map(|(n, v)| (n.0, *v)).collect()
+    }
+
+    /// An element's scroll position (scrollLeft, scrollTop)
+    pub fn box_scroll(&self, node: NodeId) -> (f32, f32) {
+        self.box_scroll.get(&node).copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// The web fonts `document`'s CSS declares and uses
+    pub fn web_font_requests(&self, document: &Document) -> Vec<crate::font_loader::FontRequest> {
+        let l = self.layouter.borrow();
+        let css = l.extract_css_from_document(document);
+        let media = fos_css::MediaContext { width: l.viewport_width as f32, height: l.viewport_height as f32 };
+        crate::font_loader::requests(&css, &media, &crate::css_loader::base_url(document))
+    }
+
+    pub fn web_fonts(&self) -> &crate::font_loader::WebFonts {
+        &self.web_fonts
+    }
+
+    /// Use `fonts` as the page's web fonts: they join a font database
+    /// over the system's, and the layout is redone
+    pub fn set_web_fonts(&mut self, fonts: crate::font_loader::WebFonts) {
+        if Arc::ptr_eq(&self.web_fonts, &fonts) {
+            return;
+        }
+        let mut db = fos_text::FontDatabase::overlay(fos_text::FontDatabase::shared());
+        for f in fonts.iter() {
+            let r = &f.request;
+            let style = if r.italic { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
+            if let Err(e) = db.add_web_font_weights(&r.family, r.weights, style, f.data.clone()) {
+                log::debug!("Web font {} unusable: {e}", r.url);
+            }
+        }
+        let db = Arc::new(db);
+        self.web_fonts = fonts;
+        self.text_renderer.fonts = db.clone();
+        self.text_renderer.clear_glyph_cache();
+        let mut l = self.layouter.borrow_mut();
+        l.fonts = FontContext::new(db);
+        l.cached = None;
+    }
+
+    /// Images the current layout's CSS uses (backgrounds, masks)
+    pub fn css_image_urls(&self) -> Vec<String> {
+        self.layout_snapshot().map(|l| l.css_images.clone()).unwrap_or_default()
+    }
+
+    /// Use `images` for the page's images (fetched by the browser); the
+    /// layout is redone if they changed
+    pub fn set_images(&mut self, images: crate::image_loader::Images) {
+        let mut l = self.layouter.borrow_mut();
+        if !Arc::ptr_eq(&l.images, &images) {
+            l.images = images;
+            l.cached = None;
+        }
+    }
+
+    /// The images in use (to keep what is still needed when reloading)
+    pub fn images(&self) -> crate::image_loader::Images {
+        self.layouter.borrow().images.clone()
+    }
+
+    /// Parse the page's own CSS (`<style>` elements) and compile it for
+    /// matching
+    #[cfg(test)]
+    fn page_stylesheet(&self, document: &Document) -> Option<Arc<PageStyles>> {
+        let l = self.layouter.borrow();
+        l.compile(&l.extract_css_from_document(document)).map(Arc::new)
+    }
+
+    /// The current layout, for element geometry (`getBoundingClientRect`)
+    pub fn layout_snapshot(&self) -> Option<Arc<PageLayout>> {
+        self.layouter.borrow().snapshot()
+    }
+
+    /// Use `sheets` for the page's `<link rel="stylesheet">` elements
+    /// (fetched by the browser); the layout is redone if they changed
+    pub fn set_stylesheets(&mut self, sheets: crate::css_loader::Stylesheets) {
+        let mut l = self.layouter.borrow_mut();
+        if !Arc::ptr_eq(&l.stylesheets, &sheets) {
+            l.stylesheets = sheets;
+            l.cached = None;
+        }
+    }
 
     /// Paint the band of `layout` starting at document y `origin`,
     /// `height` rows tall
     fn paint(&mut self, layout: &PageLayout, origin: f32, scroll: f32, height: u32) -> Option<Vec<u32>> {
         let bg = layout.background;
-        let mut canvas = Canvas::filled(self.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
-        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&self.images, &layout.base).with_canvases(&self.canvases).with_box_scroll(&self.box_scroll);
+        let l = self.layouter.borrow();
+        let mut canvas = Canvas::filled(l.viewport_width, height, Color::rgba(bg.r, bg.g, bg.b, 255))?;
+        let mut painter = crate::paint::Painter::new(&mut canvas, &mut self.text_renderer, origin, scroll, layout.background_box).with_fixed(layout.has_fixed).with_images(&l.images, &layout.base).with_canvases(&self.canvases).with_box_scroll(&self.box_scroll);
         painter.paint(&layout.fragments);
         Some(canvas.into_argb32())
     }
@@ -1224,23 +1293,23 @@ mod tests {
     fn test_layout_is_cached_between_renders() {
         let mut renderer = PageRenderer::new(320, 240);
         renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
-        let key = renderer.cached.as_ref().unwrap().source;
+        let key = renderer.layouter.borrow().cached.as_ref().unwrap().source;
 
         // Scrolling reuses the layout
         renderer.render_html(PAGE, "https://example.com/", 100.0).unwrap();
-        assert_eq!(renderer.cached.as_ref().unwrap().source, key);
+        assert_eq!(renderer.layouter.borrow().cached.as_ref().unwrap().source, key);
 
         // A new width re-lays out the same page
         renderer.set_viewport(200, 240);
         renderer.render_html(PAGE, "https://example.com/", 0.0).unwrap();
-        assert_eq!(renderer.cached.as_ref().unwrap().width, 200);
+        assert_eq!(renderer.layouter.borrow().cached.as_ref().unwrap().width, 200);
 
         // A different page replaces it
         renderer.render_html("<p>other</p>", "https://example.com/", 0.0).unwrap();
-        assert_ne!(renderer.cached.as_ref().unwrap().source, key);
+        assert_ne!(renderer.layouter.borrow().cached.as_ref().unwrap().source, key);
 
         renderer.clear_cache();
-        assert!(renderer.cached.is_none());
+        assert!(renderer.layouter.borrow().cached.is_none());
     }
 
     #[test]
@@ -1250,11 +1319,11 @@ mod tests {
 
         let before = renderer.render_document(&document, 0.0).unwrap();
         assert!(renderer.is_layout_current(&document));
-        let source = renderer.cached.as_ref().unwrap().source;
+        let source = renderer.layouter.borrow().cached.as_ref().unwrap().source;
 
         // Re-rendering an unchanged DOM reuses the layout
         renderer.render_document(&document, 50.0).unwrap();
-        assert_eq!(renderer.cached.as_ref().unwrap().source, source);
+        assert_eq!(renderer.layouter.borrow().cached.as_ref().unwrap().source, source);
 
         // A mutation (as a script would make) invalidates it
         let body = document.body();
@@ -1842,7 +1911,7 @@ mod tests {
             let mut family = String::new();
             layout.fragments.for_each(|f| {
                 if let layout_engine::Fragment::Text(t) = f {
-                    family = t.font.id.and_then(|id| r.fonts.database().font(id)).map(|e| e.family.clone()).unwrap_or_default();
+                    family = t.font.id.and_then(|id| r.layouter.borrow().fonts.database().font(id).map(|e| e.family.clone())).unwrap_or_default();
                 }
             });
             family
@@ -1925,9 +1994,9 @@ mod tests {
         let blue = (0..200).find(|&y| px(20, y) == 0xff0000ff).expect("blue svg");
         assert!((0..40).all(|d| px(5, blue + d) == 0xff0000ff || d > 37));
         // The same markup rasterizes once
-        let before = renderer.svgs.map.len();
+        let before = renderer.layouter.borrow().svgs.map.len();
         renderer.render_document(&document, 0.0).unwrap();
-        assert_eq!(renderer.svgs.map.len(), before);
+        assert_eq!(renderer.layouter.borrow().svgs.map.len(), before);
     }
 
     #[test]

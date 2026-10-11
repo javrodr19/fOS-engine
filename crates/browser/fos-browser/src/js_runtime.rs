@@ -599,6 +599,15 @@ impl PageJsRuntime {
         }
     }
 
+    /// Let the page's scripts lay the page out with `layouter` when they
+    /// read geometry after changing the DOM (otherwise they read the last
+    /// layout the browser gave them)
+    pub fn set_layouter(&mut self, layouter: crate::renderer::SharedLayouter) {
+        if let Some(h) = self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()) {
+            h.layouter = Some(layouter);
+        }
+    }
+
     /// Canvas elements whose bitmaps scripts changed since the last call
     pub fn take_canvas_updates(&mut self) -> Vec<(NodeId, (u32, u32), Option<fos_canvas::tiny_skia::Pixmap>)> {
         self.vm.as_mut().map(crate::canvas_bindings::take_canvas_updates).unwrap_or_default()
@@ -1997,6 +2006,47 @@ mod tests {
             rt.process_timers(&mut |_: &str| None).unwrap();
         }
         assert_eq!(rt.eval("R").unwrap(), "10,hello hello hello,31,139,TypeError,TypeError,true,hello hello hello");
+    }
+
+    #[test]
+    fn geometry_reads_lay_out_dom_changes() {
+        let (mut rt, doc) = page(
+            r#"<html><head><script>
+              // Modernizr's generated content test: a rule and an element
+              // added, then measured, in one go
+              function measure(rule, id) {
+                const div = document.createElement('div');
+                div.id = id;
+                div.innerHTML += '&#173;<style id="s' + id + '">' + rule + '</style>';
+                document.body.appendChild(div);
+                const r = [div.offsetHeight, Math.round(div.getBoundingClientRect().width), getComputedStyle(div).color];
+                div.remove();
+                return r.join(' ');
+              }
+              window.R = [
+                measure('#m1{font:0/0 a}#m1:after{content:":)";visibility:hidden;font:3px/1 a}', 'm1'),
+                measure('#m2{height:7px;width:50px;color:rgb(1, 2, 3)}', 'm2'),
+              ];
+              // Reads in between changes see each change
+              const box = document.createElement('p');
+              box.style.margin = '0';
+              document.body.appendChild(box);
+              box.style.height = '10px';
+              R.push(box.offsetHeight);
+              box.style.height = '20px';
+              R.push(box.offsetHeight, document.body.scrollHeight >= 20);
+            </script></head><body style="margin:0"></body></html>"#,
+        );
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+        rt.set_layouter(renderer.layouter());
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("R.join('|')").unwrap(), "3 800 rgb(0, 0, 0)|7 50 rgb(1, 2, 3)|10|20|true");
+        // The renderer paints the layout the scripts' last read made
+        let forced = renderer.layout_snapshot().unwrap();
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        assert!(Arc::ptr_eq(&forced, &renderer.layout_snapshot().unwrap()));
     }
 
     #[test]

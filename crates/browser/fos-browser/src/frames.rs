@@ -217,6 +217,7 @@ impl Frame {
         let size = (self.size.0 as f32, self.size.1 as f32);
         if let Some(rt) = self.page.js_runtime.as_mut() {
             rt.set_layout(layout, size, (0.0, 0.0));
+            rt.set_layouter(self.renderer.layouter());
         }
     }
 

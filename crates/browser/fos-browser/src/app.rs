@@ -304,7 +304,7 @@ impl BrowserApp {
         self.load_web_fonts();
         let width = self.content_width() as f32;
         let Some(page) = self.current_page.as_ref() else { return };
-        let previous = self.renderer.images().clone();
+        let previous = self.renderer.images();
         let css_urls = self.renderer.css_image_urls();
         let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous, &css_urls);
         if !Arc::ptr_eq(&images, &previous) {
@@ -571,6 +571,7 @@ impl BrowserApp {
         if let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
             rt.set_layout(layout, viewport, scroll);
             rt.set_box_scrolls(box_scrolls);
+            rt.set_layouter(self.renderer.layouter());
         }
     }
 

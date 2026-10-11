@@ -338,26 +338,42 @@ impl FragmentTree {
     /// Border boxes of elements (inline elements have one per line) and
     /// the rectangles of their text, in tree order
     pub fn element_rects(&self) -> Vec<(NodeId, Rect)> {
+        self.rects(false)
+    }
+
+    /// What elements' geometry is made of: their border boxes (inline
+    /// elements have one per line), and the rectangles of text whose
+    /// element has no box around it (an element's text overflowing its box
+    /// is not part of the box), in tree order
+    pub fn element_geometry(&self) -> Vec<(NodeId, Rect)> {
+        self.rects(true)
+    }
+
+    fn rects(&self, owned_text: bool) -> Vec<(NodeId, Rect)> {
         let mut out = Vec::new();
-        fn walk(b: &BoxFragment, out: &mut Vec<(NodeId, Rect)>) {
+        // `owner`: the element of the nearest box that is not anonymous
+        // (a `::before` or `::after` box's is its element's); its own text
+        // is left out if `owned_text`
+        fn walk(b: &BoxFragment, owner: NodeId, owned_text: bool, out: &mut Vec<(NodeId, Rect)>) {
             if b.node.is_valid() && !b.node.is_generated() {
                 out.push((b.node, b.border_box));
             }
+            let owner = if b.node.is_valid() { b.node.originating() } else { owner };
             for c in &b.children {
                 match c {
-                    Fragment::Box(cb) => walk(cb, out),
-                    Fragment::Text(t) if t.node.is_valid() => out.push((t.node, t.rect)),
+                    Fragment::Box(cb) => walk(cb, owner, owned_text, out),
+                    Fragment::Text(t) if t.node.is_valid() && !(owned_text && t.node == owner) => out.push((t.node, t.rect)),
                     Fragment::Text(_) => {}
                 }
             }
         }
         if let Some(root) = &self.root {
-            walk(root, &mut out);
+            walk(root, NodeId::NONE, owned_text, &mut out);
         }
         out
     }
 
-    /// [`Self::element_rects`] where they are painted: through CSS
+    /// [`Self::element_geometry`] where it is painted: through CSS
     /// transforms (their bounds), with fixed boxes following the page
     /// scroll `scroll` and sticky ones held in the viewport (`view_h`
     /// tall), and content inside scroll containers moved by `offsets`
@@ -379,7 +395,7 @@ impl FragmentTree {
         }
         // `view`: the visible part (top, height) of the scroll container
         // in `b`'s layout coordinates; `container`: its parent's content box
-        fn walk(w: &mut Walk, b: &BoxFragment, mut m: Matrix, view: (f32, f32), container: Rect) {
+        fn walk(w: &mut Walk, b: &BoxFragment, mut m: Matrix, view: (f32, f32), container: Rect, owner: NodeId) {
             if b.style.box_.position == fos_css::style::Position::Fixed {
                 m = [1.0, 0.0, 0.0, 1.0, 0.0, w.scroll];
             }
@@ -403,17 +419,18 @@ impl FragmentTree {
                 inner_view = (pad.y + oy, pad.h);
             }
             let content = b.content_box();
+            let owner = if b.node.is_valid() { b.node.originating() } else { owner };
             for c in &b.children {
                 match c {
-                    Fragment::Box(cb) => walk(w, cb, m, inner_view, content),
-                    Fragment::Text(t) if t.node.is_valid() => w.out.push((t.node, map(&m, t.rect))),
+                    Fragment::Box(cb) => walk(w, cb, m, inner_view, content, owner),
+                    Fragment::Text(t) if t.node.is_valid() && t.node != owner => w.out.push((t.node, map(&m, t.rect))),
                     Fragment::Text(_) => {}
                 }
             }
         }
         let mut w = Walk { scroll, offsets, out: Vec::new() };
         if let Some(root) = &self.root {
-            walk(&mut w, root, IDENTITY, (scroll, view_h), root.border_box);
+            walk(&mut w, root, IDENTITY, (scroll, view_h), root.border_box, NodeId::NONE);
         }
         w.out
     }

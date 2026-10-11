@@ -733,6 +733,30 @@ pub struct BoxStyle {
     /// An absolutely positioned box whose `display` was inline-level
     /// before it was blockified: its static position is in its line
     pub inline_origin: bool,
+    /// `width`, `min-width` and `max-width` given as intrinsic sizes
+    /// (`min-content`...); the lengths are then auto (none for max-width)
+    pub intrinsic_width: [IntrinsicSize; 3],
+}
+
+/// An intrinsic size keyword
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IntrinsicSize {
+    #[default]
+    None,
+    MinContent,
+    MaxContent,
+    FitContent,
+}
+
+impl IntrinsicSize {
+    fn of(v: &PropertyValue) -> Self {
+        match v {
+            PropertyValue::Keyword(Keyword::MinContent) => Self::MinContent,
+            PropertyValue::Keyword(Keyword::MaxContent) => Self::MaxContent,
+            PropertyValue::Keyword(Keyword::FitContent) => Self::FitContent,
+            _ => Self::None,
+        }
+    }
 }
 
 impl Default for BoxStyle {
@@ -797,6 +821,7 @@ impl Default for BoxStyle {
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
             inline_origin: false,
+            intrinsic_width: [IntrinsicSize::None; 3],
         }
     }
 }
@@ -1308,7 +1333,18 @@ impl Style {
             PropertyId::Clear => set!(box_, [clear], enum_of!(Clear)),
             PropertyId::BoxSizing => set!(box_, [box_sizing], enum_of!(BoxSizing)),
             PropertyId::Width | PropertyId::Height | PropertyId::MinWidth | PropertyId::MinHeight | PropertyId::FlexBasis => {
-                let Some(val) = self.lp_auto(v, ctx) else { return };
+                let intrinsic = IntrinsicSize::of(v);
+                match id {
+                    PropertyId::Width => set!(box_, [intrinsic_width[0]], intrinsic),
+                    PropertyId::MinWidth => set!(box_, [intrinsic_width[1]], intrinsic),
+                    _ => {}
+                }
+                let val = if intrinsic != IntrinsicSize::None {
+                    LpAuto::Auto
+                } else {
+                    let Some(val) = self.lp_auto(v, ctx) else { return };
+                    val
+                };
                 match id {
                     PropertyId::Width => set!(box_, [width], val),
                     PropertyId::Height => set!(box_, [height], val),
@@ -1318,8 +1354,11 @@ impl Style {
                 }
             }
             PropertyId::MaxWidth | PropertyId::MaxHeight => {
+                if id == PropertyId::MaxWidth {
+                    set!(box_, [intrinsic_width[2]], IntrinsicSize::of(v));
+                }
                 let val = match v {
-                    PropertyValue::Keyword(Keyword::None) => MaxSize::None,
+                    PropertyValue::Keyword(Keyword::None | Keyword::MinContent | Keyword::MaxContent | Keyword::FitContent) => MaxSize::None,
                     _ => match self.lp(v, ctx) {
                         Some(l) => MaxSize::Lp(l),
                         None => return,
@@ -1884,11 +1923,20 @@ impl Style {
             PropertyId::Float => copy!(box_, [float]),
             PropertyId::Clear => copy!(box_, [clear]),
             PropertyId::BoxSizing => copy!(box_, [box_sizing]),
-            PropertyId::Width => copy!(box_, [width]),
+            PropertyId::Width => {
+                copy!(box_, [width]);
+                copy!(box_, [intrinsic_width[0]]);
+            }
             PropertyId::Height => copy!(box_, [height]),
-            PropertyId::MinWidth => copy!(box_, [min_width]),
+            PropertyId::MinWidth => {
+                copy!(box_, [min_width]);
+                copy!(box_, [intrinsic_width[1]]);
+            }
             PropertyId::MinHeight => copy!(box_, [min_height]),
-            PropertyId::MaxWidth => copy!(box_, [max_width]),
+            PropertyId::MaxWidth => {
+                copy!(box_, [max_width]);
+                copy!(box_, [intrinsic_width[2]]);
+            }
             PropertyId::MaxHeight => copy!(box_, [max_height]),
             PropertyId::FlexBasis => copy!(box_, [flex_basis]),
             PropertyId::MarginTop => copy!(box_, [margin[0]]),

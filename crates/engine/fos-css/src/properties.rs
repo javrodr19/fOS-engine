@@ -407,6 +407,10 @@ pub enum Keyword {
     Lighter,
     Italic,
     Oblique,
+    // Intrinsic sizes (width, min-width, max-width)
+    MinContent,
+    MaxContent,
+    FitContent,
 }
 
 impl Keyword {
@@ -418,6 +422,9 @@ impl Keyword {
             "none" => Self::None,
             "auto" => Self::Auto,
             "normal" => Self::Normal,
+            "min-content" => Self::MinContent,
+            "max-content" => Self::MaxContent,
+            "fit-content" => Self::FitContent,
             "hidden" => Self::Hidden,
             "visible" => Self::Visible,
             "block" => Self::Block,

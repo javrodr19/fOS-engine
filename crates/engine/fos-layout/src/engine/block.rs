@@ -281,12 +281,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     }
 
     // Width (§10.3.3), or shrink-to-fit (§10.3.5)
-    let specified = match forced.width {
-        Some(w) => Some((w - hbp).max(0.0)),
-        None => style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp)),
-    };
     let (ml_auto, mr_auto) = (e.margin[3].is_none(), e.margin[1].is_none());
     let (mut ml, mut mr) = (e.margin[3].unwrap_or(0.0), e.margin[1].unwrap_or(0.0));
+    let intrinsic = style.box_.intrinsic_width;
+    let avail_w = (cb_w - ml - mr - hbp).max(0.0);
+    let specified = match forced.width {
+        Some(w) => Some((w - hbp).max(0.0)),
+        None => style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp)).or_else(|| intrinsic_size(ctx, b, intrinsic[0], avail_w)),
+    };
     // Tables are as wide as their content needs (up to the space there is)
     let is_table = matches!(b.kind, BoxKind::Table(_));
     // aspect-ratio applies to the box-sizing box: a shrink-to-fit box with
@@ -316,6 +318,15 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             clamp_width(style, w, cb_w, hbp)
         }
     };
+    // min-width and max-width given as intrinsic sizes (min wins)
+    if forced.width.is_none() {
+        if let Some(max) = intrinsic_size(ctx, b, intrinsic[2], avail_w) {
+            width = width.min(max);
+        }
+        if let Some(min) = intrinsic_size(ctx, b, intrinsic[1], avail_w) {
+            width = width.max(min);
+        }
+    }
     if sizing == Sizing::Stretch {
         // Auto margins take the free space; overconstrained, the right
         // margin gives (the left one in right-to-left content)
@@ -768,6 +779,21 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
     }
 }
 
+/// The content width an intrinsic size keyword gives a box, `avail` wide
+/// at most for fit-content (`None` for no keyword)
+fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
+    use fos_css::style::IntrinsicSize;
+    if k == IntrinsicSize::None {
+        return None;
+    }
+    let (min, max) = intrinsic_content(ctx, b);
+    Some(match k {
+        IntrinsicSize::MinContent => min,
+        IntrinsicSize::MaxContent => max,
+        _ => max.min(avail).max(min),
+    })
+}
+
 /// The min-content and max-content widths of a box's content box
 pub fn intrinsic_content(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
     let key = b as *const LayoutBox as usize;
@@ -837,8 +863,16 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         LpAuto::Lp(l) if !l.has_percent() => Some(content_size(style, l.px, hbp)),
         _ => None,
     };
-    let (min, max) = match (fixed, &b.kind) {
+    let (min, max) = match (fixed, style.box_.intrinsic_width[0]) {
         (Some(w), _) => (w, w),
+        (None, fos_css::style::IntrinsicSize::MinContent) => {
+            let min = intrinsic_content(ctx, b).0;
+            (min, min)
+        }
+        (None, fos_css::style::IntrinsicSize::MaxContent) => {
+            let max = intrinsic_content(ctx, b).1;
+            (max, max)
+        }
         (None, _) => intrinsic_content(ctx, b),
     };
     let clamp = |w: f32| {

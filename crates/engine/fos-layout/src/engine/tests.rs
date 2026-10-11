@@ -842,6 +842,53 @@ fn images_keep_their_ratio_under_two_limits() {
 }
 
 #[test]
+fn intrinsic_size_keywords() {
+    let (mut tree, html, body) = doc();
+    let block = |tree: &mut DomTree, style: &str, w: f32| {
+        let d = el(tree, body, "div", style);
+        el(tree, d, "span", &format!("display: inline-block; width: {w}px; height: 5px"));
+        text(tree, d, " ");
+        el(tree, d, "span", "display: inline-block; width: 30px; height: 5px");
+        d
+    };
+    let min = block(&mut tree, "width: min-content", 50.0);
+    let max = block(&mut tree, "width: max-content", 50.0);
+    // (two 500px items: wider than the container together, not alone)
+    let fit = el(&mut tree, body, "div", "width: fit-content");
+    el(&mut tree, fit, "span", "display: inline-block; width: 500px; height: 5px");
+    text(&mut tree, fit, " ");
+    el(&mut tree, fit, "span", "display: inline-block; width: 500px; height: 5px");
+    let floor = block(&mut tree, "width: 10px; min-width: max-content", 50.0);
+    let cap = block(&mut tree, "max-width: min-content", 50.0);
+    let t = layout(&tree, html, 800.0);
+    let space = rect_of(&t, max).w - 80.0;
+    assert_eq!(rect_of(&t, min).w, 50.0);
+    assert!(space > 2.0 && space < 6.0, "{space}");
+    assert_eq!(rect_of(&t, fit).w, 784.0);
+    assert_eq!(rect_of(&t, floor).w, 80.0 + space);
+    assert_eq!(rect_of(&t, cap).w, 50.0);
+}
+
+#[test]
+fn spanning_cells_widen_columns_by_their_max_widths() {
+    // A cell across both columns needs 400px: the 20px and 60px columns
+    // grow in proportion, to 100px and 300px
+    let (mut tree, html, body) = doc();
+    let table = el(&mut tree, body, "table", "display: table; width: max-content; border-spacing: 0");
+    let r1 = el(&mut tree, table, "tr", "display: table-row");
+    let a = el(&mut tree, r1, "td", "display: table-cell; padding: 0");
+    el(&mut tree, a, "span", "display: inline-block; width: 20px; height: 5px");
+    let b = el(&mut tree, r1, "td", "display: table-cell; padding: 0");
+    el(&mut tree, b, "span", "display: inline-block; width: 60px; height: 5px");
+    let r2 = el(&mut tree, table, "tr", "display: table-row");
+    let wide = el(&mut tree, r2, "td", "display: table-cell; padding: 0");
+    tree.set_attribute(wide, "colspan", "2");
+    el(&mut tree, wide, "span", "display: inline-block; width: 400px; height: 5px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, a).w, rect_of(&t, b).w), (100.0, 300.0));
+}
+
+#[test]
 fn table_extra_width_goes_to_auto_columns() {
     // A 600px table: the fixed column keeps its width, the percentage one
     // gets its share, and the auto one the rest

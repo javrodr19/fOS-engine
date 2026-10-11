@@ -1016,11 +1016,14 @@ fn length(v: &str, allow_auto: bool, allow_none: bool, allow_negative: bool) -> 
     Some(PropertyValue::Length(l))
 }
 
-/// width / height / min-* / flex-basis (intrinsic keywords become auto)
+/// width / height / min-* / max-* / flex-basis: lengths, or the intrinsic
+/// size keywords (stretching ones stand for auto, or none)
 fn size(v: &str, allow_auto: bool) -> Option<PropertyValue> {
     match v {
-        "min-content" | "max-content" | "fit-content" | "-webkit-fit-content" | "-moz-fit-content" | "-webkit-fill-available" | "stretch"
-        | "content" => Some(if allow_auto { PropertyValue::Keyword(Keyword::Auto) } else { PropertyValue::Keyword(Keyword::None) }),
+        "min-content" | "-webkit-min-content" | "-moz-min-content" => Some(PropertyValue::Keyword(Keyword::MinContent)),
+        "max-content" | "-webkit-max-content" | "-moz-max-content" => Some(PropertyValue::Keyword(Keyword::MaxContent)),
+        "fit-content" | "-webkit-fit-content" | "-moz-fit-content" => Some(PropertyValue::Keyword(Keyword::FitContent)),
+        "-webkit-fill-available" | "stretch" | "content" => Some(if allow_auto { PropertyValue::Keyword(Keyword::Auto) } else { PropertyValue::Keyword(Keyword::None) }),
         _ => length(v, allow_auto, false, false),
     }
 }

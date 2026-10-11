@@ -120,20 +120,26 @@ fn column_widths(ctx: &mut LayoutCtx, g: &Grid) -> (Vec<f32>, Vec<f32>) {
             spanning.push((c, cell.colspan as usize, cmin, cmax));
         }
     }
-    // Spanning cells widen their columns evenly where they need more
+    // Spanning cells widen their columns where they need more, in
+    // proportion to the columns' max widths (evenly when they have none),
+    // as browsers' auto table layout does; narrower spans first
+    spanning.sort_by_key(|s| s.1);
     for (c, span, cmin, cmax) in spanning {
         let end = (c + span).min(g.cols);
         let n = (end - c) as f32;
         let (have_min, have_max): (f32, f32) = (min[c..end].iter().sum(), max[c..end].iter().sum());
+        let share = |i: usize, total: f32| if have_max > 0.0 { total * max[i] / have_max } else { total / n };
         if cmin > have_min {
-            for m in &mut min[c..end] {
-                *m += (cmin - have_min) / n;
+            let wanted: Vec<f32> = (c..end).map(|i| min[i].max(share(i, cmin))).collect();
+            // Columns already wider than their share may leave it short
+            let short = (cmin - wanted.iter().sum::<f32>()).max(0.0);
+            for (i, w) in (c..end).zip(wanted) {
+                min[i] = w + short / n;
             }
         }
         if cmax > have_max {
-            for m in &mut max[c..end] {
-                *m += (cmax - have_max) / n;
-            }
+            let grown: Vec<f32> = (c..end).map(|i| max[i] + share(i, cmax - have_max)).collect();
+            max[c..end].copy_from_slice(&grown);
         }
         for i in c..end {
             max[i] = max[i].max(min[i]);

@@ -1624,6 +1624,18 @@ mod tests {
     }
 
     #[test]
+    fn test_gradients_fade_to_transparent_without_darkening() {
+        // Halfway from rgb(200, 200, 200) to transparent over white: 50%
+        // of that gray (about 228), not 50% of a gray darkened toward black
+        let html = r#"<html><body style="margin: 0; background: white"><div style="height: 100px; background: linear-gradient(rgb(200, 200, 200), transparent)"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(10, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let green = (page.pixels[50 * 10 + 5] >> 8) & 0xff;
+        assert!((225..=231).contains(&green), "{green}");
+    }
+
+    #[test]
     fn test_unstyled_controls_are_drawn_natively() {
         // The UA's 2px inset border is drawn as Chromium draws text fields:
         // 1px of gray inside rounded corners; an author's border is drawn

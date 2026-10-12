@@ -1707,13 +1707,45 @@ fn stop_fractions(stops: &[ColorStop], len: f32) -> Vec<f32> {
     pos.into_iter().map(|p| p.unwrap_or(0.0)).collect()
 }
 
+/// Gradient stops at `at(fraction)`, interpolating as CSS does: in
+/// premultiplied alpha (fading to `transparent` does not darken). Toward a
+/// fully transparent stop the other color's channels hold; between other
+/// alphas the segment is split into premultiplied steps.
+fn gradient_stops(stops: &[ColorStop], fr: &[f32], at: impl Fn(f32) -> f32, alpha: f32) -> Vec<GradientStop> {
+    let mut out = Vec::with_capacity(stops.len() * 2);
+    for (i, (s, &f)) in stops.iter().zip(fr).enumerate() {
+        let c = s.color;
+        if c.a == 0 {
+            // Each side of a transparent stop takes its neighbor's color
+            let before = i.checked_sub(1).map(|j| stops[j].color).unwrap_or(c);
+            let after = stops.get(i + 1).map(|n| n.color).unwrap_or(before);
+            out.push(GradientStop::new(at(f), skia_color(CssColor { a: 0, ..before }, alpha)));
+            out.push(GradientStop::new(at(f), skia_color(CssColor { a: 0, ..after }, alpha)));
+            continue;
+        }
+        if let (Some(prev), Some(&pf)) = (i.checked_sub(1).map(|j| stops[j].color), i.checked_sub(1).and_then(|j| fr.get(j))) {
+            if prev.a != 0 && prev.a != c.a && f > pf {
+                const STEPS: usize = 8;
+                for k in 1..STEPS {
+                    let t = k as f32 / STEPS as f32;
+                    let a = prev.a as f32 + (c.a as f32 - prev.a as f32) * t;
+                    let ch = |p: u8, q: u8| ((p as f32 * prev.a as f32 * (1.0 - t) + q as f32 * c.a as f32 * t) / a.max(1e-3)).round().clamp(0.0, 255.0) as u8;
+                    let mid = CssColor { r: ch(prev.r, c.r), g: ch(prev.g, c.g), b: ch(prev.b, c.b), a: a.round() as u8 };
+                    out.push(GradientStop::new(at(pf + (f - pf) * t), skia_color(mid, alpha)));
+                }
+            }
+        }
+        out.push(GradientStop::new(at(f), skia_color(c, alpha)));
+    }
+    out
+}
+
 /// Normalize stop fractions to 0..1, returning the stops and the start and
 /// end fractions they now map to
 fn normalized(stops: &[ColorStop], fr: &[f32], alpha: f32) -> (Vec<GradientStop>, f32, f32) {
     let (lo, hi) = (fr.first().copied().unwrap_or(0.0).min(0.0), fr.last().copied().unwrap_or(1.0).max(1.0));
     let span = (hi - lo).max(1e-6);
-    let gs = stops.iter().zip(fr).map(|(s, &f)| GradientStop::new((f - lo) / span, skia_color(s.color, alpha))).collect();
-    (gs, lo, hi)
+    (gradient_stops(stops, fr, |f| (f - lo) / span, alpha), lo, hi)
 }
 
 fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'static>> {
@@ -1738,7 +1770,7 @@ fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'stat
                 if b - a <= 1e-3 {
                     return None;
                 }
-                let gs = stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new((f - a) / (b - a), skia_color(s.color, alpha))).collect();
+                let gs = gradient_stops(stops, &fr, |f| (f - a) / (b - a), alpha);
                 let p = |t: f32| Point::from_xy(cx + vx * len * (t - 0.5), cy + vy * len * (t - 0.5));
                 return LinearGradient::new(p(a), p(b), gs, SpreadMode::Repeat, Transform::identity());
             }
@@ -1776,10 +1808,10 @@ fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'stat
                 if b - a <= 1e-3 {
                     return None;
                 }
-                (stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new(f / b, skia_color(s.color, alpha))).collect(), SpreadMode::Repeat, rx * b)
+                (gradient_stops(stops, &fr, |f| f / b, alpha), SpreadMode::Repeat, rx * b)
             } else {
                 let hi = fr.last().copied().unwrap_or(1.0).max(1.0);
-                (stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new(f.max(0.0) / hi, skia_color(s.color, alpha))).collect(), SpreadMode::Pad, rx * hi)
+                (gradient_stops(stops, &fr, |f| f.max(0.0) / hi, alpha), SpreadMode::Pad, rx * hi)
             };
             let transform = Transform::from_translate(tile.x + cx, tile.y + cy).pre_scale(1.0, ry / rx);
             RadialGradient::new(Point::zero(), Point::zero(), radius, gs, mode, transform)

@@ -699,6 +699,29 @@ fn floats_share_max_content_with_inline_content() {
 }
 
 #[test]
+fn trailing_spaces_in_inline_boxes_take_no_room() {
+    let (mut tree, html, body) = doc();
+    // `<b>x </b> ` ends its line with a space inside the box and one after
+    // it: neither widens the shrink-to-fit float
+    let a = el(&mut tree, body, "div", "float: left");
+    let b = el(&mut tree, a, "b", "");
+    text(&mut tree, b, "x ");
+    text(&mut tree, a, " ");
+    // Followed by more on the line, the space stays inside its box: before
+    // the box's padding
+    let c = el(&mut tree, body, "div", "clear: both");
+    let tag = el(&mut tree, c, "span", "padding: 0 5px");
+    text(&mut tree, tag, "x ");
+    text(&mut tree, c, " y ");
+    let bare = el(&mut tree, c, "span", "padding: 0 5px");
+    text(&mut tree, bare, "x");
+    let t = layout(&tree, html, 800.0);
+    assert!((rect_of(&t, a).w - rects_of(&t, b)[0].w).abs() < 0.01, "{:?} {:?}", rect_of(&t, a), rects_of(&t, b));
+    let space = rects_of(&t, tag)[0].w - rects_of(&t, bare)[0].w;
+    assert!(space > 2.0 && space < 6.0, "{space}");
+}
+
+#[test]
 fn absolute_boxes_stay_in_their_line() {
     let (mut tree, html, body) = doc();
     // An absolutely positioned label between inline blocks does not

@@ -473,10 +473,18 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             }
             open
         };
+        // Whether words or atomic boxes come later on the line: spaces
+        // before a box's end then stay in that box
+        let mut content_after = vec![false; order.len()];
+        let mut seen = false;
+        for (k, v) in order.iter().enumerate().rev() {
+            content_after[k] = seen;
+            seen |= matches!(v, Visual::Piece(i) if matches!(line[*i].kind, PieceKind::Word { .. } | PieceKind::Atomic(_)));
+        }
         let mut content = false;
         let mut pending = 0.0f32;
         let mut pending_n = 0usize;
-        for v in order {
+        for (k, v) in order.into_iter().enumerate() {
             let p = match v {
                 Visual::Piece(i) => &line[i],
                 Visual::OpenCarried(style, node) => {
@@ -565,6 +573,11 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     x += p.width;
                 }
                 PieceKind::Close => {
+                    if content && content_after[k] {
+                        x += pending + extra * pending_n as f32;
+                        pending = 0.0;
+                        pending_n = 0;
+                    }
                     x += p.width;
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
@@ -839,6 +852,9 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                     }
                 }
                 PieceKind::OutOfFlow(_) => {}
+                // An inline box's edges keep the spaces before them pending:
+                // at the end of a line they still go
+                PieceKind::Open { .. } | PieceKind::Close => x += p.width,
                 _ => {
                     x += pending + p.width;
                     pending = 0.0;

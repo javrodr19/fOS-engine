@@ -862,6 +862,51 @@ fn quirks_mode_line_height() {
 }
 
 #[test]
+fn vertical_align_offsets_as_blink() {
+    // Spans in their parent's font and line height: sub and super move by
+    // a fifth and a third of the font size and a pixel; middle puts the
+    // box's middle half an x-height above the baseline
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, va: &str| {
+        let p = el(tree, body, "div", "font-size: 16px; line-height: 20px");
+        let base = el(tree, p, "span", "");
+        text(tree, base, "x");
+        let s = el(tree, p, "span", &format!("vertical-align: {va}"));
+        text(tree, s, "x");
+        (base, s)
+    };
+    let sub = line(&mut tree, "sub");
+    let sup = line(&mut tree, "super");
+    let mid = line(&mut tree, "middle");
+    let t = layout(&tree, html, 800.0);
+    let shift = |(p, s): (NodeId, NodeId)| rects_of(&t, s)[0].y - rects_of(&t, p)[0].y;
+    assert!((shift(sub) - 4.2).abs() < 0.01, "{}", shift(sub));
+    assert!((shift(sup) + 16.0 / 3.0 + 1.0).abs() < 0.01, "{}", shift(sup));
+    let mut fonts = FontContext::default();
+    let mut style = Style::default();
+    std::sync::Arc::make_mut(&mut style.inherited).font_size = 16.0;
+    let font = fonts.resolve(&style);
+    let (a, d) = (font.ascent(), font.descent());
+    let above = ((20.0 - a - d) / 2.0).floor();
+    let expected = (a + above - (20.0 - a - above)) / 2.0 - font.x_height() / 2.0;
+    assert!((shift(mid) - expected).abs() < 0.01, "{} {expected}", shift(mid));
+}
+
+#[test]
+fn inline_blocks_sit_on_their_line_boxes_baseline() {
+    // An inline block whose text is moved by vertical-align still has its
+    // line box's baseline: beside the same text, it adds no height
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "font-size: 16px; line-height: 23px");
+    text(&mut tree, p, "x ");
+    let ib = el(&mut tree, p, "span", "display: inline-block");
+    let tag = el(&mut tree, ib, "span", "font-size: 10px; vertical-align: middle");
+    text(&mut tree, tag, "tag");
+    let t = layout(&tree, html, 800.0);
+    assert!((rect_of(&t, p).h - rect_of(&t, ib).h).abs() < 0.01, "{:?} {:?}", rect_of(&t, p), rect_of(&t, ib));
+}
+
+#[test]
 fn flex_items_shrink_by_their_inner_base_sizes() {
     // Two 400px items in 400px: the padded one's inner base is 300px, so
     // it gives up 300/700 of the 400px overflow, the other 400/700

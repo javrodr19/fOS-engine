@@ -303,6 +303,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             marker: None,
             replaced: None,
             scroll_extent: None,
+            line_baselines: None,
         })
         .collect();
     for (r, c, rs, mut f, content) in laid_cells {
@@ -318,6 +319,10 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
         if shift > 0.0 {
             for ch in &mut f.children {
                 ch.translate(0.0, shift);
+            }
+            if let Some((first, last)) = &mut f.line_baselines {
+                *first += shift;
+                *last += shift;
             }
         }
         f.border_box.h = f.border_box.h.max(h);

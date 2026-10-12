@@ -21,6 +21,8 @@ use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect, TextFragment
 pub struct InlineLayout {
     pub frags: Vec<Fragment>,
     pub height: f32,
+    /// The first and last line boxes' baselines (lines with content)
+    pub baselines: Option<(f32, f32)>,
 }
 
 enum PieceKind {
@@ -290,10 +292,12 @@ fn baseline_shift(va: VerticalAlign, parent: &ResolvedFont, parent_shift: f32, t
     let size = parent.size;
     match va {
         VerticalAlign::Baseline => parent_shift,
-        VerticalAlign::Sub => parent_shift + size * 0.2,
-        VerticalAlign::Super => parent_shift - size * 0.34,
+        // As Blink: a fifth of the parent's font size and a pixel down,
+        // a third and a pixel up
+        VerticalAlign::Sub => parent_shift + size / 5.0 + 1.0,
+        VerticalAlign::Super => parent_shift - (size / 3.0 + 1.0),
         // The box's middle at the parent's baseline plus half an x-height
-        VerticalAlign::Middle => parent_shift - size * 0.25 - height / 2.0 + top_to_baseline,
+        VerticalAlign::Middle => parent_shift - parent.x_height() / 2.0 - height / 2.0 + top_to_baseline,
         VerticalAlign::TextTop | VerticalAlign::Top => parent_shift - parent.ascent() + top_to_baseline,
         VerticalAlign::TextBottom | VerticalAlign::Bottom => parent_shift + parent.descent() - (height - top_to_baseline),
         VerticalAlign::Length(l) => parent_shift - l.resolve(line_height),
@@ -337,6 +341,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     let align = container.inherited.text_align;
 
     let mut frags: Vec<Fragment> = Vec::new();
+    let mut baselines: Option<(f32, f32)> = None;
     let mut y = 0.0f32;
     // Inline boxes open across line ends: (style, node)
     let mut carried: Vec<(u32, NodeId)> = Vec::new();
@@ -614,6 +619,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             continue;
         }
         let baseline = y - top;
+        baselines = Some((baselines.map_or(baseline, |b| b.0), baseline));
         let mut line_frags = root.children;
         line_frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, top, bottom)));
         for f in &mut line_frags {
@@ -622,7 +628,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         frags.extend(line_frags);
         y += bottom - top;
     }
-    InlineLayout { frags, height: y }
+    InlineLayout { frags, height: y, baselines }
 }
 
 /// Bidi embedding levels of each byte of `text` (paragraph direction
@@ -760,7 +766,10 @@ fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont]
     let font = fonts[style as usize];
     let pfont = fonts[parent.style as usize];
     let lh = font.line_height(st.inherited.line_height);
-    let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, font.ascent(), font.ascent() + font.descent(), lh);
+    // Aligned by its extents with the leading (as Blink: the half above
+    // floored), whose middle is not quite the text's
+    let (above, _) = half_leading_extents(&font, lh, 0.0);
+    let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, -above, lh, lh);
     let (t, b) = half_leading_extents(&font, lh, shift);
     // (in quirks mode, boxes with vertical borders or padding count at once)
     let edges = st.border.width[0] + st.border.width[2] + st.box_.padding[0].resolve(0.0) + st.box_.padding[2].resolve(0.0);
@@ -804,6 +813,7 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
     };
     frag.update_ink();
     // `position: relative` moves the box and its content, not the line

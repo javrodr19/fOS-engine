@@ -94,6 +94,9 @@ pub struct BoxFragment {
     /// For boxes that clip their overflow: the size of their content
     /// (from the padding box's corner), which scrolling can reveal
     pub scroll_extent: Option<(f32, f32)>,
+    /// For a box whose content is lines: the first and last line boxes'
+    /// baselines (not those of text moved by vertical-align)
+    pub line_baselines: Option<(f32, f32)>,
 }
 
 impl BoxFragment {
@@ -141,6 +144,10 @@ impl BoxFragment {
         }
         self.border_box = self.border_box.translate(dx, dy);
         self.ink = self.ink.translate(dx, dy);
+        if let Some((first, last)) = &mut self.line_baselines {
+            *first += dy;
+            *last += dy;
+        }
         if let Some(m) = &mut self.marker {
             m.translate(dx, dy);
         }
@@ -151,6 +158,9 @@ impl BoxFragment {
 
     /// The first line's baseline inside the box, if it has lines
     pub fn first_baseline(&self) -> Option<f32> {
+        if let Some((first, _)) = self.line_baselines {
+            return Some(first);
+        }
         for c in &self.children {
             match c {
                 Fragment::Text(t) => return Some(t.baseline),
@@ -166,6 +176,9 @@ impl BoxFragment {
 
     /// The last line's baseline (inline-block baselines)
     pub fn last_baseline(&self) -> Option<f32> {
+        if let Some((_, last)) = self.line_baselines {
+            return Some(last);
+        }
         for c in self.children.iter().rev() {
             match c {
                 Fragment::Text(t) => return Some(t.baseline),
@@ -575,6 +588,7 @@ impl BoxFragment {
             marker: self.marker.clone(),
             replaced: self.replaced.clone(),
             scroll_extent: self.scroll_extent,
+            line_baselines: self.line_baselines,
         }
     }
 }

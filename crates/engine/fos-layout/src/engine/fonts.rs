@@ -15,11 +15,17 @@ pub struct FontMetrics {
     /// Below the baseline (positive)
     pub descent: f32,
     pub line_gap: f32,
+    /// The height of lowercase letters (what `vertical-align: middle`
+    /// centers on)
+    pub x_height: f32,
+    /// The x-height was measured from the "x" glyph, whose hinted outline
+    /// has it in whole pixels
+    pub x_height_measured: bool,
 }
 
 impl FontMetrics {
     /// When no font is available
-    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0 };
+    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0, x_height: 0.448, x_height_measured: false };
 
     /// The content-area height of `normal` line height, per em
     pub fn normal_line_height(&self) -> f32 {
@@ -89,6 +95,16 @@ impl ResolvedFont {
     /// Below the baseline, in whole pixels
     pub fn descent(&self) -> f32 {
         (self.metrics.descent * self.size).round()
+    }
+
+    /// The x-height in pixels
+    pub fn x_height(&self) -> f32 {
+        let x = self.metrics.x_height * self.size;
+        if self.metrics.x_height_measured {
+            x.round()
+        } else {
+            x
+        }
     }
 
     /// `line-height` in pixels: `normal` is the font's own line spacing
@@ -188,8 +204,21 @@ impl FontContext {
                 let p = FontParser::parse_index(data, index).ok()?;
                 let upem = p.units_per_em().max(1) as f32;
                 let (a, d, g) = (p.ascender() as f32 / upem, -(p.descender() as f32) / upem, p.line_gap() as f32 / upem);
+                // As Skia: OS/2's sxHeight (table version 2 and up), else
+                // the height of the "x" glyph, else (Blink) 56% of the ascent
+                let os2 = p.table_data(b"OS/2").filter(|t| t.len() >= 88 && u16::from_be_bytes([t[0], t[1]]) >= 2).map(|t| i16::from_be_bytes([t[86], t[87]]));
+                let glyph = || p.glyph_index('x').and_then(|g| p.glyph_bounding_box(g)).map(|b| b.y_max);
+                let os2 = os2.filter(|&h| h > 0);
+                let measured = if os2.is_none() { glyph() } else { None };
+                let x = os2.or(measured).map(|h| h as f32 / upem).filter(|&x| x > 0.0 && x < a);
                 // Faces with broken metrics get sane ones
-                (a > 0.0 && d >= 0.0 && a + d < 4.0).then_some(FontMetrics { ascent: a, descent: d, line_gap: g.max(0.0) })
+                (a > 0.0 && d >= 0.0 && a + d < 4.0).then_some(FontMetrics {
+                    ascent: a,
+                    descent: d,
+                    line_gap: g.max(0.0),
+                    x_height: x.unwrap_or(a * 0.56),
+                    x_height_measured: x.is_some() && measured.is_some(),
+                })
             })
             .flatten()
             .unwrap_or(FontMetrics::FALLBACK);

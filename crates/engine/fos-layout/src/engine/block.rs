@@ -390,6 +390,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
     };
     let (content_x, content_y) = (ml + e.border[3] + e.padding[3], e.border[0] + e.padding[0]);
     // A new formatting context has its own floats and coordinates
@@ -412,6 +413,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         BoxKind::Inline(content) => {
             let lines = inline::layout_inline(ctx, content, width, inner_cb_h, base);
             frag.children = lines.frags;
+            frag.line_baselines = lines.baselines;
             lines.height
         }
         BoxKind::Flex(items) => {
@@ -450,6 +452,10 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let through = through && collapse_top && collapse_bottom && height <= 0.0;
     for c in &mut frag.children {
         c.translate(content_x, content_y);
+    }
+    if let Some((first, last)) = &mut frag.line_baselines {
+        *first += content_y;
+        *last += content_y;
     }
     frag.border_box = Rect::new(ml, 0.0, width + hbp, height + vbp);
 
@@ -650,6 +656,7 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
     }
 }
 
@@ -715,6 +722,7 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
     };
     let content = frag.content_box();
     let paint = match &r.what {

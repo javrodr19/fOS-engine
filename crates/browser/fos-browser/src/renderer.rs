@@ -1138,10 +1138,11 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         let c = style.color();
         // CSS fill and stroke beat presentation attributes: they go into
         // the elements' style attributes
-        let mut paint = std::collections::HashMap::new();
+        let mut paint = crate::image_loader::SvgStyles::default();
         if let Some(d) = svg_paint_decl(style) {
-            paint.insert(node, d);
+            paint.paint.insert(node, d);
         }
+        svg_attr_vars(tree, node, style, &mut paint.attrs);
         if self.stylesheet.is_some() {
             let mut budget = 2000;
             self.svg_paint(tree, node, style, &mut paint, &mut budget);
@@ -1168,6 +1169,25 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         if self.stylesheet.is_some() {
             self.ancestors.pop();
         }
+    }
+}
+
+/// An SVG element's presentation attributes that use `var()`, with the
+/// element's custom properties substituted (as browsers parse them: as
+/// CSS values; Stripe colors its sign-in button so)
+fn svg_attr_vars(tree: &DomTree, node: NodeId, style: &Style, out: &mut HashMap<NodeId, Vec<(String, Option<String>)>>) {
+    let Some(e) = tree.get(node).and_then(|n| n.as_element()) else { return };
+    let subs: Vec<(String, Option<String>)> = e
+        .attrs
+        .iter()
+        .filter(|a| a.value.contains("var(") && tree.resolve(a.name.local) != "style")
+        .map(|a| {
+            let source = style.custom.as_deref().map(|c| c as &dyn fos_css::VarSource);
+            (tree.resolve(a.name.local).to_string(), fos_css::substitute_vars(&a.value, source).map(|v| v.trim().to_string()))
+        })
+        .collect();
+    if !subs.is_empty() {
+        out.insert(node, subs);
     }
 }
 
@@ -1218,7 +1238,7 @@ impl<'a> BrowserStyler<'a> {
 
     /// Styles of the elements of an inline SVG: those with fill or stroke
     /// declared (at most `budget` elements are styled)
-    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut std::collections::HashMap<NodeId, String>, budget: &mut u32) {
+    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut crate::image_loader::SvgStyles, budget: &mut u32) {
         use layout_engine::Styler;
         self.enter(tree, node);
         let kids: Vec<NodeId> = tree.children(node).filter(|(_, n)| n.is_element()).map(|(id, _)| id).collect();
@@ -1229,8 +1249,9 @@ impl<'a> BrowserStyler<'a> {
             *budget -= 1;
             let cs = self.style(tree, child, style);
             if let Some(d) = svg_paint_decl(&cs) {
-                out.insert(child, d);
+                out.paint.insert(child, d);
             }
+            svg_attr_vars(tree, child, &cs, &mut out.attrs);
             self.svg_paint(tree, child, &cs, out, budget);
         }
         self.leave();
@@ -1679,6 +1700,19 @@ mod tests {
         assert_eq!(at(20, 1), 0xffffffff);
         assert_ne!(at(0, 0), 0xff767676, "rounded corner");
         assert_eq!((at(20, 21), at(20, 22)), (0xffff0000, 0xffff0000));
+    }
+
+    #[test]
+    fn test_svg_presentation_attributes_take_css_variables() {
+        // Presentation attributes are CSS values: var() in them is
+        // substituted (Stripe's sign-in button), with fallbacks; one
+        // that cannot be is left out (black, the initial fill)
+        let html = r#"<html><head><style>svg { --blue: #0000ff }</style></head><body style="margin: 0"><svg width="30" height="10" style="display: block"><rect width="10" height="10" fill="var(--blue)"/><rect x="10" width="10" height="10" fill="var(--none, #00ff00)"/><rect x="20" width="10" height="10" fill="var(--none)"/></svg></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(30, 10);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 30 + x];
+        assert_eq!([at(5, 5), at(15, 5), at(25, 5)], [0xff0000ff, 0xff00ff00, 0xff000000]);
     }
 
     #[test]

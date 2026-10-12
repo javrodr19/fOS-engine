@@ -444,9 +444,20 @@ pub struct SvgCache {
 /// Most inline SVG bitmap bytes kept between layouts
 const MAX_CACHED_SVG_BYTES: usize = 16 << 20;
 
+/// What CSS makes of an inline SVG's elements
+#[derive(Default)]
+pub struct SvgStyles {
+    /// Declarations (fill, stroke) for elements, put before their own
+    /// style attribute's
+    pub paint: HashMap<NodeId, String>,
+    /// Presentation attributes with `var()` in them, substituted (`None`
+    /// when invalid: the attribute is then left out)
+    pub attrs: HashMap<NodeId, Vec<(String, Option<String>)>>,
+}
+
 /// An inline `<svg>` element drawn as an image: its subtree serialized
 /// as SVG markup, `currentColor` being `color` (CSS rgba)
-pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &HashMap<NodeId, String>, refs: Option<SvgRefs>, cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
+pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &SvgStyles, refs: Option<SvgRefs>, cache: &mut SvgCache) -> Option<Arc<LoadedImage>> {
     let mut markup = String::new();
     let mut defs = Vec::new();
     serialize_svg(tree, node, true, color, paint, refs, &mut defs, &mut markup);
@@ -482,12 +493,13 @@ fn escape_xml(s: &str, out: &mut String) {
     }
 }
 
-/// `paint`: CSS declarations (fill, stroke) for elements, put before
-/// their own style attribute's. `<use>` references to other SVG
-/// documents point into the document's contents, which `defs` gathers
-/// (by URL) and the root gets as `<defs>`.
+/// `styles`: what CSS makes of the elements. `<use>` references to other
+/// SVG documents point into the document's contents, which `defs`
+/// gathers (by URL) and the root gets as `<defs>`.
 #[allow(clippy::too_many_arguments)]
-fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint: &HashMap<NodeId, String>, refs: Option<SvgRefs>, defs: &mut Vec<(String, Arc<str>)>, out: &mut String) {
+fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], styles: &SvgStyles, refs: Option<SvgRefs>, defs: &mut Vec<(String, Arc<str>)>, out: &mut String) {
+    let paint = &styles.paint;
+    let substituted = styles.attrs.get(&node);
     let Some(n) = tree.get(node) else { return };
     if let Some(text) = n.as_text() {
         escape_xml(text, out);
@@ -502,6 +514,11 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
         if root && (local == "xmlns" || local.starts_with("xmlns:") || local == "color") {
             continue;
         }
+        let value = match substituted.and_then(|l| l.iter().find(|(n, _)| n == local)) {
+            Some((_, Some(v))) => v.as_str(),
+            Some((_, None)) => continue,
+            None => &a.value,
+        };
         out.push(' ');
         if tree.resolve(a.name.ns) == "http://www.w3.org/1999/xlink" && !local.contains(':') {
             out.push_str("xlink:");
@@ -530,7 +547,7 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
                     defs.push((url, src));
                 }
             }
-            None => escape_xml(&a.value, out),
+            None => escape_xml(value, out),
         }
         out.push('"');
     }
@@ -545,7 +562,7 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], paint
     }
     out.push('>');
     for (child, _) in tree.children(node) {
-        serialize_svg(tree, child, false, color, paint, refs, defs, out);
+        serialize_svg(tree, child, false, color, styles, refs, defs, out);
     }
     if root && !defs.is_empty() {
         out.push_str("<defs>");

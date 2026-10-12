@@ -265,6 +265,16 @@ impl InlineContent {
             InlineItem::Atomic(_) | InlineItem::Break | InlineItem::OutOfFlow(_) => false,
         }) && !self.items.iter().any(|i| matches!(i, InlineItem::Open { style, .. } if has_edges(&self.styles[*style as usize])))
     }
+
+    /// Nothing but white space, preserved or not: such a run between flex
+    /// or grid items is not rendered (CSS Flexbox §4, Grid §6.1)
+    fn is_white_space(&self) -> bool {
+        self.items.iter().all(|i| match i {
+            InlineItem::Text { start, end, .. } => self.text[*start..*end].chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')),
+            InlineItem::Open { .. } | InlineItem::Close | InlineItem::Break => true,
+            InlineItem::Atomic(_) | InlineItem::OutOfFlow(_) => false,
+        })
+    }
 }
 
 /// An inline box with left/right borders, padding or margins makes its
@@ -535,7 +545,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             self.flex_items(node, &style, &mut items, &mut text);
             self.leave();
             let content = text.take(&style);
-            if !content.is_blank() {
+            if !content.is_white_space() {
                 items.push(LayoutBox::anonymous(&style, BoxKind::Inline(content)));
             }
             self.deco = saved;
@@ -894,7 +904,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     fn generated_item(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder, after: bool) {
         let Some((mut ps, generated)) = self.pseudo_box(parent, parent_style, after) else { return };
         let content = text.take(parent_style);
-        if !content.is_blank() {
+        if !content.is_white_space() {
             items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
         }
         let blockified = ps.display().blockified();
@@ -931,7 +941,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 continue;
             }
             let content = text.take(parent_style);
-            if !content.is_blank() {
+            if !content.is_white_space() {
                 items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
             }
             let blockified = display.blockified();

@@ -1408,3 +1408,23 @@ fn nowrap_flex_items_keep_their_text_width() {
     let text_right = texts.iter().map(|r| r.right()).fold(0.0f32, f32::max);
     assert!(rb.x >= text_right - 0.5, "{ra:?} {rb:?} text ends at {text_right}");
 }
+
+#[test]
+fn white_space_between_flex_and_grid_items_is_not_rendered() {
+    let (mut tree, html, body) = doc();
+    // Even preserved, white space between items makes no item of its own
+    // (CSS Grid §6.1, Flexbox §4): shiki's code lines are grid items with
+    // newlines between them
+    let grid = el(&mut tree, body, "div", "display: grid; white-space: pre");
+    let a = el(&mut tree, grid, "div", "height: 10px");
+    text(&mut tree, grid, "\n  ");
+    let b = el(&mut tree, grid, "div", "height: 10px");
+    let flex = el(&mut tree, body, "div", "display: flex; flex-direction: column; white-space: pre-wrap");
+    let c = el(&mut tree, flex, "div", "height: 10px");
+    text(&mut tree, flex, "\n");
+    let d = el(&mut tree, flex, "div", "height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, b).y - rect_of(&t, a).y, 10.0);
+    assert_eq!(rect_of(&t, grid).h, 20.0);
+    assert_eq!(rect_of(&t, d).y - rect_of(&t, c).y, 10.0);
+}

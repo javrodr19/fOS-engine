@@ -27,8 +27,9 @@ pub struct InlineLayout {
 
 enum PieceKind {
     Word { style: u32, node: NodeId, word: Arc<ShapedWord> },
-    /// Spaces (`collapsible` ones vanish at line starts)
-    Space { collapsible: bool },
+    /// Spaces (`collapsible` ones vanish at line starts; ones that `trail`
+    /// take room at line ends, where others hang)
+    Space { collapsible: bool, trails: bool },
     Open { style: u32, node: NodeId },
     Close,
     Atomic(usize),
@@ -81,6 +82,8 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                 let font = &fonts[*style as usize];
                 let wraps = inh.white_space.wraps();
                 let collapsible = inh.white_space.collapses_spaces();
+                let trails = inh.white_space.keeps_trailing_spaces();
+                let break_spaces = inh.white_space == fos_css::style::WhiteSpace::BreakSpaces;
                 let break_all = inh.word_break == WordBreak::BreakAll;
                 let text = &ic.text[*start..*end];
                 let mut rest = text;
@@ -88,10 +91,17 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                     let at = *start + text.len() - rest.len();
                     let spaces = rest.len() - rest.trim_start_matches(' ').len();
                     if spaces > 0 {
-                        let n = spaces as f32;
-                        let w = ctx.fonts.shape(font, " ").width * n + (inh.word_spacing + inh.letter_spacing) * n;
-                        out.push(Piece { kind: PieceKind::Space { collapsible }, width: w, break_before: false, at });
-                        opportunity = wraps;
+                        let one = ctx.fonts.shape(font, " ").width + inh.word_spacing + inh.letter_spacing;
+                        if break_spaces {
+                            // A line may break after every space
+                            for k in 0..spaces {
+                                out.push(Piece { kind: PieceKind::Space { collapsible, trails }, width: one, break_before: opportunity, at: at + k });
+                                opportunity = true;
+                            }
+                        } else {
+                            out.push(Piece { kind: PieceKind::Space { collapsible, trails }, width: one * spaces as f32, break_before: false, at });
+                            opportunity = wraps;
+                        }
                         rest = &rest[spaces..];
                         continue;
                     }
@@ -208,10 +218,19 @@ fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
         }
         match p.kind {
             PieceKind::Break => return i + 1,
-            // Spaces hang at line ends: they never overflow
-            PieceKind::Space { collapsible } => {
+            // Spaces hang at line ends: they never overflow, except
+            // break-spaces ones, which take room there
+            PieceKind::Space { collapsible, trails } => {
                 if content || !collapsible {
                     x += p.width;
+                }
+                if trails {
+                    if x > avail + 0.01 {
+                        if let Some(o) = last_opportunity {
+                            return o;
+                        }
+                    }
+                    content = true;
                 }
             }
             PieceKind::Word { .. } | PieceKind::Atomic(_) => {
@@ -389,10 +408,20 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         let mut end = start_x;
         for p in line {
             match &p.kind {
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
                         pending_n += 1;
+                    }
+                    // Preserved spaces make a line, and in pre text take
+                    // room at its end
+                    has_content |= !collapsible;
+                    if *trails {
+                        x += pending;
+                        opportunities += pending_n;
+                        pending = 0.0;
+                        pending_n = 0;
+                        end = x;
                     }
                 }
                 PieceKind::Word { .. } | PieceKind::Atomic(_) => {
@@ -405,11 +434,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     content = true;
                     has_content = true;
                 }
+                // (Only preserved spaces are pending before any content)
                 PieceKind::Open { .. } => {
-                    if content {
-                        x += pending;
-                        opportunities += pending_n;
-                    }
+                    x += pending;
+                    opportunities += pending_n;
                     pending = 0.0;
                     pending_n = 0;
                     x += p.width;
@@ -505,10 +533,15 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                 }
             };
             match &p.kind {
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
                         pending_n += 1;
+                    }
+                    if *trails {
+                        x += pending + extra * pending_n as f32;
+                        pending = 0.0;
+                        pending_n = 0;
                     }
                 }
                 PieceKind::Word { style, node, word } => {
@@ -569,10 +602,9 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     content = true;
                     placed_content += 1;
                 }
+                // (Only preserved spaces are pending before any content)
                 PieceKind::Open { style, node } => {
-                    if content {
-                        x += pending + extra * pending_n as f32;
-                    }
+                    x += pending + extra * pending_n as f32;
                     pending = 0.0;
                     pending_n = 0;
                     open_box(&mut stack, ic, &fonts, *style, *node, x, true, quirks, &mut top, &mut bottom);
@@ -857,9 +889,13 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                 // Spaces count unless a line can break right after them
                 // (the next piece's break opportunity drops them): in
                 // nowrap text they are part of the min-content width
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
+                    }
+                    if trails {
+                        x += pending;
+                        pending = 0.0;
                     }
                 }
                 PieceKind::OutOfFlow(_) => {}

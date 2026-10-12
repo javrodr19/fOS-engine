@@ -1487,3 +1487,33 @@ fn intrinsic_widths_size_flex_and_grid_items() {
     assert!(w > 130.0 && w < 150.0, "{w}");
     assert_eq!(rect_of(&t, in_grid).w, 80.0);
 }
+
+#[test]
+fn preserved_spaces_take_room_at_line_ends_and_starts() {
+    let (mut tree, html, body) = doc();
+    // Under pre, spaces at a line's end take room rather than hang (CSS
+    // Text 3 §4.1.3): Tailwind's "text-8xl " labels sit apart
+    let row = el(&mut tree, body, "div", "display: flex; white-space: pre");
+    let a = el(&mut tree, row, "span", "");
+    text(&mut tree, a, "ab ");
+    let b = el(&mut tree, row, "span", "");
+    text(&mut tree, b, "cd");
+    let keep = el(&mut tree, body, "div", "white-space: pre; width: min-content");
+    text(&mut tree, keep, "ab   ");
+    // pre-wrap's hang
+    let hang = el(&mut tree, body, "div", "white-space: pre-wrap; width: min-content");
+    text(&mut tree, hang, "ab   ");
+    // Spaces starting a line indent the inline box after them (a code
+    // line's first token)
+    let line = el(&mut tree, body, "div", "white-space: pre");
+    text(&mut tree, line, "  ");
+    let token = el(&mut tree, line, "span", "");
+    text(&mut tree, token, "x");
+    let t = layout(&tree, html, 800.0);
+    let ab = rect_of(&t, hang).w;
+    assert!(ab > 0.0);
+    assert!(rect_of(&t, a).w > ab + 1.0);
+    assert_eq!(rect_of(&t, b).x, rect_of(&t, a).x + rect_of(&t, a).w);
+    assert!(rect_of(&t, keep).w > rect_of(&t, a).w + 1.0);
+    assert!(rect_of(&t, token).x > rect_of(&t, line).x + 1.0);
+}

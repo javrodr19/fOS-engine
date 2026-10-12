@@ -263,6 +263,12 @@ impl WhiteSpace {
     pub fn wraps(self) -> bool {
         !matches!(self, WhiteSpace::Pre | WhiteSpace::Nowrap)
     }
+
+    /// Preserved spaces at the end of a line take room there rather than
+    /// hang (CSS Text 3 §4.1.3)
+    pub fn keeps_trailing_spaces(self) -> bool {
+        matches!(self, WhiteSpace::Pre | WhiteSpace::BreakSpaces)
+    }
 }
 
 css_enum!(TextTransform { None = "none", Capitalize = "capitalize", Uppercase = "uppercase", Lowercase = "lowercase" });

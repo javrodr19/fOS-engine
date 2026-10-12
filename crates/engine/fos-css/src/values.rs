@@ -216,6 +216,20 @@ fn resolve_custom<'a>(
     let Some(&value) = raw.get(name) else {
         return inherited.and_then(|m| m.get(name)).map(str::to_string);
     };
+    // CSS-wide keywords: `initial` is the guaranteed-invalid value (so
+    // var() takes its fallback); the others give the inherited value, as
+    // custom properties inherit
+    let keyword = value.trim();
+    if keyword.eq_ignore_ascii_case("initial") {
+        return None;
+    }
+    if ["inherit", "unset", "revert", "revert-layer"].iter().any(|k| keyword.eq_ignore_ascii_case(k)) {
+        let v = inherited.and_then(|m| m.get(name)).map(str::to_string);
+        if let Some(v) = &v {
+            done.insert(name.to_string(), v.clone());
+        }
+        return v;
+    }
     if resolving.contains(&name) {
         // A cycle: every property in it is invalid
         return None;
@@ -641,6 +655,21 @@ mod tests {
         assert_eq!(substitute_vars("var(--missing)", Some(m)), None);
         // Not a var() call
         assert_eq!(substitute_vars("navvar(x)", Some(m)).as_deref(), Some("navvar(x)"));
+    }
+
+    #[test]
+    fn custom_properties_take_css_wide_keywords() {
+        let root = std::sync::Arc::new(compute_custom_properties(None, &[("--a", "1"), ("--b", "2")]));
+        // `initial` is the guaranteed-invalid value, hiding what is
+        // inherited (Tailwind resets its variables so); `inherit` and
+        // `unset` take the parent's value
+        let own = [("--a", "initial"), ("--b", "unset"), ("--c", "inherit"), ("--d", "var(--a, 7)")];
+        let m = compute_custom_properties(Some(&root), &own);
+        assert_eq!(m.get("--a"), None);
+        assert_eq!(m.get("--b"), Some("2"));
+        assert_eq!(m.get("--c"), None);
+        assert_eq!(m.get("--d"), Some("7"));
+        assert_eq!(substitute_vars("var(--a, 1.5)", Some(&m)).as_deref(), Some("1.5"));
     }
 
     #[test]

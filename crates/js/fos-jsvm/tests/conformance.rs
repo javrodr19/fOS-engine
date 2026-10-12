@@ -1485,3 +1485,24 @@ fn proxy_prototype_chain() {
         ("var t = { a: 1 }; Object.seal(new Proxy(t, {})); [Object.isSealed(t), Object.isFrozen(t), Object.isFrozen(new Proxy({}, {}))]", "[ true, false, false ]"),
     ]);
 }
+
+#[test]
+fn tasks_out_of_time_stop() {
+    // A task that never ends is stopped past every catch and finally, and
+    // the next task runs normally
+    let mut vm = Vm::new();
+    vm.script_time_limit = Some(std::time::Duration::from_millis(50));
+    let t = std::time::Instant::now();
+    let r = vm.eval("var caught = false; try { for (;;) {} } catch (e) { caught = true; } finally { caught = 'finally'; }");
+    assert!(r.is_err());
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    let msg = vm.display(r.unwrap_err());
+    assert!(msg.contains("Script stopped"), "{msg}");
+    // Recursion through calls stops too
+    let r = vm.eval("function f() { return f() + g(); } function g() { for (var i = 0; i < 1e3; i++); return 1; } try { while (true) { try { f(); } catch (e) {} } } catch (e) {}");
+    assert!(r.is_err());
+    let caught = vm.eval("caught").unwrap();
+    assert_eq!(vm.display(caught), "false");
+    let two = vm.eval("1 + 1").unwrap();
+    assert_eq!(vm.display(two), "2");
+}

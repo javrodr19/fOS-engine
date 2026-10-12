@@ -70,6 +70,10 @@ pub enum ScriptType {
     ImportMap,
 }
 
+/// How long one task (a script, a timer or event callback and its
+/// microtasks) may run before it is stopped
+const SCRIPT_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// JavaScript runtime for a page
 pub struct PageJsRuntime {
     vm: Option<Vm>,
@@ -136,6 +140,9 @@ impl PageJsRuntime {
             return Ok(());
         }
         let mut vm = Vm::new();
+        // A script, timer or event handler that runs this long is stopped
+        // (the page stays usable; browsers offer to stop such pages)
+        vm.script_time_limit = Some(SCRIPT_TIME_LIMIT);
         // FOS_GC_STRESS=1: collect garbage at every safepoint (debugging)
         if std::env::var_os("FOS_GC_STRESS").is_some() {
             vm.heap.set_stress(true);

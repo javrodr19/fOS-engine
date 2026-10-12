@@ -92,12 +92,22 @@ impl Vm {
                         break 'inner e;
                     }};
                 }
+                // A task out of time stops at its next loop iteration or call
+                macro_rules! deadline {
+                    () => {{
+                        if self.out_of_time() {
+                            let e = self.timeout_error();
+                            break 'inner e;
+                        }
+                    }};
+                }
                 macro_rules! jump {
                     ($off:expr) => {{
                         let off = $off as isize;
                         pc = (pc as isize + off) as usize;
                         if off < 0 {
                             safepoint!();
+                            deadline!();
                         }
                     }};
                 }
@@ -130,6 +140,7 @@ impl Vm {
                         match &o.get().kind {
                             ObjectKind::Function(c) if !o.get().class_constructor => {
                                 let p: *const FunctionProto = &*c.proto;
+                                deadline!();
                                 self.frames.last_mut().unwrap().pc = pc as u32;
                                 tri!(self.enter_frame(o, p, base + $func as usize + 1, argc, $dst, 0, Value::UNDEFINED));
                                 load_frame!();
@@ -1098,7 +1109,9 @@ impl Vm {
                 let p = unsafe { &*f.proto };
                 // Closing a generator runs finally blocks but not catches
                 let closing = exc == Value::object(self.realm.generator_return);
-                if let Some(h) = p.handlers.iter().find(|h| (h.start as usize) <= fault && fault < h.end as usize && (h.finally || !closing)) {
+                // (nothing catches a task that ran out of time)
+                let terminating = self.terminating;
+                if let Some(h) = p.handlers.iter().find(|h| !terminating && (h.start as usize) <= fault && fault < h.end as usize && (h.finally || !closing)) {
                     let (target, reg) = (h.target, h.reg);
                     self.frames.last_mut().unwrap().pc = target;
                     load_frame!();

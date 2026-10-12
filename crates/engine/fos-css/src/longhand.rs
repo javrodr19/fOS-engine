@@ -1168,8 +1168,9 @@ fn flex_shorthand(v: &str, important: bool, out: Out) {
             }
             let grow = numbers.first().copied().unwrap_or(1.0);
             let shrink = numbers.get(1).copied().unwrap_or(1.0);
-            // A unitless grow alone means a basis of 0
-            let basis = basis.unwrap_or(PropertyValue::Length(Length::px(0.0)));
+            // A unitless grow alone means a basis of 0% (as browsers
+            // compute it: the content's in a container of unknown size)
+            let basis = basis.unwrap_or(PropertyValue::Length(Length { value: 0.0, unit: LengthUnit::Percent }));
             (num(grow), num(shrink), basis)
         }
     };
@@ -1771,7 +1772,9 @@ mod tests {
         assert_eq!(s.border.radius[0], (Lp::px(4.0), Lp::px(8.0)));
         assert_eq!(s.border.radius[1], (Lp::px(4.0), Lp::px(2.0)));
         let s = computed("flex: 1; gap: 10px 5%; overflow: hidden auto; inset: 0 auto");
-        assert_eq!((s.box_.flex_grow, s.box_.flex_shrink, s.box_.flex_basis), (1.0, 1.0, LpAuto::ZERO));
+        // A basis of 0% (not 0px) when only the grow factor is given
+        assert_eq!((s.box_.flex_grow, s.box_.flex_shrink, s.box_.flex_basis), (1.0, 1.0, LpAuto::Lp(Lp::pct(0.0))));
+        assert_ne!(s.box_.flex_basis, LpAuto::ZERO);
         assert_eq!((s.box_.row_gap, s.box_.column_gap), (Some(Lp::px(10.0)), Some(Lp::pct(5.0))));
         assert_eq!((s.box_.overflow_x, s.box_.overflow_y), (Overflow::Hidden, Overflow::Auto));
         assert_eq!(s.box_.inset, [LpAuto::ZERO, LpAuto::Auto, LpAuto::ZERO, LpAuto::Auto]);

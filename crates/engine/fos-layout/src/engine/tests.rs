@@ -1517,3 +1517,28 @@ fn preserved_spaces_take_room_at_line_ends_and_starts() {
     assert!(rect_of(&t, keep).w > rect_of(&t, a).w + 1.0);
     assert!(rect_of(&t, token).x > rect_of(&t, line).x + 1.0);
 }
+
+#[test]
+fn percentage_flex_bases_of_an_unknown_height_are_the_contents() {
+    let (mut tree, html, body) = doc();
+    // In a column of unknown height a basis of 0% (flex: 1's) cannot
+    // resolve, so it is the content's (CSS Flexbox §9.2.3): react.dev's
+    // code panels were collapsed to nothing. 0px is 0
+    let column = |tree: &mut DomTree, item: &str| {
+        let c = el(tree, body, "div", "display: flex; flex-direction: column");
+        let i = el(tree, c, "div", item);
+        el(tree, i, "div", "height: 100px");
+        i
+    };
+    let pct = column(&mut tree, "flex: 1 1 0%; overflow: auto");
+    let shorthand = column(&mut tree, "flex: 1; overflow: hidden");
+    let px = column(&mut tree, "flex: 1 1 0px; overflow: auto");
+    // With a height the percentage resolves, and the item grows into it
+    let sized = el(&mut tree, body, "div", "display: flex; flex-direction: column; height: 50px");
+    let grows = el(&mut tree, sized, "div", "flex: 1 1 0%");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, pct).h, 100.0);
+    assert_eq!(rect_of(&t, shorthand).h, 100.0);
+    assert_eq!(rect_of(&t, px).h, 0.0);
+    assert_eq!(rect_of(&t, grows).h, 50.0);
+}

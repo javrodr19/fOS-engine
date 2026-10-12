@@ -17,11 +17,21 @@ use crate::Declaration;
 
 // ---- values ----
 
-/// A length-percentage: `px` plus `pct` percent of a basis known at layout
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// A length-percentage: `px` plus `pct` percent of a basis known at layout.
+/// A zero percentage is kept as -0.0 so `0%` stays a percentage (a flex
+/// basis of 0% in a container of unknown height is the content's, where
+/// 0px is 0); it computes like 0.0 but is not equal to it, so styles
+/// shared as equal keep it
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Lp {
     pub px: f32,
     pub pct: f32,
+}
+
+impl PartialEq for Lp {
+    fn eq(&self, other: &Lp) -> bool {
+        self.px == other.px && self.pct == other.pct && self.has_percent() == other.has_percent()
+    }
 }
 
 impl Lp {
@@ -32,7 +42,7 @@ impl Lp {
     }
 
     pub const fn pct(pct: f32) -> Lp {
-        Lp { px: 0.0, pct }
+        Lp { px: 0.0, pct: if pct == 0.0 { -0.0 } else { pct } }
     }
 
     /// Pixels, given what a percentage is of
@@ -50,7 +60,7 @@ impl Lp {
     }
 
     pub fn has_percent(self) -> bool {
-        self.pct != 0.0
+        self.pct != 0.0 || self.pct.is_sign_negative()
     }
 }
 

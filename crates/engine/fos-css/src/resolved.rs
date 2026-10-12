@@ -75,7 +75,7 @@ pub fn color(c: Color) -> String {
 }
 
 fn lp(v: Lp) -> String {
-    if v.pct == 0.0 {
+    if !v.has_percent() {
         px(v.px)
     } else if v.px == 0.0 {
         format!("{}%", number(v.pct))

@@ -533,8 +533,17 @@ impl HttpClient {
         };
 
         let addr = format!("{}:{}", url.host, url.port_or_default());
-        let stream = TcpConnection::connect_with_config(&addr, tcp_config)
-            .map_err(|e| NetError::Network(format!("Connection to {} failed: {}", addr, e)))?;
+        let stream = match proxy_for(url) {
+            // Through the proxy the environment names: a tunnel to the host
+            Some(proxy) => {
+                let mut stream = TcpConnection::connect_with_config(&proxy, tcp_config)
+                    .map_err(|e| NetError::Network(format!("Connection to proxy {} failed: {}", proxy, e)))?;
+                open_tunnel(&mut stream, &addr)?;
+                stream
+            }
+            None => TcpConnection::connect_with_config(&addr, tcp_config)
+                .map_err(|e| NetError::Network(format!("Connection to {} failed: {}", addr, e)))?,
+        };
 
         if !url.is_https {
             return Ok((Transport::Plain(BufStream::new(stream)), Protocol::Http1));
@@ -1085,8 +1094,137 @@ pub mod blocking {
     }
 }
 
+/// The HTTP proxy the environment names for `url` (`https_proxy` or
+/// `http_proxy`, else `all_proxy`, in either case), as `host:port`, unless
+/// `no_proxy` exempts the host
+fn proxy_for(url: &UrlParts) -> Option<String> {
+    let var = |name: &str| std::env::var(name).ok().or_else(|| std::env::var(name.to_ascii_uppercase()).ok()).filter(|v| !v.trim().is_empty());
+    let proxy = if url.is_https { var("https_proxy") } else { var("http_proxy") }.or_else(|| var("all_proxy"))?;
+    if var("no_proxy").is_some_and(|list| no_proxy_matches(&list, &url.host)) {
+        return None;
+    }
+    proxy_authority(&proxy)
+}
+
+/// A proxy URL's `host:port`: only plain-HTTP proxies, http://host:port
+/// (the scheme may be left out; the port defaults to 80)
+fn proxy_authority(proxy: &str) -> Option<String> {
+    let rest = match proxy.trim().split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        Some(_) => return None,
+        None => proxy.trim(),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        return None;
+    }
+    let has_port = authority.rsplit_once(':').is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) && !authority.ends_with(']');
+    Some(if has_port { authority.to_string() } else { format!("{authority}:80") })
+}
+
+/// Whether a `no_proxy` list (`*`, host names and domain suffixes, IPv4
+/// addresses and CIDR ranges) covers `host`
+fn no_proxy_matches(list: &str, host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let ip: Option<std::net::Ipv4Addr> = host.parse().ok();
+    list.split(',').map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty()).any(|entry| {
+        if entry == "*" {
+            return true;
+        }
+        if let (Some(ip), Some((net, bits))) = (ip, entry.split_once('/')) {
+            let (Ok(net), Ok(bits)) = (net.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>()) else { return false };
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits.min(32)) };
+            return u32::from(ip) & mask == u32::from(net) & mask;
+        }
+        let entry = entry.trim_start_matches("*.").trim_start_matches('.');
+        host == entry || host.ends_with(&format!(".{entry}"))
+    })
+}
+
+/// Ask an HTTP proxy for a tunnel to `addr` (host:port) over `stream`
+fn open_tunnel(stream: &mut TcpConnection, addr: &str) -> Result<(), NetError> {
+    use std::io::{Read, Write};
+    let request = format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    stream.write_all(request.as_bytes()).map_err(|e| NetError::Network(format!("Proxy write failed: {e}")))?;
+    // The proxy's response head, a byte at a time so nothing past it is
+    // consumed (the TLS handshake follows)
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 16 * 1024 {
+            return Err(NetError::Network("Proxy response too long".into()));
+        }
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            Ok(_) => return Err(NetError::Network("Proxy closed the connection".into())),
+            Err(e) => return Err(NetError::Network(format!("Proxy read failed: {e}"))),
+        }
+    }
+    let status_line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+    let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        // (a refusal, 403 or 407 among them, is reported as is: not retried)
+        Err(NetError::Network(format!("Proxy refused a tunnel to {addr}: {status_line}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proxies_from_the_environment() {
+        use super::{no_proxy_matches, proxy_authority};
+        assert_eq!(proxy_authority("http://127.0.0.1:33687").as_deref(), Some("127.0.0.1:33687"));
+        assert_eq!(proxy_authority("proxy.example:8080/").as_deref(), Some("proxy.example:8080"));
+        assert_eq!(proxy_authority("http://user:pw@proxy.example").as_deref(), Some("proxy.example:80"));
+        assert_eq!(proxy_authority("socks5://127.0.0.1:1080"), None);
+        let list = "localhost,127.0.0.0/8,.internal.example,api.example.com,10.0.0.0/8";
+        for host in ["localhost", "127.0.0.1", "a.internal.example", "api.example.com", "x.api.example.com", "10.1.2.3"] {
+            assert!(no_proxy_matches(list, host), "{host}");
+        }
+        for host in ["example.com", "11.0.0.1", "notapi.example.com", "internal.example.org"] {
+            assert!(!no_proxy_matches(list, host), "{host}");
+        }
+        assert!(no_proxy_matches("*", "anything.example"));
+    }
+
+    #[test]
+    fn tunnels_through_a_proxy() {
+        use std::io::{Read, Write};
+        // A proxy that answers 200 and then serves as the tunnel's far
+        // end, and one that refuses
+        let serve = |answer: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap() == 1 {
+                    head.push(b[0]);
+                }
+                s.write_all(answer.as_bytes()).unwrap();
+                s.write_all(b"tunneled").unwrap();
+                String::from_utf8(head).unwrap()
+            });
+            (addr, handle)
+        };
+        let (addr, handle) = serve("HTTP/1.1 200 Connection established\r\n\r\n");
+        let mut stream = super::TcpConnection::connect(&addr.to_string()).unwrap();
+        super::open_tunnel(&mut stream, "example.com:443").unwrap();
+        let mut rest = String::new();
+        stream.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "tunneled");
+        assert!(handle.join().unwrap().starts_with("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"));
+        let (addr, handle) = serve("HTTP/1.1 403 Forbidden\r\n\r\n");
+        let mut stream = super::TcpConnection::connect(&addr.to_string()).unwrap();
+        let err = super::open_tunnel(&mut stream, "blocked.example:443").unwrap_err();
+        assert!(format!("{err:?}").contains("403"), "{err:?}");
+        handle.join().unwrap();
+    }
+
     use super::*;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

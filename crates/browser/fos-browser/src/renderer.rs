@@ -1638,6 +1638,21 @@ mod tests {
     }
 
     #[test]
+    fn test_fully_rounded_boxes_are_pills() {
+        // A huge radius on a wide box rounds its ends into half circles
+        // (radius 20, half its height): its top edge is straight from x = 20
+        // on, where half ellipses would still be curving away from it
+        let html = r#"<html><body style="margin: 0; background: white"><div style="width: 200px; height: 40px; border-radius: 9999px; background: #00f"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        assert_eq!(at(30, 1), 0xff0000ff);
+        assert_eq!(at(1, 1), 0xffffffff);
+        assert_eq!(at(1, 20), 0xff0000ff);
+    }
+
+    #[test]
     fn test_unstyled_controls_are_drawn_natively() {
         // The UA's 2px inset border is drawn as Chromium draws text fields:
         // 1px of gray inside rounded corners; an author's border is drawn

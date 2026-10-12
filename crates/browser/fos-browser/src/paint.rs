@@ -133,16 +133,22 @@ fn shade(c: CssColor, f: f32) -> CssColor {
     CssColor { r: (c.r as f32 * f) as u8, g: (c.g as f32 * f) as u8, b: (c.b as f32 * f) as u8, a: c.a }
 }
 
+/// Radii past this are as good as infinite
+const RADIUS_CAP: f32 = 1.0e7;
+
 /// Corner radii (horizontal, vertical): top-left, top-right, bottom-right,
-/// bottom-left, reduced so adjacent curves never overlap
+/// bottom-left, all scaled down alike so adjacent curves never overlap
+/// (CSS Backgrounds 3 §5.5)
 fn radii(b: &BoxFragment, r: Rect) -> [(f32, f32); 4] {
     let spec = &b.style.border.radius;
     let mut out = [(0.0, 0.0); 4];
     for i in 0..4 {
         let (h, v): (Lp, Lp) = spec[i];
-        // Huge radii (999em, 3.4e38px: "fully round") are capped at the
-        // box so the sums below stay finite
-        out[i] = (h.resolve(r.w).clamp(0.0, r.w.max(0.0)), v.resolve(r.h).clamp(0.0, r.h.max(0.0)));
+        // Huge radii (999em, 3.4e38px: "fully round") are capped so the
+        // sums below stay finite, alike on both axes: the scaling below
+        // keeps each corner's shape, so 9999px rounds a wide box's ends
+        // into half circles (a pill), not half ellipses
+        out[i] = (h.resolve(r.w).clamp(0.0, RADIUS_CAP), v.resolve(r.h).clamp(0.0, RADIUS_CAP));
         if out[i].0 == 0.0 || out[i].1 == 0.0 {
             out[i] = (0.0, 0.0);
         }

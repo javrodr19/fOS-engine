@@ -55,6 +55,23 @@ impl FloatList {
         self.items.is_empty()
     }
 
+    /// How many floats there are (a mark for [`FloatList::shift_from`])
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Move the floats placed since `mark` down by `dy`: they were placed
+    /// inside a box laid out higher than where it went
+    pub fn shift_from(&mut self, mark: usize, dy: f32) {
+        if dy == 0.0 || mark >= self.items.len() {
+            return;
+        }
+        for (r, _) in &mut self.items[mark..] {
+            r.y += dy;
+        }
+        self.last_top = self.items.iter().map(|(r, _)| r.y).fold(f32::NEG_INFINITY, f32::max);
+    }
+
     /// The free span of `[left, right)` beside floats between `top` and
     /// `bottom`
     pub fn available(&self, top: f32, bottom: f32, left: f32, right: f32) -> (f32, f32) {
@@ -566,7 +583,9 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             // Beside earlier floats, as high as the current position
             let mut laid = layout_block_level(ctx, child, width, cb_h, Sizing::Shrink, false);
             let (w, h) = (laid.margin_box_width(), laid.mt.size() + laid.frag.border_box.h + laid.mb.size());
-            let mut y_min = base.1 + y + if placed { pending.size() } else { 0.0 };
+            // (below margins collapsed so far, unless they go through the
+            // top of this box)
+            let mut y_min = base.1 + y + if placed || !collapse_top { pending.size() } else { 0.0 };
             if let Some(c) = clear_at {
                 y_min = y_min.max(c + base.1);
             }
@@ -592,11 +611,16 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
         }
         ctx.center_in_parent = center;
         ctx.justify_in_parent = super::grid::block_justify(&child.style, justify_items);
+        let mark = ctx.floats.len();
         let mut laid = layout_block_level(ctx, child, cw, cb_h, Sizing::Stretch, false);
         laid.frag.translate(shift, 0.0);
         if let Some(c) = cleared {
             // Clearance: the child starts below the floats; margins above
-            // it no longer collapse through
+            // it no longer collapse through (those of empty boxes before
+            // it still go through the top of this box)
+            if !placed && collapse_top {
+                top = pending;
+            }
             let h = laid.frag.border_box.h;
             laid.frag.translate(rel.0, c + rel.1);
             frags.push(Fragment::Box(laid.frag));
@@ -606,8 +630,11 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             continue;
         }
         if laid.through {
-            let at = y + pending.adjoin(laid.mt).size();
+            // An empty box: at this box's top when its margins go through
+            // it, else where it would be with a bottom border
+            let at = if !placed && collapse_top { y } else { y + pending.adjoin(laid.mt).size() };
             pending = pending.adjoin(laid.mt);
+            ctx.floats.shift_from(mark, at - est_y);
             laid.frag.translate(rel.0, at + rel.1);
             frags.push(Fragment::Box(laid.frag));
             continue;
@@ -619,6 +646,8 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
         } else {
             y + m.size()
         };
+        // Floats inside it were placed where it was expected to start
+        ctx.floats.shift_from(mark, child_y - est_y);
         let h = laid.frag.border_box.h;
         laid.frag.translate(rel.0, child_y + rel.1);
         frags.push(Fragment::Box(laid.frag));

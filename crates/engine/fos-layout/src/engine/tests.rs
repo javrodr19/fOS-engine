@@ -726,6 +726,26 @@ fn justify_self_aligns_blocks_in_block_layout() {
 }
 
 #[test]
+fn margins_collapsing_through_empty_boxes_move_what_follows() {
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "height: 10px");
+    // An empty box's margins go through its parent's top, even when a
+    // cleared box follows: the parent and its floats start below them
+    let a = el(&mut tree, body, "div", "");
+    let empty = el(&mut tree, a, "div", "margin: 20px 0");
+    let float = el(&mut tree, a, "div", "float: left; width: 10px; height: 10px");
+    let cleared = el(&mut tree, a, "div", "clear: both");
+    // In a formatting context root they stay inside, above its floats
+    let b = el(&mut tree, body, "div", "overflow: hidden");
+    el(&mut tree, b, "div", "margin: 20px 0");
+    let inner = el(&mut tree, b, "div", "float: left; width: 10px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let y = |n| rect_of(&t, n).y - 8.0;
+    assert_eq!((y(a), y(empty), y(float), y(cleared)), (30.0, 30.0, 30.0, 40.0));
+    assert_eq!(y(inner) - y(b), 20.0);
+}
+
+#[test]
 fn images_keep_their_ratio_when_a_given_size_is_clamped() {
     // width="1024" (a hint) and max-width: 100% in a 598px box, height
     // auto: the height follows the clamped width

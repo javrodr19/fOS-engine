@@ -118,6 +118,7 @@ pub enum PropertyId {
     OutlineColor,
     OutlineOffset,
     BoxSizing,
+    Appearance,
     VerticalAlign,
     ListStyleType,
     ListStylePosition,

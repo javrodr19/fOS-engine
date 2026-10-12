@@ -90,6 +90,41 @@ fn skia_color(c: CssColor, alpha: f32) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba8(c.r, c.g, c.b, (c.a as f32 * alpha).round().clamp(0.0, 255.0) as u8)
 }
 
+/// Chromium's form control colors: borders, button faces, and the accent
+/// of checked and filled controls
+const CONTROL_BORDER: CssColor = CssColor { r: 118, g: 118, b: 118, a: 255 };
+const CONTROL_FACE: CssColor = CssColor { r: 239, g: 239, b: 239, a: 255 };
+const ACCENT: CssColor = CssColor { r: 0, g: 117, b: 255, a: 255 };
+
+/// A form control the page left to the browser's styles (appearance:
+/// auto, and the UA sheet's border and background) is drawn natively: what
+/// it is filled with then
+fn native_control(b: &BoxFragment) -> Option<CssColor> {
+    use fos_css::style::{Appearance, BorderStyle};
+    let s = &b.style;
+    let border = &s.border;
+    if s.box_.appearance != Appearance::Auto || border.has_radius() || !s.background.images.is_empty() {
+        return None;
+    }
+    let w = border.width[0];
+    if !(0..4).all(|i| border.width[i] == w && border.style[i] == border.style[0] && border.color[i] == border.color[0]) {
+        return None;
+    }
+    let color = border.color[0].unwrap_or(s.color());
+    let (white, black) = (CssColor::WHITE, CssColor::rgba(0, 0, 0, 255));
+    let bg = s.background.color;
+    match (w, border.style[0]) {
+        // Text fields, buttons, drop-downs (drawn white), textareas, color
+        // inputs
+        (2.0, BorderStyle::Inset) if color == CONTROL_BORDER && bg == white => Some(white),
+        (2.0, BorderStyle::Outset) if color == black && bg == CONTROL_FACE => Some(CONTROL_FACE),
+        (1.0, BorderStyle::Solid) if color == CONTROL_BORDER && bg == CONTROL_FACE => Some(white),
+        (1.0, BorderStyle::Solid) if color == CONTROL_BORDER && bg == white => Some(white),
+        (1.0, BorderStyle::Solid) if color == black && bg == CONTROL_FACE => Some(CONTROL_FACE),
+        _ => None,
+    }
+}
+
 fn render_color(c: CssColor, alpha: f32) -> fos_render::Color {
     fos_render::Color::rgba(c.r, c.g, c.b, (c.a as f32 * alpha).round().clamp(0.0, 255.0) as u8)
 }
@@ -623,6 +658,14 @@ impl<'a> Painter<'a> {
         let shadows = b.style.box_.box_shadow.is_some();
         if shadows {
             self.shadows(b, clip, alpha, false);
+        }
+        if let Some(fill) = native_control(b) {
+            // Styled only by the browser: drawn as Chromium draws it
+            self.control_frame(self.dev(b.border_box), fill, clip, alpha);
+            if let Some(r) = &b.replaced {
+                self.replaced(b, r, clip, alpha);
+            }
+            return;
         }
         if b.style.background.clip == fos_css::style::BackgroundClip::Text {
             self.text_background(b, clip, alpha);
@@ -1266,6 +1309,42 @@ impl<'a> Painter<'a> {
     }
 
     /// Form controls drawn by the browser
+    /// A form control's frame as Chromium draws it: a 1px gray border with
+    /// 2px corners around `fill`
+    fn control_frame(&mut self, r: Rect, fill: CssColor, clip: Clip, alpha: f32) {
+        let Some(outer) = rounded_path(r, [(2.0, 2.0); 4]) else { return };
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(skia_color(fill, alpha));
+        self.fill(&outer, &paint, FillRule::Winding, clip);
+        let edge = Rect::new(r.x + 0.5, r.y + 0.5, (r.w - 1.0).max(0.0), (r.h - 1.0).max(0.0));
+        if let Some(ring) = rounded_path(edge, [(1.5, 1.5); 4]).and_then(|p| p.stroke(&Stroke { width: 1.0, ..Stroke::default() }, 1.0)) {
+            paint.set_color(skia_color(CONTROL_BORDER, alpha));
+            self.fill(&ring, &paint, FillRule::Winding, clip);
+        }
+    }
+
+    /// A rounded track (a range's, a progress bar's), filled with `fill`
+    /// up to `upto` and light gray with a gray edge after
+    fn gauge_track(&mut self, track: Rect, upto: f32, fill: CssColor, clip: Clip, alpha: f32) {
+        let rad = [(track.h / 2.0, track.h / 2.0); 4];
+        let Some(path) = rounded_path(track, rad) else { return };
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(skia_color(CONTROL_FACE, alpha));
+        self.fill(&path, &paint, FillRule::Winding, clip);
+        let edge = Rect::new(track.x + 0.5, track.y + 0.5, (track.w - 1.0).max(0.0), (track.h - 1.0).max(0.0));
+        if let Some(ring) = rounded_path(edge, [((track.h - 1.0) / 2.0, (track.h - 1.0) / 2.0); 4]).and_then(|p| p.stroke(&Stroke { width: 1.0, ..Stroke::default() }, 1.0)) {
+            paint.set_color(skia_color(CssColor::rgba(178, 178, 178, 255), alpha));
+            self.fill(&ring, &paint, FillRule::Winding, clip);
+        }
+        let filled = (upto - track.x).clamp(0.0, track.w);
+        if filled > 0.0 {
+            paint.set_color(skia_color(fill, alpha));
+            self.fill(&path, &paint, FillRule::Winding, clip.intersect(Rect::new(track.x, track.y, filled, track.h)));
+        }
+    }
+
     fn replaced(&mut self, b: &BoxFragment, r: &ReplacedPaint, clip: Clip, alpha: f32) {
         let c = self.dev(b.content_box());
         match r {
@@ -1305,20 +1384,53 @@ impl<'a> Painter<'a> {
                     }
                 }
             }
+            // A chevron, 8px wide, 4px in from the end of the content
             ReplacedPaint::Select => {
-                let s = (c.h * 0.3).clamp(3.0, 6.0);
-                let (cx, cy) = (c.right() - s - 2.0, c.y + c.h / 2.0);
+                let (x, cy) = (c.right() - 12.0, c.y + c.h / 2.0);
                 let mut pb = PathBuilder::new();
-                pb.move_to(cx - s, cy - s / 2.0);
-                pb.line_to(cx + s, cy - s / 2.0);
-                pb.line_to(cx, cy + s / 2.0);
-                pb.close();
-                if let Some(p) = pb.finish() {
+                pb.move_to(x + 0.5, cy - 1.75);
+                pb.line_to(x + 4.0, cy + 1.75);
+                pb.line_to(x + 7.5, cy - 1.75);
+                if let Some(p) = pb.finish().and_then(|p| p.stroke(&Stroke { width: 2.0, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() }, 1.0)) {
                     let mut paint = Paint::default();
                     paint.anti_alias = true;
                     paint.set_color(skia_color(b.style.color(), alpha));
                     self.fill(&p, &paint, FillRule::Winding, clip);
                 }
+            }
+            ReplacedPaint::File { button_w } => {
+                self.control_frame(Rect::new(c.x, c.y, *button_w, c.h), CONTROL_FACE, clip, alpha);
+            }
+            // A track 8px tall, filled to the thumb (16px across, kept 8px
+            // from the ends)
+            ReplacedPaint::Range(at) => {
+                let thumb_x = c.x + 8.0 + (c.w - 16.0).max(0.0) * at;
+                let track = Rect::new(c.x, c.y + (c.h - 8.0) / 2.0, c.w, 8.0);
+                self.gauge_track(track, thumb_x, ACCENT, clip, alpha);
+                let cy = c.y + c.h / 2.0;
+                if let Some(p) = PathBuilder::from_circle(thumb_x, cy, 8.0) {
+                    let mut paint = Paint::default();
+                    paint.anti_alias = true;
+                    paint.set_color(skia_color(ACCENT, alpha));
+                    self.fill(&p, &paint, FillRule::Winding, clip);
+                }
+            }
+            // A swatch inside the frame (inset 2px across, 4px down)
+            ReplacedPaint::ColorWell(color) => {
+                let r = Rect::new(c.x + 2.0, c.y + 4.0, (c.w - 4.0).max(0.0), (c.h - 8.0).max(0.0));
+                let mut paint = Paint::default();
+                for (r, c) in [(r, CssColor::rgba(119, 119, 119, 255)), (Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0), *color)] {
+                    if let Some(rect) = tiny_skia::Rect::from_xywh(r.x, r.y, r.w, r.h) {
+                        paint.set_color(skia_color(c, alpha));
+                        self.fill(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, clip);
+                    }
+                }
+            }
+            // An 8px track across the middle, filled from the start
+            ReplacedPaint::Gauge { value, meter } => {
+                let track = Rect::new(c.x, c.y + (c.h - 8.0) / 2.0, c.w, 8.0);
+                let fill = if *meter { CssColor::rgba(16, 124, 16, 255) } else { ACCENT };
+                self.gauge_track(track, c.x + c.w * value.unwrap_or(0.0), fill, clip, alpha);
             }
             ReplacedPaint::Image(handle) => {
                 if let Some(img) = handle.0.downcast_ref::<crate::image_loader::LoadedImage>() {

@@ -141,6 +141,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "float" => Float,
         "clear" => Clear,
         "box-sizing" => BoxSizing,
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => Appearance,
         "width" => Width,
         "height" => Height,
         "min-width" => MinWidth,
@@ -503,6 +504,13 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
             other => other,
         }),
         P::BoxSizing => enum_value::<BoxSizing>(v),
+        // Every widget keyword (menulist, button, textfield...) draws the
+        // control natively, as auto does
+        P::Appearance => enum_value::<Appearance>(match v {
+            "none" => "none",
+            "auto" | "menulist" | "menulist-button" | "button" | "push-button" | "square-button" | "textfield" | "textarea" | "searchfield" | "checkbox" | "radio" | "listbox" | "meter" | "progress-bar" | "slider-horizontal" | "slider-vertical" => "auto",
+            _ => return None,
+        }),
         P::Width | P::Height | P::FlexBasis => size(v, true),
         P::MinWidth | P::MinHeight => size(v, true),
         P::MaxWidth | P::MaxHeight => {
@@ -692,7 +700,7 @@ macro_rules! css_enum_impl {
     };
 }
 css_enum_impl!(
-    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
+    Display, Position, Float, Clear, BoxSizing, Appearance, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
     ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
 );

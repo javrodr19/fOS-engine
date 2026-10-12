@@ -310,8 +310,9 @@ fn atomic_baseline(laid: &Laid) -> f32 {
     let mt = laid.mt.size();
     let bottom = mt + f.border_box.h + laid.mb.size();
     match f.kind {
-        BoxFragmentKind::Replaced => f.first_baseline().map_or(bottom, |b| mt + b),
+        // (a textarea scrolls: its baseline is its bottom)
         _ if clips(&f.style) => bottom,
+        BoxFragmentKind::Replaced => f.first_baseline().map_or(bottom, |b| mt + b),
         _ => f.last_baseline().map_or(bottom, |b| mt + b),
     }
 }

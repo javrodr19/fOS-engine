@@ -1497,6 +1497,47 @@ mod tests {
     }
 
     #[test]
+    fn test_form_controls_are_sized_as_chromium_sizes_them() {
+        let html = r#"<html><body style="margin: 0">
+            <input id=a><input id=b size=10><input id=e><br>
+            <select id=s><option>one</option><option>a longer option</option></select>
+            <select id=n style="appearance: none"><option>one</option><option>a longer option</option></select>
+            <select id=l multiple><option>one</option></select><br>
+            <input type=submit id=sub><input type=button id=btn><textarea id=t></textarea><textarea id=th style="overflow: hidden"></textarea>
+            <progress id=p></progress><meter id=m></meter><input type=range id=r style="width: 200px"></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 1000.0);
+        let boxes = layout.boxes();
+        let rect = |id: &str| {
+            let node = document.get_element_by_id(id).unwrap();
+            boxes.iter().find(|(n, _)| *n == node).map(|b| b.1).unwrap()
+        };
+        // Text fields: `size` whole average characters, 2px borders and
+        // 1px/2px padding around one line, empty or not on one baseline
+        let (a, b) = (rect("a"), rect("b"));
+        let per_char = (a.w - b.w) / 10.0;
+        assert!(per_char >= 5.0 && per_char.fract() == 0.0, "{a:?} {b:?}");
+        assert_eq!((a.y, a.h), (rect("e").y, rect("e").h));
+        // Drop-downs: the widest option, 4px before it and 16px for the
+        // arrow, in a 1px border (without them when not drawn natively)
+        let (s, n) = (rect("s"), rect("n"));
+        assert_eq!(s.w - n.w, 20.0, "{s:?} {n:?}");
+        assert!(s.w.fract() == 0.0 && s.w > 60.0);
+        assert_eq!(s.h - n.h, 2.0);
+        // A list box shows 4 rows
+        let l = rect("l");
+        assert!((l.h - 2.0 - 4.0 * (n.h - 2.0 + 2.0)).abs() < 0.01, "{l:?} {n:?}");
+        // Button inputs show their (default) label, or none
+        assert!(rect("sub").w > 30.0 && rect("btn").w == 16.0 && rect("btn").h == rect("sub").h);
+        // A textarea leaves room for a scrollbar unless it cannot scroll
+        assert_eq!(rect("t").w - rect("th").w, 15.0);
+        // Progress bars, meters and sliders take the size of their font
+        // and the UA sheet; a slider has no ratio to keep
+        assert_eq!((rect("p").w, rect("p").h, rect("m").w), (160.0, 16.0, 80.0));
+        assert_eq!((rect("r").w, rect("r").h), (200.0, 16.0));
+    }
+
+    #[test]
     fn test_layout_boxes_follow_the_document() {
         let document = fos_html::parse_with_url(PAGE, "https://example.com/");
         let layout = layout_of(&document, 320.0);
@@ -1580,6 +1621,22 @@ mod tests {
         let red = |x: usize, y: usize| page.pixels[y * 40 + x] == 0xffff0000;
         assert!(red(20, 20) && red(11, 2) && red(28, 37));
         assert!(!red(5, 20) && !red(35, 20));
+    }
+
+    #[test]
+    fn test_unstyled_controls_are_drawn_natively() {
+        // The UA's 2px inset border is drawn as Chromium draws text fields:
+        // 1px of gray inside rounded corners; an author's border is drawn
+        // as is
+        let html = r#"<html><body style="margin: 0"><input style="display: block"><input style="display: block; border: 2px solid #f00"></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 60);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        assert_eq!(at(20, 0), 0xff767676);
+        assert_eq!(at(20, 1), 0xffffffff);
+        assert_ne!(at(0, 0), 0xff767676, "rounded corner");
+        assert_eq!((at(20, 21), at(20, 22)), (0xffff0000, 0xffff0000));
     }
 
     #[test]

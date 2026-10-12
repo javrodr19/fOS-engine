@@ -240,6 +240,7 @@ css_enum!(Position { Static = "static", Relative = "relative", Absolute = "absol
 css_enum!(Float { None = "none", Left = "left", Right = "right" });
 css_enum!(Clear { None = "none", Left = "left", Right = "right", Both = "both" });
 css_enum!(BoxSizing { ContentBox = "content-box", BorderBox = "border-box" });
+css_enum!(Appearance { None = "none", Auto = "auto" });
 css_enum!(Overflow { Visible = "visible", Hidden = "hidden", Clip = "clip", Scroll = "scroll", Auto = "auto" });
 css_enum!(Visibility { Visible = "visible", Hidden = "hidden", Collapse = "collapse" });
 css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent", WebkitCenter = "-webkit-center" });
@@ -653,6 +654,8 @@ pub struct BoxStyle {
     pub float: Float,
     pub clear: Clear,
     pub box_sizing: BoxSizing,
+    /// `appearance`: form controls drawn natively (`auto`) or by CSS
+    pub appearance: Appearance,
     pub width: LpAuto,
     pub height: LpAuto,
     pub min_width: LpAuto,
@@ -767,6 +770,7 @@ impl Default for BoxStyle {
             float: Float::None,
             clear: Clear::None,
             box_sizing: BoxSizing::ContentBox,
+            appearance: Appearance::None,
             width: LpAuto::Auto,
             height: LpAuto::Auto,
             min_width: LpAuto::Auto,
@@ -1332,6 +1336,7 @@ impl Style {
             PropertyId::Float => set!(box_, [float], enum_of!(Float)),
             PropertyId::Clear => set!(box_, [clear], enum_of!(Clear)),
             PropertyId::BoxSizing => set!(box_, [box_sizing], enum_of!(BoxSizing)),
+            PropertyId::Appearance => set!(box_, [appearance], enum_of!(Appearance)),
             PropertyId::Width | PropertyId::Height | PropertyId::MinWidth | PropertyId::MinHeight | PropertyId::FlexBasis => {
                 let intrinsic = IntrinsicSize::of(v);
                 match id {
@@ -1923,6 +1928,7 @@ impl Style {
             PropertyId::Float => copy!(box_, [float]),
             PropertyId::Clear => copy!(box_, [clear]),
             PropertyId::BoxSizing => copy!(box_, [box_sizing]),
+            PropertyId::Appearance => copy!(box_, [appearance]),
             PropertyId::Width => {
                 copy!(box_, [width]);
                 copy!(box_, [intrinsic_width[0]]);

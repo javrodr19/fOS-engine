@@ -272,6 +272,15 @@ pub enum ReplacedPaint {
     Check { radio: bool, checked: bool },
     /// A drop-down's arrow (its text is a child fragment)
     Select,
+    /// A file input's button, this wide from the content box's start (its
+    /// texts are child fragments)
+    File { button_w: f32 },
+    /// A range input's track and thumb, the thumb this far along (0 to 1)
+    Range(f32),
+    /// A color input's swatch
+    ColorWell(Color),
+    /// A progress bar or meter, filled this far (`None`: indeterminate)
+    Gauge { value: Option<f32>, meter: bool },
     /// Nothing to show (yet)
     Empty,
 }

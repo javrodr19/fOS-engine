@@ -682,13 +682,68 @@ pub fn relative_offset(style: &Style, cb_w: f32, cb_h: Option<f32>) -> (f32, f32
     (dx, dy)
 }
 
+/// The character width text fields are sized by, and how much wider than
+/// it their widest glyph is (as Blink: the OS/2 average, rounded, for a
+/// proportional face; the "0"'s width for a fixed-pitch one)
+fn field_char_width(ctx: &mut LayoutCtx, font: &super::fonts::ResolvedFont) -> (f32, Option<f32>) {
+    let m = font.metrics;
+    let mut zero = || ctx.fonts.shape(font, "0").width;
+    if m.avg_char_width <= 0.0 {
+        return (zero(), None);
+    }
+    let avg = if m.fixed_pitch { zero() } else { (m.avg_char_width * font.size).round() };
+    (avg, Some((m.max_char_width * font.size).round() - avg))
+}
+
+/// The room a drop-down's arrow takes after its text, and the padding
+/// before the text and above and below it (none when not drawn natively)
+fn select_chrome(style: &Style) -> (f32, f32, f32) {
+    if style.box_.appearance == fos_css::style::Appearance::Auto {
+        (16.0, 4.0, 1.0)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
+}
+
+/// How far a scrollbar takes from a box that may scroll
+const SCROLLBAR: f32 = 15.0;
+
 /// A replaced element's default size when it has no natural one
 fn default_replaced_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced) -> (f32, f32) {
+    use fos_css::style::Overflow;
     let font = ctx.fonts.resolve(style);
     let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
+    let text_w = |ctx: &mut LayoutCtx, t: &str| ctx.fonts.shape(&font, t).width;
     match &r.what {
-        ReplacedWhat::TextField(..) => (font.size * 11.25, line),
-        ReplacedWhat::Select(text) => (ctx.fonts.shape(&font, text).width + font.size * 1.5, line),
+        // `size` characters, and the widest glyph's excess
+        ReplacedWhat::TextField(_, _, size) => {
+            let (cw, extra) = field_char_width(ctx, &font);
+            ((cw * *size as f32).ceil() + extra.unwrap_or(0.0), line)
+        }
+        // `cols` characters and a scrollbar, `rows` lines
+        ReplacedWhat::TextArea { cols, rows, .. } => {
+            let (cw, _) = field_char_width(ctx, &font);
+            let bar = if matches!(style.box_.overflow_y, Overflow::Auto | Overflow::Scroll) { SCROLLBAR } else { 0.0 };
+            ((cw * *cols as f32).ceil() + bar, line * *rows as f32)
+        }
+        // As wide as the widest option: a drop-down with its arrow, a list
+        // box with its rows' padding
+        ReplacedWhat::Select { options, rows, .. } => {
+            let widest = options.iter().map(|o| text_w(ctx, o)).fold(0.0f32, f32::max);
+            match rows {
+                Some(n) => (widest + 4.0, (font.ascent() + font.descent() + 2.0) * *n as f32),
+                None => {
+                    let (arrow, start, vpad) = select_chrome(style);
+                    (widest.ceil() + start + arrow, font.ascent() + font.descent() + 2.0 * vpad)
+                }
+            }
+        }
+        ReplacedWhat::Button(label) => (text_w(ctx, label), line),
+        // Room for 34 digits (its button and "No file chosen" fit in that)
+        ReplacedWhat::File => ((text_w(ctx, "0") * 34.0).ceil(), line + 6.0),
+        ReplacedWhat::Range(_) => (129.0, 16.0),
+        ReplacedWhat::ColorWell(_) => (44.0, 23.0),
+        ReplacedWhat::Gauge { meter, .. } => (if *meter { 80.0 } else { 160.0 }, 16.0),
         _ => (300.0, 150.0),
     }
 }
@@ -730,26 +785,109 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         // Frames show their documents' pictures, supplied like canvases'
         ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg | ReplacedWhat::Frame => ReplacedPaint::Bitmap,
         ReplacedWhat::Check { radio, checked } => ReplacedPaint::Check { radio: *radio, checked: *checked },
-        ReplacedWhat::TextField(text, placeholder) => {
+        ReplacedWhat::TextField(text, placeholder, _) => {
             if !text.is_empty() {
-                let color = if *placeholder { Color::rgba(117, 117, 117, 255) } else { style.color() };
+                let color = if *placeholder { PLACEHOLDER } else { style.color() };
                 frag.children.push(Fragment::Text(control_text(ctx, style, text, content, color)));
             }
             ReplacedPaint::Empty
         }
-        ReplacedWhat::Select(text) => {
-            if !text.is_empty() {
-                frag.children.push(Fragment::Text(control_text(ctx, style, text, content, style.color())));
-            }
-            ReplacedPaint::Select
+        ReplacedWhat::TextArea { text, placeholder, .. } => {
+            let color = if *placeholder { PLACEHOLDER } else { style.color() };
+            control_lines(ctx, style, text, content, color, &mut frag.children);
+            ReplacedPaint::Empty
         }
+        ReplacedWhat::Select { shown, options, rows } => match rows {
+            None => {
+                let (_, start, _) = select_chrome(style);
+                if !shown.is_empty() {
+                    let inner = Rect::new(content.x + start, content.y, (content.w - start).max(0.0), content.h);
+                    frag.children.push(Fragment::Text(control_text(ctx, style, shown, inner, style.color())));
+                }
+                if start > 0.0 { ReplacedPaint::Select } else { ReplacedPaint::Empty }
+            }
+            // A list box's options, a row each
+            Some(n) => {
+                let font = ctx.fonts.resolve(style);
+                let row = font.ascent() + font.descent() + 2.0;
+                for (i, o) in options.iter().take(*n as usize).enumerate() {
+                    let r = Rect::new(content.x + 2.0, content.y + i as f32 * row, (content.w - 4.0).max(0.0), row);
+                    frag.children.push(Fragment::Text(control_text(ctx, style, o, r, style.color())));
+                }
+                ReplacedPaint::Empty
+            }
+        },
+        ReplacedWhat::Button(label) => {
+            if !label.is_empty() {
+                let font = ctx.fonts.resolve(style);
+                let w = ctx.fonts.shape(&font, label).width;
+                let x = content.x + ((content.w - w) / 2.0).max(0.0);
+                frag.children.push(Fragment::Text(control_text(ctx, style, label, Rect::new(x, content.y, (content.right() - x).max(0.0), content.h), style.color())));
+            }
+            ReplacedPaint::Empty
+        }
+        // A button (its label padded 6px across, 1px down, in a 2px
+        // border), then the note that no file is chosen
+        ReplacedWhat::File => {
+            let font = ctx.fonts.resolve(style);
+            let label = "Choose File";
+            let w = (ctx.fonts.shape(&font, label).width + 16.0).min(content.w);
+            let button = Rect::new(content.x, content.y, w, content.h);
+            frag.children.push(Fragment::Text(control_text(ctx, style, label, Rect::new(button.x + 8.0, button.y, (w - 8.0).max(0.0), button.h), style.color())));
+            let x = button.right() + 4.0;
+            frag.children.push(Fragment::Text(control_text(ctx, style, "No file chosen", Rect::new(x, content.y, (content.right() - x).max(0.0), content.h), style.color())));
+            ReplacedPaint::File { button_w: w }
+        }
+        ReplacedWhat::Range(at) => ReplacedPaint::Range(*at),
+        ReplacedWhat::ColorWell([r, g, b, a]) => ReplacedPaint::ColorWell(Color::rgba(*r, *g, *b, *a)),
+        ReplacedWhat::Gauge { value, meter } => ReplacedPaint::Gauge { value: *value, meter: *meter },
     };
+    // One-line controls have their text's baseline, text or not (a list
+    // box, its first row's)
+    let one_line = match &r.what {
+        ReplacedWhat::TextField(..) | ReplacedWhat::Button(_) | ReplacedWhat::File | ReplacedWhat::ColorWell(_) => Some(content),
+        ReplacedWhat::Select { rows: None, .. } => Some(content),
+        ReplacedWhat::Select { rows: Some(_), .. } => {
+            let font = ctx.fonts.resolve(style);
+            Some(Rect::new(content.x, content.y, content.w, font.ascent() + font.descent() + 2.0))
+        }
+        _ => None,
+    };
+    if let Some(line) = one_line {
+        let font = ctx.fonts.resolve(style);
+        let baseline = line.y + (line.h - font.ascent() - font.descent()) / 2.0 + font.ascent();
+        frag.line_baselines = Some((baseline, baseline));
+    }
+    // Checkboxes, radio buttons and sliders sit on their border box's
+    // bottom (their bottom margin hangs below the baseline)
+    if matches!(r.what, ReplacedWhat::Check { .. } | ReplacedWhat::Range(_)) {
+        let bottom = frag.border_box.bottom();
+        frag.line_baselines = Some((bottom, bottom));
+    }
     frag.replaced = Some(Arc::new(paint));
     frag.update_ink();
     let mt = Margin::new(e.margin[0].unwrap_or(0.0));
     let mb = Margin::new(e.margin[2].unwrap_or(0.0));
     let content_h = frag.content_box().h;
     Laid { frag, mt, mb, through: false, ml, mr, content_h }
+}
+
+/// Placeholder text's color
+const PLACEHOLDER: Color = Color { r: 117, g: 117, b: 117, a: 255 };
+
+/// A textarea's lines, from the top of its content box (those that fit)
+fn control_lines(ctx: &mut LayoutCtx, style: &Style, text: &str, content: Rect, color: Color, out: &mut Vec<Fragment>) {
+    let font = ctx.fonts.resolve(style);
+    let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
+    for (i, l) in text.lines().enumerate() {
+        let y = content.y + i as f32 * line;
+        if y + line > content.bottom() + 0.5 {
+            break;
+        }
+        if !l.is_empty() {
+            out.push(Fragment::Text(control_text(ctx, style, l, Rect::new(content.x, y, content.w, line), color)));
+        }
+    }
 }
 
 /// One line of a form control's text, vertically centered and clipped to

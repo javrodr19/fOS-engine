@@ -1190,6 +1190,8 @@ fn regex_unicode_properties() {
     check(&[
         ("/^\\p{ID_Start}\\p{ID_Continue}*$/u.test('ñame_1')", "true"),
         ("/^\\p{ID_Start}/u.test('1a')", "false"),
+        ("'a{b}c d→'.replace(/\\p{Pattern_Syntax}/gu, '_')", "'a_b_c d_'"),
+        ("/^\\p{Pattern_White_Space}+$/u.test(' \\t\\n\\u200e')", "true"),
         ("'a+b=$5 ©→😀'.match(/\\p{S}/gu).join('')", "'+=$©→😀'"),
         ("'a+b=$5'.match(/\\p{Sc}/gu).join('')", "'$'"),
         ("/\\p{Sm}/u.test('∑')", "true"),

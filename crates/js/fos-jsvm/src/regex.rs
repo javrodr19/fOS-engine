@@ -756,6 +756,15 @@ fn property_class(name: &str) -> Option<ClassSet> {
         "Emoji_Component" | "EComp" => |c| matches!(c, '#' | '*' | '0'..='9' | '\u{200D}' | '\u{20E3}' | '\u{FE0F}' | '\u{1F1E6}'..='\u{1F1FF}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{1F9B0}'..='\u{1F9B3}' | '\u{E0020}'..='\u{E007F}'),
         "Hex_Digit" | "Hex" | "ASCII_Hex_Digit" | "AHex" => |c| c.is_ascii_hexdigit(),
         "Ideographic" | "Ideo" => |c| matches!(c, '\u{3006}' | '\u{3007}' | '\u{3021}'..='\u{3029}' | '\u{3038}'..='\u{303A}' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{3134F}'),
+        // Characters reserved for pattern syntax (Unicode's PropList, as
+        // message formatters and tokenizers use them)
+        "Pattern_Syntax" | "Pat_Syn" => |c| matches!(c,
+            '\u{21}'..='\u{2F}' | '\u{3A}'..='\u{40}' | '\u{5B}'..='\u{5E}' | '\u{60}' | '\u{7B}'..='\u{7E}' | '\u{A1}'..='\u{A7}' | '\u{A9}'
+                | '\u{AB}' | '\u{AC}' | '\u{AE}' | '\u{B0}' | '\u{B1}' | '\u{B6}' | '\u{BB}' | '\u{BF}' | '\u{D7}' | '\u{F7}'
+                | '\u{2010}'..='\u{2027}' | '\u{2030}'..='\u{203E}' | '\u{2041}'..='\u{2053}' | '\u{2055}'..='\u{205E}' | '\u{2190}'..='\u{245F}'
+                | '\u{2500}'..='\u{2775}' | '\u{2794}'..='\u{2BFF}' | '\u{2E00}'..='\u{2E7F}' | '\u{3001}'..='\u{3003}' | '\u{3008}'..='\u{3020}'
+                | '\u{3030}' | '\u{FD3E}' | '\u{FD3F}' | '\u{FE45}' | '\u{FE46}'),
+        "Pattern_White_Space" | "Pat_WS" => |c| matches!(c, '\u{9}'..='\u{D}' | ' ' | '\u{85}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'),
         "ASCII" => |c| c.is_ascii(),
         "Any" => |_| true,
         "Emoji" | "Emoji_Presentation" | "Extended_Pictographic" => {

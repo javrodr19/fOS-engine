@@ -29,6 +29,62 @@ pub struct LoadedImage {
     /// An SVG image's markup, for inline `<svg>`s whose `<use>` refers to
     /// its elements (sprite sheets)
     pub svg_source: Option<Arc<str>>,
+    /// How an SVG with a `viewBox` fits a box of another shape
+    /// (`preserveAspectRatio`); `None` stretches it to the box
+    pub svg_fit: Option<SvgFit>,
+}
+
+/// An SVG's `preserveAspectRatio`: its contents keep their shape,
+/// scaled to fit the box (`meet`) or to cover it (`slice`) and aligned in
+/// it (0 start, 0.5 middle, 1 end, per axis)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SvgFit {
+    pub align: (f32, f32),
+    pub slice: bool,
+}
+
+impl SvgFit {
+    /// From the root `<svg>` tag of `markup`: only an SVG with a `viewBox`
+    /// scales to its box keeping its shape
+    fn of(markup: &[u8]) -> Option<SvgFit> {
+        let text = String::from_utf8_lossy(&markup[..markup.len().min(64 * 1024)]);
+        let start = text.match_indices("<svg").map(|(i, _)| i).find(|&i| text[i + 4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'))?;
+        let tag = &text[start..];
+        let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+        let attr = |name: &str| {
+            let at = tag.match_indices(name).map(|(i, _)| i).find(|&i| tag[..i].ends_with(|c: char| c.is_ascii_whitespace()) && tag[i + name.len()..].trim_start().starts_with('='))?;
+            let rest = tag[at + name.len()..].trim_start()[1..].trim_start();
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let rest = &rest[1..];
+            Some(&rest[..rest.find(quote)?])
+        };
+        attr("viewBox")?;
+        let par = attr("preserveAspectRatio").unwrap_or("").trim();
+        let mut words = par.split_ascii_whitespace();
+        let align = words.next().unwrap_or("xMidYMid");
+        if align == "none" {
+            return None;
+        }
+        let at = |s: &str| match s {
+            "Min" => 0.0,
+            "Max" => 1.0,
+            _ => 0.5,
+        };
+        let (ax, ay) = match (align.strip_prefix('x'), align.find('Y')) {
+            (Some(_), Some(y)) => (at(&align[1..y]), at(&align[y + 1..])),
+            _ => (0.5, 0.5),
+        };
+        Some(SvgFit { align: (ax, ay), slice: words.next() == Some("slice") })
+    }
+
+    /// Where an image of `natural` shape is drawn in `dest`
+    pub fn place(&self, natural: (f32, f32), dest: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = dest;
+        let (sx, sy) = (w / natural.0, h / natural.1);
+        let s = if self.slice { sx.max(sy) } else { sx.min(sy) };
+        let (dw, dh) = (natural.0 * s, natural.1 * s);
+        (x + (w - dw) * self.align.0, y + (h - dh) * self.align.1, dw, dh)
+    }
 }
 
 /// Largest SVG kept as markup for `<use>` references
@@ -215,7 +271,7 @@ pub fn decode(bytes: &[u8]) -> Option<LoadedImage> {
         }
     }
     let pixmap = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)?;
-    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap), svg_source: None })
+    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap), svg_source: None, svg_fit: None })
 }
 
 /// Downscale a bitmap over the pixel budget
@@ -401,7 +457,7 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
     let mut pixmap = Pixmap::new(pw, ph)?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h), &mut pixmap.as_mut());
     let svg_source = (bytes.len() <= MAX_SVG_SOURCE).then(|| String::from_utf8_lossy(bytes).into());
-    Some(LoadedImage { natural: (w, h), pixmap, svg_source })
+    Some(LoadedImage { natural: (w, h), pixmap, svg_source, svg_fit: SvgFit::of(bytes) })
 }
 
 /// Fetch and decode the images of `page` (in parallel, through the HTTP
@@ -506,9 +562,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn svgs_with_a_view_box_keep_their_shape() {
+        let fit = |m: &str| SvgFit::of(m.as_bytes());
+        let mid = SvgFit { align: (0.5, 0.5), slice: false };
+        assert_eq!(fit(r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path/></svg>"#), Some(mid));
+        assert_eq!(fit(r#"<svg width="10" height="10"><rect/></svg>"#), None);
+        assert_eq!(fit(r#"<svg viewBox='0 0 1 1' preserveAspectRatio='none'/>"#), None);
+        assert_eq!(fit(r#"<svg viewBox="0 0 1 1" preserveAspectRatio="xMinYMax slice">"#), Some(SvgFit { align: (0.0, 1.0), slice: true }));
+        // A 320x512 icon in a 40px square: 25px wide, centered
+        assert_eq!(mid.place((320.0, 512.0), (0.0, 0.0, 40.0, 40.0)), (7.5, 0.0, 25.0, 40.0));
+    }
+
+    #[test]
     fn loaded_images_are_found_by_element() {
         let doc = fos_html::parse_with_url(r#"<html><body><img id=a src="a.png"><img id=b src="b.png"><img id=c srcset="c.png 1x"><p>x</p></body></html>"#, "https://example.com/");
-        let image = Arc::new(LoadedImage { natural: (1.0, 1.0), pixmap: Pixmap::new(1, 1).unwrap(), svg_source: None });
+        let image = Arc::new(LoadedImage { natural: (1.0, 1.0), pixmap: Pixmap::new(1, 1).unwrap(), svg_source: None, svg_fit: None });
         let images: Images = Arc::new(["https://example.com/a.png", "https://example.com/c.png"].into_iter().map(|u| (u.to_string(), image.clone())).collect());
         let found = loaded_img_elements(&doc, &images, 800.0);
         let ids: Vec<&str> = found.iter().filter_map(|(n, _)| doc.tree().get_attribute(*n, "id")).collect();

@@ -828,7 +828,7 @@ impl PageRenderer {
         for (node, (w, h), pixmap) in updates {
             match pixmap {
                 Some(pixmap) => {
-                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None, svg_fit: None }));
                 }
                 None => {
                     self.canvases.remove(&node);
@@ -1566,6 +1566,20 @@ mod tests {
         assert!(red(15, 80), "fixed box in a clipping box");
         assert!(red(25, 80), "absolute box in a clipping box below its containing block");
         assert!(red(35, 15) && !red(35, 30), "absolute box clipped by its containing block");
+    }
+
+    #[test]
+    fn test_svgs_keep_their_shape_in_other_boxes() {
+        // A tall icon in a square box is drawn narrower, centered
+        let html = r##"<html><body style="margin: 0">
+            <svg viewBox="0 0 10 20" style="display: block; width: 40px; height: 40px; fill: #f00"><rect width="10" height="20"/></svg>
+            </body></html>"##;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 40 + x] == 0xffff0000;
+        assert!(red(20, 20) && red(11, 2) && red(28, 37));
+        assert!(!red(5, 20) && !red(35, 20));
     }
 
     #[test]

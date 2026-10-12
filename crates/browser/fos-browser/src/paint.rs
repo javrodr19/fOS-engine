@@ -1361,7 +1361,13 @@ impl<'a> Painter<'a> {
         };
         // object-position (50% 50% by default) places it in the box
         let (px, py) = b.style.box_.object_position;
-        let dest = Rect::new(c.x + px.resolve(c.w - dw), c.y + py.resolve(c.h - dh), dw, dh);
+        let mut dest = Rect::new(c.x + px.resolve(c.w - dw), c.y + py.resolve(c.h - dh), dw, dh);
+        if let Some(fit) = img.svg_fit {
+            // An SVG's contents keep their shape in the box it is given
+            let (x, y, w, h) = fit.place(img.natural, (dest.x, dest.y, dest.w, dest.h));
+            dest = Rect::new(x, y, w, h);
+        }
+        let (dw, dh) = (dest.w, dest.h);
         let visible = clip.intersect(c).intersect(dest);
         if visible.is_empty() {
             return;

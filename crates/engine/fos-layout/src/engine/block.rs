@@ -1051,7 +1051,14 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         };
         w.min(maxw).max(minw)
     };
-    (clamp(min) + hbp + margins, clamp(max) + hbp + margins)
+    // A replaced element whose width or max-width is a percentage can
+    // shrink to nothing: it adds nothing to a min-content size (CSS Sizing
+    // 3 §5.2.2, compressible replaced elements)
+    let percent = |l: &fos_css::style::Lp| l.has_percent();
+    let compressible = matches!(b.kind, BoxKind::Replaced(_))
+        && (matches!(style.box_.width, LpAuto::Lp(l) if percent(&l)) || matches!(style.box_.max_width, fos_css::style::MaxSize::Lp(l) if percent(&l)));
+    let min = if compressible { clamp(0.0) } else { clamp(min) };
+    (min + hbp + margins, clamp(max) + hbp + margins)
 }
 
 /// Whether a box clips its overflow (an inline-block's baseline is then its

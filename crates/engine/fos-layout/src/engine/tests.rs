@@ -726,6 +726,30 @@ fn justify_self_aligns_blocks_in_block_layout() {
 }
 
 #[test]
+fn percentage_sized_images_add_nothing_to_min_content() {
+    // A wrapping flex row of two flex: 1 columns stays one line when one
+    // holds a 1024px wide image (its width attribute's) that max-width: 95%
+    // can shrink, or one that width: 50% sizes, but not a fixed one
+    let (mut tree, html, body) = doc();
+    let row = |tree: &mut DomTree, img_style: &str| {
+        let r = el(tree, body, "div", "display: flex; flex-wrap: wrap; width: 600px");
+        let a = el(tree, r, "div", "flex: 1");
+        let img = el(tree, a, "img", img_style);
+        tree.set_attribute(img, "data-natural", "1024x10");
+        let b = el(tree, r, "div", "flex: 1; height: 10px");
+        (a, b)
+    };
+    let max = row(&mut tree, "width: 1024px; max-width: 95%");
+    let pct = row(&mut tree, "width: 50%");
+    let fixed = row(&mut tree, "width: 1024px");
+    let t = layout(&tree, html, 800.0);
+    for (a, b) in [max, pct] {
+        assert_eq!((rect_of(&t, a).w, rect_of(&t, b).y), (300.0, rect_of(&t, a).y));
+    }
+    assert!(rect_of(&t, fixed.1).y > rect_of(&t, fixed.0).y);
+}
+
+#[test]
 fn trailing_spaces_in_inline_boxes_take_no_room() {
     let (mut tree, html, body) = doc();
     // `<b>x </b> ` ends its line with a space inside the box and one after

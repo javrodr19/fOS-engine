@@ -28,13 +28,17 @@ pub struct LayoutCtx<'a> {
     /// The box about to be laid out is in a block whose text-align is
     /// -webkit-center (<center>, align=center): it is centered
     pub center_in_parent: bool,
+    /// The box about to be laid out is aligned in its block container by
+    /// `justify-self` (the container's `justify-items` for `auto`), not
+    /// stretched: where in the free space it goes (0 start, 1 end)
+    pub justify_in_parent: Option<f32>,
     /// The document is in quirks mode
     pub quirks: bool,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, quirks: false }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, justify_in_parent: None, quirks: false }
     }
 }
 
@@ -267,6 +271,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let vbp = e.vertical_bp();
     let sizing = if forced.width.is_some() { Sizing::Shrink } else { sizing };
     let centered = std::mem::take(&mut ctx.center_in_parent);
+    let justify = std::mem::take(&mut ctx.justify_in_parent).filter(|_| sizing == Sizing::Stretch && forced.width.is_none());
 
     if let BoxKind::Replaced(r) = &b.kind {
         let mut laid = layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
@@ -309,7 +314,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         None => {
             let avail = (cb_w - ml - mr - hbp).max(0.0);
             let w = match sizing {
-                Sizing::Stretch if !is_table => avail,
+                // Aligned rather than stretched: as wide as its content
+                Sizing::Stretch if !is_table && justify.is_none() => avail,
                 _ => {
                     let (min, max) = intrinsic_content(ctx, b);
                     max.min(avail).max(min)
@@ -338,7 +344,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             }
             (true, false) => ml = free,
             (false, true) => mr = free,
-            // Inside <center> (and align=center) blocks are centered
+            // Aligned by justify-self, or centered inside <center> (and
+            // align=center)
+            (false, false) if free > 0.0 && justify.is_some() => {
+                let at = justify.unwrap_or(0.0);
+                let at = if style.inherited.direction == fos_css::style::Direction::Rtl { 1.0 - at } else { at };
+                ml += free * at;
+                mr += free * (1.0 - at);
+            }
             (false, false) if free > 0.0 && centered => {
                 ml += free / 2.0;
                 mr += free / 2.0;
@@ -388,7 +401,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let content_h = match &b.kind {
         BoxKind::Block(children) => {
             let center = style.inherited.text_align == fos_css::style::TextAlign::WebkitCenter;
-            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base, center);
+            let justify_items = fos_css::style::AlignItems::from_u8(style.box_.grid.justify_items).unwrap_or(fos_css::style::AlignItems::Normal);
+            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base, (center, justify_items));
             escaped_top = flow.top;
             escaped_bottom = flow.bottom;
             through = flow.through;
@@ -523,7 +537,10 @@ fn flow_order(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32) -> Vec<us
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), center: bool) -> Flow {
+/// `align`: whether the container centers its blocks (`<center>`), and its
+/// `justify-items`
+fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), align: (bool, fos_css::style::AlignItems)) -> Flow {
+    let (center, justify_items) = align;
     let mut frags = Vec::with_capacity(children.len());
     let mut y = 0.0f32;
     let mut pending = Margin::default();
@@ -568,6 +585,7 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             shift = l - base.0;
         }
         ctx.center_in_parent = center;
+        ctx.justify_in_parent = super::grid::block_justify(&child.style, justify_items);
         let mut laid = layout_block_level(ctx, child, cw, cb_h, Sizing::Stretch, false);
         laid.frag.translate(shift, 0.0);
         if let Some(c) = cleared {

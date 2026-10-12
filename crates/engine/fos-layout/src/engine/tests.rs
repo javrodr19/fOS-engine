@@ -699,6 +699,33 @@ fn floats_share_max_content_with_inline_content() {
 }
 
 #[test]
+fn justify_self_aligns_blocks_in_block_layout() {
+    let (mut tree, html, body) = doc();
+    let wrap = |tree: &mut DomTree, style: &str| el(tree, body, "div", &format!("width: 300px; {style}"));
+    // Aligned blocks are as wide as their content and placed in the free
+    // space; justify-items stands in for auto
+    let p = wrap(&mut tree, "");
+    let center = el(&mut tree, p, "div", "justify-self: center; width: 100px; height: 10px");
+    let p = wrap(&mut tree, "justify-items: end");
+    let end = el(&mut tree, p, "div", "width: 100px; height: 10px; margin-right: 20px");
+    let p = wrap(&mut tree, "");
+    let shrunk = el(&mut tree, p, "div", "justify-self: start; display: flex");
+    el(&mut tree, shrunk, "div", "width: 40px; height: 10px");
+    // Auto margins win; stretch fills
+    let p = wrap(&mut tree, "");
+    let auto = el(&mut tree, p, "div", "justify-self: left; margin: 0 auto; width: 100px; height: 10px");
+    let p = wrap(&mut tree, "");
+    let stretch = el(&mut tree, p, "div", "justify-self: stretch; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let x = |n| rect_of(&t, n).x - 8.0;
+    assert_eq!((x(center), rect_of(&t, center).w), (100.0, 100.0));
+    assert_eq!(x(end), 180.0);
+    assert_eq!((x(shrunk), rect_of(&t, shrunk).w), (0.0, 40.0));
+    assert_eq!(x(auto), 100.0);
+    assert_eq!(rect_of(&t, stretch).w, 300.0);
+}
+
+#[test]
 fn trailing_spaces_in_inline_boxes_take_no_room() {
     let (mut tree, html, body) = doc();
     // `<b>x </b> ` ends its line with a space inside the box and one after

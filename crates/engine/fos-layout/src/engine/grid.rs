@@ -490,6 +490,17 @@ fn self_align(value: AlignItems) -> (bool, f32) {
     }
 }
 
+/// Where a block-level box in a block container goes in the free space
+/// across it (0 start, 1 end) when `justify-self` (its container's
+/// `justify-items` for `auto`) aligns it rather than stretching it
+pub(super) fn block_justify(style: &fos_css::style::Style, justify_items: AlignItems) -> Option<f32> {
+    let own = AlignSelf::from_u8(style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
+    match self_align(self_value(own, justify_items)) {
+        (true, _) => None,
+        (false, at) => Some(at),
+    }
+}
+
 fn self_value(own: AlignSelf, container: AlignItems) -> AlignItems {
     match own {
         AlignSelf::Auto => container,

@@ -531,7 +531,7 @@ impl<'a> Painter<'a> {
         let inner = self.inner_clip(b, clip);
         let saved = self.enter_scroll(b);
         let mut layers: Vec<Layer> = Vec::new();
-        self.collect_layers(b, inner, alpha, &mut layers);
+        self.collect_layers(b, inner, inner, alpha, &mut layers);
         layers.sort_by_key(|l| l.0);
         let here = self.at();
         for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 < 0) {
@@ -551,19 +551,29 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// The positioned boxes under `b` that are not inside another layer
-    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
+    /// The positioned boxes under `b` that are not inside another layer.
+    /// Each is clipped by the boxes around it up to its containing block:
+    /// `clip` is the clip here, `layer_clip` the clip inside the layer
+    /// being painted (what absolutely positioned boxes get) and fixed boxes
+    /// get the viewport's.
+    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, layer_clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
+        use fos_css::style::Position;
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
             if Self::is_layer_in(b, cb) {
                 // A sticky box is drawn moved to stay in view
                 let mut at = self.at();
                 at.0 -= cb.sticky_offset(b.content_box(), self.view);
+                let clip = match cb.style.box_.position {
+                    Position::Fixed => Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]),
+                    Position::Absolute => layer_clip,
+                    _ => clip,
+                };
                 out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha, at));
             } else if self.find_fixed || !self.culled(cb, clip) {
                 let inner = self.inner_clip(cb, clip);
                 let saved = self.enter_scroll(cb);
-                self.collect_layers(cb, inner, alpha * cb.style.box_.opacity, out);
+                self.collect_layers(cb, inner, layer_clip, alpha * cb.style.box_.opacity, out);
                 self.go(saved);
             }
         }

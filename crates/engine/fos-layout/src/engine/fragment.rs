@@ -224,6 +224,17 @@ impl BoxFragment {
             if let Some(m) = &self.marker {
                 ink = ink.union(&m.rect);
             }
+            // Positioned children whose containing block is further out
+            // are not clipped here
+            let positioned = self.style.is_positioned() || self.style.has_transform();
+            for c in &self.children {
+                if let Fragment::Box(cb) = c {
+                    let p = cb.style.box_.position;
+                    if p == fos_css::style::Position::Fixed || (p == fos_css::style::Position::Absolute && !positioned) {
+                        ink = ink.union(&cb.ink);
+                    }
+                }
+            }
             self.ink = ink;
             return;
         }

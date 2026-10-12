@@ -201,6 +201,7 @@ impl PageLayout {
             resolved: Default::default(),
             ctx: self.styling.ctx,
             root_styled: true,
+            viewport_overflow: None,
             quirks: self.styling.quirks,
             images: &images,
             base: String::new(),
@@ -1006,6 +1007,15 @@ fn links_in(layout: &PageLayout, origin: f32, height: f32) -> Vec<LinkRegion> {
         .collect()
 }
 
+/// Which element's `overflow` the viewport has yet to take
+#[derive(Clone, Copy)]
+enum ViewportOverflow {
+    /// The root element's
+    Root(NodeId),
+    /// The body child of this root, the root's overflow being visible
+    Body(NodeId),
+}
+
 /// Computes element styles while the box tree is built: the UA's
 /// defaults, the page's matching rules, presentational hints and `style`
 /// attributes. Styles live only as long as layout needs them.
@@ -1020,6 +1030,10 @@ struct BrowserStyler<'a> {
     /// What lengths are computed against (the root's font size once known)
     ctx: StyleContext,
     root_styled: bool,
+    /// Whose `overflow` the viewport takes: the root's, or body's when the
+    /// root's is visible. That box itself then does not clip. `None` once
+    /// decided, or when styles are computed rather than laid out.
+    viewport_overflow: Option<ViewportOverflow>,
     /// The document is in quirks mode
     quirks: bool,
     /// Loaded images, and the URL their sources resolve against
@@ -1027,6 +1041,33 @@ struct BrowserStyler<'a> {
     base: String,
     /// Rasterized inline SVGs
     svgs: &'a mut crate::image_loader::SvgCache,
+}
+
+impl BrowserStyler<'_> {
+    /// The viewport takes the root's `overflow`, or body's when the root's
+    /// is visible (CSS Overflow 3 §3.3): that element does not clip
+    fn propagate_overflow(&mut self, tree: &DomTree, node: NodeId, tag: &str, style: &mut Style) {
+        use fos_css::style::Overflow;
+        let to_viewport = |style: &mut Style| {
+            let b = Arc::make_mut(&mut style.box_);
+            (b.overflow_x, b.overflow_y) = (Overflow::Visible, Overflow::Visible);
+        };
+        match self.viewport_overflow {
+            Some(ViewportOverflow::Root(root)) if root == node => {
+                self.viewport_overflow = if style.clips() {
+                    to_viewport(style);
+                    None
+                } else {
+                    Some(ViewportOverflow::Body(root))
+                };
+            }
+            Some(ViewportOverflow::Body(root)) if tree.get(node).is_some_and(|n| n.parent == root) && tag == "body" => {
+                self.viewport_overflow = None;
+                to_viewport(style);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
@@ -1069,6 +1110,9 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             // The root element's font size is what `rem` means
             self.root_styled = true;
             self.ctx.root_font_size = style.font_size();
+        }
+        if self.viewport_overflow.is_some() {
+            self.propagate_overflow(tree, node, tree.resolve(element.name.local), &mut style);
         }
         style
     }
@@ -1202,6 +1246,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
         resolved: Default::default(),
         ctx: StyleContext { root_font_size: 16.0, viewport },
         root_styled: false,
+        viewport_overflow: Some(ViewportOverflow::Root(root)),
         quirks: document.is_quirks(),
         images,
         base: if images.is_empty() { String::new() } else { crate::css_loader::base_url(document) },
@@ -1495,6 +1540,32 @@ mod tests {
             assert!(red(x0 + 20, 30), "shape {i} center");
             assert!(!red(x0 + 2, 2) && !red(x0 + 37, 2), "shape {i} corners");
         }
+    }
+
+    #[test]
+    fn test_positioned_boxes_escape_clips_below_their_containing_block() {
+        // Body's overflow belongs to the viewport (the root's is visible),
+        // so the short body clips nothing; a fixed box escapes a clipping
+        // ancestor, as does an absolutely positioned box whose containing
+        // block is outside the clipping box, but not one inside it
+        let html = r#"<html><body style="margin: 0; height: 10px; overflow-x: hidden">
+            <div style="position: fixed; left: 0; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            <div style="overflow: hidden; height: 10px">
+              <div style="position: fixed; left: 10px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+              <div style="position: absolute; left: 20px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            </div>
+            <div style="position: relative; overflow: hidden; height: 10px">
+              <div style="position: absolute; left: 30px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            </div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(50, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 50 + x] == 0xffff0000;
+        assert!(red(5, 80), "fixed box under body");
+        assert!(red(15, 80), "fixed box in a clipping box");
+        assert!(red(25, 80), "absolute box in a clipping box below its containing block");
+        assert!(red(35, 15) && !red(35, 30), "absolute box clipped by its containing block");
     }
 
     #[test]

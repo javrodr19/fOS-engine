@@ -135,6 +135,17 @@ fn image(i: &Image) -> String {
             let shape = if *circle { "circle" } else { "ellipse" };
             format!("{name}({shape} at {} {}, {})", lp(center.0), lp(center.1), stops(s))
         }
+        Image::Conic { from, center, stops: s, repeating } => {
+            let name = if *repeating { "repeating-conic-gradient" } else { "conic-gradient" };
+            let stops: Vec<String> = s
+                .iter()
+                .map(|st| match st.position {
+                    Some(p) => format!("{} {}deg", color(st.color), number(p.pct * 3.6)),
+                    None => color(st.color),
+                })
+                .collect();
+            format!("{name}(from {}deg at {} {}, {})", number(*from), lp(center.0), lp(center.1), stops.join(", "))
+        }
     }
 }
 

@@ -1500,6 +1500,7 @@ fn image(v: &str) -> Option<Image> {
         }
         "linear-gradient" | "repeating-linear-gradient" => linear_gradient(args, func.contains("repeating"), func.starts_with('-')),
         "radial-gradient" | "repeating-radial-gradient" => radial_gradient(args, func.contains("repeating")),
+        "conic-gradient" | "repeating-conic-gradient" => conic_gradient(args, func.contains("repeating")),
         _ => None,
     }
 }
@@ -1520,27 +1521,29 @@ fn angle(v: &str) -> Option<f32> {
 
 /// Color stops (the arguments after any direction)
 fn color_stops(args: &[&str]) -> Option<Arc<[ColorStop]>> {
+    color_stops_at(args, |s| match length(s, false, false, true)? {
+        PropertyValue::Length(l) => Some(match l.unit {
+            LengthUnit::Percent => Lp::pct(l.value),
+            LengthUnit::Px => Lp::px(l.value),
+            LengthUnit::Em | LengthUnit::Rem => Lp::px(l.value * 16.0),
+            _ => Lp::px(l.value),
+        }),
+        PropertyValue::Mix { px, pct } => Some(Lp { px, pct }),
+        _ => None,
+    })
+}
+
+/// Color stops at positions `pos` reads
+fn color_stops_at(args: &[&str], pos: impl Fn(&str) -> Option<Lp>) -> Option<Arc<[ColorStop]>> {
     let mut stops = Vec::new();
     for a in args {
         let parts = components(a.trim());
         let Some(c) = parts.first().and_then(|c| parse_color(c)) else {
-            // A transition hint (a bare length) shapes interpolation: skip
-            if parts.len() == 1 && length(parts[0], false, false, true).is_some() {
+            // A transition hint (a bare position) shapes interpolation: skip
+            if parts.len() == 1 && pos(parts[0]).is_some() {
                 continue;
             }
             return None;
-        };
-        let pos = |s: &str| -> Option<Lp> {
-            match length(s, false, false, true)? {
-                PropertyValue::Length(l) => Some(match l.unit {
-                    LengthUnit::Percent => Lp::pct(l.value),
-                    LengthUnit::Px => Lp::px(l.value),
-                    LengthUnit::Em | LengthUnit::Rem => Lp::px(l.value * 16.0),
-                    _ => Lp::px(l.value),
-                }),
-                PropertyValue::Mix { px, pct } => Some(Lp { px, pct }),
-                _ => None,
-            }
         };
         match parts.len() {
             1 => stops.push(ColorStop { color: c, position: None }),
@@ -1601,6 +1604,43 @@ fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
     };
     let stops = color_stops(&parts[stops_from..])?;
     Some(Image::Linear { direction, stops, repeating })
+}
+
+/// `conic-gradient([from <angle>] [at <position>], <angular stops>)`
+fn conic_gradient(args: &str, repeating: bool) -> Option<Image> {
+    let parts = split_top(args, b',');
+    let first = parts.first()?.trim().to_ascii_lowercase();
+    let words = components(&first);
+    let mut from = 0.0;
+    let mut center = (Lp::pct(50.0), Lp::pct(50.0));
+    let stops_from = if matches!(words.first(), Some(&"from" | &"at")) {
+        let at = words.iter().position(|w| *w == "at");
+        if words[0] == "from" {
+            from = angle(words.get(1)?)?;
+            if words.len() > 2 && at != Some(2) {
+                return None;
+            }
+        }
+        if let Some(i) = at {
+            let Some(PropertyValue::List(xy)) = background_position(&words[i + 1..]) else { return None };
+            let lp = |v: &PropertyValue| match v {
+                PropertyValue::Length(l) if l.unit == LengthUnit::Percent => Some(Lp::pct(l.value)),
+                PropertyValue::Length(l) => Some(Lp::px(l.value)),
+                PropertyValue::Mix { px, pct } => Some(Lp { px: *px, pct: *pct }),
+                _ => None,
+            };
+            center = (lp(&xy[0])?, lp(&xy[1])?);
+        }
+        1
+    } else {
+        0
+    };
+    // Angles as percentages of a turn
+    let stops = color_stops_at(&parts[stops_from..], |s| match s.strip_suffix('%') {
+        Some(p) => p.parse().ok().map(Lp::pct),
+        None => angle(s).map(|deg| Lp::pct(deg / 3.6)),
+    })?;
+    Some(Image::Conic { from, center, stops, repeating })
 }
 
 fn radial_gradient(args: &str, repeating: bool) -> Option<Image> {
@@ -1759,6 +1799,20 @@ mod tests {
         assert_eq!(g.areas.as_ref().unwrap().columns, 2);
         let s = computed("grid-template-columns: repeat(2, calc(50% - 10px))");
         assert!(matches!(&s.box_.grid.template_columns[0], TemplateItem::Repeat(_, inner) if matches!(inner[0], TemplateItem::Track(t) if t.min == Breadth::Length(Lp { px: -10.0, pct: 50.0 }))));
+    }
+
+    #[test]
+    fn conic_gradients() {
+        // react.dev's section backdrop
+        let s = computed("background-image: conic-gradient(from 90deg at -10% 100%, #bcc1cd 0deg, #bcc1cd 90deg, #fff 360deg)");
+        let Image::Conic { from, center, stops, repeating } = &s.background.images[0] else { panic!("{:?}", s.background.images) };
+        assert_eq!((*from, *center, *repeating), (90.0, (Lp::pct(-10.0), Lp::pct(100.0)), false));
+        let at: Vec<f32> = stops.iter().map(|s| s.position.unwrap().pct).collect();
+        assert_eq!(at, [0.0, 25.0, 100.0]);
+        // Stops in turns and percentages, two positions, no configuration
+        let s = computed("background-image: repeating-conic-gradient(red 0 0.25turn, blue 25% 50%)");
+        assert!(matches!(&s.background.images[0], Image::Conic { from: 0.0, repeating: true, stops, .. } if stops.len() == 4 && stops[1].position == Some(Lp::pct(25.0))));
+        assert_eq!(computed("background-image: conic-gradient(from 45deg, red, blue 50%)").resolved_value("background-image", None).as_deref(), Some("conic-gradient(from 45deg at 50% 50%, rgb(255, 0, 0), rgb(0, 0, 255) 180deg)"));
     }
 
     #[test]

@@ -1117,12 +1117,21 @@ impl<'a> Painter<'a> {
                 }
                 for &tx in &xs {
                     let tile = Rect::new(tx, ty, tw, th);
+                    let conic;
                     let shader = match loaded {
                         Some(img) => {
                             let pm = &img.pixmap;
                             let t = Transform::from_row(tw / pm.width() as f32, 0.0, 0.0, th / pm.height() as f32, tx, ty);
                             tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, alpha, t)
                         }
+                        None if matches!(image, Image::Conic { .. }) => match conic_pixmap(image, tile, alpha) {
+                            Some(pm) => {
+                                conic = pm;
+                                let t = Transform::from_translate(tx.floor(), ty.floor());
+                                tiny_skia::Pattern::new(conic.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Nearest, 1.0, t)
+                            }
+                            None => continue,
+                        },
                         None => match gradient_shader(image, tile, alpha) {
                             Some(s) => s,
                             None => continue,
@@ -1822,8 +1831,69 @@ fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'stat
             let transform = Transform::from_translate(tile.x + cx, tile.y + cy).pre_scale(1.0, ry / rx);
             RadialGradient::new(Point::zero(), Point::zero(), radius, gs, mode, transform)
         }
-        Image::None | Image::Url(_) => None,
+        Image::None | Image::Url(_) | Image::Conic { .. } => None,
     }
+}
+
+/// Tiles larger than this are not drawn with conic gradients
+const MAX_CONIC_TILE: f32 = 8192.0;
+
+/// A conic gradient over `tile`, colored pixel by pixel (tiny-skia has no
+/// sweep shader): each pixel takes the color at its angle around the
+/// center, clockwise from `from`, interpolated in premultiplied alpha
+fn conic_pixmap(image: &Image, tile: Rect, alpha: f32) -> Option<tiny_skia::Pixmap> {
+    let Image::Conic { from, center, stops, repeating } = image else { return None };
+    if tile.w > MAX_CONIC_TILE || tile.h > MAX_CONIC_TILE {
+        return None;
+    }
+    let (x0, y0) = (tile.x.floor(), tile.y.floor());
+    let (w, h) = ((tile.x + tile.w).ceil() - x0, (tile.y + tile.h).ceil() - y0);
+    let mut pm = tiny_skia::Pixmap::new(w as u32, h as u32)?;
+    let (cx, cy) = (tile.x - x0 + center.0.resolve(tile.w), tile.y - y0 + center.1.resolve(tile.h));
+    let fr = stop_fractions(stops, 1.0);
+    let premul: Vec<[f32; 4]> = stops
+        .iter()
+        .map(|s| {
+            let a = s.color.a as f32 / 255.0 * alpha;
+            [s.color.r as f32 * a, s.color.g as f32 * a, s.color.b as f32 * a, a * 255.0]
+        })
+        .collect();
+    let (first, last) = (fr.first().copied()?, fr.last().copied()?);
+    let period = last - first;
+    if *repeating && period <= 1e-4 {
+        return None;
+    }
+    let sample = |t: f32| -> [f32; 4] {
+        if t <= fr[0] {
+            return premul[0];
+        }
+        for i in 1..fr.len() {
+            if t <= fr[i] {
+                let span = fr[i] - fr[i - 1];
+                if span <= 1e-6 {
+                    return premul[i];
+                }
+                let u = (t - fr[i - 1]) / span;
+                let (a, b) = (premul[i - 1], premul[i]);
+                return [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * u);
+            }
+        }
+        premul[premul.len() - 1]
+    };
+    let width = w as usize;
+    for (i, px) in pm.pixels_mut().iter_mut().enumerate() {
+        let (dx, dy) = ((i % width) as f32 + 0.5 - cx, (i / width) as f32 + 0.5 - cy);
+        // Clockwise from up, as a fraction of a turn past `from`
+        let turn = (dx.atan2(-dy).to_degrees() - from).rem_euclid(360.0) / 360.0;
+        let t = if *repeating { first + (turn - first).rem_euclid(period) } else { turn };
+        let c = sample(t);
+        let a = c[3].round().clamp(0.0, 255.0) as u8;
+        let ch = |v: f32| (v.round().clamp(0.0, 255.0) as u8).min(a);
+        if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(ch(c[0]), ch(c[1]), ch(c[2]), a) {
+            *px = p;
+        }
+    }
+    Some(pm)
 }
 
 #[cfg(test)]

@@ -1638,6 +1638,19 @@ mod tests {
     }
 
     #[test]
+    fn test_conic_gradients_sweep_clockwise_from_up() {
+        // A quarter turn per color, from up; then the same turned a
+        // quarter by `from`
+        let html = r#"<html><body style="margin: 0"><div style="width: 100px; height: 100px; background: conic-gradient(red 0deg 90deg, blue 90deg 180deg, lime 180deg 270deg, black 270deg)"></div><div style="width: 100px; height: 100px; background: conic-gradient(from 90deg, red 0 25%, blue 0)"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(100, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 100 + x];
+        assert_eq!([at(75, 25), at(75, 75), at(25, 75), at(25, 25)], [0xffff0000, 0xff0000ff, 0xff00ff00, 0xff000000]);
+        assert_eq!([at(75, 175), at(25, 175), at(25, 125), at(75, 125)], [0xffff0000, 0xff0000ff, 0xff0000ff, 0xff0000ff]);
+    }
+
+    #[test]
     fn test_fully_rounded_boxes_are_pills() {
         // A huge radius on a wide box rounds its ends into half circles
         // (radius 20, half its height): its top edge is straight from x = 20

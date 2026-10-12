@@ -437,6 +437,9 @@ pub enum Image {
     Url(Arc<str>),
     Linear { direction: GradientDirection, stops: Arc<[ColorStop]>, repeating: bool },
     Radial { circle: bool, size: RadialSize, center: (Lp, Lp), stops: Arc<[ColorStop]>, repeating: bool },
+    /// `conic-gradient()`: `from` in degrees clockwise from up; stop
+    /// positions are percentages of a turn
+    Conic { from: f32, center: (Lp, Lp), stops: Arc<[ColorStop]>, repeating: bool },
 }
 
 /// A `background-size` layer

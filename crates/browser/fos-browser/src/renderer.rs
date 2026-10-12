@@ -1122,9 +1122,11 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             return None;
         }
         let tag = tree.get(node).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))?;
-        let src = if tag == "img" { crate::image_loader::image_source(tree, node, self.ctx.viewport.0)? } else { tree.get_attribute(node, "src")?.to_string() };
+        let (src, density) = if tag == "img" { crate::image_loader::image_source_density(tree, node, self.ctx.viewport.0)? } else { (tree.get_attribute(node, "src")?.to_string(), 1.0) };
         let img = self.images.get(&fos_net::url_util::resolve(&self.base, &src))?;
-        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+        // A srcset candidate's pixels over its density
+        let natural = (img.natural.0 / density, img.natural.1 / density);
+        Some((natural, layout_engine::ImageHandle(img.clone())))
     }
 
     fn content_image(&mut self, url: &str) -> Option<((f32, f32), layout_engine::ImageHandle)> {

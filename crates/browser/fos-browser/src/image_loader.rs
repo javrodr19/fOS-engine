@@ -102,8 +102,16 @@ pub type Images = Arc<HashMap<String, Arc<LoadedImage>>>;
 /// The URL an `<img>` shows: from `srcset` (or a `<picture>` source) the
 /// candidate best for a viewport `viewport_w` wide, else `src`
 pub fn image_source(tree: &DomTree, node: NodeId, viewport_w: f32) -> Option<String> {
+    image_source_density(tree, node, viewport_w).map(|(url, _)| url)
+}
+
+/// [`image_source`], and the density of the chosen candidate: how many of
+/// its pixels make a CSS pixel (its natural size is its pixels' over that)
+pub fn image_source_density(tree: &DomTree, node: NodeId, viewport_w: f32) -> Option<(String, f32)> {
     let parent = tree.get(node).map_or(NodeId::NONE, |n| n.parent);
     let in_picture = tree.get(parent).and_then(|p| p.as_element()).is_some_and(|e| tree.resolve(e.name.local) == "picture");
+    // The slot width `sizes` gives (100vw without one)
+    let slot = |el: NodeId| tree.get_attribute(el, "sizes").and_then(|s| sizes_width(s, viewport_w)).unwrap_or(viewport_w);
     if in_picture {
         for (child, n) in tree.children(parent) {
             let Some(e) = n.as_element() else { continue };
@@ -123,46 +131,182 @@ pub fn image_source(tree: &DomTree, node: NodeId, viewport_w: f32) -> Option<Str
                     continue;
                 }
             }
-            if let Some(url) = tree.get_attribute(child, "srcset").and_then(|s| pick_srcset(s, viewport_w)) {
-                return Some(url);
+            if let Some(pick) = tree.get_attribute(child, "srcset").and_then(|s| pick_srcset(s, slot(child))) {
+                return Some(pick);
             }
         }
     }
-    if let Some(url) = tree.get_attribute(node, "srcset").and_then(|s| pick_srcset(s, viewport_w)) {
-        return Some(url);
+    if let Some(pick) = tree.get_attribute(node, "srcset").and_then(|s| pick_srcset(s, slot(node))) {
+        return Some(pick);
     }
-    tree.get_attribute(node, "src").map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    tree.get_attribute(node, "src").map(str::trim).filter(|s| !s.is_empty()).map(|s| (s.to_string(), 1.0))
 }
 
-/// The best `srcset` candidate: a 1x density, else the narrowest width
-/// descriptor at least the viewport's (or the widest)
-fn pick_srcset(srcset: &str, viewport_w: f32) -> Option<String> {
-    let mut by_density: Vec<(f32, &str)> = Vec::new();
-    let mut by_width: Vec<(f32, &str)> = Vec::new();
+/// The best `srcset` candidate for a slot `slot_w` CSS pixels wide (at one
+/// device pixel per CSS pixel): the lowest density of 1 or more, else the
+/// highest; and that density
+fn pick_srcset(srcset: &str, slot_w: f32) -> Option<(String, f32)> {
+    let mut candidates: Vec<(f32, &str)> = Vec::new();
     for candidate in srcset.split(',') {
         let mut parts = candidate.split_whitespace();
         let Some(url) = parts.next() else { continue };
-        match parts.next() {
-            Some(d) if d.ends_with('w') => {
-                if let Ok(w) = d[..d.len() - 1].parse::<f32>() {
-                    by_width.push((w, url));
-                }
+        let density = match parts.next() {
+            Some(d) if d.ends_with('w') => match d[..d.len() - 1].parse::<f32>() {
+                Ok(w) if w > 0.0 => w / slot_w.max(1.0),
+                _ => continue,
+            },
+            Some(d) if d.ends_with('x') => match d[..d.len() - 1].parse::<f32>() {
+                Ok(x) if x > 0.0 => x,
+                _ => continue,
+            },
+            _ => 1.0,
+        };
+        candidates.push((density, url));
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    candidates.iter().find(|(d, _)| *d >= 1.0).or(candidates.last()).map(|&(d, url)| (url.to_string(), d))
+}
+
+/// The slot width a `sizes` attribute gives in a viewport `viewport_w`
+/// wide: its first entry whose media condition matches (`auto`: the
+/// viewport's width)
+fn sizes_width(sizes: &str, viewport_w: f32) -> Option<f32> {
+    let mut depth = 0;
+    let mut start = 0;
+    let mut entries = Vec::new();
+    for (i, c) in sizes.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                entries.push(&sizes[start..i]);
+                start = i + 1;
             }
-            Some(d) if d.ends_with('x') => {
-                if let Ok(x) = d[..d.len() - 1].parse::<f32>() {
-                    by_density.push((x, url));
-                }
-            }
-            _ => by_density.push((1.0, url)),
+            _ => {}
         }
     }
-    if !by_width.is_empty() {
-        by_width.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let want = viewport_w.min(1200.0);
-        return by_width.iter().find(|(w, _)| *w >= want).or(by_width.last()).map(|c| c.1.to_string());
+    entries.push(&sizes[start..]);
+    let media = fos_css::MediaContext { width: viewport_w, height: viewport_w * 0.75 };
+    for entry in entries.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        // The length ends the entry: a function's call or a last word
+        let split = if entry.ends_with(')') {
+            let mut depth = 0;
+            let open = entry.char_indices().rev().find(|&(_, c)| {
+                match c {
+                    ')' => depth += 1,
+                    '(' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            });
+            open.map(|(i, _)| entry[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).map_or(0, |j| j + 1))
+        } else {
+            Some(entry.rfind(char::is_whitespace).map_or(0, |i| i + 1))
+        };
+        let Some(at) = split else { continue };
+        let (condition, length) = (entry[..at].trim(), entry[at..].trim());
+        if !condition.is_empty() && !fos_css::media_matches(condition, &media) {
+            continue;
+        }
+        if length.eq_ignore_ascii_case("auto") {
+            return Some(viewport_w);
+        }
+        return SizeExpr { s: length.as_bytes(), at: 0, vw: viewport_w }.sum().filter(|w| w.is_finite() && *w >= 0.0);
     }
-    by_density.sort_by(|a, b| a.0.total_cmp(&b.0));
-    by_density.iter().find(|(x, _)| *x >= 1.0).or(by_density.last()).map(|c| c.1.to_string())
+    None
+}
+
+/// A `sizes` length: px, em, rem, vw, vh, in calc(), min(), max() and
+/// clamp() with + - * /
+struct SizeExpr<'a> {
+    s: &'a [u8],
+    at: usize,
+    vw: f32,
+}
+
+impl SizeExpr<'_> {
+    fn ws(&mut self) {
+        while self.s.get(self.at).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.at += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> bool {
+        self.ws();
+        if self.s.get(self.at) == Some(&c) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sum(&mut self) -> Option<f32> {
+        let mut v = self.product()?;
+        loop {
+            if self.eat(b'+') {
+                v += self.product()?;
+            } else if self.eat(b'-') {
+                v -= self.product()?;
+            } else {
+                return Some(v);
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<f32> {
+        let mut v = self.term()?;
+        loop {
+            if self.eat(b'*') {
+                v *= self.term()?;
+            } else if self.eat(b'/') {
+                v /= self.term()?;
+            } else {
+                return Some(v);
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<f32> {
+        self.ws();
+        let rest = std::str::from_utf8(&self.s[self.at..]).ok()?;
+        if self.eat(b'(') {
+            let v = self.sum()?;
+            return self.eat(b')').then_some(v);
+        }
+        for (name, f) in [("calc(", 0u8), ("min(", 1), ("max(", 2), ("clamp(", 3)] {
+            if rest.len() >= name.len() && rest[..name.len()].eq_ignore_ascii_case(name) {
+                self.at += name.len();
+                let mut args = vec![self.sum()?];
+                while self.eat(b',') {
+                    args.push(self.sum()?);
+                }
+                if !self.eat(b')') {
+                    return None;
+                }
+                return match f {
+                    0 => args.first().copied(),
+                    1 => args.into_iter().reduce(f32::min),
+                    2 => args.into_iter().reduce(f32::max),
+                    _ => (args.len() == 3).then(|| args[1].clamp(args[0], args[2].max(args[0]))),
+                };
+            }
+        }
+        let sign = usize::from(rest.starts_with(['-', '+']));
+        let num_len = sign + rest[sign..].find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len() - sign);
+        let n: f32 = rest[..num_len].parse().ok()?;
+        self.at += num_len;
+        let unit_len = rest[num_len..].find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len() - num_len);
+        let unit = rest[num_len..num_len + unit_len].to_ascii_lowercase();
+        self.at += unit_len;
+        Some(match unit.as_str() {
+            "px" | "" => n,
+            "vw" => n * self.vw / 100.0,
+            "vh" => n * self.vw * 0.75 / 100.0,
+            "em" | "rem" => n * 16.0,
+            _ => return None,
+        })
+    }
 }
 
 /// The absolute URLs of the document's images, in document order
@@ -562,6 +706,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn srcset_candidates_fit_the_sizes_slot() {
+        let set = "a.jpg 240w, b.jpg 640w, c.jpg 800w, d.jpg 1536w";
+        // (min-width: 768px) 50vw: a 640px slot in a 1280px viewport
+        let slot = sizes_width("(min-width: 768px) 50vw, 100vw", 1280.0).unwrap();
+        assert_eq!(slot, 640.0);
+        assert_eq!(pick_srcset(set, slot), Some(("b.jpg".to_string(), 1.0)));
+        assert_eq!(sizes_width("(min-width: 768px) 50vw, 100vw", 600.0), Some(600.0));
+        assert_eq!(sizes_width("(max-width: 600px) 100vw, calc(33vw - 2 * 16px)", 1200.0), Some(396.0 - 32.0));
+        assert_eq!(sizes_width("min(400px, 50vw)", 1000.0), Some(400.0));
+        assert_eq!(sizes_width("25vw", 1280.0), Some(320.0));
+        // The widest candidate for a slot wider than all, at its density
+        let (url, density) = pick_srcset(set, 2000.0).unwrap();
+        assert_eq!((url.as_str(), density), ("d.jpg", 1536.0 / 2000.0));
+        assert_eq!(pick_srcset("x1.png 1x, x2.png 2x", 500.0), Some(("x1.png".to_string(), 1.0)));
+    }
+
+    #[test]
     fn svgs_with_a_view_box_keep_their_shape() {
         let fit = |m: &str| SvgFit::of(m.as_bytes());
         let mid = SvgFit { align: (0.5, 0.5), slice: false };
@@ -598,10 +759,11 @@ mod tests {
 
     #[test]
     fn srcset_candidates() {
-        assert_eq!(pick_srcset("a.png 1x, b.png 2x", 800.0).as_deref(), Some("a.png"));
-        assert_eq!(pick_srcset("s.png 320w, m.png 800w, l.png 1600w", 800.0).as_deref(), Some("m.png"));
-        assert_eq!(pick_srcset("s.png 320w, m.png 640w", 800.0).as_deref(), Some("m.png"));
-        assert_eq!(pick_srcset("only.png", 800.0).as_deref(), Some("only.png"));
+        let url = |set: &str| pick_srcset(set, 800.0).map(|(u, _)| u);
+        assert_eq!(url("a.png 1x, b.png 2x").as_deref(), Some("a.png"));
+        assert_eq!(url("s.png 320w, m.png 800w, l.png 1600w").as_deref(), Some("m.png"));
+        assert_eq!(url("s.png 320w, m.png 640w").as_deref(), Some("m.png"));
+        assert_eq!(url("only.png").as_deref(), Some("only.png"));
     }
 
     #[test]

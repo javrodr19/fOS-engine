@@ -1750,11 +1750,12 @@ fn image_source(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsRes
     let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
     let viewport_w = host(vm).viewport.0;
     let url = with_doc(vm, |d| {
-        let src = crate::image_loader::image_source(d.tree(), id, viewport_w)?;
-        Some(fos_net::url_util::resolve(&crate::css_loader::base_url(d), src.trim()))
+        let (src, density) = crate::image_loader::image_source_density(d.tree(), id, viewport_w)?;
+        Some((fos_net::url_util::resolve(&crate::css_loader::base_url(d), src.trim()), density))
     });
-    let Some(url) = url else { return Ok(Value::NULL) };
-    let natural = host(vm).layouter.clone().and_then(|l| l.try_borrow().ok().and_then(|l| l.image_natural(&url)));
+    let Some((url, density)) = url else { return Ok(Value::NULL) };
+    // A srcset candidate's pixels over its density
+    let natural = host(vm).layouter.clone().and_then(|l| l.try_borrow().ok().and_then(|l| l.image_natural(&url))).map(|(w, h)| ((w / density).round(), (h / density).round()));
     let mut vals = vec![string(vm, &url)];
     if let Some((w, h)) = natural {
         vals.push(Value::number(w as f64));

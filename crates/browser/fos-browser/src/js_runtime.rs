@@ -1014,6 +1014,26 @@ mod tests {
     }
 
     #[test]
+    fn attributes_are_live() {
+        // React empties an element's attributes with
+        // while (attrs.length) el.removeAttributeNode(attrs[0])
+        let (mut rt, _doc) = page(
+            r#"<html><body a="1" c="2"><script>
+              var b = document.body, l = b.attributes, n = 0, out = [];
+              out.push(l.length);
+              b.setAttribute('d', '3'); out.push(l.length);
+              out.push(l[0] === b.getAttributeNode('a'), l.a === l[0], l === b.attributes, 'c' in l, '5' in l, Object.keys(l).join('|'));
+              var first = l[0];
+              while (l.length && n < 10) { out.push(b.removeAttributeNode(l[0]).name); n++; }
+              out.push(n, l.length, first.value, first.ownerElement);
+              window.result = out.join();
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "2,3,true,true,true,true,false,0|1|2,a,c,d,3,0,1,");
+    }
+
+    #[test]
     fn markup_set_in_connected_callback_connects_only_new_elements() {
         // mdBook's sidebar fills itself from connectedCallback: that must
         // not connect the element again

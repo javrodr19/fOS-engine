@@ -3818,10 +3818,30 @@
   Object.assign(global, { PerformanceResourceTiming, PerformanceObserverEntryList });
 
   // ---- attributes: NamedNodeMap of Attr ----
-  const attrState = new WeakMap(); // attr -> { el, name }
+  // One Attr per attribute while it is on its element (as in browsers:
+  // el.attributes[0] === el.getAttributeNode(name)); a removed one keeps
+  // its value, detached
+  const attrState = new WeakMap(); // attr -> { el, name } or { el: null, name, value }
+  const attrsOf = new WeakMap(); // element -> Map(name -> attr)
   function makeAttr(el, name) {
-    const a = Object.create(Attr.prototype);
-    attrState.set(a, { el, name });
+    let byName = attrsOf.get(el);
+    if (!byName) attrsOf.set(el, byName = new Map());
+    let a = byName.get(name);
+    if (!a || attrState.get(a).el !== el) {
+      a = Object.create(Attr.prototype);
+      attrState.set(a, { el, name });
+      byName.set(name, a);
+    }
+    return a;
+  }
+  // The element no longer has `name`: its Attr keeps the last value
+  function detachAttr(el, name, value) {
+    const byName = attrsOf.get(el);
+    const a = byName && byName.get(name);
+    if (a) {
+      byName.delete(name);
+      attrState.set(a, { el: null, name, value });
+    }
     return a;
   }
   const attr = (a) => attrState.get(a) || (() => { throw new TypeError('Illegal invocation'); })();
@@ -3841,49 +3861,125 @@
     get specified() { return true; },
     get nodeType() { return 2; },
   });
-  class NamedNodeMap extends Array {
-    getNamedItem(name) { return this._el && this._el.hasAttribute(name) ? makeAttr(this._el, String(name).toLowerCase()) : null; }
-    getNamedItemNS(ns, name) { return this.getNamedItem(name); }
-    item(i) { return this[i] ?? null; }
-    setNamedItem(a) {
-      const s = attr(a);
-      const old = this.getNamedItem(s.name);
-      this._el.setAttribute(s.name, a.value);
-      s.el = this._el;
-      return old;
+  // A live view of an element's attributes: by index, by name, and its
+  // length always as they are now
+  const mapElement = new WeakMap(); // map -> element
+  const mapEl = (m) => mapElement.get(m) || (() => { throw new TypeError('Illegal invocation'); })();
+  class NamedNodeMap {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get length() { return mapEl(this).getAttributeNames().length; }
+    item(i) {
+      const el = mapEl(this);
+      const name = el.getAttributeNames()[i >>> 0];
+      return name === undefined ? null : makeAttr(el, name);
     }
+    getNamedItem(name) {
+      const el = mapEl(this);
+      name = String(name).toLowerCase();
+      return el.hasAttribute(name) ? makeAttr(el, name) : null;
+    }
+    getNamedItemNS(ns, name) { return this.getNamedItem(name); }
+    setNamedItem(a) { return mapEl(this).setAttributeNode(a); }
     setNamedItemNS(a) { return this.setNamedItem(a); }
     removeNamedItem(name) {
+      const el = mapEl(this);
       const old = this.getNamedItem(name);
       if (!old) throw new DOMException(`Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '${name}' was found.`, 'NotFoundError');
-      const value = old.value;
-      this._el.removeAttribute(name);
-      attrState.set(old, { el: null, name: attr(old).name, value });
+      el.removeAttribute(attr(old).name);
       return old;
     }
     removeNamedItemNS(ns, name) { return this.removeNamedItem(name); }
-    static get [Symbol.species]() { return Array; }
+    *[Symbol.iterator]() {
+      const el = mapEl(this);
+      for (const name of el.getAttributeNames()) yield makeAttr(el, name);
+    }
   }
+  const index = (key) => typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key) ? Number(key) : -1;
+  const mapHandler = {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && !(key in target)) {
+        const i = index(key);
+        if (i >= 0) return target.item(i) ?? undefined;
+        const el = mapElement.get(target);
+        if (el && el.hasAttribute(key)) return makeAttr(el, key.toLowerCase());
+      }
+      return Reflect.get(target, key, target);
+    },
+    has(target, key) {
+      if (typeof key === 'string') {
+        const i = index(key);
+        if (i >= 0) return i < target.length;
+        const el = mapElement.get(target);
+        if (el && el.hasAttribute(key)) return true;
+      }
+      return Reflect.has(target, key);
+    },
+    ownKeys(target) {
+      const el = mapElement.get(target);
+      const names = el ? el.getAttributeNames() : [];
+      return [...names.map((_, i) => String(i)), ...names.filter((n) => !/^\d/.test(n))];
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (typeof key !== 'string') return undefined;
+      const v = this.get(target, key);
+      return v === undefined ? undefined : { value: v, enumerable: index(key) >= 0, configurable: true, writable: false };
+    },
+  };
+  const mapsOf = new WeakMap(); // element -> its NamedNodeMap
   Object.defineProperty(E, 'attributes', {
     get() {
-      const map = new NamedNodeMap();
-      Object.defineProperty(map, '_el', { value: this });
-      for (const name of this.getAttributeNames()) {
-        const a = makeAttr(this, name);
-        map.push(a);
-        // Named access (attributes.href), as in browsers
-        if (!(name in map)) Object.defineProperty(map, name, { value: a, configurable: true });
+      let map = mapsOf.get(this);
+      if (!map) {
+        const target = Object.create(NamedNodeMap.prototype);
+        mapElement.set(target, this);
+        map = new Proxy(target, mapHandler);
+        // (methods run with the map itself as `this`)
+        mapElement.set(map, this);
+        mapsOf.set(this, map);
       }
       return map;
     },
     configurable: true,
   });
   define(E, {
-    getAttributeNode(name) { return this.hasAttribute(name) ? makeAttr(this, String(name).toLowerCase()) : null; },
+    getAttributeNode(name) { name = String(name).toLowerCase(); return this.hasAttribute(name) ? makeAttr(this, name) : null; },
     getAttributeNodeNS(ns, name) { return this.getAttributeNode(name); },
-    setAttributeNode(a) { const old = this.getAttributeNode(attr(a).name); this.setAttribute(attr(a).name, a.value); attr(a).el = this; return old; },
-    removeAttributeNode(a) { this.removeAttribute(attr(a).name); return a; },
+    setAttributeNode(a) {
+      const s = attr(a);
+      if (s.el && s.el !== this) throw new DOMException("Failed to execute 'setAttributeNode' on 'Element': The node provided is an attribute node that is already an attribute of another Element; attribute nodes must be explicitly cloned.", 'InUseAttributeError');
+      const old = this.getAttributeNode(s.name);
+      if (old === a) return a;
+      const value = a.value;
+      if (old) detachAttr(this, s.name, old.value);
+      // The given Attr becomes the element's
+      let byName = attrsOf.get(this);
+      if (!byName) attrsOf.set(this, byName = new Map());
+      attrState.set(a, { el: this, name: s.name });
+      byName.set(s.name, a);
+      this.setAttribute(s.name, value);
+      return old;
+    },
+    setAttributeNodeNS(a) { return this.setAttributeNode(a); },
+    removeAttributeNode(a) {
+      const s = attr(a);
+      if (s.el !== this) throw new DOMException("Failed to execute 'removeAttributeNode' on 'Element': The node provided is owned by another element.", 'NotFoundError');
+      this.removeAttribute(s.name);
+      return a;
+    },
   });
+  // Removing an attribute detaches its Attr (which keeps its value)
+  for (const name of ['removeAttribute', 'toggleAttribute']) {
+    const original = E[name];
+    if (typeof original !== 'function') continue;
+    define(E, { [name](n, ...rest) {
+      const key = String(n).toLowerCase();
+      const had = this.hasAttribute(key);
+      const old = had ? this.getAttribute(key) : null;
+      const r = original.call(this, n, ...rest);
+      if (had && !this.hasAttribute(key)) detachAttr(this, key, old);
+      return r;
+    } });
+  }
   Document.prototype.createAttribute = function (name) {
     const a = Object.create(Attr.prototype);
     attrState.set(a, { el: null, name: String(name).toLowerCase(), value: '' });

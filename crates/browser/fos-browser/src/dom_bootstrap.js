@@ -1847,7 +1847,7 @@
       const gone = ceConnectedIn(removed);
       const r = original.apply(this, args);
       ceRemoved(gone);
-      ceInserted(added);
+      ceInserted(typeof added === 'function' ? added() : added);
       return r;
     } });
   };
@@ -1869,9 +1869,21 @@
     ceWrap(proto, 'replaceWith', function (a) { return { added: ceArgNodes(a), removed: [this] }; });
     ceWrap(proto, 'remove', function () { return { added: [], removed: [this] }; });
   }
+  // The children of `parent` now between `prev` and `next` (either null
+  // for the ends)
+  const ceBetween = (parent, prev, next) => {
+    const out = [];
+    if (!parent) return out;
+    for (let n = prev ? prev.nextSibling : parent.firstChild; n && n !== next; n = n.nextSibling) out.push(n);
+    return out;
+  };
   ceWrap(ElementP, 'insertAdjacentHTML', function (a) {
     const where = String(a[0]).toLowerCase();
-    return { added: [where === 'beforebegin' || where === 'afterend' ? this.parentNode : this], removed: [] };
+    const [parent, prev, next] = where === 'beforebegin' ? [this.parentNode, this.previousSibling, this]
+      : where === 'afterbegin' ? [this, null, this.firstChild]
+      : where === 'beforeend' ? [this, this.lastChild, null]
+      : [this.parentNode, this, this.nextSibling];
+    return { added: () => ceBetween(parent, prev, next), removed: [] };
   });
   // Markup setters replace the children
   for (const [proto, name] of [[ElementP, 'innerHTML'], [NodeP, 'textContent'], [ElementP, 'outerHTML']]) {
@@ -1884,11 +1896,12 @@
       set(v) {
         if (!ceDefs.size) return d.set.call(this, v);
         const outer = name === 'outerHTML';
-        const parent = this.parentNode;
+        const [parent, prev, next] = outer ? [this.parentNode, this.previousSibling, this.nextSibling] : [this, null, null];
         const gone = ceConnectedIn(outer ? [this] : Array.from(this.childNodes));
         d.set.call(this, v);
         ceRemoved(gone);
-        ceInserted([outer ? parent : this]);
+        // Only the new nodes connect (not the element whose children these are)
+        ceInserted(ceBetween(parent, prev, next));
       },
     });
   }

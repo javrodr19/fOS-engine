@@ -1007,6 +1007,28 @@ mod tests {
     }
 
     #[test]
+    fn markup_set_in_connected_callback_connects_only_new_elements() {
+        // mdBook's sidebar fills itself from connectedCallback: that must
+        // not connect the element again
+        let (mut rt, _doc) = page(
+            r#"<html><body><x-box id="b"></x-box><div id="d"><x-item id="i"></x-item></div>
+            <script>
+              window.log = [];
+              customElements.define('x-item', class extends HTMLElement { connectedCallback() { log.push('item ' + (this.id || 'new')); } });
+              customElements.define('x-box', class extends HTMLElement {
+                connectedCallback() { log.push('box'); this.innerHTML = '<x-item></x-item>'; }
+              });
+              log.push('-');
+              document.getElementById('d').insertAdjacentHTML('beforeend', '<x-item></x-item>');
+              log.push('-');
+              document.getElementById('i').outerHTML = '<x-item></x-item>';
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("log.join()").unwrap(), "item i,box,item new,-,item new,-,item new");
+    }
+
+    #[test]
     fn shadow_dom() {
         let (mut rt, _doc) = page(
             r#"<html><body><x-host id="h"><b slot="title">T</b>light</x-host>

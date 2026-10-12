@@ -169,11 +169,27 @@ fn substitute(value: &str, custom: Option<&dyn VarSource>, depth: u32) -> Option
             Some(v) => substitute(v, custom, depth + 1)?,
             None => substitute(fallback?.trim(), custom, depth + 1)?,
         };
+        // A substituted value is tokens of its own, never run together
+        // with what is beside it: `var(--x)var(--y)` (minified Tailwind's
+        // translate) is two values, not "-50%0"
+        if runs_together(out.chars().next_back(), replacement.chars().next()) {
+            out.push(' ');
+        }
         out.push_str(&replacement);
         at = close + 1;
+        if runs_together(replacement.chars().next_back(), value[at..].chars().next()) {
+            out.push(' ');
+        }
     }
     out.push_str(&value[at..]);
     Some(out)
+}
+
+/// Whether text ending in `a` and text starting with `b` would merge into
+/// one token
+fn runs_together(a: Option<char>, b: Option<char>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else { return false };
+    (a.is_alphanumeric() || matches!(a, '%' | ')' | '.' | '_' | '-')) && (b.is_alphanumeric() || matches!(b, '-' | '.' | '#' | '_'))
 }
 
 /// Compute the custom properties an element declares (`own`, in cascade
@@ -644,6 +660,17 @@ mod tests {
         assert!(matches!(d.first().map(|d| &d.value), Some(PropertyValue::Color(c)) if (c.r, c.g, c.b) == (0, 255, 0)), "{d:?}");
         // Still rejected when nothing understands it
         assert!(resolve_declaration("width", "calc(h + 1)", false, &ctx(None)).is_empty());
+    }
+
+    #[test]
+    fn substituted_values_stay_apart() {
+        // Minified Tailwind: `translate:var(--tw-translate-x)var(--tw-translate-y)`
+        let m: HashMap<String, String> = [("--x".to_string(), "-50%".to_string()), ("--y".to_string(), "0".to_string())].into();
+        let m: &dyn VarSource = &m;
+        assert_eq!(substitute_vars("var(--x)var(--y)", Some(m)).as_deref(), Some("-50% 0"));
+        // Nothing is added where tokens could not merge
+        assert_eq!(substitute_vars("calc(var(--x)*-1)", Some(m)).as_deref(), Some("calc(-50%*-1)"));
+        assert_eq!(substitute_vars("var(--x), var(--y)", Some(m)).as_deref(), Some("-50%, 0"));
     }
 
     #[test]

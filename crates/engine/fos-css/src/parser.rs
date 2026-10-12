@@ -913,7 +913,13 @@ pub(crate) fn components(v: &str) -> Vec<&str> {
         }
         let start = i;
         while i < b.len() && !b[i].is_ascii_whitespace() {
+            let at = i;
             i = skip_token(b, i);
+            // A function ends its component: minified CSS runs them
+            // together (`translate(-50%)rotate(45deg)`)
+            if b[at] == b'(' {
+                break;
+            }
         }
         if i > start {
             out.push(&v[start..i]);
@@ -1552,6 +1558,14 @@ mod tests {
 
     fn parse(css: &str) -> Stylesheet {
         CssParser::new().parse(css).unwrap()
+    }
+
+
+    #[test]
+    fn functions_end_components() {
+        // Minified values run functions together
+        assert_eq!(components("translate(-50%)rotate(45deg) scale(2)"), ["translate(-50%)", "rotate(45deg)", "scale(2)"]);
+        assert_eq!(components("url(a.png) no-repeat"), ["url(a.png)", "no-repeat"]);
     }
 
     fn color_of(css: &str) -> (u8, u8, u8, u8) {

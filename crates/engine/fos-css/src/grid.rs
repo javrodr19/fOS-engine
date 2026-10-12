@@ -153,6 +153,11 @@ fn tokens(v: &str) -> Vec<&str> {
                         _ => {}
                     }
                     i += 1;
+                    // A function ends its token: minified CSS runs them
+                    // together (`minmax(0,3fr)minmax(0,2fr)`)
+                    if depth == 0 && b[i - 1] == b')' {
+                        break;
+                    }
                 }
             }
         }
@@ -526,6 +531,9 @@ mod tests {
         assert!(parse_track_list("repeat(auto-fill, minmax(200px, 1fr))", &len).is_some());
         assert!(valid("grid-template-columns", "12.25rem minmax(0,1fr)"));
         assert!(expand_shorthand("grid-template", "min-content 1fr min-content / 12.25rem minmax(0,1fr)").unwrap().iter().all(|(n, v)| valid(n, v)));
+        // Minified: functions run together (deno.com's 3fr/2fr columns)
+        let l = parse_track_list("minmax(0,3fr)minmax(0,2fr)", &len).unwrap();
+        assert!(matches!((&l[0], &l[1]), (TemplateItem::Track(a), TemplateItem::Track(b)) if a.max == Breadth::Fr(3.0) && b.max == Breadth::Fr(2.0)));
         assert!(parse_track_list("minmax(1fr, 2fr)", &len).is_none());
         assert!(parse_track_list("-5px", &len).is_none());
     }

@@ -28,11 +28,13 @@ pub struct LayoutCtx<'a> {
     /// The box about to be laid out is in a block whose text-align is
     /// -webkit-center (<center>, align=center): it is centered
     pub center_in_parent: bool,
+    /// The document is in quirks mode
+    pub quirks: bool,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, quirks: false }
     }
 }
 
@@ -217,6 +219,9 @@ pub struct Laid {
     pub through: bool,
     pub ml: f32,
     pub mr: f32,
+    /// The height of the box's content as laid out, whatever height the
+    /// box was given (table cells align their content by it)
+    pub content_h: f32,
 }
 
 impl Laid {
@@ -276,12 +281,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     }
 
     // Width (§10.3.3), or shrink-to-fit (§10.3.5)
-    let specified = match forced.width {
-        Some(w) => Some((w - hbp).max(0.0)),
-        None => style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp)),
-    };
     let (ml_auto, mr_auto) = (e.margin[3].is_none(), e.margin[1].is_none());
     let (mut ml, mut mr) = (e.margin[3].unwrap_or(0.0), e.margin[1].unwrap_or(0.0));
+    let intrinsic = style.box_.intrinsic_width;
+    let avail_w = (cb_w - ml - mr - hbp).max(0.0);
+    let specified = match forced.width {
+        Some(w) => Some((w - hbp).max(0.0)),
+        None => style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp)).or_else(|| intrinsic_size(ctx, b, intrinsic[0], avail_w)),
+    };
     // Tables are as wide as their content needs (up to the space there is)
     let is_table = matches!(b.kind, BoxKind::Table(_));
     // aspect-ratio applies to the box-sizing box: a shrink-to-fit box with
@@ -311,6 +318,15 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             clamp_width(style, w, cb_w, hbp)
         }
     };
+    // min-width and max-width given as intrinsic sizes (min wins)
+    if forced.width.is_none() {
+        if let Some(max) = intrinsic_size(ctx, b, intrinsic[2], avail_w) {
+            width = width.min(max);
+        }
+        if let Some(min) = intrinsic_size(ctx, b, intrinsic[1], avail_w) {
+            width = width.max(min);
+        }
+    }
     if sizing == Sizing::Stretch {
         // Auto margins take the free space; overconstrained, the right
         // margin gives (the left one in right-to-left content)
@@ -448,7 +464,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let own_top = Margin::new(e.margin[0].unwrap_or(0.0));
     let own_bottom = Margin::new(e.margin[2].unwrap_or(0.0));
     if through {
-        Laid { frag, mt: own_top.adjoin(own_bottom).adjoin(escaped_top), mb: Margin::default(), through: true, ml, mr }
+        Laid { frag, mt: own_top.adjoin(own_bottom).adjoin(escaped_top), mb: Margin::default(), through: true, ml, mr, content_h }
     } else {
         Laid {
             frag,
@@ -457,6 +473,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             through: false,
             ml,
             mr,
+            content_h,
         }
     }
 }
@@ -471,6 +488,40 @@ struct Flow {
     through: bool,
 }
 
+/// The order to lay `children` out in: their own, except that floats
+/// right after a run of text that fits on one line beside them come
+/// first. A float sits at the line it is in, and the line flows beside it
+/// (floats are block children here, after the text before them).
+fn flow_order(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32) -> Vec<usize> {
+    use fos_css::style::Clear;
+    let text_run = |b: &LayoutBox| !b.node.is_valid() && matches!(&b.kind, BoxKind::Inline(c) if !c.items.iter().any(|i| matches!(i, super::box_tree::InlineItem::Break)));
+    let float = |b: &LayoutBox| b.style.box_.float != Float::None && b.style.box_.clear == Clear::None && !b.style.is_out_of_flow();
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    if !children.windows(2).any(|w| text_run(&w[0]) && float(&w[1])) {
+        return order;
+    }
+    order.clear();
+    let mut i = 0;
+    while i < children.len() {
+        if text_run(&children[i]) {
+            let end = i + 1 + children[i + 1..].iter().take_while(|c| float(c)).count();
+            if end > i + 1 {
+                let text = intrinsic_content(ctx, &children[i]).1;
+                let floats: f32 = children[i + 1..end].iter().map(|f| intrinsic_outer(ctx, f).1).sum();
+                if text + floats <= width {
+                    order.extend(i + 1..end);
+                    order.push(i);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        order.push(i);
+        i += 1;
+    }
+    order
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), center: bool) -> Flow {
     let mut frags = Vec::with_capacity(children.len());
@@ -478,7 +529,8 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
     let mut pending = Margin::default();
     let mut top = Margin::default();
     let mut placed = false;
-    for child in children {
+    let order = flow_order(ctx, children, width);
+    for child in order.iter().map(|&i| &children[i]) {
         if child.style.is_out_of_flow() {
             // Positioned later, from its static position
             frags.push(Fragment::Box(placeholder(child, Rect::new(0.0, y + pending.size(), 0.0, 0.0))));
@@ -608,7 +660,7 @@ pub fn relative_offset(style: &Style, cb_w: f32, cb_h: Option<f32>) -> (f32, f32
 /// A replaced element's default size when it has no natural one
 fn default_replaced_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced) -> (f32, f32) {
     let font = ctx.fonts.resolve(style);
-    let line = style.inherited.line_height.resolve(font.size).max(font.ascent() + font.descent());
+    let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
     match &r.what {
         ReplacedWhat::TextField(..) => (font.size * 11.25, line),
         ReplacedWhat::Select(text) => (ctx.fonts.shape(&font, text).width + font.size * 1.5, line),
@@ -649,8 +701,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
     let content = frag.content_box();
     let paint = match &r.what {
         ReplacedWhat::Image => r.image.clone().map_or(ReplacedPaint::Empty, ReplacedPaint::Image),
-        ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg => ReplacedPaint::Bitmap,
-        ReplacedWhat::Frame => ReplacedPaint::Empty,
+        // Frames show their documents' pictures, supplied like canvases'
+        ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg | ReplacedWhat::Frame => ReplacedPaint::Bitmap,
         ReplacedWhat::Check { radio, checked } => ReplacedPaint::Check { radio: *radio, checked: *checked },
         ReplacedWhat::TextField(text, placeholder) => {
             if !text.is_empty() {
@@ -670,7 +722,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
     frag.update_ink();
     let mt = Margin::new(e.margin[0].unwrap_or(0.0));
     let mb = Margin::new(e.margin[2].unwrap_or(0.0));
-    Laid { frag, mt, mb, through: false, ml, mr }
+    let content_h = frag.content_box().h;
+    Laid { frag, mt, mb, through: false, ml, mr, content_h }
 }
 
 /// One line of a form control's text, vertically centered and clipped to
@@ -708,12 +761,37 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
     };
     let cw = clamp_width(style, w, cb_w, hbp);
     let ch = clamp_height(style, h, cb_h, vbp);
-    // Keep the ratio when only one dimension was clamped
+    // Keep the ratio when only one dimension was clamped, or when both
+    // were the same way, by the limit that constrains most (CSS 2.1 §10.4)
     match (sw, sh, ratio) {
         (None, None, Some(r)) if cw != w && ch == h => (cw, clamp_height(style, cw / r, cb_h, vbp)),
         (None, None, Some(r)) if ch != h && cw == w => (clamp_width(style, ch * r, cb_w, hbp), ch),
+        (None, None, Some(r)) if cw != w && ch != h && w > 0.0 && h > 0.0 && (cw < w) == (ch < h) => {
+            let (sx, sy) = (cw / w, ch / h);
+            let by_width = if cw < w { sx <= sy } else { sx >= sy };
+            if by_width {
+                (cw, clamp_height(style, cw / r, cb_h, vbp))
+            } else {
+                (clamp_width(style, ch * r, cb_w, hbp), ch)
+            }
+        }
         _ => (cw, ch),
     }
+}
+
+/// The content width an intrinsic size keyword gives a box, `avail` wide
+/// at most for fit-content (`None` for no keyword)
+fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
+    use fos_css::style::IntrinsicSize;
+    if k == IntrinsicSize::None {
+        return None;
+    }
+    let (min, max) = intrinsic_content(ctx, b);
+    Some(match k {
+        IntrinsicSize::MinContent => min,
+        IntrinsicSize::MaxContent => max,
+        _ => max.min(avail).max(min),
+    })
 }
 
 /// The min-content and max-content widths of a box's content box
@@ -733,8 +811,10 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
         BoxKind::Block(children) => {
             use fos_css::style::{Clear, Float};
             let (mut min, mut max) = (0.0f32, 0.0f32);
-            // Floats in a row sit side by side at max-content
-            let mut float_row = 0.0f32;
+            // Floats in a row sit side by side at max-content, and beside
+            // the inline content around them (the runs of text between
+            // floats are one inline formatting context's)
+            let (mut float_row, mut inline_row) = (0.0f32, 0.0f32);
             for c in children {
                 if c.style.is_out_of_flow() {
                     continue;
@@ -743,15 +823,20 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
                 min = min.max(cmin);
                 if c.style.box_.float != Float::None {
                     if c.style.box_.clear != Clear::None {
-                        float_row = 0.0;
+                        (float_row, inline_row) = (0.0, 0.0);
                     }
                     float_row += cmax;
-                    max = max.max(float_row);
+                    max = max.max(float_row + inline_row);
+                } else if !c.node.is_valid() && matches!(c.kind, BoxKind::Inline(_)) {
+                    inline_row += cmax;
+                    max = max.max(float_row + inline_row);
                 } else if cmax > 0.0 {
-                    // (empty boxes between floats, like the pieces of an
-                    // inline element split around them, end no row)
-                    float_row = 0.0;
-                    max = max.max(cmax);
+                    // A box that avoids floats sits beside them; others go
+                    // below. (Empty boxes between floats, like the pieces of
+                    // an inline element split around them, end no row.)
+                    let beside = if c.is_bfc_root() { float_row } else { 0.0 };
+                    max = max.max(beside + cmax);
+                    (float_row, inline_row) = (0.0, 0.0);
                 }
             }
             (min, max)
@@ -778,8 +863,16 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         LpAuto::Lp(l) if !l.has_percent() => Some(content_size(style, l.px, hbp)),
         _ => None,
     };
-    let (min, max) = match (fixed, &b.kind) {
+    let (min, max) = match (fixed, style.box_.intrinsic_width[0]) {
         (Some(w), _) => (w, w),
+        (None, fos_css::style::IntrinsicSize::MinContent) => {
+            let min = intrinsic_content(ctx, b).0;
+            (min, min)
+        }
+        (None, fos_css::style::IntrinsicSize::MaxContent) => {
+            let max = intrinsic_content(ctx, b).1;
+            (max, max)
+        }
         (None, _) => intrinsic_content(ctx, b),
     };
     let clamp = |w: f32| {

@@ -64,6 +64,8 @@ pub enum PropertyId {
     LineHeight,
     LetterSpacing,
     WhiteSpace,
+    TextWrapStyle,
+    CaptionSide,
     
     // Visual
     Overflow,
@@ -193,6 +195,8 @@ impl PropertyId {
                 | Self::TextIndent
                 | Self::TextTransform
                 | Self::WhiteSpace
+                | Self::TextWrapStyle
+                | Self::CaptionSide
                 | Self::LetterSpacing
                 | Self::WordSpacing
                 | Self::Visibility
@@ -265,6 +269,8 @@ impl PropertyId {
             "line-height" => Self::LineHeight,
             "letter-spacing" => Self::LetterSpacing,
             "white-space" => Self::WhiteSpace,
+            "text-wrap-style" => Self::TextWrapStyle,
+            "caption-side" => Self::CaptionSide,
             
             "overflow" => Self::Overflow,
             "overflow-x" => Self::OverflowX,
@@ -401,6 +407,10 @@ pub enum Keyword {
     Lighter,
     Italic,
     Oblique,
+    // Intrinsic sizes (width, min-width, max-width)
+    MinContent,
+    MaxContent,
+    FitContent,
 }
 
 impl Keyword {
@@ -412,6 +422,9 @@ impl Keyword {
             "none" => Self::None,
             "auto" => Self::Auto,
             "normal" => Self::Normal,
+            "min-content" => Self::MinContent,
+            "max-content" => Self::MaxContent,
+            "fit-content" => Self::FitContent,
             "hidden" => Self::Hidden,
             "visible" => Self::Visible,
             "block" => Self::Block,

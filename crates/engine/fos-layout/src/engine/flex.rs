@@ -22,6 +22,9 @@ struct Item<'a> {
     auto_margin: [bool; 4],
     /// Border-box sizes along the main axis
     base: f32,
+    /// Padding and borders along the main axis (`base` less them is the
+    /// inner base size, which weighs how much an item shrinks)
+    bp_main: f32,
     hypo: f32,
     min: f32,
     max: f32,
@@ -164,7 +167,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         };
         let hypo = base.min(max).max(min);
         let _ = content_laid;
-        flex.push(Item { b, margin, auto_margin, base, hypo, min, max, target: hypo, frozen: false, laid: None, cross: 0.0 });
+        flex.push(Item { b, margin, auto_margin, base, bp_main, hypo, min, max, target: hypo, frozen: false, laid: None, cross: 0.0 });
     }
 
     // Lines
@@ -214,13 +217,15 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                     free = scaled;
                 }
             }
-            let sum_scaled: f32 = unfrozen().map(|it| it.b.style.box_.flex_shrink * it.base).sum();
+            // Items shrink in proportion to their inner base sizes (§9.7)
+            let inner = |it: &Item| (it.base - it.bp_main).max(0.0);
+            let sum_scaled: f32 = unfrozen().map(|it| it.b.style.box_.flex_shrink * inner(it)).sum();
             for it in items.iter_mut().filter(|it| !it.frozen) {
                 let s = &it.b.style.box_;
                 it.target = if grow {
                     if sum_factors > 0.0 { it.base + free * s.flex_grow / sum_factors } else { it.base }
                 } else if sum_scaled > 0.0 {
-                    it.base + free * s.flex_shrink * it.base / sum_scaled
+                    it.base + free * s.flex_shrink * inner(it) / sum_scaled
                 } else {
                     it.base
                 };

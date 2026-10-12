@@ -503,6 +503,45 @@ impl PageJsRuntime {
         r.and_then(|v| v.strip_prefix("navigate:").map(str::to_string))
     }
 
+    /// Fire a simple event of type `ty` at `node` (an iframe's `load`)
+    pub fn fire_event(&mut self, node: NodeId, ty: &str) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        let target = dom_bindings::wrap(vm, node);
+        dispatch(vm, target, ty);
+        self.after_task();
+    }
+
+    /// The messages the page posted to other windows since last asked
+    pub fn take_messages(&mut self) -> Vec<crate::frames::Message> {
+        self.vm.as_mut().map(|vm| std::mem::take(&mut dom_bindings::host(vm).outbox)).unwrap_or_default()
+    }
+
+    /// Dispatch a `message` event from another window: `data` serialized,
+    /// `origin` the sender's, `from` the iframe whose frame sent it (`None`:
+    /// the parent)
+    pub fn deliver_message(&mut self, data: String, origin: String, from: Option<NodeId>) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        dom_bindings::receive_message(vm, data, origin, from);
+        let deliver = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosDeliverMessages");
+        if let Ok(f) = deliver {
+            if let Err(e) = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]) {
+                dom_bindings::report_exception(vm, e);
+            }
+        }
+        self.after_task();
+    }
+
+    /// Make this page a frame's: `window.parent` and `top` become the
+    /// parent window, reached through messages
+    pub fn become_frame(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            let f = vm.get_str(fos_jsvm::Value::object(vm.global), "__fosBecomeFrame");
+            if let Ok(f) = f {
+                let _ = vm.call_from_host(f, fos_jsvm::Value::UNDEFINED, &[]);
+            }
+        }
+    }
+
     /// Execute arbitrary JavaScript code; returns its value as text
     pub fn eval(&mut self, code: &str) -> Result<String, JsError> {
         let vm = self.vm.as_mut().ok_or_else(|| "No JavaScript context".to_string())?;
@@ -557,6 +596,15 @@ impl PageJsRuntime {
     pub fn set_layout(&mut self, layout: Option<Arc<crate::renderer::PageLayout>>, viewport: (f32, f32), scroll: (f32, f32)) {
         if let Some(vm) = self.vm.as_mut() {
             dom_bindings::set_layout(vm, layout, viewport, scroll);
+        }
+    }
+
+    /// Let the page's scripts lay the page out with `layouter` when they
+    /// read geometry after changing the DOM (otherwise they read the last
+    /// layout the browser gave them)
+    pub fn set_layouter(&mut self, layouter: crate::renderer::SharedLayouter) {
+        if let Some(h) = self.vm.as_mut().and_then(|vm| vm.host_mut::<dom_bindings::DomHost>()) {
+            h.layouter = Some(layouter);
         }
     }
 
@@ -1930,6 +1978,160 @@ mod tests {
                 [errs.join(), s.cssRules[0].cssText, el.style.getPropertyPriority('margin-top'), el.style.backgroundImage, el.style.length, el.style instanceof CSSStyleDeclaration].join('|')").unwrap(),
             "SyntaxError,IndexSizeError,IndexSizeError,NotAllowedError,NotAllowedError|.unused { color: green }|important|url(\"data:image/png;base64,AA==\")|2|true"
         );
+    }
+
+    #[test]
+    fn compression_streams_and_stream_bodies() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><script>window.R = 'pending';
+            (async () => {
+              const text = 'hello hello hello';
+              const packed = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer();
+              const back = await new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+              const gz = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).bytes();
+              let bad = 'none';
+              try { new CompressionStream('brotli'); } catch (e) { bad = e.name; }
+              let corrupt = 'none';
+              try { await new Response(new Blob(['not deflate']).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer(); } catch (e) { corrupt = e.name; }
+              const r = new Response(new Blob([text]).stream());
+              window.R = [packed.byteLength, back, gz[0], gz[1], bad, corrupt, r.body instanceof ReadableStream, await r.clone().text()].join();
+            })();</script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        for _ in 0..50 {
+            if rt.eval("R").unwrap() != "pending" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("R").unwrap(), "10,hello hello hello,31,139,TypeError,TypeError,true,hello hello hello");
+    }
+
+    #[test]
+    fn geometry_reads_lay_out_dom_changes() {
+        let (mut rt, doc) = page(
+            r#"<html><head><script>
+              // Modernizr's generated content test: a rule and an element
+              // added, then measured, in one go
+              function measure(rule, id) {
+                const div = document.createElement('div');
+                div.id = id;
+                div.innerHTML += '&#173;<style id="s' + id + '">' + rule + '</style>';
+                document.body.appendChild(div);
+                const r = [div.offsetHeight, Math.round(div.getBoundingClientRect().width), getComputedStyle(div).color];
+                div.remove();
+                return r.join(' ');
+              }
+              window.R = [
+                measure('#m1{font:0/0 a}#m1:after{content:":)";visibility:hidden;font:3px/1 a}', 'm1'),
+                measure('#m2{height:7px;width:50px;color:rgb(1, 2, 3)}', 'm2'),
+              ];
+              // Reads in between changes see each change
+              const box = document.createElement('p');
+              box.style.margin = '0';
+              document.body.appendChild(box);
+              box.style.height = '10px';
+              R.push(box.offsetHeight);
+              box.style.height = '20px';
+              R.push(box.offsetHeight, document.body.scrollHeight >= 20);
+            </script></head><body style="margin:0"></body></html>"#,
+        );
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (800.0, 600.0), (0.0, 0.0));
+        rt.set_layouter(renderer.layouter());
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("R.join('|')").unwrap(), "3 800 rgb(0, 0, 0)|7 50 rgb(1, 2, 3)|10|20|true");
+        // The renderer paints the layout the scripts' last read made
+        let forced = renderer.layout_snapshot().unwrap();
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        assert!(Arc::ptr_eq(&forced, &renderer.layout_snapshot().unwrap()));
+    }
+
+    #[test]
+    fn images_report_their_natural_size() {
+        let (mut rt, doc) = page(r#"<html><body><img id=a src="logo.png"><img id=b src="missing.png"><img id=c></body></html>"#);
+        let mut renderer = crate::renderer::PageRenderer::new(800, 600);
+        let pixmap = fos_canvas::tiny_skia::Pixmap::new(4, 2).unwrap();
+        let image = Arc::new(crate::image_loader::LoadedImage { natural: (40.0, 20.0), pixmap, svg_source: None });
+        let images: crate::image_loader::Images = Arc::new([("https://example.com/dir/logo.png".to_string(), image)].into_iter().collect());
+        renderer.set_images(images);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layouter(renderer.layouter());
+        assert_eq!(
+            rt.eval("['a', 'b', 'c'].map(id => { const i = document.getElementById(id); return [i.naturalWidth, i.naturalHeight, i.complete, i.currentSrc].join(' '); }).join('|')").unwrap(),
+            "40 20 true https://example.com/dir/logo.png|0 0 false https://example.com/dir/missing.png|0 0 true "
+        );
+    }
+
+    #[test]
+    fn transitions_end_on_time() {
+        let (mut rt, _doc) = page(
+            r#"<html><body><div id=a></div><div id=b></div><div id=c></div><script>
+              window.ends = [];
+              const a = document.getElementById('a'), b = document.getElementById('b'), c = document.getElementById('c');
+              for (const el of [a, b, c]) el.addEventListener('transitionend', (e) => ends.push(e.target.id + ':' + e.propertyName));
+              // As Masonry moves items: transition first, then the target
+              a.style.transitionProperty = 'transform, opacity';
+              a.style.transitionDuration = '0.02s';
+              a.style.transform = 'translate3d(10px, 0, 0)';
+              a.style.left = '5px';
+              // No duration: nothing to wait for
+              b.style.transform = 'scale(2)';
+              // The shorthand, and a change made again before the end
+              c.style.transition = 'opacity 20ms ease';
+              c.style.opacity = '0.5';
+              c.style.opacity = '0';
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("ends.length").unwrap(), "0");
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("ends.sort().join()").unwrap(), "a:transform,c:opacity");
+    }
+
+    #[test]
+    fn feature_detection_sees_a_desktop_browser() {
+        let (mut rt, _doc) = page("<html><body></body></html>");
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        // No touch screen (Modernizr's test), and SVG's factories exist
+        assert_eq!(
+            rt.eval("['ontouchstart' in window, 'ontouchstart' in document.documentElement, typeof document.createElementNS('http://www.w3.org/2000/svg', 'svg').createSVGRect].join()").unwrap(),
+            "false,false,function"
+        );
+    }
+
+    #[test]
+    fn computed_styles_from_the_cascade() {
+        let (mut rt, doc) = page(
+            r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }
+            #hidden { display: none } #hidden span { color: blue; font-size: 2em } p::before { content: "hi"; color: green }</style></head>
+            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        let mut renderer = crate::renderer::PageRenderer::new(400, 600);
+        renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
+        rt.set_layout(renderer.layout_snapshot(), (400.0, 600.0), (0.0, 0.0));
+        let cases = [
+            ("const cs = (id, pe) => getComputedStyle(document.getElementById(id), pe); const h = cs('h'); [h.display, h.getPropertyValue('color'), h.fontSize, h['margin-left']].join()", "flex,rgb(255, 0, 0),32px,90px"),
+            // Used sizes of rendered boxes
+            ("[h.width, h.paddingTop, h.boxSizing].join()", "200px,10px,content-box"),
+            // Inside display: none; a flex item; a pseudo-element; a variable
+            ("[cs('s').color, cs('s').fontSize, cs('i').display, cs('p', '::before').content, cs('p', ':before').color].join()", "rgb(0, 0, 255),32px,block,\"hi\",rgb(0, 128, 0)"),
+            ("getComputedStyle(document.documentElement).getPropertyValue('--brand')", "#0a0"),
+            // Live: a style change shows at once
+            ("document.getElementById('h').style.color = 'rgb(1, 2, 3)'; h.color", "rgb(1, 2, 3)"),
+            // Detached elements have none; the declaration is read-only
+            ("[getComputedStyle(document.createElement('div')).color, h.length > 50, h instanceof CSSStyleDeclaration].join()", ",true,true"),
+            ("try { h.color = 'red'; 'set' } catch (e) { e.name }", "NoModificationAllowedError"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(rt.eval(code).unwrap(), want, "{code}");
+        }
     }
 
     #[test]

@@ -243,6 +243,8 @@ css_enum!(BoxSizing { ContentBox = "content-box", BorderBox = "border-box" });
 css_enum!(Overflow { Visible = "visible", Hidden = "hidden", Clip = "clip", Scroll = "scroll", Auto = "auto" });
 css_enum!(Visibility { Visible = "visible", Hidden = "hidden", Collapse = "collapse" });
 css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent", WebkitCenter = "-webkit-center" });
+css_enum!(CaptionSide { Top = "top", Bottom = "bottom" });
+css_enum!(TextWrapStyle { Auto = "auto", Balance = "balance", Pretty = "pretty", Stable = "stable" });
 css_enum!(WhiteSpace { Normal = "normal", Pre = "pre", Nowrap = "nowrap", PreWrap = "pre-wrap", PreLine = "pre-line", BreakSpaces = "break-spaces" });
 
 impl WhiteSpace {
@@ -446,6 +448,10 @@ pub struct InheritedStyle {
     pub text_indent: Lp,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
+    /// `text-wrap-style` (`balance` evens out the lines)
+    pub text_wrap: TextWrapStyle,
+    /// Where a table's captions go
+    pub caption_side: CaptionSide,
     pub letter_spacing: f32,
     pub word_spacing: f32,
     pub visibility: Visibility,
@@ -472,6 +478,8 @@ impl Default for InheritedStyle {
             text_indent: Lp::ZERO,
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
+            text_wrap: TextWrapStyle::Auto,
+            caption_side: CaptionSide::Top,
             letter_spacing: 0.0,
             word_spacing: 0.0,
             visibility: Visibility::Visible,
@@ -722,6 +730,33 @@ pub struct BoxStyle {
     /// `None` is currentcolor
     pub text_decoration_color: Option<Color>,
     pub text_decoration_style: TextDecorationStyle,
+    /// An absolutely positioned box whose `display` was inline-level
+    /// before it was blockified: its static position is in its line
+    pub inline_origin: bool,
+    /// `width`, `min-width` and `max-width` given as intrinsic sizes
+    /// (`min-content`...); the lengths are then auto (none for max-width)
+    pub intrinsic_width: [IntrinsicSize; 3],
+}
+
+/// An intrinsic size keyword
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IntrinsicSize {
+    #[default]
+    None,
+    MinContent,
+    MaxContent,
+    FitContent,
+}
+
+impl IntrinsicSize {
+    fn of(v: &PropertyValue) -> Self {
+        match v {
+            PropertyValue::Keyword(Keyword::MinContent) => Self::MinContent,
+            PropertyValue::Keyword(Keyword::MaxContent) => Self::MaxContent,
+            PropertyValue::Keyword(Keyword::FitContent) => Self::FitContent,
+            _ => Self::None,
+        }
+    }
 }
 
 impl Default for BoxStyle {
@@ -785,6 +820,8 @@ impl Default for BoxStyle {
             text_decoration_line: 0,
             text_decoration_color: None,
             text_decoration_style: TextDecorationStyle::Solid,
+            inline_origin: false,
+            intrinsic_width: [IntrinsicSize::None; 3],
         }
     }
 }
@@ -1138,6 +1175,7 @@ impl Style {
             let blockified = bx.display.blockified();
             if blockified != bx.display || (out_of_flow && bx.float != Float::None) {
                 let bx = Arc::make_mut(&mut self.box_);
+                bx.inline_origin |= out_of_flow && bx.display.is_inline_level();
                 bx.display = blockified;
                 if out_of_flow {
                     bx.float = Float::None;
@@ -1295,7 +1333,18 @@ impl Style {
             PropertyId::Clear => set!(box_, [clear], enum_of!(Clear)),
             PropertyId::BoxSizing => set!(box_, [box_sizing], enum_of!(BoxSizing)),
             PropertyId::Width | PropertyId::Height | PropertyId::MinWidth | PropertyId::MinHeight | PropertyId::FlexBasis => {
-                let Some(val) = self.lp_auto(v, ctx) else { return };
+                let intrinsic = IntrinsicSize::of(v);
+                match id {
+                    PropertyId::Width => set!(box_, [intrinsic_width[0]], intrinsic),
+                    PropertyId::MinWidth => set!(box_, [intrinsic_width[1]], intrinsic),
+                    _ => {}
+                }
+                let val = if intrinsic != IntrinsicSize::None {
+                    LpAuto::Auto
+                } else {
+                    let Some(val) = self.lp_auto(v, ctx) else { return };
+                    val
+                };
                 match id {
                     PropertyId::Width => set!(box_, [width], val),
                     PropertyId::Height => set!(box_, [height], val),
@@ -1305,8 +1354,11 @@ impl Style {
                 }
             }
             PropertyId::MaxWidth | PropertyId::MaxHeight => {
+                if id == PropertyId::MaxWidth {
+                    set!(box_, [intrinsic_width[2]], IntrinsicSize::of(v));
+                }
                 let val = match v {
-                    PropertyValue::Keyword(Keyword::None) => MaxSize::None,
+                    PropertyValue::Keyword(Keyword::None | Keyword::MinContent | Keyword::MaxContent | Keyword::FitContent) => MaxSize::None,
                     _ => match self.lp(v, ctx) {
                         Some(l) => MaxSize::Lp(l),
                         None => return,
@@ -1814,6 +1866,8 @@ impl Style {
             }
             PropertyId::TextTransform => set!(inherited, [text_transform], enum_of!(TextTransform)),
             PropertyId::WhiteSpace => set!(inherited, [white_space], enum_of!(WhiteSpace)),
+            PropertyId::TextWrapStyle => set!(inherited, [text_wrap], enum_of!(TextWrapStyle)),
+            PropertyId::CaptionSide => set!(inherited, [caption_side], enum_of!(CaptionSide)),
             PropertyId::LetterSpacing | PropertyId::WordSpacing => {
                 let px = match v {
                     PropertyValue::Keyword(Keyword::Normal) => 0.0,
@@ -1869,11 +1923,20 @@ impl Style {
             PropertyId::Float => copy!(box_, [float]),
             PropertyId::Clear => copy!(box_, [clear]),
             PropertyId::BoxSizing => copy!(box_, [box_sizing]),
-            PropertyId::Width => copy!(box_, [width]),
+            PropertyId::Width => {
+                copy!(box_, [width]);
+                copy!(box_, [intrinsic_width[0]]);
+            }
             PropertyId::Height => copy!(box_, [height]),
-            PropertyId::MinWidth => copy!(box_, [min_width]),
+            PropertyId::MinWidth => {
+                copy!(box_, [min_width]);
+                copy!(box_, [intrinsic_width[1]]);
+            }
             PropertyId::MinHeight => copy!(box_, [min_height]),
-            PropertyId::MaxWidth => copy!(box_, [max_width]),
+            PropertyId::MaxWidth => {
+                copy!(box_, [max_width]);
+                copy!(box_, [intrinsic_width[2]]);
+            }
             PropertyId::MaxHeight => copy!(box_, [max_height]),
             PropertyId::FlexBasis => copy!(box_, [flex_basis]),
             PropertyId::MarginTop => copy!(box_, [margin[0]]),
@@ -1989,6 +2052,8 @@ impl Style {
             PropertyId::TextIndent => copy!(inherited, [text_indent]),
             PropertyId::TextTransform => copy!(inherited, [text_transform]),
             PropertyId::WhiteSpace => copy!(inherited, [white_space]),
+            PropertyId::TextWrapStyle => copy!(inherited, [text_wrap]),
+            PropertyId::CaptionSide => copy!(inherited, [caption_side]),
             PropertyId::LetterSpacing => copy!(inherited, [letter_spacing]),
             PropertyId::WordSpacing => copy!(inherited, [word_spacing]),
             PropertyId::Visibility => copy!(inherited, [visibility]),

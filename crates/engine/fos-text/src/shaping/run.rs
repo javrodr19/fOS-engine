@@ -11,6 +11,8 @@ pub struct ShapedGlyph {
     pub y_offset: i32,
     /// Horizontal advance (in font units)
     pub x_advance: i32,
+    /// The part of `x_advance` that kerning adds (in font units)
+    pub x_kerning: i32,
     /// Vertical advance (in font units)
     pub y_advance: i32,
     /// Cluster index (original character position)

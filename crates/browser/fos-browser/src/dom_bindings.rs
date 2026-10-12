@@ -80,6 +80,11 @@ pub struct DomHost {
     next_fetch_id: u32,
     /// The page's current layout and where the viewport is
     layout: Option<Arc<crate::renderer::PageLayout>>,
+    /// Lays the page out when scripts read geometry after changing the DOM
+    pub(crate) layouter: Option<crate::renderer::SharedLayouter>,
+    /// When the current second of forced layouts began, and the time they
+    /// took in it (see [`FORCED_LAYOUT_BUDGET`])
+    forced: (Instant, Duration),
     viewport: (f32, f32),
     scroll: (f32, f32),
     /// The browser has told the page its viewport (later changes resize it)
@@ -99,6 +104,18 @@ pub struct DomHost {
     pub box_scroll_requests: Vec<(NodeId, f32, f32)>,
     /// Per element: visible size and content size (from `layout`)
     metrics: Option<HashMap<u32, [f32; 4]>>,
+    /// The style `getComputedStyle` last resolved: element, pseudo-element,
+    /// the DOM revision it holds for, and the style with its box
+    computed: Option<ComputedEntry>,
+    /// Messages posted to other windows, for the browser to deliver
+    pub(crate) outbox: Vec<crate::frames::Message>,
+    /// Messages from other windows awaiting dispatch: data (JSON), the
+    /// sender's origin, and the iframe whose frame sent it (`None`: the
+    /// parent)
+    inbox: Vec<(String, String, Option<NodeId>)>,
+    /// Coders of `CompressionStream`s and `DecompressionStream`s, by id
+    pub(crate) codecs: HashMap<u32, crate::compression_streams::Codec>,
+    pub(crate) next_codec: u32,
     /// The browser's cookies (`document.cookie`; `fetch` shares them)
     cookies: fos_net::SharedCookieJar,
     /// The URL changed without a navigation (`history.pushState`)
@@ -126,6 +143,8 @@ impl DomHost {
             fetch_callbacks: HashMap::new(),
             next_fetch_id: 1,
             layout: None,
+            layouter: None,
+            forced: (Instant::now(), Duration::ZERO),
             viewport: (1024.0, 768.0),
             tag_protos: HashMap::new(),
             scroll: (0.0, 0.0),
@@ -138,6 +157,11 @@ impl DomHost {
             box_scroll: HashMap::new(),
             box_scroll_requests: Vec::new(),
             metrics: None,
+            computed: None,
+            outbox: Vec::new(),
+            inbox: Vec::new(),
+            codecs: HashMap::new(),
+            next_codec: 1,
             cookies,
             url_changed: false,
             canvas: Default::default(),
@@ -1581,10 +1605,7 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
     // Fixed and sticky boxes move with the page scroll
     let moved = h.scroll.1 != scroll.1 && h.layout.as_ref().is_some_and(|l| l.has_fixed());
     if !same {
-        h.layout = layout;
-        h.boxes = None;
-        h.layout_boxes = None;
-        h.metrics = None;
+        replace_layout(h, layout);
     } else if moved || h.viewport != viewport {
         h.boxes = None;
     }
@@ -1596,9 +1617,69 @@ pub fn set_layout(vm: &mut Vm, layout: Option<Arc<crate::renderer::PageLayout>>,
     h.scroll = scroll;
 }
 
+/// Use `layout`, dropping what was derived from the previous one
+fn replace_layout(h: &mut DomHost, layout: Option<Arc<crate::renderer::PageLayout>>) {
+    h.layout = layout;
+    h.boxes = None;
+    h.layout_boxes = None;
+    h.metrics = None;
+    h.computed = None;
+}
+
+/// The most of each second scripts may spend on layouts their geometry
+/// reads force: past it they read the latest layout, so a script that
+/// changes and measures the page in a loop cannot stall it. Reads of
+/// elements the latest layout has no box for (just inserted) may force
+/// layouts for longer than reads that would only see an older state.
+const FORCED_LAYOUT_BUDGET: Duration = Duration::from_millis(400);
+const REFRESH_LAYOUT_BUDGET: Duration = Duration::from_millis(100);
+
+/// The page's layout as its DOM is now, for a read of `node`'s geometry
+/// (or the page's). If scripts changed the DOM since the last layout, the
+/// page is laid out first, as browsers do when scripts read geometry
+/// (`offsetHeight` right after inserting an element sees the element),
+/// within the budgets above.
+fn fresh_layout(vm: &mut Vm, node: Option<NodeId>) -> Option<Arc<crate::renderer::PageLayout>> {
+    let h = host(vm);
+    let Some(layouter) = h.layouter.clone() else { return h.layout.clone() };
+    let started = Instant::now();
+    if started.duration_since(h.forced.0) >= Duration::from_secs(1) {
+        h.forced = (started, Duration::ZERO);
+    }
+    let unknown = match (&h.layout, node) {
+        (None, _) => true,
+        (Some(l), Some(n)) => !l.has_box(n),
+        (Some(_), None) => false,
+    };
+    let budget = if unknown { FORCED_LAYOUT_BUDGET } else { REFRESH_LAYOUT_BUDGET };
+    if h.forced.1 >= budget {
+        return h.layout.clone();
+    }
+    let doc = h.doc.clone();
+    let d = lock(&doc);
+    // A detached element has no box however the page is laid out
+    if node.is_some_and(|n| !d.tree().is_connected(n)) {
+        drop(d);
+        return host(vm).layout.clone();
+    }
+    let layout = match layouter.try_borrow_mut() {
+        Ok(mut l) if !l.is_current(&d) => l.layout_of(&d),
+        _ => None,
+    };
+    drop(d);
+    let h = host(vm);
+    if let Some(layout) = layout {
+        h.forced.1 += started.elapsed();
+        log::debug!("forced layout in {:?}", started.elapsed());
+        replace_layout(h, Some(layout));
+    }
+    h.layout.clone()
+}
+
 /// Boxes of all rendered elements: the union of each element's own
-/// fragments (its border boxes and text), and for elements that generate
-/// none (`display: contents`) the union of their descendants'
+/// fragments (its border boxes, or its text where it has none around
+/// it), and for elements that generate none (`display: contents`) the
+/// union of their descendants'
 fn element_boxes(tree: &DomTree, rects: Vec<(NodeId, fos_layout::engine::Rect)>) -> HashMap<u32, [f32; 4]> {
     fn union(boxes: &mut HashMap<u32, [f32; 4]>, n: u32, r: [f32; 4]) {
         match boxes.get_mut(&n) {
@@ -1635,7 +1716,7 @@ fn element_boxes(tree: &DomTree, rects: Vec<(NodeId, fos_layout::engine::Rect)>)
 fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
     let painted = fos_jsvm::vm::truthy(arg(args, 1));
-    let Some(layout) = host(vm).layout.clone() else { return Ok(Value::NULL) };
+    let Some(layout) = fresh_layout(vm, Some(id)) else { return Ok(Value::NULL) };
     if painted && host(vm).boxes.is_none() {
         let (scroll, view_h, box_scroll) = (host(vm).scroll.1, host(vm).viewport.1, host(vm).box_scroll.clone());
         let rects = layout.painted_boxes(scroll, view_h, &box_scroll);
@@ -1653,12 +1734,33 @@ fn geometry(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<
 }
 
 fn metrics_of(vm: &mut Vm, id: NodeId) -> Option<[f32; 4]> {
+    let layout = fresh_layout(vm, Some(id));
     let h = host(vm);
     if h.metrics.is_none() {
-        let m = h.layout.as_ref()?.scroll_metrics();
+        let m = layout?.scroll_metrics();
         h.metrics = Some(m);
     }
     h.metrics.as_ref()?.get(&id.0).copied()
+}
+
+/// `__fosImageSource(img)`: the URL an `<img>` shows (from `srcset` or
+/// `src`) and, once it is loaded, its natural width and height; null
+/// without a source
+fn image_source(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let viewport_w = host(vm).viewport.0;
+    let url = with_doc(vm, |d| {
+        let src = crate::image_loader::image_source(d.tree(), id, viewport_w)?;
+        Some(fos_net::url_util::resolve(&crate::css_loader::base_url(d), src.trim()))
+    });
+    let Some(url) = url else { return Ok(Value::NULL) };
+    let natural = host(vm).layouter.clone().and_then(|l| l.try_borrow().ok().and_then(|l| l.image_natural(&url)));
+    let mut vals = vec![string(vm, &url)];
+    if let Some((w, h)) = natural {
+        vals.push(Value::number(w as f64));
+        vals.push(Value::number(h as f64));
+    }
+    Ok(Value::object(vm.new_array(vals)))
 }
 
 /// `__fosScrollMetrics(el)`: `[scrollLeft, scrollTop, scrollWidth,
@@ -1688,6 +1790,86 @@ fn set_box_scroll(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsR
     Ok(Value::UNDEFINED)
 }
 
+type ComputedEntry = (NodeId, u8, fos_dom::DomRevision, Option<(fos_css::style::Style, Option<fos_css::resolved::UsedBox>)>);
+
+/// `__fosComputedStyle(el, pseudo, name)`: the resolved value of property
+/// `name` (lowercase, or a `--custom` one) of an element, or of its
+/// `::before`, `::after` or `::marker` (`pseudo` names it, or is empty);
+/// null for an element outside the document or a property not modeled
+fn computed_style(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    use fos_dom::PseudoElement;
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
+    let pseudo = if arg(args, 1).is_undefined() || arg(args, 1).is_null() { String::new() } else { arg_string(vm, args, 1)? };
+    let name = arg_string(vm, args, 2)?;
+    let (pe, key) = match pseudo.trim_start_matches(':').to_ascii_lowercase().as_str() {
+        "before" => (Some(PseudoElement::Before), 1),
+        "after" => (Some(PseudoElement::After), 2),
+        "marker" => (Some(PseudoElement::Marker), 3),
+        _ => (None, 0),
+    };
+    let Some(layout) = fresh_layout(vm, None) else { return Ok(Value::NULL) };
+    let revision = with_tree(vm, |t| t.revision());
+    let fresh = matches!(&host(vm).computed, Some((n, k, r, _)) if *n == id && *k == key && *r == revision);
+    if !fresh {
+        let resolved = with_tree(vm, |t| layout.resolved_style(t, id, pe));
+        host(vm).computed = Some((id, key, revision, resolved));
+    }
+    let value = match &host(vm).computed {
+        Some((_, _, _, Some((style, used)))) => style.resolved_value(&name, used.as_ref()),
+        _ => None,
+    };
+    Ok(match value {
+        Some(v) => string(vm, &v),
+        None => Value::NULL,
+    })
+}
+
+/// `__fosComputedStyleNames()`: the properties a computed style lists
+fn computed_style_names(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let names: Vec<Value> = fos_css::resolved::PROPERTIES.iter().map(|n| string(vm, n)).collect();
+    Ok(Value::object(vm.new_array(names)))
+}
+
+/// `__fosPostMessage(toParent, iframe, data, targetOrigin)`: queue a
+/// message (serialized) for another window: the parent, or the frame of
+/// an iframe of this document
+fn post_message(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let to = if fos_jsvm::vm::truthy(arg(args, 0)) {
+        crate::frames::MessageTarget::Parent
+    } else {
+        match node_id(arg(args, 1)) {
+            Some(n) => crate::frames::MessageTarget::Frame(n),
+            None => return Ok(Value::UNDEFINED),
+        }
+    };
+    let data = arg_string(vm, args, 2)?;
+    let target_origin = arg_string(vm, args, 3)?;
+    let h = host(vm);
+    if h.outbox.len() < 1000 {
+        h.outbox.push(crate::frames::Message { to, data, target_origin });
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `__fosTakeInbox()`: the messages awaiting dispatch, as `[data, origin,
+/// iframe or null]` triples
+fn take_inbox(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let inbox = std::mem::take(&mut host(vm).inbox);
+    let mut out = Vec::with_capacity(inbox.len());
+    for (data, origin, from) in inbox {
+        let data = string(vm, &data);
+        let origin = string(vm, &origin);
+        let from = from.map_or(Value::NULL, |n| wrap(vm, n));
+        out.push(Value::object(vm.new_array(vec![data, origin, from])));
+    }
+    Ok(Value::object(vm.new_array(out)))
+}
+
+/// Queue a message from another window for the page's scripts
+pub(crate) fn receive_message(vm: &mut Vm, data: String, origin: String, from: Option<NodeId>) {
+    host(vm).inbox.push((data, origin, from));
+}
+
 /// `__fosQuirks()`: whether the document is in quirks mode
 fn quirks(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     Ok(Value::bool(with_doc(vm, |d| d.is_quirks())))
@@ -1695,8 +1877,9 @@ fn quirks(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value
 
 /// `__fosViewport()`: `[width, height, scrollX, scrollY, documentHeight]`
 fn viewport(vm: &mut Vm, _: Value, _: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let layout = fresh_layout(vm, None);
     let h = host(vm);
-    let doc_height = h.layout.as_ref().map_or(h.viewport.1, |l| l.content_height().max(h.viewport.1));
+    let doc_height = layout.map_or(h.viewport.1, |l| l.content_height().max(h.viewport.1));
     let v = [h.viewport.0, h.viewport.1, h.scroll.0, h.scroll.1, doc_height];
     let vals: Vec<Value> = v.iter().map(|&x| Value::number(x as f64)).collect();
     Ok(Value::object(vm.new_array(vals)))
@@ -1912,8 +2095,16 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosSetCookie", 1, set_cookie),
         ("__fosFetch", 8, fetch_start),
         ("__fosGeometry", 1, geometry),
+        ("__fosImageSource", 1, image_source),
         ("__fosViewport", 0, viewport),
         ("__fosQuirks", 0, quirks),
+        ("__fosComputedStyle", 3, computed_style),
+        ("__fosPostMessage", 4, post_message),
+        ("__fosTakeInbox", 0, take_inbox),
+        ("__fosCodecNew", 2, crate::compression_streams::codec_new),
+        ("__fosCodecWrite", 2, crate::compression_streams::codec_write),
+        ("__fosCodecFinish", 1, crate::compression_streams::codec_finish),
+        ("__fosComputedStyleNames", 0, computed_style_names),
         ("__fosScrollMetrics", 1, scroll_metrics),
         ("__fosSetBoxScroll", 3, set_box_scroll),
         ("__fosScrollTo", 1, scroll_to),

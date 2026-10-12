@@ -29,10 +29,12 @@ use fos_dom::{DomTree, NodeId};
 
 /// Lay out the document rooted at element `root` in a viewport
 pub fn layout_document<S: Styler>(tree: &DomTree, root: NodeId, styler: &mut S, fonts: &mut FontContext, viewport: (f32, f32)) -> FragmentTree {
+    let quirks = styler.quirks();
     let Some(boxes) = build_box_tree(tree, root, styler) else {
         return FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 };
     };
     let mut ctx = LayoutCtx::new(fonts, viewport);
+    ctx.quirks = quirks;
     let (mut frag, bottom) = block::layout_root(&mut ctx, &boxes);
     position::place_absolutes(&mut ctx, &mut frag, &boxes);
     let document_height = bottom.max(frag.ink.bottom()).max(viewport.1);

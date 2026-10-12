@@ -81,12 +81,23 @@ pub struct ResolvedFont {
 }
 
 impl ResolvedFont {
+    /// Above the baseline, in whole pixels as browsers round font metrics
     pub fn ascent(&self) -> f32 {
-        self.metrics.ascent * self.size
+        (self.metrics.ascent * self.size).round()
     }
 
+    /// Below the baseline, in whole pixels
     pub fn descent(&self) -> f32 {
-        self.metrics.descent * self.size
+        (self.metrics.descent * self.size).round()
+    }
+
+    /// `line-height` in pixels: `normal` is the font's own line spacing
+    /// (ascent, descent and line gap, each rounded)
+    pub fn line_height(&self, lh: fos_css::style::LineHeight) -> f32 {
+        match lh {
+            fos_css::style::LineHeight::Normal => self.ascent() + self.descent() + (self.metrics.line_gap * self.size).round(),
+            other => other.resolve(self.size),
+        }
     }
 }
 
@@ -106,6 +117,8 @@ pub struct FontContext {
     fallback: HashMap<char, Option<FontId>>,
     /// Faces to try for fallback, best first (built on first need)
     fallback_order: Option<Vec<FontId>>,
+    /// (face, weight, size) -> the face to draw (a variable face's instance)
+    instances: HashMap<(FontId, u16, u16), FontId>,
 }
 
 impl Default for FontContext {
@@ -116,7 +129,7 @@ impl Default for FontContext {
 
 impl FontContext {
     pub fn new(db: Arc<FontDatabase>) -> Self {
-        FontContext { db, shaper: TextShaper::new(), selection: HashMap::new(), metrics: HashMap::new(), words: HashMap::new(), word_count: 0, fallback: HashMap::new(), fallback_order: None }
+        FontContext { db, shaper: TextShaper::new(), selection: HashMap::new(), metrics: HashMap::new(), words: HashMap::new(), word_count: 0, fallback: HashMap::new(), fallback_order: None, instances: HashMap::new() }
     }
 
     pub fn database(&self) -> &Arc<FontDatabase> {
@@ -130,13 +143,14 @@ impl FontContext {
         let (id, synthesis) = match self.selection.get(&key) {
             Some(sel) => *sel,
             None => {
-                let families: Vec<&str> = i.font_family.iter().map(|f| match &**f {
-                    // Generic names the font database knows by other names
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif" => "sans-serif",
-                    "ui-serif" => "serif",
-                    "ui-monospace" => "monospace",
-                    other => other,
-                }).collect();
+                // As in Chromium on Linux: names of fonts that are not
+                // installed (and of Apple's system fonts) match nothing, and
+                // when nothing in the list does, the standard font, serif,
+                // is used
+                let mut families: Vec<&str> = i.font_family.iter().map(|f| &**f).collect();
+                if families.last() != Some(&"serif") {
+                    families.push("serif");
+                }
                 let style = if key.2 { fos_text::FontStyle::Italic } else { fos_text::FontStyle::Normal };
                 let query = FontQuery::new(&families).weight(fos_text::FontWeight(i.font_weight)).style(style);
                 let id = self.db.query(&query);
@@ -146,7 +160,7 @@ impl FontContext {
                     if key.2 && face.style == fos_text::FontStyle::Normal {
                         synthesis |= fos_text::SYNTH_OBLIQUE;
                     }
-                    if key.1 >= 600 && face.weight.0 < 600 {
+                    if key.1 >= 600 && face.weights.1 < 600 {
                         synthesis |= fos_text::SYNTH_BOLD;
                     }
                 }
@@ -154,6 +168,12 @@ impl FontContext {
                 (id, synthesis)
             }
         };
+        // A variable face is drawn through its instance at the weight and
+        // (font-optical-sizing: auto) the size asked for
+        let id = id.map(|id| {
+            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16);
+            *self.instances.entry(key).or_insert_with(|| self.db.instance(id, key.1, key.2))
+        });
         let metrics = id.map_or(FontMetrics::FALLBACK, |id| self.metrics_of(id));
         ResolvedFont { id, size: i.font_size, metrics, synthesis }
     }
@@ -204,7 +224,7 @@ impl FontContext {
         match shaped {
             Some(run) if run.glyphs.iter().any(|g| g.glyph_id == 0) && !text.trim().is_empty() => self.shape_with_fallback(font, text, run),
             Some(run) => {
-                let (glyphs, width) = positioned(&run, 0.0);
+                let (glyphs, width) = positioned(&run, 0.0, self.whole_pixels(font.id));
                 ShapedWord { font: font.id, size, width, glyphs: glyphs.into(), fallback: Box::new([]) }
             }
             // No font: an estimate, so layout still works
@@ -255,6 +275,13 @@ impl FontContext {
     }
 
     /// Shape `text` in runs: characters the face lacks in a fallback face
+    /// Whether glyphs of face `id` advance by whole pixels: web fonts do,
+    /// as in Chromium on Linux, which positions them without subpixel
+    /// precision (system fonts keep fractional advances)
+    fn whole_pixels(&self, id: Option<FontId>) -> bool {
+        id.and_then(|id| self.db.font(id)).is_some_and(|f| f.web)
+    }
+
     fn shape_with_fallback(&mut self, font: &ResolvedFont, text: &str, first: fos_text::ShapedRun) -> ShapedWord {
         let missing: std::collections::HashSet<u32> = first.glyphs.iter().filter(|g| g.glyph_id == 0).map(|g| g.cluster).collect();
         // Runs of characters by face
@@ -275,7 +302,7 @@ impl FontContext {
             if face != last_face {
                 fallback.push((glyphs.len() as u32, if face == font.id { None } else { face }));
             }
-            let (g, w) = positioned(&run, x);
+            let (g, w) = positioned(&run, x, self.whole_pixels(face));
             glyphs.extend(g);
             x = w;
         }
@@ -326,14 +353,22 @@ pub fn is_complex(c: char) -> bool {
     matches!(c as u32, 0x0590..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
 }
 
-fn positioned(run: &fos_text::ShapedRun, x0: f32) -> (Vec<Glyph>, f32) {
+/// Glyphs of `run` placed from `x0`, and where the run ends; with
+/// `whole_pixels`, each glyph's advance (kerning included) is rounded
+fn positioned(run: &fos_text::ShapedRun, x0: f32, whole_pixels: bool) -> (Vec<Glyph>, f32) {
     let scale = run.scale();
     let mut x = x0;
     let glyphs = run
         .glyphs
         .iter()
         .map(|g| {
-            let advance = g.x_advance as f32 * scale;
+            // (whole pixels: the glyph's own advance and its kerning are
+            // each rounded, as Chromium's hinted advances and kerning are)
+            let advance = if whole_pixels {
+                ((g.x_advance - g.x_kerning) as f32 * scale).round() + (g.x_kerning as f32 * scale).round()
+            } else {
+                g.x_advance as f32 * scale
+            };
             let glyph = Glyph { id: g.glyph_id, x: x + g.x_offset as f32 * scale, y: g.y_offset as f32 * scale, advance };
             x += advance;
             glyph
@@ -345,6 +380,21 @@ fn positioned(run: &fos_text::ShapedRun, x0: f32) -> (Vec<Glyph>, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_families_fall_back_to_serif() {
+        let mut fonts = FontContext::default();
+        let mut face = |families: &[&str]| {
+            let mut style = Style::default();
+            std::sync::Arc::make_mut(&mut style.inherited).font_family = families.iter().map(|f| Arc::from(*f)).collect();
+            fonts.resolve(&style).id
+        };
+        let serif = face(&["serif"]);
+        assert_eq!(face(&["no such font"]), serif);
+        assert_eq!(face(&["-apple-system", "BlinkMacSystemFont"]), serif);
+        // Apple's names are skipped, not taken for sans-serif
+        assert_eq!(face(&["-apple-system", "monospace"]), face(&["monospace"]));
+    }
 
     #[test]
     fn missing_characters_come_from_fallback_faces() {

@@ -218,6 +218,9 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "text-indent" => TextIndent,
         "text-transform" => TextTransform,
         "white-space" => WhiteSpace,
+        // text-wrap's mode is white-space's business; its style is ours
+        "text-wrap" | "text-wrap-style" => TextWrapStyle,
+        "caption-side" => CaptionSide,
         "letter-spacing" => LetterSpacing,
         "word-spacing" => WordSpacing,
         "visibility" => Visibility,
@@ -632,6 +635,20 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         }
         P::TextTransform => enum_value::<TextTransform>(v.split_whitespace().next().unwrap_or("")),
         P::WhiteSpace => white_space(v),
+        P::CaptionSide => enum_value::<CaptionSide>(match v {
+            "block-start" => "top",
+            "block-end" => "bottom",
+            other => other,
+        }),
+        // text-wrap: the style among the mode and style it gives
+        P::TextWrapStyle => {
+            let words: Vec<&str> = v.split_whitespace().filter(|w| !matches!(*w, "wrap" | "nowrap")).collect();
+            match words.as_slice() {
+                [] => enum_value::<TextWrapStyle>("auto"),
+                [style] => enum_value::<TextWrapStyle>(style),
+                _ => None,
+            }
+        }
         P::LetterSpacing | P::WordSpacing => {
             if v == "normal" {
                 Some(PropertyValue::Keyword(Keyword::Normal))
@@ -675,7 +692,7 @@ macro_rules! css_enum_impl {
     };
 }
 css_enum_impl!(
-    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextTransform, FontStyle, BorderStyle, ListStyleType,
+    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
     ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
 );
@@ -999,11 +1016,14 @@ fn length(v: &str, allow_auto: bool, allow_none: bool, allow_negative: bool) -> 
     Some(PropertyValue::Length(l))
 }
 
-/// width / height / min-* / flex-basis (intrinsic keywords become auto)
+/// width / height / min-* / max-* / flex-basis: lengths, or the intrinsic
+/// size keywords (stretching ones stand for auto, or none)
 fn size(v: &str, allow_auto: bool) -> Option<PropertyValue> {
     match v {
-        "min-content" | "max-content" | "fit-content" | "-webkit-fit-content" | "-moz-fit-content" | "-webkit-fill-available" | "stretch"
-        | "content" => Some(if allow_auto { PropertyValue::Keyword(Keyword::Auto) } else { PropertyValue::Keyword(Keyword::None) }),
+        "min-content" | "-webkit-min-content" | "-moz-min-content" => Some(PropertyValue::Keyword(Keyword::MinContent)),
+        "max-content" | "-webkit-max-content" | "-moz-max-content" => Some(PropertyValue::Keyword(Keyword::MaxContent)),
+        "fit-content" | "-webkit-fit-content" | "-moz-fit-content" => Some(PropertyValue::Keyword(Keyword::FitContent)),
+        "-webkit-fill-available" | "stretch" | "content" => Some(if allow_auto { PropertyValue::Keyword(Keyword::Auto) } else { PropertyValue::Keyword(Keyword::None) }),
         _ => length(v, allow_auto, false, false),
     }
 }
@@ -1429,8 +1449,14 @@ fn url(v: &str) -> Option<Arc<str>> {
     } else {
         return None;
     };
-    let inner = inner.trim().trim_matches(|c| c == '"' || c == '\'');
-    Some(Arc::from(inner))
+    let inner = inner.trim();
+    // Escapes resolved (`\"` in a quoted SVG data URL is a quote)
+    let text = match inner.as_bytes().first() {
+        Some(&q @ (b'"' | b'\'')) => css_string(inner, 1, q)?.0,
+        _ if inner.contains('\\') => css_string(inner, 0, 0)?.0,
+        _ => inner.to_string(),
+    };
+    Some(Arc::from(text))
 }
 
 fn background_images(raw: &str) -> Option<Vec<Image>> {
@@ -1763,6 +1789,20 @@ mod tests {
     }
 
     #[test]
+    fn text_wrap_style() {
+        for (css, want) in [
+            ("text-wrap: balance", TextWrapStyle::Balance),
+            ("text-wrap: wrap balance", TextWrapStyle::Balance),
+            ("text-wrap-style: pretty", TextWrapStyle::Pretty),
+            ("text-wrap: nowrap", TextWrapStyle::Auto),
+            ("text-wrap: balance; text-wrap: wrap", TextWrapStyle::Auto),
+            ("text-wrap: balance pretty", TextWrapStyle::Auto),
+        ] {
+            assert_eq!(computed(css).inherited.text_wrap, want, "{css}");
+        }
+    }
+
+    #[test]
     fn keywords_and_blockification() {
         let s = computed("display: inline flow-root");
         assert_eq!(s.box_.display, Display::InlineBlock);
@@ -1793,6 +1833,16 @@ mod tests {
         let plain = Style::inherit_from(&parent);
         assert!(Arc::ptr_eq(&plain.inherited, &parent.inherited));
         assert!(Arc::ptr_eq(&plain.box_, &Style::default().box_));
+    }
+
+    #[test]
+    fn urls_resolve_escapes() {
+        let s = computed(r#"background-image: url("data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\"/>")"#);
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == r#"data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"/>"#));
+        let s = computed(r"background-image: url(a\(1\).png)");
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == "a(1).png"));
+        let s = computed("background-image: url('b.png')");
+        assert!(matches!(&s.background.images[0], Image::Url(u) if &**u == "b.png"));
     }
 
     #[test]

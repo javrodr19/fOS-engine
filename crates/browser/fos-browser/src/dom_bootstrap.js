@@ -243,8 +243,10 @@
   }
   const eventTypes = ['click', 'dblclick', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout',
     'mouseenter', 'mouseleave', 'contextmenu', 'wheel', 'keydown', 'keyup', 'keypress', 'input', 'change',
-    'submit', 'reset', 'focus', 'blur', 'load', 'error', 'scroll', 'resize', 'touchstart', 'touchend',
-    'touchmove', 'pointerdown', 'pointerup', 'pointermove', 'animationend', 'transitionend', 'select',
+    // No ontouch*: desktop browsers without a touch screen leave them out,
+    // and pages test for them to pick their touch layouts
+    'submit', 'reset', 'focus', 'blur', 'load', 'error', 'scroll', 'resize',
+    'pointerdown', 'pointerup', 'pointermove', 'animationend', 'transitionend', 'select',
     'DOMContentLoaded', 'beforeunload', 'unload', 'hashchange', 'popstate', 'message', 'toggle',
     'abort', 'timeout', 'loadstart', 'progress', 'loadend', 'readystatechange'];
   for (const type of eventTypes) {
@@ -481,12 +483,60 @@
   // style: a CSSStyleDeclaration over the `style` attribute
   const camelToKebab = s => s.startsWith('--') ? s : s.replace(/[A-Z]/g, c => '-' + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, '-$1-');
   const styles = new WeakMap();
+  // Transitions are not animated: a change to a transitioning property
+  // takes effect at once, and `transitionend` fires when the transition
+  // would have ended (libraries wait for it to finish their work)
+  const transitionTimers = new WeakMap();
+  const isTime = (t) => /^-?[\d.]+m?s$/i.test(t);
+  const seconds = (v) => { v = String(v).trim(); const n = parseFloat(v); return isNaN(n) ? 0 : /ms$/i.test(v) ? n / 1000 : n; };
+  function transitionsOf(map) {
+    const props = map.get('transition-property'), durations = map.get('transition-duration'), delays = map.get('transition-delay');
+    const list = [];
+    if (props !== undefined || durations !== undefined) {
+      const d = (durations ?? '0s').split(',').map(seconds);
+      const l = (delays ?? '0s').split(',').map(seconds);
+      (props ?? 'all').split(',').forEach((name, i) => list.push({ property: name.trim(), duration: d[i % d.length], delay: l[i % l.length] }));
+    } else if (map.has('transition')) {
+      for (const part of map.get('transition').split(/,(?![^(]*\))/)) {
+        const tokens = part.trim().split(/\s+/);
+        const times = tokens.filter(isTime).map(seconds);
+        const name = tokens.find((t) => !isTime(t) && !/^(ease|linear|step|cubic-bezier|steps|initial|inherit)/i.test(t)) ?? 'all';
+        list.push({ property: name, duration: times[0] ?? 0, delay: times[1] ?? 0 });
+      }
+    }
+    return list;
+  }
+  function transitionChanged(el, beforeText, afterText) {
+    if (!/transition/i.test(afterText)) return;
+    const after = parseDeclarations(afterText);
+    const list = transitionsOf(after).filter((t) => t.duration > 0);
+    if (!list.length) return;
+    const before = parseDeclarations(beforeText);
+    const names = new Set([...after.keys(), ...before.keys()]);
+    for (const name of names) {
+      if (name.startsWith('transition') || before.get(name) === after.get(name)) continue;
+      const bare = name.replace(/^-(webkit|moz|ms)-/, '');
+      const t = list.find((x) => x.property === 'all' || x.property.replace(/^-(webkit|moz|ms)-/, '') === bare);
+      if (!t) continue;
+      let timers = transitionTimers.get(el);
+      if (!timers) transitionTimers.set(el, timers = new Map());
+      clearTimeout(timers.get(name));
+      timers.set(name, setTimeout(() => {
+        timers.delete(name);
+        el.dispatchEvent(new TransitionEvent('transitionend', { propertyName: name, elapsedTime: t.duration, bubbles: true }));
+      }, (t.duration + t.delay) * 1000));
+    }
+  }
   Object.defineProperty(E, 'style', {
     get() {
       let s = styles.get(this);
       if (!s) {
         const el = this;
-        s = makeDeclaration(() => el.getAttribute('style'), (t) => { if (t) el.setAttribute('style', t); else el.removeAttribute('style'); });
+        s = makeDeclaration(() => el.getAttribute('style'), (t) => {
+          const before = el.getAttribute('style') || '';
+          if (t) el.setAttribute('style', t); else el.removeAttribute('style');
+          transitionChanged(el, before, t || '');
+        });
         styles.set(this, s);
       }
       return s;
@@ -888,6 +938,16 @@
   makeInterface('SVGElement', HTMLElement, 'svg:*');
   makeInterface('SVGGraphicsElement', SVGElement, '');
   makeInterface('SVGSVGElement', SVGGraphicsElement, 'svg:svg');
+  // Factories of SVG's geometry types (pages test for createSVGRect to
+  // detect SVG support)
+  Object.assign(global.SVGSVGElement.prototype, {
+    createSVGRect() { return new global.DOMRect(); },
+    createSVGPoint() { return new global.DOMPoint(); },
+    createSVGMatrix() { return new global.DOMMatrix(); },
+    createSVGNumber() { return { value: 0 }; },
+    createSVGLength() { return { value: 0, unitType: 1, valueInSpecifiedUnits: 0, valueAsString: '0' }; },
+    createSVGTransform() { return { type: 1, matrix: new global.DOMMatrix(), angle: 0 }; },
+  });
 
   // Reflected attributes of particular elements
   const reflectOn = (names, props, descriptor) => {
@@ -1265,6 +1325,43 @@
         if (key === 'cssFloat') key = 'float';
         declarationMethods.setProperty(d, camelToKebab(key), value);
         return true;
+      },
+      has(_, key) { return typeof key === 'string'; },
+    });
+  }
+
+  // getComputedStyle: a live, read-only CSSStyleDeclaration of an
+  // element's resolved values (the renderer's styles, through its layout)
+  let computedNames = null;
+  function makeComputedDeclaration(el, pseudo) {
+    const names = () => (el.isConnected ? (computedNames ??= __fosComputedStyleNames()) : []);
+    const value = (name) => __fosComputedStyle(el, pseudo, normalizeProperty(name)) ?? '';
+    const readOnly = (what) => () => {
+      throw new DOMException(`Failed to execute '${what}' on 'CSSStyleDeclaration': These styles are computed, and therefore read-only.`, 'NoModificationAllowedError');
+    };
+    const methods = {
+      getPropertyValue: (name) => value(name),
+      getPropertyPriority: () => '',
+      setProperty: readOnly('setProperty'),
+      removeProperty: readOnly('removeProperty'),
+      item: (i) => names()[i] ?? '',
+    };
+    return new Proxy(Object.create(CSSStyleDeclaration.prototype), {
+      get(target, key) {
+        if (key === Symbol.iterator) return function* () { yield* names(); };
+        if (typeof key === 'symbol') return target[key];
+        if (key in methods) return methods[key];
+        if (key === 'length') return names().length;
+        if (key === 'cssText') return '';
+        if (key === 'parentRule') return null;
+        if (key === 'constructor') return CSSStyleDeclaration;
+        if (/^\d+$/.test(key)) return names()[+key];
+        if (key === 'cssFloat') key = 'float';
+        return value(key.startsWith('--') ? key : camelToKebab(key));
+      },
+      set(_, key) {
+        if (typeof key === 'symbol') return true;
+        readOnly('setProperty')();
       },
       has(_, key) { return typeof key === 'string'; },
     });
@@ -2717,10 +2814,19 @@
         terminate: () => { try { readController.close(); } catch {} writable._error(new TypeError('The transform stream has been terminated')); },
         get desiredSize() { return readController.desiredSize; },
       };
+      // A transformer that throws errors both sides (readers stop waiting)
+      const guarded = (f) => {
+        try {
+          return Promise.resolve(f()).catch((e) => { controller.error(e); throw e; });
+        } catch (e) {
+          controller.error(e);
+          return Promise.reject(e);
+        }
+      };
       writable = new WritableStream({
         start: () => transformer.start && transformer.start.call(transformer, controller),
-        write: (chunk) => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk)),
-        close: () => Promise.resolve(transformer.flush && transformer.flush.call(transformer, controller)).then(() => { try { readController.close(); } catch {} }),
+        write: (chunk) => guarded(() => (transformer.transform ? transformer.transform.call(transformer, chunk, controller) : controller.enqueue(chunk))),
+        close: () => guarded(() => transformer.flush && transformer.flush.call(transformer, controller)).then(() => { try { readController.close(); } catch {} }),
         abort: (reason) => readController.error(reason),
       }, writableStrategy);
       Object.defineProperties(this, { readable: { value: readable, enumerable: true }, writable: { value: writable, enumerable: true } });
@@ -2746,6 +2852,27 @@
     }
     get encoding() { return this._decoder.encoding; }
   }
+
+  // CompressionStream and DecompressionStream: a readable and a writable
+  // side around a native gzip, zlib (`deflate`) or raw deflate coder
+  function codecSides(self, name, format, decompress) {
+    format = String(format);
+    if (!['gzip', 'deflate', 'deflate-raw'].includes(format)) {
+      throw new TypeError(`Failed to construct '${name}': Unsupported compression format: '${format}'`);
+    }
+    const id = __fosCodecNew(format, decompress);
+    const out = (c, bytes) => { if (bytes.byteLength) c.enqueue(new Uint8Array(bytes)); };
+    const t = new TransformStream({
+      transform(chunk, c) {
+        if (!(chunk instanceof ArrayBuffer || ArrayBuffer.isView(chunk))) throw new TypeError(`The provided value is not of type '(ArrayBuffer or ArrayBufferView)'`);
+        out(c, __fosCodecWrite(id, chunk));
+      },
+      flush(c) { out(c, __fosCodecFinish(id)); },
+    });
+    Object.defineProperties(self, { readable: { value: t.readable, enumerable: true }, writable: { value: t.writable, enumerable: true } });
+  }
+  class CompressionStream { constructor(format) { codecSides(this, 'CompressionStream', format, false); } }
+  class DecompressionStream { constructor(format) { codecSides(this, 'DecompressionStream', format, true); } }
 
   // Byte-stream sources a body or blob gives: one chunk, then done
   const bytesStream = (getBytes) => new ReadableStream({
@@ -2920,8 +3047,31 @@
 
   // A body given to Request, Response or XMLHttpRequest: its bytes (or
   // string) and the content type it implies
+  // A body given as a ReadableStream: read in full when consumed
+  class StreamBody { constructor(stream) { this.stream = stream; } }
+  async function readAllBytes(stream) {
+    const reader = stream.getReader();
+    const parts = [];
+    let size = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const bytes = typeof value === 'string' ? new TextEncoder().encode(value)
+        : value instanceof ArrayBuffer ? new Uint8Array(value)
+        : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : null;
+      if (!bytes) throw new TypeError('Failed to read the body: chunks must be Uint8Arrays');
+      parts.push(bytes);
+      size += bytes.byteLength;
+    }
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.byteLength; }
+    return out.buffer;
+  }
   function extractBody(body) {
     if (body == null) return { data: null, type: null };
+    if (body instanceof ReadableStream) return { data: new StreamBody(body), type: null };
     if (typeof body === 'string') return { data: body, type: 'text/plain;charset=UTF-8' };
     if (body instanceof URLSearchParams) return { data: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
     if (body instanceof FormData) return body._encode();
@@ -2934,7 +3084,7 @@
     _consume() {
       if (this.bodyUsed) return Promise.reject(new TypeError('Failed to execute: body stream already read'));
       this.bodyUsed = true;
-      return Promise.resolve(this._body);
+      return this._body instanceof StreamBody ? readAllBytes(this._body.stream) : Promise.resolve(this._body);
     },
     text() { return this._consume().then(b => b == null ? '' : typeof b === 'string' ? b : __fosDecode(b, 'utf-8')); },
     json() { return this.text().then(t => JSON.parse(t)); },
@@ -2950,6 +3100,7 @@
     },
     get body() {
       if (this._body == null) return null;
+      if (this._body instanceof StreamBody) return this._body.stream;
       if (!this._stream) {
         this._stream = bytesStream(() => {
           if (this.bodyUsed) return null;
@@ -3021,6 +3172,11 @@
       const r = Object.create(Response.prototype);
       slots.set(r, { ...slotOf(this) });
       Object.assign(r, this, { headers: new Headers(this.headers), bodyUsed: false, _stream: undefined });
+      if (this._body instanceof StreamBody) {
+        const [a, b] = this._body.stream.tee();
+        this._body = new StreamBody(a);
+        r._body = new StreamBody(b);
+      }
       return r;
     }
     static error() {
@@ -3059,6 +3215,11 @@
       let settled = false;
       const onAbort = () => { if (!settled) { settled = true; reject(signal.reason); } };
       if (signal) signal.addEventListener('abort', onAbort);
+      // Streamed uploads go once read
+      if (req._body instanceof StreamBody) {
+        readAllBytes(req._body.stream).then((bytes) => fetch(new Request(req, { body: bytes, method: req.method })).then(resolve, reject), reject);
+        return;
+      }
       __fosFetch(req.method, req.url, [...req.headers], req._body, req.mode, req.credentials, req.redirect, (err, r) => {
         if (signal) signal.removeEventListener('abort', onAbort);
         if (settled) return;
@@ -3368,6 +3529,69 @@
     return mql;
   }
 
+  // ---- other windows: the parent's, frames' ----
+  //
+  // Windows in other runtimes are reached through the browser: postMessage
+  // serializes the message, and what comes back arrives as `message`
+  // events whose `source` is the same proxy object.
+  function serializeMessage(message) {
+    let s;
+    try {
+      s = JSON.stringify(message === undefined ? null : message);
+    } catch (e) {
+      throw new DOMException(`Failed to execute 'postMessage' on 'Window': ${e.message}`, 'DataCloneError');
+    }
+    return s === undefined ? 'null' : s;
+  }
+  function messageTargetOrigin(targetOrigin) {
+    if (targetOrigin && typeof targetOrigin === 'object') targetOrigin = targetOrigin.targetOrigin;
+    targetOrigin = targetOrigin === undefined ? '/' : String(targetOrigin);
+    return targetOrigin === '/' ? global.location.origin : targetOrigin;
+  }
+  class RemoteWindow {
+    constructor(isParent, iframe) {
+      Object.defineProperties(this, { _isParent: { value: isParent }, _iframe: { value: iframe } });
+    }
+    postMessage(message, targetOrigin) {
+      __fosPostMessage(this._isParent, this._iframe, serializeMessage(message), messageTargetOrigin(targetOrigin));
+    }
+    get window() { return this; }
+    get self() { return this; }
+    get frames() { return this; }
+    get parent() { return this._isParent ? this : global; }
+    get top() { return this._isParent ? this : global.top; }
+    get closed() { return false; }
+    get length() { return 0; }
+    get opener() { return null; }
+    get location() { throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError'); }
+    get document() { throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError'); }
+    focus() {}
+    blur() {}
+    close() {}
+  }
+  // What an <img> shows, and its natural size once loaded
+  Object.defineProperties(global.HTMLImageElement.prototype, {
+    currentSrc: { get() { const r = __fosImageSource(this); return r ? r[0] : ''; }, enumerable: true, configurable: true },
+    naturalWidth: { get() { const r = __fosImageSource(this); return r && r.length > 1 ? Math.round(r[1]) : 0; }, enumerable: true, configurable: true },
+    naturalHeight: { get() { const r = __fosImageSource(this); return r && r.length > 1 ? Math.round(r[2]) : 0; }, enumerable: true, configurable: true },
+    complete: { get() { const r = __fosImageSource(this); return !r || r.length > 1; }, enumerable: true, configurable: true },
+  });
+
+  const contentWindows = new WeakMap();
+  Object.defineProperties(global.HTMLIFrameElement.prototype, {
+    contentWindow: {
+      get() {
+        if (!this.isConnected) return null;
+        let w = contentWindows.get(this);
+        if (!w) contentWindows.set(this, w = new RemoteWindow(false, this));
+        return w;
+      },
+      enumerable: true, configurable: true,
+    },
+    // Frames are other runtimes: their documents are out of reach
+    contentDocument: { get() { return null; }, enumerable: true, configurable: true },
+  });
+
   let rafId = 0;
   const rafs = new Map();
   define(global, {
@@ -3403,7 +3627,7 @@
     EventTarget: EventTargetCtor,
     fetch, Headers, Request, Response, Blob, File, FormData, ReadableStream,
     ReadableStreamDefaultReader, ReadableStreamDefaultController, WritableStream, WritableStreamDefaultWriter,
-    TransformStream, TextEncoderStream, TextDecoderStream, MessageChannel, MessagePort,
+    TransformStream, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, MessageChannel, MessagePort,
     XMLHttpRequest, XMLHttpRequestUpload, XMLHttpRequestEventTarget,
     TextEncoder, TextDecoder,
     MutationObserver: noopObserver, IntersectionObserver: noopObserver, ResizeObserver: noopObserver,
@@ -3417,7 +3641,10 @@
     requestIdleCallback(cb) { return setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1); },
     cancelIdleCallback(id) { clearTimeout(id); },
     matchMedia,
-    getComputedStyle(el) { return el.style; },
+    getComputedStyle(el, pseudo) {
+      if (!(el instanceof Element)) throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+      return makeComputedDeclaration(el, pseudo == null ? '' : String(pseudo));
+    },
     getSelection() { return { rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }; },
     scrollTo(x, y) { __fosScrollTo(typeof x === 'object' && x ? (+x.top || 0) : (+y || 0)); },
     scroll(x, y) { global.scrollTo(x, y); },
@@ -3438,6 +3665,22 @@
       document.dispatchEvent(new Event('readystatechange'));
     },
     __fosSetCurrentScript(s) { currentScript = s; },
+    // This window is a frame's: its parent is another runtime's
+    __fosBecomeFrame() {
+      const parentWindow = new RemoteWindow(true, null);
+      for (const k of ['parent', 'top']) Object.defineProperty(global, k, { value: parentWindow, writable: true, configurable: true });
+    },
+    // Messages from other windows, as `message` events
+    __fosDeliverMessages() {
+      for (const [json, origin, iframe] of __fosTakeInbox()) {
+        let data;
+        try { data = JSON.parse(json); } catch { continue; }
+        const source = iframe ? iframe.contentWindow : global.parent;
+        const ev = new MessageEvent('message', { data, origin, source });
+        ev.isTrusted = true;
+        global.dispatchEvent(ev);
+      }
+    },
   });
   global.location = new Location();
   global.origin = global.location.origin;

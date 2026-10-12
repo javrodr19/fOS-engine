@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use fos_css::properties::Color;
-use fos_css::style::{Direction, Style, TextAlign, VerticalAlign, Visibility, WordBreak};
+use fos_css::style::{Direction, Style, TextAlign, TextWrapStyle, VerticalAlign, Visibility, WordBreak};
 use fos_dom::NodeId;
 
-use super::block::{clips, intrinsic_outer, layout_block_level, relative_offset, Laid, LayoutCtx, Sizing};
-use super::box_tree::{InlineContent, InlineItem};
+use super::block::{clips, intrinsic_outer, layout_block_level, placeholder, relative_offset, Laid, LayoutCtx, Sizing};
+use super::box_tree::{InlineContent, InlineItem, LayoutBox};
 use super::fonts::{Glyph, ResolvedFont, ShapedWord};
 use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect, TextFragment};
 
@@ -30,6 +30,8 @@ enum PieceKind {
     Open { style: u32, node: NodeId },
     Close,
     Atomic(usize),
+    /// An absolutely positioned box's place (no room taken)
+    OutOfFlow(usize),
     Break,
 }
 
@@ -68,6 +70,7 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
     let mut opportunity = false;
     let mut stack: Vec<u32> = Vec::new();
     let mut atomic = 0;
+    let mut out_of_flow = 0;
     for item in &ic.items {
         match item {
             InlineItem::Text { start, end, style, node } => {
@@ -144,6 +147,10 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                 atomic += 1;
                 opportunity = wraps;
             }
+            InlineItem::OutOfFlow(_) => {
+                out.push(Piece { kind: PieceKind::OutOfFlow(out_of_flow), width: 0.0, break_before: false, at: 0 });
+                out_of_flow += 1;
+            }
             InlineItem::Break => {
                 out.push(Piece { kind: PieceKind::Break, width: 0.0, break_before: false, at: 0 });
                 opportunity = false;
@@ -155,6 +162,38 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
 
 /// The end of the line starting at piece `start` (greedy: as many
 /// pieces as fit in `avail`, breaking at the last opportunity)
+/// Lines `pieces` take at width `avail` (counting stops past `limit`)
+fn line_count(pieces: &[Piece], avail: f32, indent: f32, limit: usize) -> usize {
+    let (mut start, mut n) = (0, 0);
+    while start < pieces.len() && n <= limit {
+        start = next_line(pieces, start, avail, if n == 0 { indent } else { 0.0 }).max(start + 1);
+        n += 1;
+    }
+    n
+}
+
+/// Most lines `text-wrap: balance` evens out (as in browsers)
+const BALANCED_LINES: usize = 6;
+
+/// The width to break balanced text at: the narrowest that keeps its
+/// line count, so its lines come out about equally long
+fn balanced_width(pieces: &[Piece], avail: f32, indent: f32) -> f32 {
+    let n = line_count(pieces, avail, indent, BALANCED_LINES);
+    if !(2..=BALANCED_LINES).contains(&n) {
+        return avail;
+    }
+    let (mut lo, mut hi) = (avail / n as f32, avail);
+    for _ in 0..12 {
+        let mid = (lo + hi) / 2.0;
+        if line_count(pieces, mid, indent, n) <= n {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
 fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
     let mut x = indent;
     let mut last_opportunity: Option<usize> = None;
@@ -183,6 +222,7 @@ fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
                 content = true;
             }
             PieceKind::Open { .. } | PieceKind::Close => x += p.width,
+            PieceKind::OutOfFlow(_) => {}
         }
         i += 1;
     }
@@ -228,12 +268,18 @@ struct OpenBox {
     /// The style of the last text fragment in `children`, to extend it
     last_text: Option<(u32, NodeId)>,
     decoration: (u8, Color),
+    /// In quirks mode, the line height (top and bottom) the box gives the
+    /// line once text goes directly in it
+    extents: Option<(f32, f32)>,
 }
 
 fn half_leading_extents(font: &ResolvedFont, line_height: f32, shift: f32) -> (f32, f32) {
     let (a, d) = (font.ascent(), font.descent());
-    let half = (line_height - (a + d)) / 2.0;
-    (shift - a - half, shift + d + half)
+    // As Blink: the leading above the text is half of it, floored to a
+    // whole pixel; the rest goes below
+    let leading = line_height - (a + d);
+    let above = (leading / 2.0).floor();
+    (shift - a - above, shift + d + (leading - above))
 }
 
 /// The baseline shift of a box with `font` inside a parent box with
@@ -278,6 +324,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }
     }
     let atomic_styles: Vec<&Style> = ic.items.iter().filter_map(|i| if let InlineItem::Atomic(b) = i { Some(&b.style) } else { None }).collect();
+    let out_of_flow: Vec<&LayoutBox> = ic.items.iter().filter_map(|i| if let InlineItem::OutOfFlow(b) = i { Some(&**b) } else { None }).collect();
     let widths: Vec<f32> = atomics.iter().map(|a| a.as_ref().map_or(0.0, |a| a.margin_box_width())).collect();
     let rtl = ic.styles[0].inherited.direction == Direction::Rtl;
     let levels = bidi_levels(&ic.text, rtl);
@@ -286,7 +333,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     let container = &ic.styles[0];
     let indent = container.inherited.text_indent.resolve(avail);
     let root_font = fonts[0];
-    let root_lh = container.inherited.line_height.resolve(root_font.size);
+    let root_lh = root_font.line_height(container.inherited.line_height);
     let align = container.inherited.text_align;
 
     let mut frags: Vec<Fragment> = Vec::new();
@@ -294,6 +341,8 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     // Inline boxes open across line ends: (style, node)
     let mut carried: Vec<(u32, NodeId)> = Vec::new();
     let full_avail = avail;
+    // Balanced text breaks as if narrower (and aligns in the full width)
+    let wrap = if container.inherited.text_wrap == TextWrapStyle::Balance && ctx.floats.is_empty() { balanced_width(&pieces, avail, indent) } else { avail };
     let mut start = 0;
     let mut li = 0;
     loop {
@@ -309,7 +358,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             let bottom = top + root_lh.max(1.0);
             let (l, r) = ctx.floats.available(top, bottom, base.0, base.0 + full_avail);
             if r - l < full_avail {
-                if first_run_width(&pieces, start) + first_indent > r - l {
+                if first_run_width(&pieces, start) + first_indent > r - l + 0.01 {
                     if let Some(next) = ctx.floats.next_bottom(top, bottom).filter(|&n| n > top) {
                         y = next - base.1;
                         continue;
@@ -320,7 +369,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             }
         }
         let a = start;
-        let b = next_line(&pieces, start, avail, first_indent).max((start + 1).min(pieces.len()));
+        let b = next_line(&pieces, start, avail.min(wrap), first_indent).max((start + 1).min(pieces.len()));
         start = b;
         li += 1;
         let line = &pieces[a..b];
@@ -366,6 +415,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     end = x;
                     has_content |= p.width > 0.0;
                 }
+                PieceKind::OutOfFlow(_) => {}
                 PieceKind::Break => has_content = true,
             }
         }
@@ -387,6 +437,14 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         let extra = if justify { free / opportunities as f32 } else { 0.0 };
 
         // Pass 2: fragments, relative to the line's root baseline
+        // (absolutely positioned boxes' places: index, x before and after
+        // the pending space, and the content pieces placed before them)
+        let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
+        let mut placed_content = 0usize;
+        let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
+        // The line height quirk: in quirks mode, an inline box (the root one
+        // too) adds its line height to the line only when text goes in it
+        let quirks = ctx.quirks;
         let mut stack: Vec<OpenBox> = vec![OpenBox {
             style: 0,
             node: NodeId::NONE,
@@ -396,9 +454,9 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             children: Vec::new(),
             last_text: None,
             decoration: ic.decoration,
+            extents: quirks.then_some((root_top, root_bottom)),
         }];
-        let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
-        let (mut top, mut bottom) = (root_top, root_bottom);
+        let (mut top, mut bottom) = if quirks { (f32::INFINITY, f32::NEG_INFINITY) } else { (root_top, root_bottom) };
         let mut x = start_x + offset;
         let order = visual_order(line, &carried, levels.as_deref(), rtl);
         // Boxes still open at the line's end continue on the next
@@ -422,7 +480,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             let p = match v {
                 Visual::Piece(i) => &line[i],
                 Visual::OpenCarried(style, node) => {
-                    open_box(&mut stack, ic, &fonts, style, node, x, false, &mut top, &mut bottom);
+                    open_box(&mut stack, ic, &fonts, style, node, x, false, quirks, &mut top, &mut bottom);
                     continue;
                 }
                 Visual::CloseOpen => {
@@ -444,6 +502,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     pending = 0.0;
                     pending_n = 0;
                     let top_box = stack.last_mut().expect("root box");
+                    if let Some((t, b)) = top_box.extents.take() {
+                        top = top.min(t);
+                        bottom = bottom.max(b);
+                    }
                     let font = fonts[*style as usize];
                     let st = &ic.styles[*style as usize];
                     let extend = top_box.last_text == Some((*style, *node));
@@ -467,6 +529,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     x += word.width;
                     content = true;
+                    placed_content += 1;
                 }
                 PieceKind::Atomic(i) => {
                     x += pending + extra * pending_n as f32;
@@ -478,7 +541,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                         let st = atomic_styles[*i];
                         let h = laid.mt.size() + laid.frag.border_box.h + laid.mb.size();
                         let bl = atomic_baseline(&laid);
-                        let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, st.inherited.line_height.resolve(st.font_size()));
+                        let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, ctx.fonts.resolve(st).line_height(st.inherited.line_height));
                         top = top.min(shift - bl);
                         bottom = bottom.max(shift - bl + h);
                         // Inside its inline box (whose opacity, filter...
@@ -490,6 +553,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     x += p.width;
                     content = true;
+                    placed_content += 1;
                 }
                 PieceKind::Open { style, node } => {
                     if content {
@@ -497,25 +561,48 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     }
                     pending = 0.0;
                     pending_n = 0;
-                    open_box(&mut stack, ic, &fonts, *style, *node, x, true, &mut top, &mut bottom);
+                    open_box(&mut stack, ic, &fonts, *style, *node, x, true, quirks, &mut top, &mut bottom);
                     x += p.width;
                 }
                 PieceKind::Close => {
                     x += p.width;
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
-                PieceKind::Break => {}
+                PieceKind::OutOfFlow(i) => placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content)),
+                // A line break counts as text
+                PieceKind::Break => {
+                    if let Some((t, b)) = stack.last_mut().and_then(|o| o.extents.take()) {
+                        top = top.min(t);
+                        bottom = bottom.max(b);
+                    }
+                }
             }
+        }
+        if top > bottom {
+            // Nothing gave the line a height
+            (top, bottom) = (root_top, root_bottom);
         }
         while stack.len() > 1 {
             close_box(&mut stack, ic, &fonts, x, false, avail);
         }
         let root = stack.pop().expect("root box");
+        // The space before an absolutely positioned box is before it when
+        // content follows on the line (at the line's end, it is dropped)
+        let placed = placed.into_iter().map(|(i, x0, x1, n)| (i, if placed_content > n { x1 } else { x0 }));
+        // An absolutely positioned box's static position: where it stands
+        // in the line, or below the line if it was block-level
+        let static_rect = |i: usize, x: f32, line_top: f32, line_bottom: f32| {
+            let b = out_of_flow[i];
+            let at = if b.style.box_.inline_origin { Rect::new(x, line_top, 0.0, 0.0) } else { Rect::new(0.0, line_bottom, 0.0, 0.0) };
+            Fragment::Box(placeholder(b, at))
+        };
         if !has_content {
+            frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, y, y)));
             continue;
         }
         let baseline = y - top;
         let mut line_frags = root.children;
+        line_frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, top, bottom)));
         for f in &mut line_frags {
             f.translate(0.0, baseline);
         }
@@ -653,19 +740,27 @@ fn visual_order(line: &[Piece], carried: &[(u32, NodeId)], levels: Option<&[u8]>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont], style: u32, node: NodeId, x: f32, has_start: bool, top: &mut f32, bottom: &mut f32) {
+#[allow(clippy::too_many_arguments)]
+fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont], style: u32, node: NodeId, x: f32, has_start: bool, quirks: bool, top: &mut f32, bottom: &mut f32) {
     let parent = stack.last().expect("root box");
     let st = &ic.styles[style as usize];
     let font = fonts[style as usize];
     let pfont = fonts[parent.style as usize];
-    let lh = st.inherited.line_height.resolve(font.size);
+    let lh = font.line_height(st.inherited.line_height);
     let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, font.ascent(), font.ascent() + font.descent(), lh);
     let (t, b) = half_leading_extents(&font, lh, shift);
-    *top = top.min(t);
-    *bottom = bottom.max(b);
+    // (in quirks mode, boxes with vertical borders or padding count at once)
+    let edges = st.border.width[0] + st.border.width[2] + st.box_.padding[0].resolve(0.0) + st.box_.padding[2].resolve(0.0);
+    let extents = if quirks && edges <= 0.0 {
+        Some((t, b))
+    } else {
+        *top = top.min(t);
+        *bottom = bottom.max(b);
+        None
+    };
     let own = st.box_.text_decoration_line;
     let decoration = if own != 0 { (parent.decoration.0 | own, st.box_.text_decoration_color.unwrap_or(st.color())) } else { parent.decoration };
-    stack.push(OpenBox { style, node, shift, x, has_start, children: Vec::new(), last_text: None, decoration });
+    stack.push(OpenBox { style, node, shift, x, has_start, children: Vec::new(), last_text: None, decoration, extents });
 }
 
 /// Close the innermost inline box at `x` (the end of its margin box) into
@@ -698,6 +793,11 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         scroll_extent: None,
     };
     frag.update_ink();
+    // `position: relative` moves the box and its content, not the line
+    let rel = relative_offset(st, cb_w, None);
+    if rel != (0.0, 0.0) {
+        frag.translate(rel.0, rel.1);
+    }
     let parent = stack.last_mut().expect("root box");
     parent.children.push(Fragment::Box(frag));
     parent.last_text = None;
@@ -738,6 +838,7 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                         pending += p.width;
                     }
                 }
+                PieceKind::OutOfFlow(_) => {}
                 _ => {
                     x += pending + p.width;
                     pending = 0.0;

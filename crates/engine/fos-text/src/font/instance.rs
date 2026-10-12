@@ -32,13 +32,43 @@ pub fn glyph_count(data: &[u8], index: u32) -> u16 {
     ttf_parser::Face::parse(data, index).map_or(0, |f| f.number_of_glyphs())
 }
 
+/// The variation axes of a variable TrueType face: (tag, min, default,
+/// max); empty for other faces
+pub fn axes(data: &[u8], index: u32) -> Vec<([u8; 4], f32, f32, f32)> {
+    let Ok(face) = ttf_parser::Face::parse(data, index) else { return Vec::new() };
+    if !face.is_variable() || face.tables().glyf.is_none() {
+        return Vec::new();
+    }
+    face.variation_axes().into_iter().map(|a| (a.tag.to_bytes(), a.min_value, a.def_value, a.max_value)).collect()
+}
+
 /// The face at `index` of `data` as a static TrueType font at `weight`
 /// (clamped to its `wght` axis); `None` for faces without TrueType
 /// outlines or a weight axis
 pub fn instance_at_weight(data: &[u8], index: u32, weight: f32) -> Option<Vec<u8>> {
-    let (min, _, max) = weight_axis(data, index)?;
+    weight_axis(data, index)?;
+    instance(data, index, &[(*b"wght", weight)])
+}
+
+/// The face at `index` of `data` as a static TrueType font at the axis
+/// coordinates `coords` (each clamped to its axis; axes the face lacks are
+/// ignored, others keep their defaults); `None` for faces that are not
+/// variable or lack TrueType outlines
+pub fn instance(data: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Option<Vec<u8>> {
+    let axes = axes(data, index);
+    if axes.is_empty() {
+        return None;
+    }
     let mut face = ttf_parser::Face::parse(data, index).ok()?;
-    face.set_variation(Tag::from_bytes(b"wght"), weight.clamp(min, max))?;
+    let mut weight = None;
+    for &(tag, value) in coords {
+        let Some(&(_, min, _, max)) = axes.iter().find(|a| a.0 == tag) else { continue };
+        let value = value.clamp(min, max);
+        face.set_variation(Tag::from_bytes(&tag), value)?;
+        if &tag == b"wght" {
+            weight = Some(value);
+        }
+    }
     let raw = face.raw_face();
     let count = face.number_of_glyphs();
 
@@ -99,7 +129,11 @@ pub fn instance_at_weight(data: &[u8], index: u32, weight: f32) -> Option<Vec<u8
                 put(&mut bytes, 28, 0);
                 put(&mut bytes, 30, 0);
             }
-            b"OS/2" => put(&mut bytes, 4, weight.clamp(1.0, 1000.0).round() as u16),
+            b"OS/2" => {
+                if let Some(w) = weight {
+                    put(&mut bytes, 4, w.clamp(1.0, 1000.0).round() as u16);
+                }
+            }
             _ => {}
         }
         tables.push((tag, bytes));
@@ -240,13 +274,13 @@ impl OutlineBuilder for Outline {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A variable font with a `wght` axis (100 to 900, default 400) and one
     /// square glyph, 100 units wide with a 500 advance, that grows 100
     /// units wider (advance included) at weight 900
-    fn variable_square() -> Vec<u8> {
+    pub(crate) fn variable_square() -> Vec<u8> {
         let be16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_be_bytes());
         let be32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_be_bytes());
         let mut head = vec![0u8; 54];
@@ -321,7 +355,15 @@ mod tests {
             be32(&mut gvar, o);
         }
         gvar.extend_from_slice(&gvd);
+        // name: family "Square" (Windows, Unicode BMP, en-US)
+        let family: Vec<u8> = "Square".encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+        let mut name = Vec::new();
+        for v in [0u16, 1, 18, 3, 1, 0x409, 1, family.len() as u16, 0] {
+            be16(&mut name, v);
+        }
+        name.extend_from_slice(&family);
         write_sfnt(vec![
+            (*b"name", name),
             (*b"head", head),
             (*b"hhea", hhea),
             (*b"maxp", maxp),

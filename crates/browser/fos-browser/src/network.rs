@@ -129,7 +129,7 @@ impl NetworkManager {
 
     /// Fetch a URL with caching. Non-2xx responses are errors.
     pub fn fetch(&mut self, url: &str, page_url: Option<&str>) -> Result<FetchResult, NetworkError> {
-        let result = self.fetch_any_status(url, page_url, None, false)?;
+        let result = self.fetch_any_status(url, page_url, None, None)?;
         if !(200..300).contains(&result.status) {
             return Err(NetworkError::HttpError(result.status));
         }
@@ -145,8 +145,10 @@ impl NetworkManager {
         url: &str,
         page_url: Option<&str>,
         accept: Option<&str>,
-        navigation: bool,
+        navigation: Option<Destination>,
     ) -> Result<FetchResult, NetworkError> {
+        let dest = navigation;
+        let navigation = navigation.is_some();
         if let Some(hit) = self.cached(url) {
             return Ok(hit);
         }
@@ -162,6 +164,9 @@ impl NetworkManager {
         let mut headers = request_headers(page_url, &url);
         if let Some(accept) = accept {
             headers.push(("Accept".to_string(), accept.to_string()));
+        }
+        if let Some(dest) = dest {
+            headers.extend(navigation_metadata(page_url, &url, dest));
         }
         let context = if navigation {
             CookieContext::navigation(page_url, "GET")
@@ -342,7 +347,16 @@ impl NetworkManager {
     /// `initiator` (a link followed, a script's navigation); None when the
     /// user started it. This decides the cookies sent and the Referer.
     pub fn fetch_page_from(&mut self, url: &str, initiator: Option<&str>) -> Result<FetchedPage, NetworkError> {
-        let result = self.fetch_any_status(url, initiator, Some(ACCEPT_DOCUMENT), true)?;
+        self.fetch_document(url, initiator, Destination::Document)
+    }
+
+    /// Fetch the document of an iframe in the page at `parent`
+    pub fn fetch_frame_document(&mut self, url: &str, parent: &str) -> Result<FetchedPage, NetworkError> {
+        self.fetch_document(url, Some(parent), Destination::Iframe)
+    }
+
+    fn fetch_document(&mut self, url: &str, initiator: Option<&str>, dest: Destination) -> Result<FetchedPage, NetworkError> {
+        let result = self.fetch_any_status(url, initiator, Some(ACCEPT_DOCUMENT), Some(dest))?;
         let mime = result.content_type
             .split(';')
             .next()
@@ -417,6 +431,39 @@ impl Default for NetworkManager {
 }
 
 /// Headers a request from the page at `page_url` carries (its Referer)
+/// What a navigation loads: a tab's document, or a frame's
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    Document,
+    Iframe,
+}
+
+/// Fetch Metadata of a navigation to `url` from the page at `initiator`
+/// (None: the user started it): `Sec-Fetch-Site`, `-Mode`, `-Dest` and,
+/// for user navigations, `-User`, as browsers send them
+fn navigation_metadata(initiator: Option<&str>, url: &str, dest: Destination) -> Vec<(String, String)> {
+    let site = match initiator {
+        None => "none",
+        Some(from) if fos_net::url_util::origin(from).is_some() && fos_net::url_util::origin(from) == fos_net::url_util::origin(url) => "same-origin",
+        Some(from) if fos_net::psl::same_site(from, url) => "same-site",
+        Some(_) => "cross-site",
+    };
+    let dest = match dest {
+        Destination::Document => "document",
+        Destination::Iframe => "iframe",
+    };
+    let mut out = vec![
+        ("Sec-Fetch-Site".to_string(), site.to_string()),
+        ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
+        ("Sec-Fetch-Dest".to_string(), dest.to_string()),
+        ("Upgrade-Insecure-Requests".to_string(), "1".to_string()),
+    ];
+    if initiator.is_none() {
+        out.push(("Sec-Fetch-User".to_string(), "?1".to_string()));
+    }
+    out
+}
+
 fn request_headers(page_url: Option<&str>, url: &str) -> Vec<(String, String)> {
     page_url
         .and_then(|page| crate::script_fetch::referrer_for(page, url))

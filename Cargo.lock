@@ -788,6 +788,7 @@ name = "fos-browser"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "flate2",
  "fos-a11y",
  "fos-canvas",
  "fos-css",
@@ -891,6 +892,7 @@ name = "fos-jsvm"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",
+ "unicode-ident",
 ]
 
 [[package]]

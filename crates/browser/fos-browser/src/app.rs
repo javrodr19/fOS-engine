@@ -84,6 +84,14 @@ struct BrowserApp {
     renderer: PageRenderer,
     /// Current rendered page (cached)
     rendered_page: Option<RenderedPage>,
+    /// The documents the page's iframes show
+    frames: crate::frames::Frames,
+    /// `<img>` elements told their image loaded, and which (a new `src`
+    /// loads again)
+    image_loads: std::collections::HashMap<fos_dom::NodeId, String>,
+    /// `load` events for images are being fired (their handlers may load
+    /// more images; those fire next time)
+    firing_image_loads: bool,
     /// Initial URL
     initial_url: String,
     /// Window dimensions
@@ -139,6 +147,9 @@ impl BrowserApp {
             loader: Loader::new(),
             renderer: PageRenderer::new(800, 600),
             rendered_page: None,
+            frames: Default::default(),
+            image_loads: Default::default(),
+            firing_image_loads: false,
             initial_url,
             width: 1024,
             height: 768,
@@ -277,6 +288,8 @@ impl BrowserApp {
         // painting without them would show the page unstyled first
         page.stylesheets = self.load_stylesheets(&page);
         self.renderer.new_page();
+        self.frames.clear();
+        self.image_loads.clear();
         self.renderer.set_stylesheets(page.stylesheets.clone());
         log::info!("Rendering {} bytes of HTML...", page.html.len());
         self.current_url = page.url.clone();
@@ -300,7 +313,7 @@ impl BrowserApp {
         self.load_web_fonts();
         let width = self.content_width() as f32;
         let Some(page) = self.current_page.as_ref() else { return };
-        let previous = self.renderer.images().clone();
+        let previous = self.renderer.images();
         let css_urls = self.renderer.css_image_urls();
         let images = crate::image_loader::load_for_page(&mut self.network, page, width, &previous, &css_urls);
         if !Arc::ptr_eq(&images, &previous) {
@@ -309,6 +322,32 @@ impl BrowserApp {
             self.ensure_render_covers_scroll();
             self.request_redraw();
         }
+        self.fire_image_loads();
+    }
+
+    /// Fire `load` at the `<img>` elements whose images arrived since they
+    /// were last told
+    fn fire_image_loads(&mut self) {
+        if self.firing_image_loads {
+            return;
+        }
+        let Some(doc) = self.current_document() else { return };
+        let images = self.renderer.images();
+        let loaded = crate::image_loader::loaded_img_elements(&lock_document(&doc), &images, self.content_width() as f32);
+        let new: Vec<_> = loaded.into_iter().filter(|(node, url)| self.image_loads.get(node) != Some(url)).collect();
+        let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) else { return };
+        if new.is_empty() {
+            return;
+        }
+        self.firing_image_loads = true;
+        for (node, url) in new {
+            self.image_loads.insert(node, url);
+            rt.fire_event(node, "load");
+        }
+        // Handlers may have changed the page
+        self.refresh_if_dom_changed();
+        self.follow_script_navigation();
+        self.firing_image_loads = false;
     }
 
     /// Fetch the web fonts the page's CSS uses; text is redrawn in them
@@ -344,6 +383,10 @@ impl BrowserApp {
         if let Some(waker) = self.network_waker.clone() {
             page.set_network_waker(waker);
         }
+        // Scripts see the real viewport from the start (pages pick their
+        // layout from innerWidth and matchMedia while loading)
+        self.sync_page_geometry();
+        let Some(page) = self.current_page.as_mut() else { return };
         let network = &mut self.network;
         let page_url = page.url.clone();
         if let Err(e) = page.execute_scripts_with(&mut PageFetcher { network, page_url: &page_url }) {
@@ -353,6 +396,8 @@ impl BrowserApp {
 
         self.refresh_if_dom_changed();
         self.load_images();
+        self.sync_frames();
+        self.process_frame_tasks();
         self.follow_script_navigation();
 
         // Build accessibility tree and extract media from DOM
@@ -379,6 +424,42 @@ impl BrowserApp {
         self.current_page.as_ref().and_then(Page::document)
     }
 
+    /// Load the frames of iframes added (or pointed elsewhere) since the
+    /// last check, and show the pictures of frames that changed
+    fn sync_frames(&mut self) {
+        let Some(doc) = self.current_document() else { return };
+        let Some(layout) = self.renderer.layout_snapshot() else { return };
+        if self.frames.sync(&mut self.network, &doc, &layout) {
+            self.show_frame_pictures();
+        }
+    }
+
+    fn show_frame_pictures(&mut self) {
+        let pictures = self.frames.pictures();
+        if self.renderer.update_canvases(pictures) {
+            self.rerender_at(self.render_start_y);
+            self.request_redraw();
+        }
+    }
+
+    /// Run the frames' due timers and finished requests, then hand
+    /// messages and `load` events between the page and its frames
+    fn process_frame_tasks(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.frames.process_tasks(&mut self.network);
+        let parent_ran = match self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
+            Some(rt) => self.frames.exchange(rt, &self.current_url),
+            None => false,
+        };
+        if parent_ran {
+            self.refresh_if_dom_changed();
+            self.follow_script_navigation();
+        }
+        self.show_frame_pictures();
+    }
+
     /// Re-render if the DOM changed since it was laid out (e.g. by a script)
     fn refresh_if_dom_changed(&mut self) {
         // What scripts drew on canvases
@@ -394,8 +475,9 @@ impl BrowserApp {
             self.rerender_at(self.render_start_y);
             self.ensure_render_covers_scroll();
             self.request_redraw();
-            // Scripts may have added images
+            // Scripts may have added images and frames
             self.load_images();
+            self.sync_frames();
         }
     }
 
@@ -524,6 +606,7 @@ impl BrowserApp {
         if let Some(rt) = self.current_page.as_mut().and_then(|p| p.js_runtime.as_mut()) {
             rt.set_layout(layout, viewport, scroll);
             rt.set_box_scrolls(box_scrolls);
+            rt.set_layouter(self.renderer.layouter());
         }
     }
 
@@ -585,6 +668,8 @@ impl BrowserApp {
                 let start = self.render_start_y;
                 self.rerender_at(start);
                 self.ensure_render_covers_scroll();
+                // Frames follow their iframes' new sizes
+                self.sync_frames();
             }
         }
 
@@ -936,6 +1021,19 @@ impl BrowserApp {
         // handlers run first and decide whether a link is followed
         let doc_x = hit_x;
         let doc_y = content_y as f32 + self.scroll_offset;
+        // Clicks in a frame belong to its document
+        if let Some(iframe) = self.renderer.node_at(doc_x, doc_y).filter(|n| self.frames.has_frame(*n)) {
+            let content = self.renderer.layout_snapshot().and_then(|l| l.content_box(iframe));
+            if let Some(c) = content {
+                let top = self.frames.click(&mut self.network, iframe, doc_x - c.x, doc_y - c.y);
+                self.process_frame_tasks();
+                self.show_frame_pictures();
+                if let Some(url) = top {
+                    self.follow_link(&url);
+                }
+                return;
+            }
+        }
         let has_js = self.current_page.as_ref().is_some_and(|p| p.js_runtime.is_some());
         if has_js {
             if let Some(node) = self.renderer.node_at(doc_x, doc_y) {
@@ -1168,10 +1266,16 @@ impl ApplicationHandler for BrowserApp {
         // Deliver finished network requests, then run due timers
         self.process_js_network();
         self.process_js_timers();
+        self.process_frame_tasks();
 
         // Wake up for the next timer tick only while timers are pending;
         // otherwise sleep until the next input event (zero idle CPU)
-        match self.current_page.as_ref().and_then(Page::next_timer_due) {
+        let page_due = self.current_page.as_ref().and_then(Page::next_timer_due);
+        let due = match (page_due, self.frames.next_timer_due()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match due {
             // Timers never fire more often than every TIMER_TICK, which
             // keeps a page spinning on `setTimeout(f, 0)` from pegging a core
             Some(due) => {

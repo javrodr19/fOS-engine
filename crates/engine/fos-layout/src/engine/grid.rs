@@ -10,7 +10,7 @@ use std::sync::Arc;
 use fos_css::grid::{Breadth, GridLine, GridStyle, RepeatCount, TemplateItem, TrackSize};
 use fos_css::style::{AlignContent, AlignItems, AlignSelf, JustifyContent, Style};
 
-use super::block::{intrinsic_outer, layout_sized, placeholder, relative_offset, Forced, LayoutCtx, Sizing};
+use super::block::{clips, content_size, edges, intrinsic_outer, layout_sized, placeholder, relative_offset, Forced, LayoutCtx, Sizing};
 use super::box_tree::LayoutBox;
 use super::fragment::{Fragment, Rect};
 
@@ -299,7 +299,14 @@ impl Track {
 /// Size the tracks of one axis (§11, simplified): `contrib[i]` is item
 /// i's (min-content, max-content) outer size in this axis and `span` its
 /// tracks
-fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, f32)], avail: Option<f32>, gap: f32, stretch: bool) {
+/// Size `tracks` for items spanning `spans`, with their min-content and
+/// max-content contributions `contrib` and their minimum contributions
+/// `minimum` (what `auto` minimums take). `min_content`: sizing under a
+/// min-content constraint, where tracks stay at their base sizes and
+/// flexible ones get no share (their flex fraction is zero, CSS Grid
+/// §12.7.1)
+#[allow(clippy::too_many_arguments)]
+fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, f32)], minimum: &[f32], avail: Option<f32>, gap: f32, stretch: bool, min_content: bool) {
     let basis = avail.unwrap_or(0.0);
     for t in tracks.iter_mut() {
         t.base = match t.size.min {
@@ -313,13 +320,14 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
     }
     let mut max_seen = vec![0.0f32; tracks.len()];
     // Items in one track
-    for (&(s, e), &(cmin, cmax)) in spans.iter().zip(contrib) {
+    for ((&(s, e), &(cmin, cmax)), &least) in spans.iter().zip(contrib).zip(minimum) {
         if e - s != 1 {
             continue;
         }
         let t = &mut tracks[s];
         match t.size.min {
-            Breadth::Auto | Breadth::MinContent => t.base = t.base.max(cmin),
+            Breadth::Auto => t.base = t.base.max(least),
+            Breadth::MinContent => t.base = t.base.max(cmin),
             Breadth::MaxContent => t.base = t.base.max(cmax),
             _ => {}
         }
@@ -347,7 +355,7 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
     // the intrinsic ones. Items spanning a flexible track are left to the
     // flexible tracks (they would otherwise inflate the auto tracks a
     // later `fr` track should have grown into)
-    for (&(s, e), &(cmin, cmax)) in spans.iter().zip(contrib) {
+    for ((&(s, e), &(_, cmax)), &cmin) in spans.iter().zip(contrib).zip(minimum) {
         if e - s < 2 || tracks[s..e].iter().any(|t| t.flex().is_some()) {
             continue;
         }
@@ -391,7 +399,7 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
                 free -= add;
             }
         }
-    } else {
+    } else if !min_content {
         for t in tracks.iter_mut().filter(|t| t.flex().is_none()) {
             t.base = t.limit.max(t.base);
         }
@@ -421,6 +429,7 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
                 }
                 fr
             }
+            None if min_content => 0.0,
             None => {
                 let single = tracks.iter().enumerate().filter_map(|(i, t)| t.flex().map(|f| max_seen[i].max(t.base) / f.max(1.0))).fold(0.0, f32::max);
                 // Items spanning flexible tracks: what they need beyond
@@ -572,6 +581,31 @@ fn prepare<'a>(style: &Style, items: &'a [LayoutBox], width: Option<f32>, height
     Prepared { items: placed.iter().map(|p| p.0).collect(), areas, cols, rows }
 }
 
+/// The items' minimum contributions to their columns (CSS Grid §6.6): an
+/// item whose preferred width is auto or a percentage contributes its
+/// margin box at its used minimum width. An automatic minimum is the
+/// content-based one (the min-content contribution), except that scroll
+/// containers and items spanning a flexible track among others have none.
+/// Other items contribute their min-content contributions
+fn minimum_contributions(items: &[&LayoutBox], spans: &[(usize, usize)], contrib: &[(f32, f32)], cols: &[TrackSize]) -> Vec<f32> {
+    use fos_css::style::{IntrinsicSize, LpAuto};
+    items.iter().zip(spans).zip(contrib).map(|((b, &(s, e)), &(min_content, _))| {
+        let st = &b.style;
+        let sized = matches!(st.box_.width, LpAuto::Lp(l) if !l.has_percent()) || st.box_.intrinsic_width[0] != IntrinsicSize::None;
+        if sized || st.box_.intrinsic_width[1] != IntrinsicSize::None || matches!(b.kind, super::box_tree::BoxKind::Replaced(_)) {
+            return min_content;
+        }
+        let ed = edges(st, 0.0);
+        let hbp = ed.horizontal_bp();
+        let outer = hbp + ed.margin[1].unwrap_or(0.0) + ed.margin[3].unwrap_or(0.0);
+        match st.box_.min_width {
+            LpAuto::Lp(l) => content_size(st, l.px, hbp) + outer,
+            LpAuto::Auto if clips(st) || (e - s > 1 && cols[s..e].iter().any(|t| matches!(t.max, Breadth::Fr(_)))) => outer,
+            LpAuto::Auto => min_content,
+        }
+    }).collect()
+}
+
 fn gaps(style: &Style, width: f32, height: Option<f32>) -> (f32, f32) {
     let b = &style.box_;
     (b.column_gap.map_or(0.0, |g| g.resolve(width)), b.row_gap.map_or(0.0, |g| g.resolve(height.unwrap_or(0.0))))
@@ -593,9 +627,10 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     // Columns from the items' min/max-content widths
     let col_spans: Vec<(usize, usize)> = p.areas.iter().map(|a| (a.c0, a.c1)).collect();
     let col_contrib: Vec<(f32, f32)> = p.items.iter().map(|b| intrinsic_outer(ctx, b)).collect();
+    let col_minimum = minimum_contributions(&p.items, &col_spans, &col_contrib, &p.cols);
     let mut cols = new_tracks(&p.cols);
     let justify = style.box_.justify_content;
-    size_tracks(&mut cols, &col_spans, &col_contrib, Some(width), cgap, matches!(justify, JustifyContent::Normal | JustifyContent::Stretch));
+    size_tracks(&mut cols, &col_spans, &col_contrib, &col_minimum, Some(width), cgap, matches!(justify, JustifyContent::Normal | JustifyContent::Stretch), false);
     let span_size = |tracks: &[Track], s: usize, e: usize, gap: f32| tracks[s..e].iter().map(|t| t.base).sum::<f32>() + gap * (e - s).saturating_sub(1) as f32;
 
     // Items at their column widths, for row heights
@@ -617,7 +652,8 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     let row_spans: Vec<(usize, usize)> = p.areas.iter().map(|a| (a.r0, a.r1)).collect();
     let mut rows = new_tracks(&p.rows);
     let align_content = style.box_.align_content;
-    size_tracks(&mut rows, &row_spans, &row_contrib, height, rgap, matches!(align_content, AlignContent::Normal | AlignContent::Stretch));
+    let row_minimum: Vec<f32> = row_contrib.iter().map(|c| c.0).collect();
+    size_tracks(&mut rows, &row_spans, &row_contrib, &row_minimum, height, rgap, matches!(align_content, AlignContent::Normal | AlignContent::Stretch), false);
 
     // Track positions with content distribution
     let total = |tracks: &[Track], gap: f32| tracks.iter().map(|t| t.base).sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32;
@@ -684,11 +720,13 @@ pub fn intrinsic_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox]) -
     let p = prepare(style, items, None, None, (cgap, 0.0));
     let spans: Vec<(usize, usize)> = p.areas.iter().map(|a| (a.c0, a.c1)).collect();
     let contrib: Vec<(f32, f32)> = p.items.iter().map(|b| intrinsic_outer(ctx, b)).collect();
-    let mins: Vec<(f32, f32)> = contrib.iter().map(|c| (c.0, c.0)).collect();
+    let minimum = minimum_contributions(&p.items, &spans, &contrib, &p.cols);
+    // The min-content size: the tracks' base sizes, which `auto` minimums
+    // take from the items' minimum contributions (as Blink sizes them)
     let mut min_tracks = new_tracks(&p.cols);
-    size_tracks(&mut min_tracks, &spans, &mins, None, cgap, false);
+    size_tracks(&mut min_tracks, &spans, &contrib, &minimum, None, cgap, false, true);
     let mut max_tracks = new_tracks(&p.cols);
-    size_tracks(&mut max_tracks, &spans, &contrib, None, cgap, false);
+    size_tracks(&mut max_tracks, &spans, &contrib, &minimum, None, cgap, false, false);
     let total = |t: &[Track]| t.iter().map(|t| t.base).sum::<f32>() + cgap * t.len().saturating_sub(1) as f32;
     let (min, max) = (total(&min_tracks), total(&max_tracks));
     (min, max.max(min))

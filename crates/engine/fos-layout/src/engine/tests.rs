@@ -1428,3 +1428,36 @@ fn white_space_between_flex_and_grid_items_is_not_rendered() {
     assert_eq!(rect_of(&t, grid).h, 20.0);
     assert_eq!(rect_of(&t, d).y - rect_of(&t, c).y, 10.0);
 }
+
+#[test]
+fn grid_min_content_comes_from_minimum_contributions() {
+    let (mut tree, html, body) = doc();
+    // A minmax(0, 1fr) column needs nothing at min-content: its flex
+    // fraction is zero there
+    let fr = el(&mut tree, body, "div", "display: grid; grid-template-columns: minmax(0, 1fr); width: min-content");
+    el(&mut tree, fr, "div", "width: 200px; height: 10px");
+    // A scroll container has no automatic minimum, so an auto column's
+    // min-content is what its other items need, and its max-content what
+    // the scroll container's content does
+    let scrolls = |tree: &mut DomTree, width: &str| {
+        let g = el(tree, body, "div", &format!("display: grid; {width}"));
+        let s = el(tree, g, "div", "overflow-x: auto");
+        el(tree, s, "div", "width: 300px; height: 10px");
+        let o = el(tree, g, "div", "");
+        el(tree, o, "div", "width: 120px; height: 10px");
+        (g, s)
+    };
+    let (min, _) = scrolls(&mut tree, "width: min-content");
+    let (max, _) = scrolls(&mut tree, "width: max-content");
+    // In a narrower container the column fits it, and the scroll
+    // container scrolls
+    let narrow = el(&mut tree, body, "div", "width: 200px");
+    let g = el(&mut tree, narrow, "div", "display: grid");
+    let s = el(&mut tree, g, "div", "overflow-x: auto");
+    el(&mut tree, s, "div", "width: 300px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, fr).w, 0.0);
+    assert_eq!(rect_of(&t, min).w, 120.0);
+    assert_eq!(rect_of(&t, max).w, 300.0);
+    assert_eq!((rect_of(&t, g).w, rect_of(&t, s).w), (200.0, 200.0));
+}

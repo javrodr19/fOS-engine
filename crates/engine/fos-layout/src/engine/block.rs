@@ -928,6 +928,9 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
     // Keep the ratio when only one dimension was clamped, or when both
     // were the same way, by the limit that constrains most (CSS 2.1 §10.4)
     match (sw, sh, ratio) {
+        // One size given: the other follows it once min/max clamped it
+        (Some(_), None, Some(r)) => (cw, clamp_height(style, cw / r, cb_h, vbp)),
+        (None, Some(_), Some(r)) => (clamp_width(style, ch * r, cb_w, hbp), ch),
         (None, None, Some(r)) if cw != w && ch == h => (cw, clamp_height(style, cw / r, cb_h, vbp)),
         (None, None, Some(r)) if ch != h && cw == w => (clamp_width(style, ch * r, cb_w, hbp), ch),
         (None, None, Some(r)) if cw != w && ch != h && w > 0.0 && h > 0.0 && (cw < w) == (ch < h) => {

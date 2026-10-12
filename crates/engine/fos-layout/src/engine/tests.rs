@@ -726,6 +726,23 @@ fn justify_self_aligns_blocks_in_block_layout() {
 }
 
 #[test]
+fn images_keep_their_ratio_when_a_given_size_is_clamped() {
+    // width="1024" (a hint) and max-width: 100% in a 598px box, height
+    // auto: the height follows the clamped width
+    let (mut tree, html, body) = doc();
+    let wrap = el(&mut tree, body, "div", "width: 598px");
+    let img = el(&mut tree, wrap, "img", "width: 1024px; max-width: 100%; height: auto");
+    tree.set_attribute(img, "data-natural", "1024x576");
+    let tall = el(&mut tree, wrap, "img", "height: 576px; max-height: 288px; display: block");
+    tree.set_attribute(tall, "data-natural", "1024x576");
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, img);
+    assert_eq!(r.w, 598.0);
+    assert!((r.h - 598.0 * 576.0 / 1024.0).abs() < 0.01, "{r:?}");
+    assert_eq!((rect_of(&t, tall).w, rect_of(&t, tall).h), (512.0, 288.0));
+}
+
+#[test]
 fn percentage_sized_images_add_nothing_to_min_content() {
     // A wrapping flex row of two flex: 1 columns stays one line when one
     // holds a 1024px wide image (its width attribute's) that max-width: 95%

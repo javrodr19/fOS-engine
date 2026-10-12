@@ -1,7 +1,7 @@
 //! Custom Font Parser
 //!
 //! From-scratch OpenType/TrueType font parser using Arena allocation.
-//! Replaces ttf-parser dependency for zero-dependency font handling.
+//! PostScript (CFF/CFF2) outlines are read with ttf-parser.
 
 pub mod reader;
 mod tables;
@@ -29,6 +29,8 @@ pub enum ParseError {
 /// Parsed font with access to tables
 pub struct FontParser<'a> {
     data: &'a [u8],
+    /// The face's index in a collection
+    index: u32,
     /// Table directory
     tables: Vec<TableRecord>,
     /// Font units per em
@@ -156,6 +158,7 @@ impl<'a> FontParser<'a> {
 
         Ok(Self {
             data,
+            index,
             tables,
             units_per_em,
             num_glyphs,
@@ -235,8 +238,10 @@ impl<'a> FontParser<'a> {
     
     /// Get glyph bounding box
     pub fn glyph_bounding_box(&self, glyph_id: GlyphId) -> Option<BoundingBox> {
-        let glyf_data = self.table_data(b"glyf")?;
-        let loca_data = self.table_data(b"loca")?;
+        let (Some(glyf_data), Some(loca_data)) = (self.table_data(b"glyf"), self.table_data(b"loca")) else {
+            let r = self.postscript_face()?.glyph_bounding_box(ttf_parser::GlyphId(glyph_id.0))?;
+            return Some(BoundingBox { x_min: r.x_min, y_min: r.y_min, x_max: r.x_max, y_max: r.y_max });
+        };
         
         let offset = glyf::get_glyph_offset(loca_data, glyph_id.0, self.index_format)?;
         let next_offset = glyf::get_glyph_offset(loca_data, glyph_id.0 + 1, self.index_format)?;
@@ -258,10 +263,42 @@ impl<'a> FontParser<'a> {
     
     /// Outline a glyph
     pub fn outline_glyph<B: OutlineBuilder>(&self, glyph_id: GlyphId, builder: &mut B) -> Option<()> {
-        let glyf_data = self.table_data(b"glyf")?;
-        let loca_data = self.table_data(b"loca")?;
-        
+        let (Some(glyf_data), Some(loca_data)) = (self.table_data(b"glyf"), self.table_data(b"loca")) else {
+            let mut adapter = Outlines(builder);
+            return self.postscript_face()?.outline_glyph(ttf_parser::GlyphId(glyph_id.0), &mut adapter).map(|_| ());
+        };
         glyf::outline_glyph(glyf_data, loca_data, glyph_id.0, self.index_format, builder)
+    }
+
+    /// The face read by ttf-parser, for the PostScript outlines (`CFF `
+    /// and `CFF2` tables) of OpenType fonts without `glyf` ones, which
+    /// this parser does not read
+    fn postscript_face(&self) -> Option<ttf_parser::Face<'a>> {
+        if self.table_data(b"CFF ").is_none() && self.table_data(b"CFF2").is_none() {
+            return None;
+        }
+        ttf_parser::Face::parse(self.data, self.index).ok()
+    }
+}
+
+/// Passes ttf-parser's outline commands on to a builder
+struct Outlines<'b, B: OutlineBuilder>(&'b mut B);
+
+impl<B: OutlineBuilder> ttf_parser::OutlineBuilder for Outlines<'_, B> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.0.move_to(x, y);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.0.line_to(x, y);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.0.quad_to(x1, y1, x, y);
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.0.curve_to(x1, y1, x2, y2, x, y);
+    }
+    fn close(&mut self) {
+        self.0.close();
     }
 }
 

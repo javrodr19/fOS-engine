@@ -642,7 +642,7 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
         let (stretch, _) = self_align(self_value(jself, justify_items));
         let m = b.style.box_.margin.map(|m| m.resolve(area_w));
-        let forced_w = (stretch && b.style.box_.width.is_auto() && m[1].is_some() && m[3].is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)))
+        let forced_w = (stretch && b.style.box_.auto_width() && m[1].is_some() && m[3].is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)))
             .then(|| (area_w - m[1].unwrap_or(0.0) - m[3].unwrap_or(0.0)).max(0.0));
         let l = layout_sized(ctx, b, area_w, None, Sizing::Shrink, false, Forced { width: forced_w, height: None, root: true });
         let outer = l.mt.size() + l.frag.border_box.h + l.mb.size();

@@ -762,6 +762,14 @@ impl IntrinsicSize {
     }
 }
 
+impl BoxStyle {
+    /// `width: auto`, with no intrinsic size keyword in its place (the box
+    /// may be stretched)
+    pub fn auto_width(&self) -> bool {
+        self.width.is_auto() && self.intrinsic_width[0] == IntrinsicSize::None
+    }
+}
+
 impl Default for BoxStyle {
     fn default() -> Self {
         BoxStyle {

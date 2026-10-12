@@ -116,7 +116,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let definite = |v: LpAuto| v.resolve_definite(main_size).map(border_box);
         let mut content_laid: Option<Laid> = None;
         let align = align_of(s, style);
-        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal) && (if row { s.box_.height } else { s.box_.width }).is_auto();
+        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal) && (if row { s.box_.height.is_auto() } else { s.box_.auto_width() });
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
             // A column item's height at its cross size
             let cross_w = if stretch_cross { Some((width - margin[1] - margin[3]).max(0.0)) } else { None };
@@ -126,7 +126,8 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             (LpAuto::Lp(_), Some(v)) => v,
             _ => match definite(main_prop) {
                 Some(v) => v,
-                None if row => intrinsic_content(ctx, b).1 + bp_main,
+                // `width: min-content` and the like
+                None if row => super::block::intrinsic_size(ctx, b, s.box_.intrinsic_width[0], main_size.unwrap_or(f32::INFINITY) - bp_main).unwrap_or_else(|| intrinsic_content(ctx, b).1) + bp_main,
                 None => {
                     let laid = layout_column(ctx);
                     let h = laid.frag.border_box.h;
@@ -257,7 +258,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let forced = if row {
             Forced { width: Some(it.target), height: None, root: true }
         } else {
-            let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.width.is_auto() && !it.auto_margin[1] && !it.auto_margin[3];
+            let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.auto_width() && !it.auto_margin[1] && !it.auto_margin[3];
             Forced { width: stretch.then(|| (width - it.margin[1] - it.margin[3]).max(0.0)), height: Some(it.target), root: true }
         };
         let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, forced);
@@ -309,7 +310,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for (li, l) in lines.iter().enumerate() {
         for it in &mut flex[l.clone()] {
             let s = &it.b.style;
-            let auto_cross = if row { s.box_.height.is_auto() } else { s.box_.width.is_auto() };
+            let auto_cross = if row { s.box_.height.is_auto() } else { s.box_.auto_width() };
             let cross_auto_margins = if row { it.auto_margin[0] || it.auto_margin[2] } else { it.auto_margin[1] || it.auto_margin[3] };
             if row && auto_cross && !cross_auto_margins && matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) {
                 let mut target = (line_cross[li] - it.cross_margins(row)).max(0.0);

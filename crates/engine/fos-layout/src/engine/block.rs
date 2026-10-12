@@ -977,7 +977,7 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
 
 /// The content width an intrinsic size keyword gives a box, `avail` wide
 /// at most for fit-content (`None` for no keyword)
-fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
+pub(super) fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
     use fos_css::style::IntrinsicSize;
     if k == IntrinsicSize::None {
         return None;

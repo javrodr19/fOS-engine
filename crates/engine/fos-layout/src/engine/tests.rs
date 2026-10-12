@@ -1461,3 +1461,29 @@ fn grid_min_content_comes_from_minimum_contributions() {
     assert_eq!(rect_of(&t, max).w, 300.0);
     assert_eq!((rect_of(&t, g).w, rect_of(&t, s).w), (200.0, 200.0));
 }
+
+#[test]
+fn intrinsic_widths_size_flex_and_grid_items() {
+    let (mut tree, html, body) = doc();
+    let words = |tree: &mut DomTree, parent: NodeId| {
+        el(tree, parent, "div", "display: inline-block; width: 50px; height: 10px");
+        text(tree, parent, " ");
+        el(tree, parent, "div", "display: inline-block; width: 80px; height: 10px");
+    };
+    // A row item's flex base size, and a column or grid item's width, are
+    // the keyword's rather than stretched
+    let row = el(&mut tree, body, "div", "display: flex; width: 400px");
+    let in_row = el(&mut tree, row, "div", "width: min-content");
+    words(&mut tree, in_row);
+    let column = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 400px");
+    let in_column = el(&mut tree, column, "div", "width: max-content");
+    words(&mut tree, in_column);
+    let grid = el(&mut tree, body, "div", "display: grid; width: 400px");
+    let in_grid = el(&mut tree, grid, "div", "width: min-content");
+    words(&mut tree, in_grid);
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, in_row).w, 80.0);
+    let w = rect_of(&t, in_column).w;
+    assert!(w > 130.0 && w < 150.0, "{w}");
+    assert_eq!(rect_of(&t, in_grid).w, 80.0);
+}

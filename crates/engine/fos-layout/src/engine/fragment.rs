@@ -206,8 +206,41 @@ impl BoxFragment {
 
     /// Its ink as painted: the bounds of its transformed ink
     pub fn transformed_ink(&self) -> Rect {
-        let Some(m) = self.transform() else { return self.ink };
-        let r = self.ink;
+        self.transformed(self.ink)
+    }
+
+    /// What it adds to the scrollable overflow around it (CSS Overflow 3
+    /// §2.2): its border box and, unless it clips them, its descendants',
+    /// through its transform; not shadows or outlines (ink), nor fixed
+    /// boxes (the viewport's)
+    pub fn scrollable_overflow(&self) -> Rect {
+        let mut r = self.border_box;
+        let clips = self.style.clips() && self.kind != BoxFragmentKind::InlinePart;
+        // Positioned children whose containing block is further out escape
+        // a clip
+        let positioned = self.style.is_positioned() || self.style.has_transform() || self.style.contains_layout();
+        for c in &self.children {
+            match c {
+                Fragment::Box(cb) => {
+                    let p = cb.style.box_.position;
+                    if p == fos_css::style::Position::Fixed || (clips && !(p == fos_css::style::Position::Absolute && !positioned)) {
+                        continue;
+                    }
+                    r = r.union(&cb.transformed(cb.scrollable_overflow()));
+                }
+                Fragment::Text(t) if !clips => r = r.union(&t.rect),
+                Fragment::Text(_) => {}
+            }
+        }
+        if let Some(m) = self.marker.as_ref().filter(|_| !clips) {
+            r = r.union(&m.rect);
+        }
+        r
+    }
+
+    /// The bounds of `r` through the box's transform
+    fn transformed(&self, r: Rect) -> Rect {
+        let Some(m) = self.transform() else { return r };
         let pts = [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())].map(|p| fos_css::transform::apply(m, p));
         let (x0, x1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
         let (y0, y1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.1), b.max(p.1)));

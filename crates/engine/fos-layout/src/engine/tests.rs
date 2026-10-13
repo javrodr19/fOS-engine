@@ -1706,3 +1706,23 @@ fn replaced_sizes_without_percentages_or_natural_sizes() {
     assert_eq!(rect_of(&t, c).w, 0.0);
     assert_eq!((rect_of(&t, d).w, rect_of(&t, e).w), (300.0, 100.0));
 }
+
+#[test]
+fn the_page_scrolls_over_its_scrollable_overflow() {
+    // Box shadows are ink, not scrollable overflow (CSS Overflow 3 §2.2):
+    // djangoproject.com's footer shadow made the page 137px longer.
+    // Transformed boxes count where they are drawn; fixed ones are the
+    // viewport's
+    let page = |style: &str| {
+        let (mut tree, html, body) = doc();
+        el(&mut tree, body, "div", "height: 1000px");
+        el(&mut tree, body, "div", style);
+        layout(&tree, html, 800.0).document_height
+    };
+    let plain = page("height: 10px");
+    assert_eq!(plain, 8.0 + 1000.0 + 10.0 + 8.0);
+    assert_eq!(page("height: 10px; box-shadow: 0 0 0 300px black"), plain);
+    assert_eq!(page("height: 10px; outline: 200px solid"), plain);
+    assert_eq!(page("height: 10px; transform: translateY(100px)"), 8.0 + 1000.0 + 110.0);
+    assert_eq!(page("height: 10px; position: fixed; top: 2000px"), 8.0 + 1000.0 + 8.0);
+}

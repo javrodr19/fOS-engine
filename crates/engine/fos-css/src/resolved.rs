@@ -21,7 +21,7 @@ pub const PROPERTIES: &[&str] = &[
     "min-height", "min-width", "object-fit", "opacity", "order", "outline-color", "outline-offset", "outline-style",
     "outline-width", "overflow-wrap", "overflow-x", "overflow-y", "padding-bottom", "padding-left", "padding-right",
     "padding-top", "pointer-events", "position", "right", "row-gap", "table-layout", "text-align",
-    "text-decoration-color", "text-decoration-line", "text-decoration-style", "text-indent", "text-overflow",
+    "text-box-edge", "text-box-trim", "text-decoration-color", "text-decoration-line", "text-decoration-style", "text-indent", "text-overflow",
     "text-transform", "text-wrap-style", "top", "transform", "transform-origin", "vertical-align", "visibility",
     "white-space", "width", "word-break", "word-spacing", "z-index",
 ];
@@ -318,6 +318,31 @@ impl Style {
                 }
             }
             "text-overflow" => b.text_overflow.as_css().into(),
+            "text-box-trim" => {
+                use crate::style::text_box::*;
+                match b.text_box_trim {
+                    0 => "none",
+                    TRIM_START => "trim-start",
+                    TRIM_END => "trim-end",
+                    _ => "trim-both",
+                }
+                .into()
+            }
+            "text-box-edge" => {
+                use crate::style::text_box::*;
+                let name = |e: u8| match e {
+                    CAP => "cap",
+                    EX => "ex",
+                    ALPHABETIC => "alphabetic",
+                    IDEOGRAPHIC => "ideographic",
+                    _ => "text",
+                };
+                match i.text_box_edge {
+                    (TEXT, TEXT) => "auto".into(),
+                    (CAP | EX, TEXT) | (IDEOGRAPHIC, IDEOGRAPHIC) => name(i.text_box_edge.0).into(),
+                    (over, under) => format!("{} {}", name(over), name(under)),
+                }
+            }
             "table-layout" => b.table_layout.as_css().into(),
             "vertical-align" => match b.vertical_align {
                 VerticalAlign::Baseline => "baseline".into(),

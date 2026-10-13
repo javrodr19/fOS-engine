@@ -380,6 +380,17 @@ css_enum!(TextOverflow { Clip = "clip", Ellipsis = "ellipsis" });
 css_enum!(ObjectFit { Fill = "fill", Contain = "contain", Cover = "cover", None = "none", ScaleDown = "scale-down" });
 css_enum!(ContentVisibility { Visible = "visible", Auto = "auto", Hidden = "hidden" });
 
+/// `text-box-trim` bits and `text-box-edge` keywords (CSS Inline 3)
+pub mod text_box {
+    pub const TRIM_START: u8 = 1;
+    pub const TRIM_END: u8 = 2;
+    pub const TEXT: u8 = 0;
+    pub const CAP: u8 = 1;
+    pub const EX: u8 = 2;
+    pub const ALPHABETIC: u8 = 3;
+    pub const IDEOGRAPHIC: u8 = 4;
+}
+
 /// `contain` bits (CSS Containment 2)
 pub mod contain {
     pub const SIZE: u8 = 1;
@@ -480,6 +491,8 @@ pub struct InheritedStyle {
     pub white_space: WhiteSpace,
     /// `text-wrap-style` (`balance` evens out the lines)
     pub text_wrap: TextWrapStyle,
+    /// `text-box-edge`: the over and under edges ([`text_box`] keywords)
+    pub text_box_edge: (u8, u8),
     /// Where a table's captions go
     pub caption_side: CaptionSide,
     pub letter_spacing: f32,
@@ -509,6 +522,7 @@ impl Default for InheritedStyle {
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             text_wrap: TextWrapStyle::Auto,
+            text_box_edge: (0, 0),
             caption_side: CaptionSide::Top,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -715,6 +729,8 @@ pub struct BoxStyle {
     pub object_fit: ObjectFit,
     /// `contain` ([`contain`] bits)
     pub contain: u8,
+    /// `text-box-trim` ([`text_box`] trim bits)
+    pub text_box_trim: u8,
     pub content_visibility: ContentVisibility,
     /// `contain-intrinsic-width` and `-height` in pixels (`None`: none)
     pub contain_intrinsic: [Option<f32>; 2],
@@ -841,6 +857,7 @@ impl Default for BoxStyle {
             column_gap: None,
             object_fit: ObjectFit::Fill,
             contain: 0,
+            text_box_trim: 0,
             content_visibility: ContentVisibility::Visible,
             contain_intrinsic: [None, None],
             text_overflow: TextOverflow::Clip,
@@ -1632,6 +1649,16 @@ impl Style {
                 }
             }
             PropertyId::ContentVisibility => set!(box_, [content_visibility], enum_of!(ContentVisibility)),
+            PropertyId::TextBoxTrim => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [text_box_trim], *bits as u8);
+                }
+            }
+            PropertyId::TextBoxEdge => {
+                if let PropertyValue::Integer(e) = v {
+                    set!(inherited, [text_box_edge], ((*e / 8) as u8, (*e % 8) as u8));
+                }
+            }
             PropertyId::ContainIntrinsicWidth | PropertyId::ContainIntrinsicHeight => {
                 let size = match v {
                     PropertyValue::Keyword(Keyword::None) => None,
@@ -2144,6 +2171,8 @@ impl Style {
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
             PropertyId::Contain => copy!(box_, [contain]),
             PropertyId::ContentVisibility => copy!(box_, [content_visibility]),
+            PropertyId::TextBoxTrim => copy!(box_, [text_box_trim]),
+            PropertyId::TextBoxEdge => copy!(inherited, [text_box_edge]),
             PropertyId::ContainIntrinsicWidth => copy!(box_, [contain_intrinsic[0]]),
             PropertyId::ContainIntrinsicHeight => copy!(box_, [contain_intrinsic[1]]),
             PropertyId::TextOverflow => copy!(box_, [text_overflow]),

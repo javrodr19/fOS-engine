@@ -1670,6 +1670,43 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn text_box_trim_takes_off_the_half_leading() {
+    // text-box-trim trims the first line to the font's over edge and the
+    // last to its under edge: remix.run's headings, trimmed to cap and
+    // alphabetic, are a cap height tall per line less a line's leading
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, trim: &str| {
+        let p = el(tree, body, "div", &format!("font-size: 16px; line-height: 100px; {trim}"));
+        let s = el(tree, p, "span", "");
+        text(tree, s, "Hx");
+        (p, s)
+    };
+    let text_edges = line(&mut tree, "text-box: trim-both");
+    let cap = line(&mut tree, "text-box: trim-both cap alphabetic");
+    let start = line(&mut tree, "text-box-trim: trim-start");
+    let two = el(&mut tree, body, "div", "font-size: 16px; line-height: 100px; width: 0; text-box: cap alphabetic");
+    text(&mut tree, two, "H H");
+    let after = el(&mut tree, body, "div", "height: 1px");
+    let t = layout(&tree, html, 800.0);
+    let mut fonts = FontContext::default();
+    let mut style = Style::default();
+    std::sync::Arc::make_mut(&mut style.inherited).font_size = 16.0;
+    let font = fonts.resolve(&style);
+    let (a, d, c) = (font.ascent(), font.descent(), font.metrics.cap_height * 16.0);
+    let half = ((100.0 - a - d) / 2.0).floor();
+    let (p, s) = text_edges;
+    assert!((rect_of(&t, p).h - (a + d)).abs() < 0.5, "{:?} {a} {d}", rect_of(&t, p));
+    // The text moves up with the trimmed edge
+    assert!((rect_of(&t, s).y - rect_of(&t, p).y).abs() < 0.5, "{:?} {:?}", rect_of(&t, s), rect_of(&t, p));
+    assert!((rect_of(&t, cap.0).h - c).abs() < 0.5, "{:?} {c}", rect_of(&t, cap.0));
+    assert!((rect_of(&t, cap.1).y - (rect_of(&t, cap.0).y - (a - c))).abs() < 0.5);
+    assert!((rect_of(&t, start.0).h - (100.0 - half)).abs() < 0.5, "{:?} {half}", rect_of(&t, start.0));
+    // Only the first line's top and the last's bottom are trimmed
+    assert!((rect_of(&t, two).h - (100.0 + c)).abs() < 0.5, "{:?}", rect_of(&t, two));
+    assert!((rect_of(&t, after).y - (rect_of(&t, two).y + rect_of(&t, two).h)).abs() < 0.01);
+}
+
+#[test]
 fn replaced_sizes_without_percentages_or_natural_sizes() {
     let (mut tree, html, body) = doc();
     let img = |tree: &mut DomTree, parent: NodeId, attrs: &[(&str, &str)]| {

@@ -144,6 +144,8 @@ pub enum PropertyId {
     ObjectFit,
     Contain,
     ContentVisibility,
+    TextBoxTrim,
+    TextBoxEdge,
     ContainIntrinsicWidth,
     ContainIntrinsicHeight,
     BorderCollapse,
@@ -201,6 +203,7 @@ impl PropertyId {
                 | Self::TextTransform
                 | Self::WhiteSpace
                 | Self::TextWrapStyle
+                | Self::TextBoxEdge
                 | Self::CaptionSide
                 | Self::LetterSpacing
                 | Self::WordSpacing

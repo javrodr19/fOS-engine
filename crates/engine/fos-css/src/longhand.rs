@@ -36,6 +36,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
         "contain-intrinsic-size" => &[ContainIntrinsicWidth, ContainIntrinsicHeight],
+        "text-box" => &[TextBoxTrim, TextBoxEdge],
         "margin-block" => &[MarginTop, MarginBottom],
         "inset-block" => &[Top, Bottom],
         "inset-inline" => &[Left, Right],
@@ -70,9 +71,9 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "overflow" => &[OverflowX, OverflowY],
         "text-decoration" => &[TextDecorationLine, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition],
-        "place-items" => &[AlignItems],
+        "place-items" => &[AlignItems, JustifyItems],
         "place-content" => &[AlignContent, JustifyContent],
-        "place-self" => &[AlignSelf],
+        "place-self" => &[AlignSelf, JustifySelf],
         _ => return None,
     })
 }
@@ -180,6 +181,8 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "column-gap" => ColumnGap,
         "object-fit" => ObjectFit,
         "contain" => Contain,
+        "text-box-trim" => TextBoxTrim,
+        "text-box-edge" => TextBoxEdge,
         "content-visibility" => ContentVisibility,
         "contain-intrinsic-width" | "contain-intrinsic-inline-size" => ContainIntrinsicWidth,
         "contain-intrinsic-height" | "contain-intrinsic-block-size" => ContainIntrinsicHeight,
@@ -319,6 +322,29 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
                         }
                     }
                 }
+            }
+            true
+        }
+        // normal | <text-box-trim> || <text-box-edge>; an edge alone trims
+        // both ends
+        "text-box" => {
+            let parts: Vec<&str> = lower.split_whitespace().collect();
+            let (trim, edge) = if parts == ["normal"] {
+                (Some(PropertyValue::Integer(0)), Some(PropertyValue::Integer(0)))
+            } else {
+                let trims: Vec<&str> = parts.iter().copied().filter(|p| p.starts_with("trim-") || *p == "none").collect();
+                let edges: Vec<&str> = parts.iter().copied().filter(|p| !p.starts_with("trim-") && *p != "none").collect();
+                let trim = match trims.as_slice() {
+                    [] => text_box_trim("trim-both"),
+                    [t] => text_box_trim(t),
+                    _ => None,
+                };
+                let edge = if edges.is_empty() { text_box_edge("auto") } else { text_box_edge(&edges.join(" ")) };
+                (trim, edge)
+            };
+            if let (Some(t), Some(e)) = (trim, edge) {
+                push(out, PropertyId::TextBoxTrim, t, important);
+                push(out, PropertyId::TextBoxEdge, e, important);
             }
             true
         }
@@ -475,15 +501,20 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
+        // <align> [<justify>]?, the justify value being the align one when
+        // omitted: grid place-items: center centers both ways
         "place-items" | "place-self" => {
-            let first = components(&lower).first().copied().unwrap_or("");
-            let (id, v) = if name == "place-items" {
-                (PropertyId::AlignItems, align_items(first))
+            let parts = components(&lower);
+            let first = parts.first().copied().unwrap_or("");
+            let second = parts.get(1).copied().unwrap_or(first);
+            let (align, justify) = if name == "place-items" {
+                ((PropertyId::AlignItems, align_items(first)), (PropertyId::JustifyItems, longhand(PropertyId::JustifyItems, second, second)))
             } else {
-                (PropertyId::AlignSelf, enum_value::<AlignSelf>(first))
+                ((PropertyId::AlignSelf, enum_value::<AlignSelf>(first)), (PropertyId::JustifySelf, longhand(PropertyId::JustifySelf, second, second)))
             };
-            if let Some(v) = v {
-                push(out, id, v, important);
+            if let (Some(a), Some(j)) = (align.1, justify.1) {
+                push(out, align.0, a, important);
+                push(out, justify.0, j, important);
             }
             true
         }
@@ -570,6 +601,8 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::RowGap | P::ColumnGap => gap(v),
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::Contain => contain(v),
+        P::TextBoxTrim => text_box_trim(v),
+        P::TextBoxEdge => text_box_edge(v),
         P::ContentVisibility => enum_value::<ContentVisibility>(v),
         P::ContainIntrinsicWidth | P::ContainIntrinsicHeight => contain_intrinsic(v.strip_prefix("auto ").unwrap_or(v).trim()),
         P::TextOverflow => enum_value::<TextOverflow>(v),
@@ -761,6 +794,47 @@ fn contain(v: &str) -> Option<PropertyValue> {
         }
     };
     Some(PropertyValue::Integer(bits as i32))
+}
+
+/// `text-box-trim` as [`crate::style::text_box`] trim bits
+fn text_box_trim(v: &str) -> Option<PropertyValue> {
+    use crate::style::text_box::*;
+    Some(PropertyValue::Integer(match v {
+        "none" => 0,
+        "trim-start" => TRIM_START,
+        "trim-end" => TRIM_END,
+        "trim-both" => TRIM_START | TRIM_END,
+        _ => return None,
+    } as i32))
+}
+
+/// `text-box-edge`: auto, or an over edge and an under one (the missing
+/// one the same where it can be, else text), packed as over * 8 + under
+fn text_box_edge(v: &str) -> Option<PropertyValue> {
+    use crate::style::text_box::*;
+    let edge = |k: &str| match k {
+        "text" => Some(TEXT),
+        "cap" => Some(CAP),
+        "ex" => Some(EX),
+        "alphabetic" => Some(ALPHABETIC),
+        "ideographic" | "ideographic-ink" => Some(IDEOGRAPHIC),
+        _ => None,
+    };
+    let parts: Vec<&str> = v.split_whitespace().collect();
+    let (over, under) = match parts.as_slice() {
+        ["auto"] => (TEXT, TEXT),
+        [one] => {
+            let e = edge(one)?;
+            match e {
+                CAP | EX => (e, TEXT),
+                ALPHABETIC => return None,
+                _ => (e, e),
+            }
+        }
+        [o, u] => (edge(o).filter(|e| *e != ALPHABETIC)?, edge(u).filter(|e| matches!(*e, TEXT | ALPHABETIC | IDEOGRAPHIC))?),
+        _ => return None,
+    };
+    Some(PropertyValue::Integer((over * 8 + under) as i32))
 }
 
 /// One axis of `contain-intrinsic-size` (after any `auto`): a length or none
@@ -1890,6 +1964,34 @@ mod tests {
         assert_eq!(g.areas.as_ref().unwrap().columns, 2);
         let s = computed("grid-template-columns: repeat(2, calc(50% - 10px))");
         assert!(matches!(&s.box_.grid.template_columns[0], TemplateItem::Repeat(_, inner) if matches!(inner[0], TemplateItem::Track(t) if t.min == Breadth::Length(Lp { px: -10.0, pct: 50.0 }))));
+    }
+
+    #[test]
+    fn place_shorthands_set_both_axes() {
+        // place-items: center centers grid items both ways (remix.run's
+        // loading overlay); a second value is the justify one
+        use crate::style::{AlignItems, AlignSelf};
+        let s = computed("place-items: center");
+        assert_eq!((s.box_.align_items, AlignItems::from_u8(s.box_.grid.justify_items)), (AlignItems::Center, Some(AlignItems::Center)));
+        let s = computed("place-self: start end");
+        assert_eq!((s.box_.align_self, AlignSelf::from_u8(s.box_.grid.justify_self)), (AlignSelf::Start, Some(AlignSelf::End)));
+    }
+
+    #[test]
+    fn text_box_properties() {
+        // The shorthand without a trim trims both; one edge keyword is both
+        // edges where it can be, else the under one is text
+        use crate::style::text_box::*;
+        let s = computed("text-box: cap alphabetic");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_START | TRIM_END, (CAP, ALPHABETIC)));
+        let s = computed("text-box-trim: trim-end; text-box-edge: ex");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_END, (EX, TEXT)));
+        let s = computed("text-box: trim-start");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_START, (TEXT, TEXT)));
+        let s = computed("text-box: normal");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (0, (TEXT, TEXT)));
+        // An under-only keyword is invalid alone
+        assert_eq!(computed("text-box-edge: alphabetic").inherited.text_box_edge, (TEXT, TEXT));
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct FontMetrics {
     /// The x-height was measured from the "x" glyph, whose hinted outline
     /// has it in whole pixels
     pub x_height_measured: bool,
+    /// The height of capital letters (`text-box-edge: cap`)
+    pub cap_height: f32,
     /// The OS/2 table's average character width (0 when absent) and the
     /// width of the face's bounding box: what text fields are sized by
     pub avg_char_width: f32,
@@ -31,7 +33,7 @@ pub struct FontMetrics {
 
 impl FontMetrics {
     /// When no font is available
-    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0, x_height: 0.448, x_height_measured: false, avg_char_width: 0.0, max_char_width: 0.0, fixed_pitch: false };
+    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0, x_height: 0.448, x_height_measured: false, cap_height: 0.56, avg_char_width: 0.0, max_char_width: 0.0, fixed_pitch: false };
 
     /// The content-area height of `normal` line height, per em
     pub fn normal_line_height(&self) -> f32 {
@@ -274,6 +276,16 @@ impl FontContext {
                     line_gap: g.max(0.0),
                     x_height: x.unwrap_or(a * 0.56),
                     x_height_measured: x.is_some() && measured.is_some(),
+                    // OS/2's sCapHeight, else the "H" glyph's top
+                    cap_height: p
+                        .table_data(b"OS/2")
+                        .filter(|t| t.len() >= 90 && u16::from_be_bytes([t[0], t[1]]) >= 2)
+                        .map(|t| i16::from_be_bytes([t[88], t[89]]))
+                        .filter(|&h| h > 0)
+                        .or_else(|| p.glyph_index('H').and_then(|g| p.glyph_bounding_box(g)).map(|b| b.y_max))
+                        .map(|h| h as f32 / upem)
+                        .filter(|&c| c > 0.0 && c <= a)
+                        .unwrap_or(a * 0.7),
                     avg_char_width: p.table_data(b"OS/2").filter(|t| t.len() >= 4).map_or(0.0, |t| i16::from_be_bytes([t[2], t[3]]).max(0) as f32 / upem),
                     max_char_width: p.table_data(b"head").filter(|t| t.len() >= 44).map_or(0.0, |t| (i16::from_be_bytes([t[40], t[41]]) as f32 - i16::from_be_bytes([t[36], t[37]]) as f32).max(0.0) / upem),
                     fixed_pitch: p.table_data(b"post").filter(|t| t.len() >= 16).is_some_and(|t| t[12..16] != [0, 0, 0, 0]),

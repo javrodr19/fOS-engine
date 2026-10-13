@@ -431,7 +431,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             let lines = inline::layout_inline(ctx, content, width, inner_cb_h, base);
             frag.children = lines.frags;
             frag.line_baselines = lines.baselines;
-            lines.height
+            let (top, bottom) = text_box_trim(ctx, style, lines.height, lines.baselines);
+            if top != 0.0 {
+                for c in &mut frag.children {
+                    c.translate(0.0, -top);
+                }
+                frag.line_baselines = frag.line_baselines.map(|(a, b)| (a - top, b - top));
+            }
+            (lines.height - top - bottom).max(0.0)
         }
         BoxKind::Flex(items) => {
             let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
@@ -1125,6 +1132,32 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         && (matches!(style.box_.width, LpAuto::Lp(l) if percent(&l)) || matches!(style.box_.max_width, fos_css::style::MaxSize::Lp(l) if percent(&l)));
     let min = if compressible { clamp(0.0) } else { clamp(min) };
     (min + hbp + margins, clamp(max) + hbp + margins)
+}
+
+/// How much `text-box-trim` takes off the top of the first line and the
+/// bottom of the last (CSS Inline 3 §5.1): down to the over edge of the
+/// container's font above the first baseline (cap height, x-height or
+/// ascent), up to its under edge below the last (the baseline or the
+/// descent). remix.run's headings are trimmed to cap and alphabetic
+fn text_box_trim(ctx: &mut LayoutCtx, style: &Style, height: f32, baselines: Option<(f32, f32)>) -> (f32, f32) {
+    use fos_css::style::text_box::*;
+    let trim = style.box_.text_box_trim;
+    let Some((first, last)) = baselines.filter(|_| trim != 0) else { return (0.0, 0.0) };
+    let font = ctx.fonts.resolve(style);
+    let size = font.size;
+    let (over, under) = style.inherited.text_box_edge;
+    let above = match over {
+        CAP => font.metrics.cap_height * size,
+        EX => font.metrics.x_height * size,
+        _ => font.ascent(),
+    };
+    let below = match under {
+        ALPHABETIC => 0.0,
+        _ => font.descent(),
+    };
+    let start = if trim & TRIM_START != 0 { first - above } else { 0.0 };
+    let end = if trim & TRIM_END != 0 { height - (last + below) } else { 0.0 };
+    (start, end)
 }
 
 /// Whether a box clips its overflow (an inline-block's baseline is then its

@@ -1230,6 +1230,7 @@ pub fn parse_length(v: &str) -> Option<Length> {
         "vmax" | "svmax" | "lvmax" | "dvmax" => (n, LengthUnit::Vmax),
         "ch" => (n, LengthUnit::Ch),
         "ex" => (n, LengthUnit::Ex),
+        "lh" => (n, LengthUnit::Lh),
         "pt" => (n * 4.0 / 3.0, LengthUnit::Px),
         "pc" => (n * 16.0, LengthUnit::Px),
         "in" => (n * 96.0, LengthUnit::Px),

@@ -1008,6 +1008,14 @@ impl StyleContext {
     pub fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32) {
         self.font_units.as_ref().map_or((size * 0.5, size * 0.5), |u| u.0.ch_ex(font, size))
     }
+
+    /// An element's line height in pixels (`lh`): `normal` is its font's
+    pub fn line_height(&self, font: &InheritedStyle) -> f32 {
+        match (font.line_height, &self.font_units) {
+            (LineHeight::Normal, Some(u)) => u.0.normal_line_height(font, font.font_size),
+            (lh, _) => lh.resolve(font.font_size),
+        }
+    }
 }
 
 /// Font metrics that styling needs: what `ch` and `ex` are
@@ -1016,6 +1024,10 @@ pub trait FontUnits: Send + Sync {
     /// first available font for the family, weight and style of `font`
     /// (CSS Values 4 §6.1.1)
     fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32);
+    /// `line-height: normal` in pixels for that font at `size`
+    fn normal_line_height(&self, _font: &InheritedStyle, size: f32) -> f32 {
+        size * 1.2
+    }
 }
 
 /// A shared [`FontUnits`]
@@ -1233,31 +1245,55 @@ impl Style {
         // `ch` and `ex` of the parent's font (for font-size) and, once the
         // font pass has set it, this element's
         let parent_units = std::cell::OnceCell::new();
-        let mut units: Option<(f32, f32)> = None;
-        for font_pass in [true, false] {
+        let mut units: Option<(f32, f32, f32)> = None;
+        // The font first: other lengths are in its em, ch and ex; then the
+        // line height (lh)
+        for pass in 0..3 {
             for d in decls {
-                // The font first: other lengths are in its em, ch and ex
-                let is_font = match &d.value {
+                let of_pass = match &d.value {
                     PropertyValue::Custom(_) => continue,
-                    PropertyValue::Unresolved(b) => matches!(b.0.as_str(), "font-size" | "font" | "font-family" | "font-weight" | "font-style"),
-                    _ => matches!(d.property, PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle),
+                    PropertyValue::Unresolved(b) => match b.0.as_str() {
+                        "font-size" | "font" | "font-family" | "font-weight" | "font-style" => 0,
+                        "line-height" => 1,
+                        _ => 2,
+                    },
+                    _ => match d.property {
+                        PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle => 0,
+                        PropertyId::LineHeight => 1,
+                        _ => 2,
+                    },
                 };
-                if is_font != font_pass {
+                if of_pass != pass {
                     continue;
                 }
                 match &d.value {
                     PropertyValue::Unresolved(b) => {
                         let custom = self.custom.clone();
-                        let parent_ch_ex = *parent_units.get_or_init(|| ctx.ch_ex(&parent.inherited, parent_font_size));
-                        let ch_ex = if font_pass { parent_ch_ex } else { *units.get_or_insert_with(|| ctx.ch_ex(&self.inherited, self.inherited.font_size)) };
+                        let (pch, pex, plh) = *parent_units.get_or_init(|| {
+                            let (ch, ex) = ctx.ch_ex(&parent.inherited, parent_font_size);
+                            (ch, ex, ctx.line_height(&parent.inherited))
+                        });
+                        let (ch, ex, lh) = match pass {
+                            0 => (pch, pex, plh),
+                            // Before this element's line height is known
+                            1 => {
+                                let (ch, ex) = ctx.ch_ex(&self.inherited, self.inherited.font_size);
+                                (ch, ex, plh)
+                            }
+                            _ => *units.get_or_insert_with(|| {
+                                let (ch, ex) = ctx.ch_ex(&self.inherited, self.inherited.font_size);
+                                (ch, ex, ctx.line_height(&self.inherited))
+                            }),
+                        };
                         let rctx = crate::values::ResolveContext {
                             custom: custom.as_deref().map(|c| c as &dyn crate::values::VarSource),
                             font_size: self.inherited.font_size,
                             parent_font_size,
                             root_font_size: ctx.root_font_size,
                             viewport: ctx.viewport,
-                            ch_ex,
-                            parent_ch_ex,
+                            ch_ex: (ch, ex),
+                            parent_ch_ex: (pch, pex),
+                            lh: (lh, plh),
                         };
                         let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &rctx).to_vec();
                         for r in &resolved {
@@ -1325,6 +1361,7 @@ impl Style {
             LengthUnit::Vmax => l.value * w.max(h) / 100.0,
             LengthUnit::Ch => l.value * ctx.ch_ex(&self.inherited, fs).0,
             LengthUnit::Ex => l.value * ctx.ch_ex(&self.inherited, fs).1,
+            LengthUnit::Lh => l.value * ctx.line_height(&self.inherited),
         };
         Lp::px(px)
     }
@@ -1951,6 +1988,7 @@ impl Style {
                         LengthUnit::Percent => l.value * parent_fs / 100.0,
                         LengthUnit::Ch => l.value * ctx.ch_ex(&parent.inherited, parent_fs).0,
                         LengthUnit::Ex => l.value * ctx.ch_ex(&parent.inherited, parent_fs).1,
+                        LengthUnit::Lh => l.value * ctx.line_height(&parent.inherited),
                         _ => self.length(*l, ctx).px,
                     },
                     PropertyValue::Mix { px, pct } => px + pct * parent_fs / 100.0,

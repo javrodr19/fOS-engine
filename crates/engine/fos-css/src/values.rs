@@ -160,6 +160,8 @@ pub struct ResolveContext<'a> {
     /// parent's (what they mean in `font-size`)
     pub ch_ex: (f32, f32),
     pub parent_ch_ex: (f32, f32),
+    /// `lh` for the element and its parent (font-size's)
+    pub lh: (f32, f32),
 }
 
 /// Find `name(` at a token boundary (case-insensitive), from `from`
@@ -557,6 +559,7 @@ impl MathParser<'_, '_> {
             "rem" => Quantity::length(n * c.root_font_size, 0.0),
             "ch" => Quantity::length(n * c.ch_ex.0, 0.0),
             "ex" => Quantity::length(n * c.ch_ex.1, 0.0),
+            "lh" => Quantity::length(n * c.lh.0, 0.0),
             "vw" | "svw" | "lvw" | "dvw" => Quantity::length(n * vw / 100.0, 0.0),
             "vh" | "svh" | "lvh" | "dvh" => Quantity::length(n * vh / 100.0, 0.0),
             "vmin" | "svmin" | "lvmin" | "dvmin" => Quantity::length(n * vw.min(vh) / 100.0, 0.0),
@@ -606,7 +609,7 @@ fn evaluate_math(expr: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -
 /// A math function of absolute lengths (`calc(1120px - 1px)`) in px, as
 /// media queries use them: `em` and `rem` are the initial 16px
 pub(crate) fn math_length(expr: &str, viewport: (f32, f32)) -> Option<f32> {
-    let ctx = ResolveContext { custom: None, font_size: 16.0, parent_font_size: 16.0, root_font_size: 16.0, viewport, ch_ex: (8.0, 8.0), parent_ch_ex: (8.0, 8.0) };
+    let ctx = ResolveContext { custom: None, font_size: 16.0, parent_font_size: 16.0, root_font_size: 16.0, viewport, ch_ex: (8.0, 8.0), parent_ch_ex: (8.0, 8.0), lh: (19.2, 19.2) };
     let out = evaluate_math(expr.trim(), &ctx, None)?;
     match out.strip_suffix("px") {
         Some(px) => px.parse().ok(),
@@ -662,7 +665,7 @@ struct CacheKey {
     font_size: u32,
     parent_font_size: u32,
     root_font_size: u32,
-    units: [u32; 4],
+    units: [u32; 6],
 }
 
 impl ResolveCache {
@@ -687,7 +690,7 @@ impl ResolveCache {
             font_size: ctx.font_size.to_bits(),
             parent_font_size: ctx.parent_font_size.to_bits(),
             root_font_size: ctx.root_font_size.to_bits(),
-            units: [ctx.ch_ex.0, ctx.ch_ex.1, ctx.parent_ch_ex.0, ctx.parent_ch_ex.1].map(f32::to_bits),
+            units: [ctx.ch_ex.0, ctx.ch_ex.1, ctx.parent_ch_ex.0, ctx.parent_ch_ex.1, ctx.lh.0, ctx.lh.1].map(f32::to_bits),
         };
         self.entries.entry(key).or_insert_with(|| resolve_declaration(name, value, important, ctx))
     }
@@ -700,7 +703,7 @@ pub fn resolve_declaration(name: &str, value: &str, important: bool, ctx: &Resol
     let Some(substituted) = substitute_vars(value, ctx.custom) else { return Vec::new() };
     // In font-size, `em` and `%` refer to the parent's font size
     let (math_ctx, basis) = if name == "font-size" || name == "font" {
-        (ResolveContext { font_size: ctx.parent_font_size, ch_ex: ctx.parent_ch_ex, ..*ctx }, Some(ctx.parent_font_size))
+        (ResolveContext { font_size: ctx.parent_font_size, ch_ex: ctx.parent_ch_ex, lh: (ctx.lh.1, ctx.lh.1), ..*ctx }, Some(ctx.parent_font_size))
     } else {
         (*ctx, None)
     };
@@ -718,7 +721,7 @@ mod tests {
     use crate::properties::{Length, LengthUnit, PropertyValue};
 
     fn ctx(custom: Option<&dyn VarSource>) -> ResolveContext<'_> {
-        ResolveContext { custom, font_size: 20.0, parent_font_size: 10.0, root_font_size: 16.0, viewport: (1000.0, 800.0), ch_ex: (10.0, 10.0), parent_ch_ex: (5.0, 5.0) }
+        ResolveContext { custom, font_size: 20.0, parent_font_size: 10.0, root_font_size: 16.0, viewport: (1000.0, 800.0), ch_ex: (10.0, 10.0), parent_ch_ex: (5.0, 5.0), lh: (24.0, 12.0) }
     }
 
     fn px(decls: &[Declaration]) -> Option<f32> {

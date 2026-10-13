@@ -517,6 +517,8 @@ pub enum LengthUnit {
     Vmax,
     Ch,
     Ex,
+    /// The element's line height
+    Lh,
 }
 
 /// CSS color

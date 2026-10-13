@@ -163,6 +163,17 @@ impl fos_css::style::FontUnits for FontUnits {
         }
         units
     }
+
+    fn normal_line_height(&self, font: &fos_css::style::InheritedStyle, size: f32) -> f32 {
+        let Ok(mut fonts) = self.fonts.lock() else { return size * 1.2 };
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = font.font_family.clone();
+        i.font_weight = font.font_weight;
+        i.font_style = font.font_style;
+        i.font_size = size;
+        fonts.resolve(&style).line_height(fos_css::style::LineHeight::Normal)
+    }
 }
 
 pub struct FontContext {

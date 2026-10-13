@@ -1893,6 +1893,23 @@ mod tests {
     }
 
     #[test]
+    fn line_height_units() {
+        // lh is the element's line height (kit.svelte.dev's paragraphs have
+        // margin: 0.5lh 0), in calc() too, and in font-size the parent's;
+        // line-height applies before the declarations that use it
+        let px = |s: &Style, i: usize| match s.box_.margin[i] {
+            LpAuto::Lp(l) => l.px,
+            LpAuto::Auto => f32::NAN,
+        };
+        let s = computed("margin: 0.5lh 0 calc(1lh + 1px); font-size: 18px; line-height: 27px");
+        assert_eq!((px(&s, 0), px(&s, 2)), (13.5, 28.0));
+        let s = computed("line-height: 2; font-size: 10px; margin-top: 1lh");
+        assert_eq!(px(&s, 0), 20.0);
+        // normal is 1.2 em without fonts to measure
+        assert_eq!(px(&computed("font-size: 10px; margin-top: 1lh"), 0), 12.0);
+    }
+
+    #[test]
     fn containment() {
         use crate::style::contain::*;
         use crate::style::ContentVisibility;

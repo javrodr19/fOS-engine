@@ -21,6 +21,9 @@ tr { display: table-row; }
 td, th { display: table-cell; }
 input, select, button, textarea, meter, progress, marquee { display: inline-block; }
 audio:not([controls]), dialog:not([open]) { display: none; }
+/* Popovers (shown ones match :popover-open) */
+[popover]:not(:popover-open):not(dialog[open]) { display: none; }
+[popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em; overflow: auto; color: CanvasText; background-color: Canvas; }
 details:not([open]) > :not(summary) { display: none; }
 summary { display: list-item; list-style-type: disc; }
 rt { font-size: 50%; }

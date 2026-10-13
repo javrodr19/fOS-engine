@@ -1014,6 +1014,30 @@ mod tests {
     }
 
     #[test]
+    fn popovers_show_and_hide() {
+        // Shown popovers match :popover-open; toggling fires toggle events
+        let (mut rt, _doc) = page(
+            r#"<html><body><div id="p" popover="manual">menu</div><div id="q"></div><script>
+              var p = document.getElementById('p'), out = [];
+              p.addEventListener('toggle', function (e) { out.push(e.oldState + '>' + e.newState); });
+              out.push(p.popover, p.matches(':popover-open'));
+              p.showPopover(); out.push(p.matches(':popover-open'));
+              out.push(p.togglePopover()); out.push(p.matches(':popover-open'));
+              try { document.getElementById('q').showPopover(); } catch (e) { out.push(e.name); }
+              window.result = out.join();
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "manual,false,true,false,false,NotSupportedError");
+        // toggle events come in tasks of their own
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("out.slice(6).join()").unwrap(), "closed>open,open>closed");
+    }
+
+    #[test]
     fn attributes_are_live() {
         // React empties an element's attributes with
         // while (attrs.length) el.removeAttributeNode(attrs[0])

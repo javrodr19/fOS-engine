@@ -25,6 +25,31 @@
   };
   const E = HTMLElement.prototype;
 
+  // ---- popovers ----
+  // Shown popovers match :popover-open (the UA sheet hides the others)
+  function setPopover(el, open) {
+    if (!el.hasAttribute('popover')) throw new DOMException("Element does not have the popover attribute", 'NotSupportedError');
+    if (__fosPopover(el) === open) return;
+    const states = open ? ['closed', 'open'] : ['open', 'closed'];
+    const before = new Event('beforetoggle', { cancelable: open });
+    before.oldState = states[0]; before.newState = states[1];
+    if (!el.dispatchEvent(before) && open) return;
+    __fosPopover(el, open);
+    // toggle comes in a task of its own
+    setTimeout(() => {
+      const toggle = new Event('toggle');
+      toggle.oldState = states[0]; toggle.newState = states[1];
+      el.dispatchEvent(toggle);
+    }, 0);
+  }
+  define(E, {
+    showPopover() { setPopover(this, true); },
+    hidePopover() { setPopover(this, false); },
+    togglePopover(force) { const open = force === undefined ? !__fosPopover(this) : !!force; setPopover(this, open); return open; },
+    get popover() { const v = this.getAttribute('popover'); return v === null ? null : (v === 'manual' || v === 'hint') ? v : 'auto'; },
+    set popover(v) { if (v === null) this.removeAttribute('popover'); else this.setAttribute('popover', v); },
+  });
+
   // ---- events ----
 
   // Shadow roots: host -> root, and root -> { host, mode, ... }

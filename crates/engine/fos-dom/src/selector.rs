@@ -191,6 +191,7 @@ enum Pseudo {
     Link,
     /// Standard elements, and custom elements once defined
     Defined,
+    PopoverOpen,
     /// `:host` or `:host(x)`: the shadow host, matched from its shadow tree
     Host(Option<SelectorList>),
     /// The element a query runs from (the root element otherwise)
@@ -684,6 +685,7 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo, at_ho
             let tag = tree.resolve(e.name.local);
             !tag.contains('-') || tree.is_custom_element_defined(tag)
         }
+        Pseudo::PopoverOpen => tree.is_popover_open(node),
         Pseudo::Never | Pseudo::PseudoElement => false,
     }
 }
@@ -977,6 +979,7 @@ impl Parser<'_> {
             "enabled" => Pseudo::Enabled,
             "link" | "any-link" => Pseudo::Link,
             "defined" => Pseudo::Defined,
+            "popover-open" => Pseudo::PopoverOpen,
             "host" => Pseudo::Host(None),
             "scope" => Pseudo::Scope,
             // Legacy single-colon pseudo-elements, user action and state

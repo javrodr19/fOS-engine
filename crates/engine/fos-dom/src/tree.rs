@@ -40,6 +40,8 @@ pub struct DomTree {
     mutations: u64,
     /// Custom element names defined by scripts (`customElements.define`)
     custom_defined: std::collections::HashSet<Box<str>>,
+    /// Popovers shown (`:popover-open`)
+    popovers_open: std::collections::HashSet<NodeId>,
     /// Shadow roots by host, and hosts by shadow root
     shadow_roots: std::collections::HashMap<NodeId, NodeId>,
     shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
@@ -56,6 +58,7 @@ impl DomTree {
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
             custom_defined: Default::default(),
+            popovers_open: Default::default(),
             shadow_roots: Default::default(),
             shadow_hosts: Default::default(),
             selector_scope: std::cell::Cell::new(NodeId::NONE),
@@ -75,6 +78,7 @@ impl DomTree {
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
             mutations: 0,
             custom_defined: Default::default(),
+            popovers_open: Default::default(),
             shadow_roots: Default::default(),
             shadow_hosts: Default::default(),
             selector_scope: std::cell::Cell::new(NodeId::NONE),
@@ -238,6 +242,19 @@ impl DomTree {
     /// Whether custom element `name` has been defined
     pub fn is_custom_element_defined(&self, name: &str) -> bool {
         self.custom_defined.contains(name)
+    }
+
+    /// Show or hide a popover (it matches `:popover-open` while shown)
+    pub fn set_popover_open(&mut self, node: NodeId, open: bool) {
+        let changed = if open { self.popovers_open.insert(node) } else { self.popovers_open.remove(&node) };
+        if changed {
+            self.mark_mutated();
+        }
+    }
+
+    /// Whether popover `node` is shown
+    pub fn is_popover_open(&self, node: NodeId) -> bool {
+        !self.popovers_open.is_empty() && self.popovers_open.contains(&node)
     }
 
     /// Get the document root

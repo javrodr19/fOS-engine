@@ -1230,6 +1230,19 @@ fn define_element(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsR
     Ok(Value::UNDEFINED)
 }
 
+/// `__fosPopover(el[, open])`: whether popover `el` is shown, after
+/// showing or hiding it when `open` is given
+fn popover(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::bool(false)) };
+    let open = (args.len() >= 2).then(|| arg(args, 1).as_bool().unwrap_or(false));
+    Ok(Value::bool(with_tree(vm, |t| {
+        if let Some(open) = open {
+            t.set_popover_open(id, open);
+        }
+        t.is_popover_open(id)
+    })))
+}
+
 /// `__fosTemplateContent(template)`: the template's contents fragment
 fn template_content(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let Some(id) = node_id(arg(args, 0)) else { return Ok(Value::NULL) };
@@ -2080,6 +2093,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosCookie", 0, get_cookie),
         ("__fosSetURL", 1, set_url),
         ("__fosDefineElement", 1, define_element),
+        ("__fosPopover", 2, popover),
         ("__fosRandomBytes", 1, random_bytes),
         ("__fosTemplateContent", 1, template_content),
         ("__fosSetElementPrototype", 2, set_element_prototype),

@@ -183,6 +183,8 @@ impl ComputedStyle {
                             parent_font_size,
                             root_font_size,
                             viewport,
+                            ch_ex: (self.font_size * 0.5, self.font_size * 0.5),
+                            parent_ch_ex: (parent_font_size * 0.5, parent_font_size * 0.5),
                         };
                         let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &ctx).to_vec();
                         for r in &resolved {

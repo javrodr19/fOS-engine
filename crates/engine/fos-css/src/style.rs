@@ -974,11 +974,39 @@ pub struct StyleContext {
     pub viewport: (f32, f32),
     /// Custom properties `@property` rules register
     pub registered: Option<Arc<crate::values::PropertyRegistry>>,
+    /// The fonts' `ch` and `ex` (without it, half an em each)
+    pub font_units: Option<FontUnitsHook>,
 }
 
 impl Default for StyleContext {
     fn default() -> Self {
-        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0), registered: None }
+        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0), registered: None, font_units: None }
+    }
+}
+
+impl StyleContext {
+    /// `ch` and `ex` in pixels for the font of `font` (an element's
+    /// inherited style) at `size`
+    pub fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32) {
+        self.font_units.as_ref().map_or((size * 0.5, size * 0.5), |u| u.0.ch_ex(font, size))
+    }
+}
+
+/// Font metrics that styling needs: what `ch` and `ex` are
+pub trait FontUnits: Send + Sync {
+    /// The advance of "0" and the x-height, in pixels at `size`, of the
+    /// first available font for the family, weight and style of `font`
+    /// (CSS Values 4 §6.1.1)
+    fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32);
+}
+
+/// A shared [`FontUnits`]
+#[derive(Clone)]
+pub struct FontUnitsHook(pub Arc<dyn FontUnits>);
+
+impl std::fmt::Debug for FontUnitsHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FontUnitsHook")
     }
 }
 
@@ -1160,12 +1188,17 @@ impl Style {
             None => {}
         }
         let parent_font_size = parent.inherited.font_size;
+        // `ch` and `ex` of the parent's font (for font-size) and, once the
+        // font pass has set it, this element's
+        let parent_units = std::cell::OnceCell::new();
+        let mut units: Option<(f32, f32)> = None;
         for font_pass in [true, false] {
             for d in decls {
+                // The font first: other lengths are in its em, ch and ex
                 let is_font = match &d.value {
                     PropertyValue::Custom(_) => continue,
-                    PropertyValue::Unresolved(b) => b.0 == "font-size" || b.0 == "font",
-                    _ => d.property == PropertyId::FontSize,
+                    PropertyValue::Unresolved(b) => matches!(b.0.as_str(), "font-size" | "font" | "font-family" | "font-weight" | "font-style"),
+                    _ => matches!(d.property, PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle),
                 };
                 if is_font != font_pass {
                     continue;
@@ -1173,12 +1206,16 @@ impl Style {
                 match &d.value {
                     PropertyValue::Unresolved(b) => {
                         let custom = self.custom.clone();
+                        let parent_ch_ex = *parent_units.get_or_init(|| ctx.ch_ex(&parent.inherited, parent_font_size));
+                        let ch_ex = if font_pass { parent_ch_ex } else { *units.get_or_insert_with(|| ctx.ch_ex(&self.inherited, self.inherited.font_size)) };
                         let rctx = crate::values::ResolveContext {
                             custom: custom.as_deref().map(|c| c as &dyn crate::values::VarSource),
                             font_size: self.inherited.font_size,
                             parent_font_size,
                             root_font_size: ctx.root_font_size,
                             viewport: ctx.viewport,
+                            ch_ex,
+                            parent_ch_ex,
                         };
                         let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &rctx).to_vec();
                         for r in &resolved {
@@ -1244,8 +1281,8 @@ impl Style {
             LengthUnit::Vh => l.value * h / 100.0,
             LengthUnit::Vmin => l.value * w.min(h) / 100.0,
             LengthUnit::Vmax => l.value * w.max(h) / 100.0,
-            LengthUnit::Ch => l.value * fs * 0.5,
-            LengthUnit::Ex => l.value * fs * 0.5,
+            LengthUnit::Ch => l.value * ctx.ch_ex(&self.inherited, fs).0,
+            LengthUnit::Ex => l.value * ctx.ch_ex(&self.inherited, fs).1,
         };
         Lp::px(px)
     }
@@ -1853,7 +1890,8 @@ impl Style {
                     PropertyValue::Length(l) => match l.unit {
                         LengthUnit::Em => l.value * parent_fs,
                         LengthUnit::Percent => l.value * parent_fs / 100.0,
-                        LengthUnit::Ch | LengthUnit::Ex => l.value * parent_fs * 0.5,
+                        LengthUnit::Ch => l.value * ctx.ch_ex(&parent.inherited, parent_fs).0,
+                        LengthUnit::Ex => l.value * ctx.ch_ex(&parent.inherited, parent_fs).1,
                         _ => self.length(*l, ctx).px,
                     },
                     PropertyValue::Mix { px, pct } => px + pct * parent_fs / 100.0,

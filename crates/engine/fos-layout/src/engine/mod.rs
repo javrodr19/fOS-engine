@@ -22,7 +22,7 @@ pub mod table;
 
 pub use block::LayoutCtx;
 pub use box_tree::{build_box_tree, BoxKind, ImageHandle, LayoutBox, Styler};
-pub use fonts::{FontContext, FontMetrics, Glyph, ResolvedFont, ShapedWord};
+pub use fonts::{FontContext, FontMetrics, FontUnits, Glyph, ResolvedFont, ShapedWord};
 pub use fragment::{BoxFragment, BoxFragmentKind, Fragment, FragmentTree, Rect, ReplacedPaint, TextFragment};
 
 use fos_dom::{DomTree, NodeId};

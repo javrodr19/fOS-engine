@@ -126,6 +126,45 @@ impl ResolvedFont {
 /// Shaped words kept before the cache starts over
 const MAX_WORDS: usize = 50_000;
 
+/// What `ch` and `ex` are for styling, from the faces text is drawn with
+pub struct FontUnits {
+    fonts: std::sync::Mutex<FontContext>,
+    /// (families, weight, italic, size) -> (ch, ex) in pixels
+    units: std::sync::Mutex<HashMap<(Arc<[Arc<str>]>, u16, bool, u32), (f32, f32)>>,
+}
+
+impl FontUnits {
+    pub fn new(db: Arc<FontDatabase>) -> Self {
+        FontUnits { fonts: std::sync::Mutex::new(FontContext::new(db)), units: Default::default() }
+    }
+}
+
+impl fos_css::style::FontUnits for FontUnits {
+    fn ch_ex(&self, font: &fos_css::style::InheritedStyle, size: f32) -> (f32, f32) {
+        let key = (font.font_family.clone(), font.font_weight, font.font_style != FontStyle::Normal, size.to_bits());
+        if let Some(units) = self.units.lock().map_or(None, |u| u.get(&key).copied()) {
+            return units;
+        }
+        let Ok(mut fonts) = self.fonts.lock() else { return (size * 0.5, size * 0.5) };
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = font.font_family.clone();
+        i.font_weight = font.font_weight;
+        i.font_style = font.font_style;
+        i.font_size = size;
+        // At the size asked for: a variable face's optical size changes
+        // its advances. "0" is half an em without a face; the x-height is
+        // as text is laid out with it (a measured one in whole pixels)
+        let f = fonts.resolve(&style);
+        let ch = if f.id.is_some() { fonts.shape(&f, "0").width } else { 0.0 };
+        let units = (if ch > 0.0 { ch } else { size * 0.5 }, f.x_height());
+        if let Ok(mut u) = self.units.lock() {
+            u.insert(key, units);
+        }
+        units
+    }
+}
+
 pub struct FontContext {
     db: Arc<FontDatabase>,
     shaper: TextShaper,

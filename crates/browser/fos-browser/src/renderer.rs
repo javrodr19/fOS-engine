@@ -1271,7 +1271,12 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
         shadow_sheets,
         ancestors: AncestorFilter::default(),
         resolved: Default::default(),
-        ctx: StyleContext { root_font_size: 16.0, viewport, registered: stylesheet.as_ref().and_then(|s| s.registered.clone()) },
+        ctx: StyleContext {
+            root_font_size: 16.0,
+            viewport,
+            registered: stylesheet.as_ref().and_then(|s| s.registered.clone()),
+            font_units: Some(fos_css::style::FontUnitsHook(Arc::new(layout_engine::FontUnits::new(fonts.database().clone())))),
+        },
         root_styled: false,
         viewport_overflow: Some(ViewportOverflow::Root(root)),
         quirks: document.is_quirks(),
@@ -1684,6 +1689,40 @@ mod tests {
         let mut renderer = PageRenderer::new(40, 40);
         let page = renderer.render_document(&document, 0.0).unwrap();
         assert_eq!(page.pixels[2 * 40 + 10], 0xffff0000);
+    }
+
+    #[test]
+    fn test_ch_and_ex_come_from_the_font() {
+        // ch is the advance of "0" and ex the x-height of the element's
+        // font (CSS Values 4 §6.1.1), in lengths, calc() and font-size;
+        // they were half an em: vercel.com's max-w-[18ch] headings wrapped
+        // too early
+        let html = r#"<html><body style="margin: 0">
+            <div style="font: 16px sans-serif"><div id="a" style="width: 10ch">x</div><div>0000000000</div><div id="x" style="width: 10ex">x</div></div>
+            <div style="font: bold 20px monospace"><div id="b" style="width: calc(5ch * 2)">x</div><div>00000</div></div>
+            <div style="font: 10px monospace"><div style="font-size: 2ch">0</div></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let width = |id: &str| layout.fragment_of(document.get_element_by_id(id).unwrap()).unwrap().border_box.w;
+        let text_width = |text: &str| texts(&document, &layout, text)[0].rect.w;
+        assert!((width("a") - text_width("0000000000")).abs() < 0.01, "{} {}", width("a"), text_width("0000000000"));
+        assert_ne!(width("a"), 80.0);
+        assert!((width("b") - 2.0 * text_width("00000")).abs() < 0.01, "{} {}", width("b"), text_width("00000"));
+        // 2ch of the parent's font
+        let size = texts(&document, &layout, "0")[0].font.size;
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = Arc::from([Arc::from("monospace")]);
+        i.font_size = 10.0;
+        let mut fonts = FontContext::default();
+        let mono = fonts.resolve(&style);
+        assert!((size - 2.0 * fonts.shape(&mono, "0").width).abs() < 0.01, "{size}");
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = Arc::from([Arc::from("sans-serif")]);
+        i.font_size = 16.0;
+        let x_height = fonts.resolve(&style).x_height();
+        assert!((width("x") - 10.0 * x_height).abs() < 0.01, "{} {}", width("x"), x_height);
     }
 
     #[test]

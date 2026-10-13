@@ -91,10 +91,20 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
 
     // Width
     let specified_w = s.box_.width.resolve(cb.w).map(|w| clamp_width(s, content_size(s, w, hbp), cb.w, hbp) + hbp);
+    // aspect-ratio with a definite height gives an automatic width (CSS
+    // Sizing 4 §5.1): vercel.com's hero art is h-full aspect-[3/2]
+    let ratio_w = s.box_.aspect_ratio.filter(|_| !replaced && specified_w.is_none()).and_then(|r| {
+        let h = s.box_.height.resolve_definite(Some(cb.h)).map(|h| content_size(s, h, vbp))?;
+        let h = clamp_height(s, h, Some(cb.h), vbp);
+        let border_box = s.box_.box_sizing == fos_css::style::BoxSizing::BorderBox;
+        let w = if border_box { ((h + vbp) * r - hbp).max(0.0) } else { h * r };
+        Some(clamp_width(s, w, cb.w, hbp) + hbp)
+    });
     let width = match (specified_w, left, right) {
         (Some(w), _, _) => Some(w),
         _ if replaced => None,
         (None, Some(l), Some(r)) => Some(clamp_width(s, (cb.w - l - r - ml - mr - hbp).max(0.0), cb.w, hbp) + hbp),
+        (None, _, _) if ratio_w.is_some() => ratio_w,
         (None, _, _) => {
             let avail = (cb.w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr - hbp).max(0.0);
             let (min, max) = intrinsic_content(ctx, b);

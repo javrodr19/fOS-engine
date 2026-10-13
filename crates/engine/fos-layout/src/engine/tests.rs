@@ -1542,3 +1542,19 @@ fn percentage_flex_bases_of_an_unknown_height_are_the_contents() {
     assert_eq!(rect_of(&t, px).h, 0.0);
     assert_eq!(rect_of(&t, grows).h, 50.0);
 }
+
+#[test]
+fn absolutely_positioned_boxes_take_their_width_from_aspect_ratio() {
+    let (mut tree, html, body) = doc();
+    // An automatic width follows a definite height through aspect-ratio,
+    // within max-width
+    let cb = el(&mut tree, body, "div", "position: relative; width: 400px; height: 200px");
+    let art = el(&mut tree, cb, "div", "position: absolute; left: 50%; height: 100%; aspect-ratio: 3 / 2");
+    let capped = el(&mut tree, cb, "div", "position: absolute; left: 0; height: 100px; aspect-ratio: 4; max-width: 300px");
+    // Both insets still stretch it
+    let stretched = el(&mut tree, cb, "div", "position: absolute; left: 10px; right: 10px; height: 50px; aspect-ratio: 1");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, art).w, rect_of(&t, art).h), (300.0, 200.0));
+    assert_eq!(rect_of(&t, capped).w, 300.0);
+    assert_eq!(rect_of(&t, stretched).w, 380.0);
+}

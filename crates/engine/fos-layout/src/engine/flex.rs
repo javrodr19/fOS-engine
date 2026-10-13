@@ -79,7 +79,7 @@ fn align_of(item: &Style, container: &Style) -> AlignItems {
 /// Lay out a flex container's items in its content box (`width` wide,
 /// `height` tall when definite)
 /// `height_bounds` are the container's min and max content heights, which
-/// bound a single row's cross size when its height is automatic
+/// bound an automatic height: a column's main size, a single row's cross size
 pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, height_bounds: (f32, f32)) -> FlexLayout {
     let bx = &style.box_;
     let row = bx.flex_direction.is_row();
@@ -190,6 +190,17 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     if start < flex.len() || lines.is_empty() {
         lines.push(start..flex.len());
     }
+    // An automatic column height is its content clamped by min-height and
+    // max-height, which flexible items then fill (§9.2 #4): vercel.com's
+    // hero is a min-h column whose flex-1 child takes the rest
+    let main_size = main_size.or_else(|| {
+        if row {
+            return None;
+        }
+        let content = lines.iter().map(|l| flex[l.clone()].iter().map(|it| it.hypo + it.main_margins(row)).sum::<f32>() + gap_main * l.len().saturating_sub(1) as f32).fold(0.0, f32::max);
+        let clamped = content.min(height_bounds.1).max(height_bounds.0);
+        (clamped != content).then_some(clamped)
+    });
 
     // Resolve flexible lengths (§9.7)
     for line in &lines {

@@ -1544,6 +1544,34 @@ fn percentage_flex_bases_of_an_unknown_height_are_the_contents() {
 }
 
 #[test]
+fn automatic_column_heights_are_clamped_before_flexing() {
+    let (mut tree, html, body) = doc();
+    // A column whose height comes from min-height grows its flexible
+    // items into it (CSS Flexbox §9.2 #4): vercel.com's hero is a
+    // min-height column with a flex: 1 child
+    let tall = el(&mut tree, body, "div", "display: flex; flex-direction: column; min-height: 300px");
+    let grows = el(&mut tree, tall, "div", "flex: 1");
+    el(&mut tree, grows, "div", "height: 18px");
+    el(&mut tree, tall, "div", "height: 20px");
+    // max-height shrinks them, and justify-content shares what is left
+    let short = el(&mut tree, body, "div", "display: flex; flex-direction: column; max-height: 100px");
+    let mut shrinks = Vec::new();
+    for _ in 0..2 {
+        let i = el(&mut tree, short, "div", "min-height: 0; overflow: hidden");
+        el(&mut tree, i, "div", "height: 100px");
+        shrinks.push(i);
+    }
+    let centered = el(&mut tree, body, "div", "display: flex; flex-direction: column; min-height: 200px; justify-content: center");
+    let middle = el(&mut tree, centered, "div", "height: 50px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, tall).h, 300.0);
+    assert_eq!(rect_of(&t, grows).h, 280.0);
+    assert_eq!(rect_of(&t, short).h, 100.0);
+    assert_eq!(shrinks.iter().map(|&i| rect_of(&t, i).h).collect::<Vec<_>>(), [50.0, 50.0]);
+    assert_eq!(rect_of(&t, middle).y - rect_of(&t, centered).y, 75.0);
+}
+
+#[test]
 fn absolutely_positioned_boxes_take_their_width_from_aspect_ratio() {
     let (mut tree, html, body) = doc();
     // An automatic width follows a definite height through aspect-ratio,

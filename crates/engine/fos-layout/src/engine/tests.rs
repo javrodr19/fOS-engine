@@ -1586,3 +1586,19 @@ fn absolutely_positioned_boxes_take_their_width_from_aspect_ratio() {
     assert_eq!(rect_of(&t, capped).w, 300.0);
     assert_eq!(rect_of(&t, stretched).w, 380.0);
 }
+
+#[test]
+fn stretched_grid_items_keep_their_max_sizes() {
+    let (mut tree, html, body) = doc();
+    // Stretching fills the grid area within min/max-width and
+    // min/max-height (CSS Box Alignment §6.1): vercel.com's col-span-8
+    // headings have a max-width
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 600px; grid-template-rows: 200px");
+    let item = el(&mut tree, grid, "div", "max-width: 300px; max-height: 50px; padding: 5px");
+    let wide = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px");
+    let min = el(&mut tree, wide, "div", "min-width: 150px");
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, item);
+    assert_eq!((r.w, r.h), (310.0, 60.0));
+    assert_eq!(rect_of(&t, min).w, 150.0);
+}

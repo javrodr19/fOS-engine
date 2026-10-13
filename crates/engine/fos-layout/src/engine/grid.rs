@@ -10,7 +10,7 @@ use std::sync::Arc;
 use fos_css::grid::{Breadth, GridLine, GridStyle, RepeatCount, TemplateItem, TrackSize};
 use fos_css::style::{AlignContent, AlignItems, AlignSelf, JustifyContent, Style};
 
-use super::block::{clips, content_size, edges, intrinsic_outer, layout_sized, placeholder, relative_offset, Forced, LayoutCtx, Sizing};
+use super::block::{clamp_height, clamp_width, clips, content_size, edges, intrinsic_outer, layout_sized, placeholder, relative_offset, Forced, LayoutCtx, Sizing};
 use super::box_tree::LayoutBox;
 use super::fragment::{Fragment, Rect};
 
@@ -642,8 +642,13 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
         let (stretch, _) = self_align(self_value(jself, justify_items));
         let m = b.style.box_.margin.map(|m| m.resolve(area_w));
-        let forced_w = (stretch && b.style.box_.auto_width() && m[1].is_some() && m[3].is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)))
-            .then(|| (area_w - m[1].unwrap_or(0.0) - m[3].unwrap_or(0.0)).max(0.0));
+        // Stretching fills the area within min/max-width (CSS Box Alignment
+        // §6.1): vercel.com's headings are col-span-8 with max-w-[18ch]
+        let forced_w = (stretch && b.style.box_.auto_width() && m[1].is_some() && m[3].is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_))).then(|| {
+            let hbp = edges(&b.style, area_w).horizontal_bp();
+            let w = (area_w - m[1].unwrap_or(0.0) - m[3].unwrap_or(0.0) - hbp).max(0.0);
+            clamp_width(&b.style, w, area_w, hbp) + hbp
+        });
         let l = layout_sized(ctx, b, area_w, None, Sizing::Shrink, false, Forced { width: forced_w, height: None, root: true });
         let outer = l.mt.size() + l.frag.border_box.h + l.mb.size();
         row_contrib.push((outer, outer));
@@ -684,7 +689,9 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let m = b.style.box_.margin;
         let (mt, mb) = (m[0].resolve(area_w), m[2].resolve(area_w));
         if vstretch && b.style.box_.height.is_auto() && mt.is_some() && mb.is_some() && !matches!(b.kind, super::box_tree::BoxKind::Replaced(_)) {
-            let target = (area_h - mt.unwrap_or(0.0) - mb.unwrap_or(0.0)).max(0.0);
+            let vbp = edges(&b.style, area_w).vertical_bp();
+            let target = (area_h - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - vbp).max(0.0);
+            let target = clamp_height(&b.style, target, Some(area_h), vbp) + vbp;
             if (target - l.frag.border_box.h).abs() > 0.01 {
                 l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: Some(target), root: true });
             }

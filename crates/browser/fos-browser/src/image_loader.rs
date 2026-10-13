@@ -19,6 +19,9 @@ const MAX_IMAGES: usize = 200;
 /// SVGs are rasterized at up to this many times their natural size, for
 /// sharpness when scaled up (and on dense screens)
 const SVG_SCALE: f32 = 2.0;
+/// The longer side of an inline SVG sized in percentages, which has no
+/// natural size to rasterize at (CSS sizes its box)
+const RELATIVE_SVG_SIDE: f32 = 512.0;
 
 /// A decoded image
 pub struct LoadedImage {
@@ -461,6 +464,9 @@ pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &SvgStyle
     let mut markup = String::new();
     let mut defs = Vec::new();
     serialize_svg(tree, node, true, color, paint, refs, &mut defs, &mut markup);
+    // A percentage size is of the containing block, which CSS resolves (a
+    // presentation attribute); the drawing takes the viewBox's shape
+    let relative = tree.get_attribute(node, "viewBox").is_some() && ["width", "height"].iter().any(|a| tree.get_attribute(node, a).is_some_and(|v| v.trim().ends_with('%')));
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -470,7 +476,7 @@ pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &SvgStyle
     if let Some(hit) = cache.map.get(&key) {
         return hit.clone();
     }
-    let img = decode_svg(markup.as_bytes()).map(Arc::new);
+    let img = decode_svg_at(markup.as_bytes(), if relative { RELATIVE_SVG_SIDE } else { 0.0 }).map(Arc::new);
     let size = img.as_ref().map_or(0, |i| i.pixmap.data().len());
     if cache.bytes + size > MAX_CACHED_SVG_BYTES || cache.map.len() >= 4096 {
         cache.map.clear();
@@ -509,9 +515,13 @@ fn serialize_svg(tree: &DomTree, node: NodeId, root: bool, color: [u8; 4], style
     let name = tree.resolve(e.name.local);
     out.push('<');
     out.push_str(name);
+    let has_view_box = root && e.attrs.iter().any(|a| tree.resolve(a.name.local) == "viewBox");
     for a in &e.attrs {
         let local = tree.resolve(a.name.local);
         if root && (local == "xmlns" || local.starts_with("xmlns:") || local == "color") {
+            continue;
+        }
+        if has_view_box && (local == "width" || local == "height") && a.value.trim().ends_with('%') {
             continue;
         }
         let value = match substituted.and_then(|l| l.iter().find(|(n, _)| n == local)) {
@@ -597,6 +607,12 @@ static SVG_FONTS: std::sync::LazyLock<(Arc<resvg::usvg::fontdb::Database>, Strin
 });
 
 fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
+    decode_svg_at(bytes, 0.0)
+}
+
+/// Rasterized with its longer side at least `min_side` pixels (within the
+/// pixel budget)
+fn decode_svg_at(bytes: &[u8], min_side: f32) -> Option<LoadedImage> {
     let mut options = resvg::usvg::Options::default();
     // Only SVGs with text need the fonts
     if bytes.windows(5).any(|w| w == b"<text") {
@@ -613,7 +629,7 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
     // Rasterized larger than natural (icons are often scaled up), within
     // the pixel budget
     let budget = (MAX_PIXELS as f32 / (w * h)).sqrt();
-    let scale = SVG_SCALE.min(budget).max(0.01);
+    let scale = SVG_SCALE.max(min_side / w.max(h)).min(budget).max(0.01);
     let (pw, ph) = ((w * scale).ceil().max(1.0) as u32, (h * scale).ceil().max(1.0) as u32);
     let mut pixmap = Pixmap::new(pw, ph)?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h), &mut pixmap.as_mut());

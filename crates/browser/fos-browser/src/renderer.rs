@@ -2252,6 +2252,25 @@ mod tests {
     }
 
     #[test]
+    fn test_svg_percentage_sizes_are_of_the_containing_block() {
+        // width="50%" is CSS width: 50% (a presentation attribute), not a
+        // share of the SVG's own viewBox: vercel.com's hero triangle
+        let html = r#"<html><body style="margin:0; color: #f00">
+            <div style="position: relative; width: 100px; height: 100px">
+            <svg style="position: absolute; left: 0; top: 0" width="50%" height="50%" viewBox="0 0 0.5 0.5"><circle cx="0.25" cy="0.25" r="0.25" fill="currentColor"/></svg>
+            </div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // A 50px circle, drawn sharp
+        assert_eq!(px(25, 25), 0xffff0000);
+        assert_eq!(px(45, 25), 0xffff0000);
+        assert_ne!(px(2, 2), 0xffff0000);
+        assert_ne!(px(60, 25), 0xffff0000);
+    }
+
+    #[test]
     fn test_marker_pseudo_element() {
         let html = r#"<html><head><style>
             ol li::marker { color: #f00 }

@@ -1038,6 +1038,37 @@ mod tests {
     }
 
     #[test]
+    fn xpath_queries() {
+        // htmx 2 builds an XPathExpression for hx-on attributes as it loads
+        let (mut rt, _doc) = page(
+            r#"<html><body><ul id="l"><li class="a">one</li><li hx-on:click="x()">two</li><li>three <b>3</b></li></ul><p lang="en-GB">p</p><script>
+              var out = [], T = XPathResult;
+              var q = new XPathEvaluator().createExpression('.//*[@*[ starts-with(name(), "hx-on:") or starts-with(name(), "data-hx-on:") ]]');
+              var it = q.evaluate(document.body), n;
+              while (n = it.iterateNext()) out.push(n.textContent);
+              var ev = function (x, t, c) { return document.evaluate(x, c || document, null, t, null); };
+              out.push(ev('count(//li)', T.NUMBER_TYPE).numberValue);
+              out.push(ev('//li[2]', T.FIRST_ORDERED_NODE_TYPE).singleNodeValue.textContent);
+              out.push(ev('//li[last()]/b', T.STRING_TYPE).stringValue);
+              out.push(ev('//LI[@class="a"]', T.ORDERED_NODE_SNAPSHOT_TYPE).snapshotLength);
+              out.push(ev('normalize-space(concat(" a ", "  b "))', T.STRING_TYPE).stringValue);
+              out.push(ev('//li[contains(., "th")] | //p', T.ORDERED_NODE_SNAPSHOT_TYPE).snapshotLength);
+              // lang() reads xml:lang, not lang
+              out.push(ev('boolean(//p[lang("en")])', T.BOOLEAN_TYPE).booleanValue);
+              out.push(ev('../li[1]/following-sibling::li[1]', T.STRING_TYPE, document.querySelector('li')).stringValue);
+              out.push(ev('ancestor::*[2]/@id', T.STRING_TYPE, document.querySelector('b')).stringValue);
+              out.push(ev('string(//li[1]/preceding-sibling::*)', T.STRING_TYPE).stringValue === '');
+              out.push(ev('(1 + 2 * 3) div 2 mod 3', T.ANY_TYPE).numberValue);
+              out.push(ev('//li', T.ANY_TYPE).resultType);
+              try { document.evaluate('//li[', document); } catch (e) { out.push(e.name); }
+              window.result = out.join('|');
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "two|3|two|3|1|a b|2|false|two|l|true|0.5|4|SyntaxError");
+    }
+
+    #[test]
     fn attributes_are_live() {
         // React empties an element's attributes with
         // while (attrs.length) el.removeAttributeNode(attrs[0])

@@ -847,6 +847,438 @@
   });
   Object.assign(global, { NodeFilter, TreeWalker, NodeIterator });
 
+  // ---- XPath 1.0: document.evaluate, XPathEvaluator, XPathResult ----
+  // htmx 2 finds its hx-on attributes with an XPathExpression as it loads
+  const xpathSyntax = (src) => new DOMException(`The string '${src}' is not a valid XPath expression.`, 'SyntaxError');
+  const XPATH_NODE_TYPES = ['node', 'text', 'comment', 'processing-instruction'];
+  const XPATH_AXES = ['ancestor', 'ancestor-or-self', 'attribute', 'child', 'descendant', 'descendant-or-self', 'following',
+    'following-sibling', 'namespace', 'parent', 'preceding', 'preceding-sibling', 'self'];
+  const XPATH_REVERSE = new Set(['ancestor', 'ancestor-or-self', 'preceding', 'preceding-sibling']);
+  function xpathTokens(src) {
+    const out = [];
+    const nameStart = /[A-Za-z_À-￿]/, nameChar = /[A-Za-z0-9_.\-·À-￿]/;
+    let i = 0;
+    while (i < src.length) {
+      const c = src[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+      const two = src.slice(i, i + 2);
+      if (two === '//' || two === '::' || two === '..' || two === '!=' || two === '<=' || two === '>=') { out.push({ t: two }); i += 2; continue; }
+      if (c === '"' || c === "'") {
+        const j = src.indexOf(c, i + 1);
+        if (j < 0) throw xpathSyntax(src);
+        out.push({ t: 'lit', v: src.slice(i + 1, j) });
+        i = j + 1;
+        continue;
+      }
+      const num = /^(\d+(\.\d*)?|\.\d+)/.exec(src.slice(i));
+      if (num) { out.push({ t: 'num', v: Number(num[0]) }); i += num[0].length; continue; }
+      if ('./()[]@,|+-=<>*$'.includes(c)) { out.push({ t: c }); i++; continue; }
+      if (nameStart.test(c)) {
+        let j = i + 1;
+        while (j < src.length && nameChar.test(src[j])) j++;
+        // A QName (prefix:local) or prefix:*
+        if (src[j] === ':' && src[j + 1] !== ':') {
+          if (src[j + 1] === '*') j += 2;
+          else if (nameStart.test(src[j + 1] || '')) { j += 2; while (j < src.length && nameChar.test(src[j])) j++; }
+        }
+        out.push({ t: 'name', v: src.slice(i, j) });
+        i = j;
+        continue;
+      }
+      throw xpathSyntax(src);
+    }
+    return out;
+  }
+  // The abbreviated `//` step
+  const xpathAnyDescendant = () => ({ axis: 'descendant-or-self', test: { type: 'node' }, preds: [], abbrev: true });
+  function xpathParse(src) {
+    const toks = xpathTokens(src);
+    let p = 0;
+    const isT = (t, o = 0) => toks[p + o] !== undefined && toks[p + o].t === t;
+    const isName = (v) => isT('name') && toks[p].v === v;
+    const next = () => toks[p++];
+    const expect = (t) => { if (!isT(t)) throw xpathSyntax(src); return next(); };
+    const orExpr = () => { let a = andExpr(); while (isName('or')) { next(); a = { k: 'or', a, b: andExpr() }; } return a; };
+    const andExpr = () => { let a = eqExpr(); while (isName('and')) { next(); a = { k: 'and', a, b: eqExpr() }; } return a; };
+    const eqExpr = () => { let a = relExpr(); while (isT('=') || isT('!=')) { const op = next().t; a = { k: 'cmp', op, a, b: relExpr() }; } return a; };
+    const relExpr = () => {
+      let a = addExpr();
+      while (isT('<') || isT('>') || isT('<=') || isT('>=')) { const op = next().t; a = { k: 'cmp', op, a, b: addExpr() }; }
+      return a;
+    };
+    const addExpr = () => { let a = mulExpr(); while (isT('+') || isT('-')) { const op = next().t; a = { k: 'arith', op, a, b: mulExpr() }; } return a; };
+    // After an operand, * and these names are operators
+    const mulExpr = () => {
+      let a = unary();
+      while (isT('*') || isName('div') || isName('mod')) { const t = next(); a = { k: 'arith', op: t.t === '*' ? '*' : t.v, a, b: unary() }; }
+      return a;
+    };
+    const unary = () => { if (isT('-')) { next(); return { k: 'neg', a: unary() }; } return union(); };
+    const union = () => { let a = pathExpr(); while (isT('|')) { next(); a = { k: 'union', a, b: pathExpr() }; } return a; };
+    const startsPrimary = () => isT('$') || isT('(') || isT('lit') || isT('num') || (isT('name') && isT('(', 1) && !XPATH_NODE_TYPES.includes(toks[p].v));
+    const startsStep = () => isT('.') || isT('..') || isT('@') || isT('*') || isT('name');
+    const relSteps = (steps) => {
+      steps.push(step());
+      while (isT('/') || isT('//')) {
+        if (next().t === '//') steps.push(xpathAnyDescendant());
+        steps.push(step());
+      }
+      return steps;
+    };
+    const pathExpr = () => {
+      if (startsPrimary()) {
+        let e = primary();
+        const preds = predicates();
+        if (preds.length) e = { k: 'filter', e, preds };
+        if (!isT('/') && !isT('//')) return e;
+        const steps = next().t === '//' ? [xpathAnyDescendant()] : [];
+        return { k: 'path', from: e, steps: relSteps(steps) };
+      }
+      if (isT('/')) { next(); return { k: 'path', root: true, steps: startsStep() ? relSteps([]) : [] }; }
+      if (isT('//')) { next(); return { k: 'path', root: true, steps: relSteps([xpathAnyDescendant()]) }; }
+      return { k: 'path', steps: relSteps([]) };
+    };
+    const step = () => {
+      if (isT('.')) { next(); return { axis: 'self', test: { type: 'node' }, preds: [] }; }
+      if (isT('..')) { next(); return { axis: 'parent', test: { type: 'node' }, preds: [] }; }
+      let axis = 'child';
+      if (isT('@')) { next(); axis = 'attribute'; }
+      else if (isT('name') && isT('::', 1)) { axis = next().v; next(); if (!XPATH_AXES.includes(axis)) throw xpathSyntax(src); }
+      let test;
+      if (isT('*')) { next(); test = { type: 'any' }; }
+      else if (isT('name')) {
+        const n = next().v;
+        if (XPATH_NODE_TYPES.includes(n) && isT('(')) {
+          next();
+          const target = n === 'processing-instruction' && isT('lit') ? next().v : null;
+          expect(')');
+          test = { type: n, target };
+        } else if (n.endsWith(':*')) test = { type: 'any' };
+        else test = { type: 'name', local: n.slice(n.indexOf(':') + 1) };
+      } else throw xpathSyntax(src);
+      return { axis, test, preds: predicates() };
+    };
+    const predicates = () => { const out = []; while (isT('[')) { next(); out.push(orExpr()); expect(']'); } return out; };
+    const primary = () => {
+      const t = next();
+      if (t.t === '$') return { k: 'var', name: expect('name').v };
+      if (t.t === '(') { const e = orExpr(); expect(')'); return e; }
+      if (t.t === 'lit' || t.t === 'num') return { k: t.t, v: t.v };
+      expect('(');
+      const args = [];
+      if (!isT(')')) { args.push(orExpr()); while (isT(',')) { next(); args.push(orExpr()); } }
+      expect(')');
+      return { k: 'fn', name: t.v, args };
+    };
+    if (!toks.length) throw xpathSyntax(src);
+    const ast = orExpr();
+    if (p !== toks.length) throw xpathSyntax(src);
+    return xpathOptimize(ast);
+  }
+  // A predicate whose value may be a number (a position) or that asks for one
+  const xpathMentionsPosition = (e) => !!e && typeof e === 'object'
+    && ((e.k === 'fn' && (e.name === 'position' || e.name === 'last')) || Object.values(e).some(v => Array.isArray(v) ? v.some(xpathMentionsPosition) : xpathMentionsPosition(v)));
+  const xpathPositional = (e) => ['num', 'arith', 'neg', 'var'].includes(e.k)
+    || (e.k === 'fn' && ['count', 'sum', 'number', 'string-length', 'floor', 'ceiling', 'round'].includes(e.name))
+    || xpathMentionsPosition(e);
+  // `//x` (without positions) is descendant::x: one walk, in document order
+  function xpathOptimize(e) {
+    if (!e || typeof e !== 'object') return e;
+    for (const v of Object.values(e)) {
+      if (Array.isArray(v)) v.forEach(xpathOptimize);
+      else if (v && typeof v === 'object') xpathOptimize(v);
+    }
+    if (e.k === 'path') {
+      const steps = [];
+      for (const st of e.steps) {
+        const prev = steps[steps.length - 1];
+        if (prev && prev.abbrev && st.axis === 'child' && !st.preds.some(xpathPositional)) steps[steps.length - 1] = { axis: 'descendant', test: st.test, preds: st.preds };
+        else steps.push(st);
+      }
+      e.steps = steps;
+    }
+    return e;
+  }
+  const xpathParent = (n) => n.nodeType === 2 ? n.ownerElement : n.parentNode;
+  const xpathAttrs = (el) => { const out = [], m = el.attributes; for (let i = 0; i < m.length; i++) out.push(m.item(i)); return out; };
+  function xpathAxis(n, axis) {
+    const out = [];
+    const kids = (x) => x.nodeType === 2 ? [] : Array.from(x.childNodes);
+    const desc = (x) => { for (const c of kids(x)) { out.push(c); desc(c); } };
+    switch (axis) {
+      case 'child': return kids(n);
+      case 'descendant': desc(n); return out;
+      case 'descendant-or-self': out.push(n); desc(n); return out;
+      case 'self': return [n];
+      case 'parent': { const p = xpathParent(n); return p ? [p] : []; }
+      case 'ancestor-or-self': out.push(n);
+      // falls through
+      case 'ancestor': for (let p = xpathParent(n); p; p = xpathParent(p)) out.push(p); return out;
+      case 'attribute': return n.nodeType === 1 ? xpathAttrs(n) : [];
+      case 'following-sibling': if (n.nodeType !== 2) for (let s = n.nextSibling; s; s = s.nextSibling) out.push(s); return out;
+      case 'preceding-sibling': if (n.nodeType !== 2) for (let s = n.previousSibling; s; s = s.previousSibling) out.push(s); return out;
+      case 'following': {
+        let x = n;
+        if (n.nodeType === 2) { x = n.ownerElement; if (x) desc(x); }
+        for (; x; x = xpathParent(x)) for (let s = x.nextSibling; s; s = s.nextSibling) { out.push(s); desc(s); }
+        return out;
+      }
+      case 'preceding': {
+        // Nearest first, ancestors excluded
+        for (let x = n.nodeType === 2 ? n.ownerElement : n; x; x = xpathParent(x)) {
+          for (let s = x.previousSibling; s; s = s.previousSibling) {
+            const sub = [];
+            (function walk(y) { sub.push(y); for (const c of kids(y)) walk(c); })(s);
+            for (let i = sub.length - 1; i >= 0; i--) out.push(sub[i]);
+          }
+        }
+        return out;
+      }
+      default: return [];
+    }
+  }
+  function xpathTest(n, test, axis) {
+    switch (test.type) {
+      case 'node': return true;
+      case 'text': return n.nodeType === 3 || n.nodeType === 4;
+      case 'comment': return n.nodeType === 8;
+      case 'processing-instruction': return n.nodeType === 7 && (test.target === null || n.target === test.target);
+      case 'any': return n.nodeType === (axis === 'attribute' ? 2 : 1);
+      default: {
+        if (n.nodeType !== (axis === 'attribute' ? 2 : 1)) return false;
+        const name = n.localName;
+        // HTML elements and attributes match whatever the case
+        return name === test.local || ((n.nodeType === 2 || !n.namespaceURI || n.namespaceURI === 'http://www.w3.org/1999/xhtml') && name.toLowerCase() === test.local.toLowerCase());
+      }
+    }
+  }
+  function xpathCompareNodes(a, b) {
+    if (a === b) return 0;
+    const ea = a.nodeType === 2 ? a.ownerElement : a, eb = b.nodeType === 2 ? b.ownerElement : b;
+    if (ea === eb) {
+      // An element comes before its attributes, which come in order
+      if (a.nodeType !== 2) return -1;
+      if (b.nodeType !== 2) return 1;
+      const attrs = xpathAttrs(ea);
+      return attrs.indexOf(a) - attrs.indexOf(b);
+    }
+    if (!ea || !eb) return ea ? -1 : 1;
+    const pos = ea.compareDocumentPosition(eb);
+    if (pos & 16) return -1;
+    if (pos & 8) return 1;
+    return pos & 4 ? -1 : 1;
+  }
+  function xpathDocOrder(nodes) {
+    const unique = [...new Set(nodes)];
+    for (let i = 1; i < unique.length; i++) {
+      if (xpathCompareNodes(unique[i - 1], unique[i]) > 0) return unique.sort(xpathCompareNodes);
+    }
+    return unique;
+  }
+  function xpathNodeString(n) {
+    if (n.nodeType === 9) return n.documentElement ? n.documentElement.textContent : '';
+    if (n.nodeType === 1 || n.nodeType === 11) return n.textContent;
+    return n.nodeType === 2 ? n.value : (n.nodeValue ?? '');
+  }
+  const xpathString = (v) => Array.isArray(v) ? (v.length ? xpathNodeString(v[0]) : '') : String(v);
+  const xpathNumber = (v) => {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    const s = xpathString(v).replace(/^[\x20\t\r\n]+|[\x20\t\r\n]+$/g, '');
+    return /^-?(\d+(\.\d*)?|\.\d+)$/.test(s) ? Number(s) : NaN;
+  };
+  const xpathBool = (v) => Array.isArray(v) ? v.length > 0 : typeof v === 'number' ? v !== 0 && !Number.isNaN(v) : typeof v === 'string' ? v.length > 0 : v;
+  const xpathRound = (n) => Number.isFinite(n) ? Math.floor(n + 0.5) : n;
+  function xpathCompare(op, a, b) {
+    const atoms = (x, y) => {
+      if (op === '=' || op === '!=') {
+        let eq;
+        if (typeof x === 'boolean' || typeof y === 'boolean') eq = xpathBool(x) === xpathBool(y);
+        else if (typeof x === 'number' || typeof y === 'number') eq = xpathNumber(x) === xpathNumber(y);
+        else eq = String(x) === String(y);
+        return op === '=' ? eq : !eq;
+      }
+      const m = xpathNumber(x), n = xpathNumber(y);
+      return op === '<' ? m < n : op === '>' ? m > n : op === '<=' ? m <= n : m >= n;
+    };
+    // Node-sets compare by some member's string value
+    const values = (set, other) => set.map(n => typeof other === 'number' ? xpathNumber(xpathNodeString(n)) : xpathNodeString(n));
+    if (Array.isArray(a) && Array.isArray(b)) { const bs = values(b, ''); return values(a, '').some(x => bs.some(y => atoms(x, y))); }
+    if (Array.isArray(a)) return typeof b === 'boolean' ? atoms(xpathBool(a), b) : values(a, b).some(x => atoms(x, b));
+    if (Array.isArray(b)) return typeof a === 'boolean' ? atoms(a, xpathBool(b)) : values(b, a).some(y => atoms(a, y));
+    return atoms(a, b);
+  }
+  const xpathNodeSet = (v, what) => { if (!Array.isArray(v)) throw new TypeError(`The ${what} needs a node-set.`); return v; };
+  function xpathFilter(nodes, pred, ctx) {
+    const size = nodes.length;
+    return nodes.filter((n, i) => {
+      const v = xpathEval(pred, { node: n, pos: i + 1, size, vars: ctx.vars });
+      return typeof v === 'number' ? v === i + 1 : xpathBool(v);
+    });
+  }
+  function xpathEval(e, ctx) {
+    switch (e.k) {
+      case 'lit': case 'num': return e.v;
+      case 'var': {
+        const v = ctx.vars && ctx.vars[e.name];
+        if (v === undefined) throw new DOMException(`Undefined XPath variable $${e.name}.`, 'NamespaceError');
+        return v;
+      }
+      case 'or': return xpathBool(xpathEval(e.a, ctx)) || xpathBool(xpathEval(e.b, ctx));
+      case 'and': return xpathBool(xpathEval(e.a, ctx)) && xpathBool(xpathEval(e.b, ctx));
+      case 'neg': return -xpathNumber(xpathEval(e.a, ctx));
+      case 'arith': {
+        const a = xpathNumber(xpathEval(e.a, ctx)), b = xpathNumber(xpathEval(e.b, ctx));
+        return e.op === '+' ? a + b : e.op === '-' ? a - b : e.op === '*' ? a * b : e.op === 'div' ? a / b : a % b;
+      }
+      case 'cmp': return xpathCompare(e.op, xpathEval(e.a, ctx), xpathEval(e.b, ctx));
+      case 'union': return xpathDocOrder([...xpathNodeSet(xpathEval(e.a, ctx), '| operator'), ...xpathNodeSet(xpathEval(e.b, ctx), '| operator')]);
+      case 'filter': {
+        let nodes = xpathNodeSet(xpathEval(e.e, ctx), 'predicate');
+        for (const pr of e.preds) nodes = xpathFilter(nodes, pr, ctx);
+        return nodes;
+      }
+      case 'path': {
+        let nodes;
+        if (e.from) nodes = xpathNodeSet(xpathEval(e.from, ctx), 'path');
+        else if (e.root) { let r = ctx.node; for (let p = xpathParent(r); p; p = xpathParent(p)) r = p; nodes = [r]; }
+        else nodes = [ctx.node];
+        for (const st of e.steps) {
+          const found = [];
+          for (const n of nodes) {
+            // Predicates count positions along the axis (nearest first on
+            // reverse axes)
+            let sel = xpathAxis(n, st.axis).filter(x => xpathTest(x, st.test, st.axis));
+            for (const pr of st.preds) sel = xpathFilter(sel, pr, ctx);
+            for (const x of sel) found.push(x);
+          }
+          nodes = nodes.length > 1 || XPATH_REVERSE.has(st.axis) ? xpathDocOrder(found) : found;
+        }
+        return nodes;
+      }
+      case 'fn': return xpathCall(e, ctx);
+    }
+    throw xpathSyntax('');
+  }
+  function xpathCall(e, ctx) {
+    const args = e.args.map(a => xpathEval(a, ctx));
+    const str = (i) => i < args.length ? xpathString(args[i]) : xpathNodeString(ctx.node);
+    const node = () => args.length ? (xpathNodeSet(args[0], `${e.name}() argument`)[0] ?? null) : ctx.node;
+    switch (e.name) {
+      case 'last': return ctx.size;
+      case 'position': return ctx.pos;
+      case 'count': return xpathNodeSet(args[0], 'count() argument').length;
+      case 'id': {
+        const ids = (Array.isArray(args[0]) ? args[0].map(xpathNodeString) : [xpathString(args[0])]).join(' ').split(/[\x20\t\r\n]+/).filter(Boolean);
+        const doc = ctx.node.nodeType === 9 ? ctx.node : ctx.node.ownerDocument;
+        return xpathDocOrder(ids.map(i => doc && doc.getElementById(i)).filter(Boolean));
+      }
+      case 'local-name': { const n = node(); return !n ? '' : n.nodeType === 7 ? n.target : (n.localName || ''); }
+      case 'name': {
+        const n = node();
+        if (!n) return '';
+        if (n.nodeType === 2) return n.name;
+        if (n.nodeType === 7) return n.target;
+        return n.nodeType === 1 ? (n.prefix ? `${n.prefix}:${n.localName}` : n.localName) : '';
+      }
+      case 'namespace-uri': { const n = node(); return (n && n.namespaceURI) || ''; }
+      case 'string': return str(0);
+      case 'concat': return args.map(xpathString).join('');
+      case 'starts-with': return str(0).startsWith(str(1));
+      case 'contains': return str(0).includes(str(1));
+      case 'substring-before': { const s = str(0), t = str(1), i = s.indexOf(t); return i < 0 ? '' : s.slice(0, i); }
+      case 'substring-after': { const s = str(0), t = str(1), i = s.indexOf(t); return i < 0 ? '' : s.slice(i + t.length); }
+      case 'substring': {
+        const from = xpathRound(xpathNumber(args[1])), len = args.length > 2 ? xpathRound(xpathNumber(args[2])) : Infinity;
+        return Array.from(str(0)).filter((_, i) => i + 1 >= from && i + 1 < from + len).join('');
+      }
+      case 'string-length': return Array.from(str(0)).length;
+      case 'normalize-space': return str(0).replace(/[\x20\t\r\n]+/g, ' ').replace(/^ | $/g, '');
+      case 'translate': {
+        const from = Array.from(str(1)), to = Array.from(str(2));
+        return Array.from(str(0)).map(c => { const i = from.indexOf(c); return i < 0 ? c : (to[i] ?? ''); }).join('');
+      }
+      case 'boolean': return xpathBool(args[0]);
+      case 'not': return !xpathBool(args[0]);
+      case 'true': return true;
+      case 'false': return false;
+      case 'lang': {
+        // xml:lang (not HTML's lang attribute)
+        const want = str(0).toLowerCase();
+        for (let n = ctx.node; n; n = xpathParent(n)) {
+          const l = n.nodeType === 1 ? n.getAttribute('xml:lang') : null;
+          if (l !== null) { const v = l.toLowerCase(); return v === want || v.startsWith(want + '-'); }
+        }
+        return false;
+      }
+      case 'number': return args.length ? xpathNumber(args[0]) : xpathNumber(xpathNodeString(ctx.node));
+      case 'sum': return xpathNodeSet(args[0], 'sum() argument').reduce((t, n) => t + xpathNumber(xpathNodeString(n)), 0);
+      case 'floor': return Math.floor(xpathNumber(args[0]));
+      case 'ceiling': return Math.ceil(xpathNumber(args[0]));
+      case 'round': return xpathRound(xpathNumber(args[0]));
+    }
+    throw new DOMException(`Unknown XPath function ${e.name}().`, 'SyntaxError');
+  }
+  const XPATH_RESULT_TYPES = {
+    ANY_TYPE: 0, NUMBER_TYPE: 1, STRING_TYPE: 2, BOOLEAN_TYPE: 3, UNORDERED_NODE_ITERATOR_TYPE: 4, ORDERED_NODE_ITERATOR_TYPE: 5,
+    UNORDERED_NODE_SNAPSHOT_TYPE: 6, ORDERED_NODE_SNAPSHOT_TYPE: 7, ANY_UNORDERED_NODE_TYPE: 8, FIRST_ORDERED_NODE_TYPE: 9,
+  };
+  const xpathState = new WeakMap();
+  const xpathResult = (r) => xpathState.get(r) || (() => { throw new TypeError('Illegal invocation'); })();
+  const xpathWrongType = (what) => new TypeError(`The result type is not ${what}.`);
+  class XPathResult {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get resultType() { return xpathResult(this).type; }
+    get numberValue() { const s = xpathResult(this); if (s.type !== 1) throw xpathWrongType('a number'); return s.value; }
+    get stringValue() { const s = xpathResult(this); if (s.type !== 2) throw xpathWrongType('a string'); return s.value; }
+    get booleanValue() { const s = xpathResult(this); if (s.type !== 3) throw xpathWrongType('a boolean'); return s.value; }
+    get singleNodeValue() { const s = xpathResult(this); if (s.type !== 8 && s.type !== 9) throw xpathWrongType('a single node'); return s.value[0] ?? null; }
+    get snapshotLength() { const s = xpathResult(this); if (s.type !== 6 && s.type !== 7) throw xpathWrongType('a snapshot'); return s.value.length; }
+    get invalidIteratorState() { return false; }
+    iterateNext() { const s = xpathResult(this); if (s.type !== 4 && s.type !== 5) throw xpathWrongType('an iterator'); return s.value[s.at++] ?? null; }
+    snapshotItem(i) { const s = xpathResult(this); if (s.type !== 6 && s.type !== 7) throw xpathWrongType('a snapshot'); return s.value[i] ?? null; }
+  }
+  Object.assign(XPathResult, XPATH_RESULT_TYPES);
+  Object.assign(XPathResult.prototype, XPATH_RESULT_TYPES);
+  function xpathMakeResult(value, type) {
+    type = Number(type) || 0;
+    if (type === 0) type = Array.isArray(value) ? 4 : typeof value === 'number' ? 1 : typeof value === 'string' ? 2 : 3;
+    if (type === 1) value = xpathNumber(value);
+    else if (type === 2) value = xpathString(value);
+    else if (type === 3) value = xpathBool(value);
+    else if (type >= 4 && type <= 9) xpathNodeSet(value, 'result');
+    else throw new TypeError('Unknown XPathResult type.');
+    const r = Object.create(XPathResult.prototype);
+    xpathState.set(r, { type, value, at: 0 });
+    return r;
+  }
+  const xpathAsts = new WeakMap();
+  class XPathExpression {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    evaluate(contextNode, type = 0, result = null) {
+      const ast = xpathAsts.get(this);
+      if (!ast) throw new TypeError('Illegal invocation');
+      if (!(contextNode instanceof Node)) throw new TypeError("Failed to execute 'evaluate' on 'XPathExpression': parameter 1 is not of type 'Node'.");
+      return xpathMakeResult(xpathEval(ast, { node: contextNode, pos: 1, size: 1, vars: null }), type);
+    }
+  }
+  function xpathCreate(src) {
+    const e = Object.create(XPathExpression.prototype);
+    xpathAsts.set(e, xpathParse(String(src)));
+    return e;
+  }
+  class XPathEvaluator {
+    createExpression(expression, resolver) { return xpathCreate(expression); }
+    createNSResolver(node) { return node; }
+    evaluate(expression, contextNode, resolver, type, result) { return xpathCreate(expression).evaluate(contextNode, type, result); }
+  }
+  define(Document.prototype, {
+    createExpression(expression, resolver) { return xpathCreate(expression); },
+    createNSResolver(node) { return node; },
+    evaluate(expression, contextNode, resolver, type, result) { return xpathCreate(expression).evaluate(contextNode, type, result); },
+  });
+  Object.assign(global, { XPathResult, XPathExpression, XPathEvaluator });
+
   // ---- element interfaces ----
   //
   // One prototype per interface, as in browsers: `instanceof` tells

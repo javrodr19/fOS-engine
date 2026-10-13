@@ -301,8 +301,8 @@ impl SizeExpr<'_> {
         self.at += unit_len;
         Some(match unit.as_str() {
             "px" | "" => n,
-            "vw" => n * self.vw / 100.0,
-            "vh" => n * self.vw * 0.75 / 100.0,
+            "vw" | "svw" | "lvw" | "dvw" => n * self.vw / 100.0,
+            "vh" | "svh" | "lvh" | "dvh" => n * self.vw * 0.75 / 100.0,
             "em" | "rem" => n * 16.0,
             _ => return None,
         })

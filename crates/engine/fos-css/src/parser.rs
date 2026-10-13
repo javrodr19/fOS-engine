@@ -1222,10 +1222,12 @@ pub fn parse_length(v: &str) -> Option<Length> {
         "em" => (n, LengthUnit::Em),
         "rem" => (n, LengthUnit::Rem),
         "%" => (n, LengthUnit::Percent),
-        "vw" => (n, LengthUnit::Vw),
-        "vh" => (n, LengthUnit::Vh),
-        "vmin" => (n, LengthUnit::Vmin),
-        "vmax" => (n, LengthUnit::Vmax),
+        // The small, large and dynamic viewports are one here: the
+        // viewport has no retractable browser UI
+        "vw" | "svw" | "lvw" | "dvw" => (n, LengthUnit::Vw),
+        "vh" | "svh" | "lvh" | "dvh" => (n, LengthUnit::Vh),
+        "vmin" | "svmin" | "lvmin" | "dvmin" => (n, LengthUnit::Vmin),
+        "vmax" | "svmax" | "lvmax" | "dvmax" => (n, LengthUnit::Vmax),
         "ch" => (n, LengthUnit::Ch),
         "ex" => (n, LengthUnit::Ex),
         "pt" => (n * 4.0 / 3.0, LengthUnit::Px),
@@ -1732,6 +1734,14 @@ mod tests {
         CssParser::new().parse(css).unwrap()
     }
 
+
+    #[test]
+    fn viewport_unit_variants() {
+        // vercel.com's hero: min-h-[min(calc(100svh-var(--header-height)),1100px)]
+        for (unit, expected) in [("svh", LengthUnit::Vh), ("dvh", LengthUnit::Vh), ("lvw", LengthUnit::Vw), ("svmin", LengthUnit::Vmin), ("dvmax", LengthUnit::Vmax)] {
+            assert_eq!(parse_length(&format!("50{unit}")).map(|l| l.unit), Some(expected), "{unit}");
+        }
+    }
 
     #[test]
     fn supports_conditions() {

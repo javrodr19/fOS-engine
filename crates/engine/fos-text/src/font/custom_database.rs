@@ -156,7 +156,7 @@ pub struct CustomFontDatabase {
 struct Instances {
     slots: Box<[OnceLock<FontEntry>]>,
     next: AtomicUsize,
-    made: Mutex<HashMap<(FontId, u16, u16), FontId>>,
+    made: Mutex<HashMap<(FontId, u16, u16, u16), FontId>>,
 }
 
 /// Most instances a database makes (each is a copy of its face)
@@ -229,12 +229,23 @@ impl CustomFontDatabase {
     /// those coordinates (made on first use); otherwise `id` itself, as
     /// when the instances run out
     pub fn instance(&self, id: FontId, weight: u16, opsz: u16) -> FontId {
+        self.instance_at(id, weight, opsz, 1000)
+    }
+
+    /// [`Self::instance`], and at width `wdth` (tenths of a percent of the
+    /// normal width, for `font-stretch`) on a face with a width axis
+    pub fn instance_at(&self, id: FontId, weight: u16, opsz: u16, wdth: u16) -> FontId {
         let Some(font) = self.font(id).filter(|f| f.variable) else { return id };
         let Some(axes) = self.with_face_data(id, super::instance::axes) else { return id };
         let has = |tag: &[u8; 4]| axes.iter().any(|a| &a.0 == tag);
         let weight = weight.clamp(font.weights.0.min(font.weights.1), font.weights.1.max(font.weights.0));
-        let key = (id, if has(b"wght") { weight } else { 0 }, if has(b"opsz") { opsz } else { 0 });
-        if key.1 == 0 && key.2 == 0 {
+        // The width axis within its range; at its default, no coordinate
+        let wdth = axes.iter().find(|a| &a.0 == b"wdth").map_or(0, |a| {
+            let w = (wdth as f32 / 10.0).clamp(a.1, a.3);
+            if (w - a.2).abs() < 0.05 { 0 } else { (w * 10.0).round() as u16 }
+        });
+        let key = (id, if has(b"wght") { weight } else { 0 }, if has(b"opsz") { opsz } else { 0 }, wdth);
+        if key.1 == 0 && key.2 == 0 && key.3 == 0 {
             return id;
         }
         let mut made = self.instances.made.lock().unwrap_or_else(|p| p.into_inner());
@@ -242,7 +253,7 @@ impl CustomFontDatabase {
             return made;
         }
         let slot = self.instances.next.load(Ordering::Relaxed);
-        let coords = [(*b"wght", key.1 as f32), (*b"opsz", key.2 as f32)];
+        let coords = [(*b"wght", key.1 as f32), (*b"opsz", key.2 as f32), (*b"wdth", key.3 as f32 / 10.0)];
         let coords: Vec<_> = coords.into_iter().filter(|(t, v)| has(t) && *v > 0.0).collect();
         let instance = (slot < MAX_INSTANCES)
             .then(|| self.with_face_data(id, |data, index| super::instance::instance(data, index, &coords)).flatten())
@@ -1034,6 +1045,21 @@ mod tests {
         let mut data = font_bytes("X", 400, false, true);
         data.truncate(20);
         assert!(db.load_font_data(data).is_err());
+    }
+
+    #[test]
+    fn variable_faces_with_a_width_axis_take_font_stretch() {
+        // font-stretch picks the width axis's coordinate, within its range;
+        // the default width is the face itself (bun.sh's condensed Archivo)
+        let mut db = CustomFontDatabase::new();
+        let id = db.add_web_font_weights("Wide", (400, 400), FontStyle::Normal, crate::font::instance::tests::variable_square_on(*b"wdth", [50, 100, 150])).unwrap();
+        let x_max = |db: &CustomFontDatabase, id| db.with_face_data(id, |data, index| ttf_parser::Face::parse(data, index).unwrap().glyph_bounding_box(ttf_parser::GlyphId(1)).unwrap().x_max);
+        assert_eq!(db.instance_at(id, 400, 16, 1000), id);
+        let wide = db.instance_at(id, 400, 16, 1250);
+        assert_eq!(x_max(&db, wide), Some(150));
+        // Beyond the axis, its maximum
+        assert_eq!(x_max(&db, db.instance_at(id, 400, 16, 2000)), Some(200));
+        assert_eq!(db.instance_at(id, 400, 16, 1250), wide);
     }
 
     #[test]

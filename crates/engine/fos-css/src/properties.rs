@@ -59,6 +59,7 @@ pub enum PropertyId {
     FontSize,
     FontWeight,
     FontStyle,
+    FontStretch,
     TextAlign,
     TextDecoration,
     LineHeight,
@@ -198,6 +199,7 @@ impl PropertyId {
                 | Self::FontSize
                 | Self::FontWeight
                 | Self::FontStyle
+                | Self::FontStretch
                 | Self::LineHeight
                 | Self::TextAlign
                 | Self::TextIndent
@@ -273,6 +275,7 @@ impl PropertyId {
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
+            "font-stretch" | "font-width" => Self::FontStretch,
             "text-align" => Self::TextAlign,
             "text-decoration" => Self::TextDecoration,
             "line-height" => Self::LineHeight,

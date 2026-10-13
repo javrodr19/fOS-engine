@@ -15,7 +15,7 @@ pub const PROPERTIES: &[&str] = &[
     "border-right-style", "border-right-width", "border-spacing", "border-top-color", "border-top-left-radius",
     "border-top-right-radius", "border-top-style", "border-top-width", "bottom", "box-shadow", "box-sizing",
     "caption-side", "clear", "color", "column-gap", "contain", "container-type", "content", "content-visibility", "direction", "display", "flex-basis",
-    "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-style",
+    "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-stretch", "font-style",
     "font-weight", "height", "justify-content", "left", "letter-spacing", "line-height", "list-style-position",
     "list-style-type", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
     "min-height", "min-width", "object-fit", "opacity", "order", "outline-color", "outline-offset", "outline-style",
@@ -433,6 +433,7 @@ impl Style {
             "font-family" => i.font_family.iter().map(|f| family(f)).collect::<Vec<_>>().join(", "),
             "font-size" => px(i.font_size),
             "font-weight" => i.font_weight.to_string(),
+            "font-stretch" => format!("{}%", number(i.font_stretch)),
             "font-style" => i.font_style.as_css().into(),
             "line-height" => match i.line_height {
                 LineHeight::Normal => "normal".into(),

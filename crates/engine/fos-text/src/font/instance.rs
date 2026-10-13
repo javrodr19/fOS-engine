@@ -281,6 +281,12 @@ pub(crate) mod tests {
     /// square glyph, 100 units wide with a 500 advance, that grows 100
     /// units wider (advance included) at weight 900
     pub(crate) fn variable_square() -> Vec<u8> {
+        variable_square_on(*b"wght", [100, 400, 900])
+    }
+
+    /// [`variable_square`] with axis `tag` from `range[0]` to `range[2]`
+    /// (default `range[1]`): the square grows at the axis maximum
+    pub(crate) fn variable_square_on(tag: [u8; 4], range: [u32; 3]) -> Vec<u8> {
         let be16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_be_bytes());
         let be32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_be_bytes());
         let mut head = vec![0u8; 54];
@@ -323,8 +329,8 @@ pub(crate) mod tests {
         for v in [1u16, 0, 16, 2, 1, 20, 0, 8] {
             be16(&mut fvar, v);
         }
-        fvar.extend_from_slice(b"wght");
-        for v in [100u32, 400, 900] {
+        fvar.extend_from_slice(&tag);
+        for v in range {
             be32(&mut fvar, v << 16);
         }
         be16(&mut fvar, 0);

@@ -60,7 +60,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "background" => &[BackgroundColor, BackgroundImage, BackgroundRepeat, BackgroundPosition, BackgroundSize],
         "mask" => &[MaskImage, MaskRepeat, MaskPosition, MaskSize],
         "animation" | "-webkit-animation" => &[AnimationName, AnimationFillMode, AnimationIterationCount, AnimationDirection],
-        "font" => &[FontStyle, FontWeight, FontSize, LineHeight, FontFamily],
+        "font" => &[FontStyle, FontWeight, FontStretch, FontSize, LineHeight, FontFamily],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
@@ -224,6 +224,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "font-size" => FontSize,
         "font-weight" => FontWeight,
         "font-style" => FontStyle,
+        "font-stretch" | "font-width" => FontStretch,
         "line-height" => LineHeight,
         "text-align" => TextAlign,
         "text-indent" => TextIndent,
@@ -694,6 +695,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::BackgroundSize | P::MaskSize => layers(v, background_size),
         P::FontFamily => font_family(raw),
         P::FontSize => font_size(v),
+        P::FontStretch => font_stretch(v).map(PropertyValue::Number),
         P::FontWeight => match v {
             "bolder" => Some(PropertyValue::Keyword(Keyword::Bolder)),
             "lighter" => Some(PropertyValue::Keyword(Keyword::Lighter)),
@@ -1361,11 +1363,15 @@ fn font_shorthand(v: &str, important: bool, out: Out) {
     let Some(size_at) = parts.iter().position(|p| font_size(p.split('/').next().unwrap_or("")).is_some()) else { return };
     let mut style = PropertyValue::Enum(FontStyle::Normal as u8);
     let mut weight = PropertyValue::Integer(400);
+    let mut stretch = 100.0;
     for p in &parts[..size_at] {
         if let Some(s) = enum_value::<FontStyle>(p) {
             style = s;
         } else if let Some(w) = font_weight(p) {
             weight = PropertyValue::Integer(w);
+        } else if let Some(s) = font_stretch(p).filter(|_| !p.ends_with('%')) {
+            // (only keywords in the shorthand)
+            stretch = s;
         }
     }
     let (size, lh) = match parts[size_at].split_once('/') {
@@ -1393,11 +1399,28 @@ fn font_shorthand(v: &str, important: bool, out: Out) {
     let family = raw_parts.get(family_at..).map(|f| f.join(" ")).unwrap_or_default();
     push(out, PropertyId::FontStyle, style, important);
     push(out, PropertyId::FontWeight, weight, important);
+    push(out, PropertyId::FontStretch, PropertyValue::Number(stretch), important);
     push(out, PropertyId::FontSize, size, important);
     push(out, PropertyId::LineHeight, line, important);
     if let Some(f) = font_family(&family) {
         push(out, PropertyId::FontFamily, f, important);
     }
+}
+
+/// `font-stretch`: a keyword or a percentage, as a percentage of normal
+fn font_stretch(v: &str) -> Option<f32> {
+    Some(match v.trim() {
+        "ultra-condensed" => 50.0,
+        "extra-condensed" => 62.5,
+        "condensed" => 75.0,
+        "semi-condensed" => 87.5,
+        "normal" => 100.0,
+        "semi-expanded" => 112.5,
+        "expanded" => 125.0,
+        "extra-expanded" => 150.0,
+        "ultra-expanded" => 200.0,
+        p => p.strip_suffix('%')?.trim().parse::<f32>().ok().filter(|p| *p >= 0.0 && p.is_finite())?,
+    })
 }
 
 /// Families without quotes, generic names lowercase
@@ -2007,6 +2030,17 @@ mod tests {
         assert_eq!((s.box_.align_items, AlignItems::from_u8(s.box_.grid.justify_items)), (AlignItems::Center, Some(AlignItems::Center)));
         let s = computed("place-self: start end");
         assert_eq!((s.box_.align_self, AlignSelf::from_u8(s.box_.grid.justify_self)), (AlignSelf::Start, Some(AlignSelf::End)));
+    }
+
+    #[test]
+    fn font_stretch_values() {
+        // bun.sh's hero words are font-stretch: 75% of a variable face
+        assert_eq!(computed("font-stretch: condensed").inherited.font_stretch, 75.0);
+        assert_eq!(computed("font-width: 62.5%").inherited.font_stretch, 62.5);
+        assert_eq!(computed("font: condensed bold 12px serif").inherited.font_stretch, 75.0);
+        assert_eq!(computed("font-stretch: 75%; font: 12px serif").inherited.font_stretch, 100.0);
+        assert_eq!(computed("font-stretch: -5%").inherited.font_stretch, 100.0);
+        assert_eq!(computed("font-stretch: expanded").resolved_value("font-stretch", None).as_deref(), Some("125%"));
     }
 
     #[test]

@@ -506,6 +506,8 @@ pub struct InheritedStyle {
     pub font_size: f32,
     pub font_weight: u16,
     pub font_style: FontStyle,
+    /// `font-stretch`, as a percentage of the normal width
+    pub font_stretch: f32,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub text_indent: Lp,
@@ -537,6 +539,7 @@ impl Default for InheritedStyle {
             font_family: Arc::from([Arc::from("serif")]),
             font_size: 16.0,
             font_weight: 400,
+            font_stretch: 100.0,
             font_style: FontStyle::Normal,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
@@ -1309,7 +1312,7 @@ impl Style {
                         _ => 2,
                     },
                     _ => match d.property {
-                        PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle => 0,
+                        PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle | PropertyId::FontStretch => 0,
                         PropertyId::LineHeight => 1,
                         _ => 2,
                     },
@@ -2087,6 +2090,11 @@ impl Style {
                 set!(inherited, [font_weight], w.clamp(1, 1000) as u16);
             }
             PropertyId::FontStyle => set!(inherited, [font_style], enum_of!(FontStyle)),
+            PropertyId::FontStretch => {
+                if let PropertyValue::Number(p) = v {
+                    set!(inherited, [font_stretch], *p);
+                }
+            }
             PropertyId::LineHeight => {
                 let fs = self.inherited.font_size;
                 let lh = match v {
@@ -2297,6 +2305,7 @@ impl Style {
             PropertyId::FontSize => copy!(inherited, [font_size]),
             PropertyId::FontWeight => copy!(inherited, [font_weight]),
             PropertyId::FontStyle => copy!(inherited, [font_style]),
+            PropertyId::FontStretch => copy!(inherited, [font_stretch]),
             PropertyId::LineHeight => copy!(inherited, [line_height]),
             PropertyId::TextAlign => copy!(inherited, [text_align]),
             PropertyId::TextIndent => copy!(inherited, [text_indent]),

@@ -132,7 +132,7 @@ const MAX_WORDS: usize = 50_000;
 pub struct FontUnits {
     fonts: std::sync::Mutex<FontContext>,
     /// (families, weight, italic, size) -> (ch, ex) in pixels
-    units: std::sync::Mutex<HashMap<(Arc<[Arc<str>]>, u16, bool, u32), (f32, f32)>>,
+    units: std::sync::Mutex<HashMap<(Arc<[Arc<str>]>, u16, bool, u32, u32), (f32, f32)>>,
 }
 
 impl FontUnits {
@@ -143,7 +143,7 @@ impl FontUnits {
 
 impl fos_css::style::FontUnits for FontUnits {
     fn ch_ex(&self, font: &fos_css::style::InheritedStyle, size: f32) -> (f32, f32) {
-        let key = (font.font_family.clone(), font.font_weight, font.font_style != FontStyle::Normal, size.to_bits());
+        let key = (font.font_family.clone(), font.font_weight, font.font_style != FontStyle::Normal, size.to_bits(), font.font_stretch.to_bits());
         if let Some(units) = self.units.lock().map_or(None, |u| u.get(&key).copied()) {
             return units;
         }
@@ -153,6 +153,7 @@ impl fos_css::style::FontUnits for FontUnits {
         i.font_family = font.font_family.clone();
         i.font_weight = font.font_weight;
         i.font_style = font.font_style;
+        i.font_stretch = font.font_stretch;
         i.font_size = size;
         // At the size asked for: a variable face's optical size changes
         // its advances. "0" is half an em without a face; the x-height is
@@ -173,6 +174,7 @@ impl fos_css::style::FontUnits for FontUnits {
         i.font_family = font.font_family.clone();
         i.font_weight = font.font_weight;
         i.font_style = font.font_style;
+        i.font_stretch = font.font_stretch;
         i.font_size = size;
         fonts.resolve(&style).line_height(fos_css::style::LineHeight::Normal)
     }
@@ -192,7 +194,7 @@ pub struct FontContext {
     /// Faces to try for fallback, best first (built on first need)
     fallback_order: Option<Vec<FontId>>,
     /// (face, weight, size) -> the face to draw (a variable face's instance)
-    instances: HashMap<(FontId, u16, u16), FontId>,
+    instances: HashMap<(FontId, u16, u16, u16), FontId>,
 }
 
 impl Default for FontContext {
@@ -245,8 +247,8 @@ impl FontContext {
         // A variable face is drawn through its instance at the weight and
         // (font-optical-sizing: auto) the size asked for
         let id = id.map(|id| {
-            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16);
-            *self.instances.entry(key).or_insert_with(|| self.db.instance(id, key.1, key.2))
+            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16, (i.font_stretch * 10.0).round().clamp(0.0, 10000.0) as u16);
+            *self.instances.entry(key).or_insert_with(|| self.db.instance_at(id, key.1, key.2, key.3))
         });
         let metrics = id.map_or(FontMetrics::FALLBACK, |id| self.metrics_of(id));
         ResolvedFont { id, size: i.font_size, metrics, synthesis }

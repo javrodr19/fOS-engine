@@ -63,7 +63,7 @@ fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map:
         if child.kind == BoxFragmentKind::Placeholder {
             let Some(b) = map.get(&child.node) else { continue };
             let containing = if b.style.box_.position == Position::Fixed { viewport } else { cb };
-            let mut placed = layout_absolute(ctx, b, containing, (child.border_box.x, child.border_box.y));
+            let mut placed = layout_absolute(ctx, b, containing, child.border_box, child.static_align.unwrap_or((0.0, 0.0)));
             // Its own absolutely positioned descendants
             walk(ctx, &mut placed, containing, viewport, map);
             *child = placed;
@@ -80,8 +80,10 @@ fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map:
 }
 
 /// Lay out an absolutely positioned box against containing block `cb`;
-/// `static_pos` is where its margin box would have started in flow
-pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos: (f32, f32)) -> BoxFragment {
+/// its static position is where its margin box would have started in
+/// flow: aligned in `static_area` by fractions `align` of the free space
+/// (an empty area at the start for block and inline layout)
+pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_area: Rect, align: (f32, f32)) -> BoxFragment {
     let s = &b.style;
     let e = edges(s, cb.w);
     let (hbp, vbp) = (e.horizontal_bp(), e.vertical_bp());
@@ -150,15 +152,16 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
         }
     }
     let _ = mr;
+    let (mr0, mb0) = (e.margin[1].unwrap_or(0.0), mb);
     let x = match (left, right) {
         (Some(l), _) => cb.x + l + ml,
-        (None, Some(r)) => cb.right() - r - e.margin[1].unwrap_or(0.0) - w,
-        (None, None) => static_pos.0 + ml,
+        (None, Some(r)) => cb.right() - r - mr0 - w,
+        (None, None) => static_area.x + ml + (static_area.w - ml - w - mr0) * align.0,
     };
     let y = match (top, bottom) {
         (Some(t), _) => cb.y + t + mt,
         (None, Some(bt)) => cb.bottom() - bt - mb - h,
-        (None, None) => static_pos.1 + mt,
+        (None, None) => static_area.y + mt + (static_area.h - mt - h - mb0) * align.1,
     };
     frag.translate(x - frag.border_box.x, y - frag.border_box.y);
     frag

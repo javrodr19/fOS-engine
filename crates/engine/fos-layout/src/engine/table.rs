@@ -82,9 +82,9 @@ fn column_kinds(g: &Grid) -> Vec<ColumnKind> {
         }
         if let LpAuto::Lp(l) = cell.b.style.box_.width {
             kinds[c] = match (kinds[c], l.has_percent()) {
-                (ColumnKind::Percent(p), true) => ColumnKind::Percent(p.max(l.pct)),
+                (ColumnKind::Percent(p), true) => ColumnKind::Percent(p.max(l.percent())),
                 (ColumnKind::Percent(p), false) => ColumnKind::Percent(p),
-                (_, true) => ColumnKind::Percent(l.pct),
+                (_, true) => ColumnKind::Percent(l.percent()),
                 (_, false) => ColumnKind::Fixed,
             };
         }
@@ -304,6 +304,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             replaced: None,
             scroll_extent: None,
             line_baselines: None,
+            static_align: None,
         })
         .collect();
     for (r, c, rs, mut f, content) in laid_cells {

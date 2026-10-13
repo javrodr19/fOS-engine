@@ -101,8 +101,26 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for &i in &order {
         let b = &items[i];
         if b.style.is_out_of_flow() {
-            // Its static position is the container's content start
-            frags.push(Fragment::Box(super::block::placeholder(b, super::fragment::Rect::default())));
+            // Its static position is where it would be as the container's
+            // sole item (CSS Flexbox §4.1): aligned in the content box by
+            // justify-content and its align-self, once its size is known.
+            // nextjs.org centers its wordmark this way
+            let mut main = match bx.justify_content {
+                JustifyContent::Center | JustifyContent::SpaceAround | JustifyContent::SpaceEvenly => 0.5,
+                JustifyContent::FlexEnd | JustifyContent::End | JustifyContent::Right => 1.0,
+                _ => 0.0,
+            };
+            if reverse && !matches!(bx.justify_content, JustifyContent::Start | JustifyContent::End | JustifyContent::Left | JustifyContent::Right) {
+                main = 1.0 - main;
+            }
+            let cross = match align_of(&b.style, style) {
+                AlignItems::Center => 0.5,
+                AlignItems::FlexEnd | AlignItems::End | AlignItems::SelfEnd => 1.0,
+                _ => 0.0,
+            };
+            let mut p = super::block::placeholder(b, super::fragment::Rect::default());
+            p.static_align = Some(if row { (main, cross) } else { (cross, main) }).filter(|&a| a != (0.0, 0.0));
+            frags.push(Fragment::Box(p));
             continue;
         }
         let s = &b.style;

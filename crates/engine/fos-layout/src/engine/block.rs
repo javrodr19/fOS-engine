@@ -408,6 +408,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         replaced: None,
         scroll_extent: None,
         line_baselines: None,
+        static_align: None,
     };
     let (content_x, content_y) = (ml + e.border[3] + e.padding[3], e.border[0] + e.padding[0]);
     // A new formatting context has its own floats and coordinates
@@ -447,7 +448,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             flex.height
         }
         BoxKind::Grid(items) => {
-            let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h);
+            let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
+            let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = grid.frags;
             grid.height
         }
@@ -478,6 +480,12 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     };
     let through = through && collapse_top && collapse_bottom && height <= 0.0;
     for c in &mut frag.children {
+        // Absolutely positioned flex children align in the content box
+        if let Fragment::Box(p) = c {
+            if p.static_align.is_some() {
+                p.border_box = Rect::new(0.0, 0.0, width, height);
+            }
+        }
         c.translate(content_x, content_y);
     }
     if let Some((first, last)) = &mut frag.line_baselines {
@@ -696,6 +704,7 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         replaced: None,
         scroll_extent: None,
         line_baselines: None,
+        static_align: None,
     }
 }
 
@@ -817,6 +826,7 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         replaced: None,
         scroll_extent: None,
         line_baselines: None,
+        static_align: None,
     };
     let content = frag.content_box();
     let paint = match &r.what {

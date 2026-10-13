@@ -28,9 +28,15 @@ pub struct Lp {
     pub pct: f32,
 }
 
+/// A math function whose comparisons wait for the percentage basis
+/// (`min(1040px, 100%)`) is an `Lp` with a NaN `pct` carrying the index of
+/// its interned tree, and `px` its value with percentages as 0 (what code
+/// ignoring the percentage expects)
+const CALC_NAN: u32 = 0x7FC0_0000;
+
 impl PartialEq for Lp {
     fn eq(&self, other: &Lp) -> bool {
-        self.px == other.px && self.pct == other.pct && self.has_percent() == other.has_percent()
+        self.px == other.px && (self.pct == other.pct || self.pct.to_bits() == other.pct.to_bits()) && self.has_percent() == other.has_percent()
     }
 }
 
@@ -45,14 +51,30 @@ impl Lp {
         Lp { px: 0.0, pct: if pct == 0.0 { -0.0 } else { pct } }
     }
 
+    pub(crate) fn calc(index: u32, px: f32) -> Lp {
+        Lp { px, pct: f32::from_bits(CALC_NAN | index) }
+    }
+
+    /// The interned math function this is, if it is one
+    pub fn calc_index(self) -> Option<u32> {
+        self.pct.is_nan().then(|| self.pct.to_bits() & !CALC_NAN & 0x7FFF_FFFF)
+    }
+
     /// Pixels, given what a percentage is of
     #[inline]
     pub fn resolve(self, basis: f32) -> f32 {
         if self.pct == 0.0 {
             self.px
+        } else if let Some(i) = self.calc_index() {
+            crate::values::eval_calc(i, basis)
         } else {
             self.px + self.pct * basis / 100.0
         }
+    }
+
+    /// The percentage alone, as a math function has none of its own
+    pub fn percent(self) -> f32 {
+        if self.pct.is_nan() { 0.0 } else { self.pct }
     }
 
     pub fn is_zero(self) -> bool {
@@ -1430,6 +1452,9 @@ impl Style {
     /// A length-percentage in text (grid tracks), including resolved
     /// mixes (`-fos-mix(Xpx Y%)`)
     fn lp_text(&self, t: &str, ctx: &StyleContext) -> Option<Lp> {
+        if t.starts_with("-fos-calc(") {
+            return crate::values::calc_length(t);
+        }
         if let Some(inner) = t.strip_prefix("-fos-mix(").and_then(|r| r.strip_suffix(')')) {
             let mut lp = Lp::ZERO;
             for part in inner.split_whitespace() {
@@ -1553,7 +1578,7 @@ impl Style {
             }
             PropertyId::PaddingTop | PropertyId::PaddingRight | PropertyId::PaddingBottom | PropertyId::PaddingLeft => {
                 let Some(val) = self.lp(v, ctx) else { return };
-                let val = Lp { px: val.px.max(0.0), pct: val.pct.max(0.0) };
+                let val = if val.calc_index().is_some() { val } else { Lp { px: val.px.max(0.0), pct: val.pct.max(0.0) } };
                 let i = match id {
                     PropertyId::PaddingTop => 0,
                     PropertyId::PaddingRight => 1,
@@ -2073,7 +2098,7 @@ impl Style {
                     PropertyValue::Keyword(Keyword::Normal) => 0.0,
                     _ => match self.lp(v, ctx) {
                         // Percentages of word-spacing are of the space width: approximate
-                        Some(l) => l.px + l.pct * self.inherited.font_size * 0.25 / 100.0,
+                        Some(l) => l.resolve(self.inherited.font_size * 0.25),
                         None => return,
                     },
                 };

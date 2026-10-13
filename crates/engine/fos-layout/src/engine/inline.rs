@@ -855,6 +855,7 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         replaced: None,
         scroll_extent: None,
         line_baselines: None,
+        static_align: None,
     };
     frag.update_ink();
     // `position: relative` moves the box and its content, not the line

@@ -1136,6 +1136,10 @@ fn color(v: &str) -> Option<PropertyValue> {
 /// `-fos-mix(<px>px <pct>%)`: what math functions mixing a percentage and
 /// pixels compute to
 fn mix(v: &str) -> Option<PropertyValue> {
+    if v.starts_with("-fos-calc(") {
+        let l = crate::values::calc_length(v)?;
+        return Some(PropertyValue::Mix { px: l.px, pct: l.pct });
+    }
     let inner = v.strip_prefix("-fos-mix(")?.strip_suffix(')')?;
     let mut parts = inner.split_whitespace();
     let px: f32 = parts.next()?.strip_suffix("px")?.parse().ok()?;
@@ -1152,7 +1156,7 @@ fn length(v: &str, allow_auto: bool, allow_none: bool, allow_negative: bool) -> 
     if allow_none && v == "none" {
         return Some(PropertyValue::Keyword(Keyword::None));
     }
-    if v.starts_with("-fos-mix(") {
+    if v.starts_with("-fos-mix(") || v.starts_with("-fos-calc(") {
         return mix(v);
     }
     if matches!(v, "0" | "-0" | "+0") {
@@ -1975,6 +1979,26 @@ mod tests {
         assert_eq!((s.box_.align_items, AlignItems::from_u8(s.box_.grid.justify_items)), (AlignItems::Center, Some(AlignItems::Center)));
         let s = computed("place-self: start end");
         assert_eq!((s.box_.align_self, AlignSelf::from_u8(s.box_.grid.justify_self)), (AlignSelf::Start, Some(AlignSelf::End)));
+    }
+
+    #[test]
+    fn math_mixing_px_and_percentages() {
+        // min(1040px, 100%) compares once layout knows the basis
+        // (remix.run's content cards); equal values stay equal
+        let w = |s: &Style| match s.box_.width {
+            LpAuto::Lp(l) => (l.resolve(1260.0), l.resolve(800.0)),
+            LpAuto::Auto => (f32::NAN, f32::NAN),
+        };
+        let a = computed("width: min(1040px, 100%)");
+        assert_eq!(w(&a), (1040.0, 800.0));
+        assert_eq!(a.box_.width, computed("width: min(1040px, 100%)").box_.width);
+        assert_ne!(a.box_.width, computed("width: max(1040px, 100%)").box_.width);
+        let s = computed("padding-left: max(16px, calc((100% - 1000px) / 2)); margin-left: clamp(10px, 10%, 50px)");
+        assert_eq!((s.box_.padding[3].resolve(1260.0), s.box_.padding[3].resolve(800.0)), (130.0, 16.0));
+        let LpAuto::Lp(m) = s.box_.margin[3] else { panic!() };
+        assert_eq!((m.resolve(1260.0), m.resolve(300.0), m.resolve(50.0)), (50.0, 30.0, 10.0));
+        // Ignoring the percentage, it is its value at a zero basis
+        assert_eq!(m.px, 10.0);
     }
 
     #[test]

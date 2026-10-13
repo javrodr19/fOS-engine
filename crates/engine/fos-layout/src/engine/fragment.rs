@@ -97,6 +97,10 @@ pub struct BoxFragment {
     /// For a box whose content is lines: the first and last line boxes'
     /// baselines (not those of text moved by vertical-align)
     pub line_baselines: Option<(f32, f32)>,
+    /// For the placeholder of an absolutely positioned child of a flex
+    /// container: where in its border box (the container's content box)
+    /// the box aligns, as fractions of the free space in x and y
+    pub static_align: Option<(f32, f32)>,
 }
 
 impl BoxFragment {
@@ -636,6 +640,7 @@ impl BoxFragment {
             replaced: self.replaced.clone(),
             scroll_extent: self.scroll_extent,
             line_baselines: self.line_baselines,
+            static_align: self.static_align,
         }
     }
 }

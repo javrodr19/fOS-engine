@@ -75,7 +75,9 @@ pub fn color(c: Color) -> String {
 }
 
 fn lp(v: Lp) -> String {
-    if !v.has_percent() {
+    if let Some(i) = v.calc_index() {
+        crate::values::calc_css(i)
+    } else if !v.has_percent() {
         px(v.px)
     } else if v.px == 0.0 {
         format!("{}%", number(v.pct))

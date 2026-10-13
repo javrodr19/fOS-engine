@@ -254,7 +254,7 @@ pub fn parse_rotate(text: &str) -> Option<Option<f32>> {
 
 /// Whether a `transform` value parses (lengths checked loosely)
 pub fn valid(text: &str) -> bool {
-    parse_list(text, &|v| crate::parser::parse_length(v).map(|_| Lp::ZERO).or((v == "0" || v.starts_with("-fos-mix(")).then_some(Lp::ZERO))).is_some()
+    parse_list(text, &|v| crate::parser::parse_length(v).map(|_| Lp::ZERO).or((v == "0" || v.starts_with("-fos-mix(") || v.starts_with("-fos-calc(")).then_some(Lp::ZERO))).is_some()
 }
 
 #[cfg(test)]

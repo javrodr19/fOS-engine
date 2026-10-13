@@ -192,6 +192,25 @@ pub(crate) fn has_function(s: &str, name: &str) -> bool {
     find_function(s, name, 0).is_some()
 }
 
+/// `s` without the math already left for layout (`-fos-calc(...)`), which
+/// is not to be computed again
+pub(crate) fn without_deferred_math(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains("-fos-calc(") {
+        return s.into();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut at = 0;
+    while let Some(start) = s[at..].find("-fos-calc(").map(|i| at + i) {
+        out.push_str(&s[at..start]);
+        let open = start + "-fos-calc".len();
+        let Some(close) = matching_paren(s, open) else { return s.into() };
+        out.push('0');
+        at = close + 1;
+    }
+    out.push_str(&s[at..]);
+    out.into()
+}
+
 /// Index of the `)` closing the `(` at `open`
 fn matching_paren(s: &str, open: usize) -> Option<usize> {
     let b = s.as_bytes();
@@ -411,6 +430,137 @@ impl Quantity {
     }
 }
 
+/// A math function over lengths whose comparisons must wait for the
+/// percentage basis (`min(1040px, 100%)`), evaluated at layout
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CalcNode {
+    Length { px: f32, pct: f32 },
+    Sum(Vec<CalcNode>),
+    Scale(Box<CalcNode>, f32),
+    Min(Vec<CalcNode>),
+    Max(Vec<CalcNode>),
+    Clamp(Box<[CalcNode; 3]>),
+}
+
+impl CalcNode {
+    pub(crate) fn eval(&self, basis: f32) -> f32 {
+        match self {
+            CalcNode::Length { px, pct } => px + pct * basis / 100.0,
+            CalcNode::Sum(v) => v.iter().map(|n| n.eval(basis)).sum(),
+            CalcNode::Scale(n, k) => n.eval(basis) * k,
+            CalcNode::Min(v) => v.iter().map(|n| n.eval(basis)).fold(f32::INFINITY, f32::min),
+            CalcNode::Max(v) => v.iter().map(|n| n.eval(basis)).fold(f32::NEG_INFINITY, f32::max),
+            CalcNode::Clamp(b) => {
+                let [lo, v, hi] = &**b;
+                let lo = lo.eval(basis);
+                v.eval(basis).min(hi.eval(basis)).max(lo)
+            }
+        }
+    }
+
+    /// As math in px and % alone, without spaces, which parses back to
+    /// the same tree
+    pub(crate) fn css(&self) -> String {
+        let list = |v: &[CalcNode], sep: &str| v.iter().map(|n| n.css()).collect::<Vec<_>>().join(sep);
+        match self {
+            CalcNode::Length { px, pct } if *pct == 0.0 => format!("{px}px"),
+            CalcNode::Length { px, pct } if *px == 0.0 => format!("{pct}%"),
+            CalcNode::Length { px, pct } => format!("calc({px}px+{pct}%)"),
+            CalcNode::Sum(v) => format!("calc({})", list(v, "+")),
+            CalcNode::Scale(n, k) => format!("calc({}*{k})", n.css()),
+            CalcNode::Min(v) => format!("min({})", list(v, ",")),
+            CalcNode::Max(v) => format!("max({})", list(v, ",")),
+            CalcNode::Clamp(b) => format!("clamp({})", list(&b[..], ",")),
+        }
+    }
+}
+
+/// Deferred math functions, interned by their text so lengths refer to
+/// them by index (an [`Lp`](crate::style::Lp) has room for 22 bits of it)
+static CALCS: std::sync::RwLock<Vec<CalcNode>> = std::sync::RwLock::new(Vec::new());
+static CALC_INDEX: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> = std::sync::OnceLock::new();
+const MAX_CALCS: u32 = 1 << 22;
+
+/// The length for `-fos-calc(<math>)`: what [`evaluate_math`] leaves for
+/// layout when comparisons need the percentage basis
+pub(crate) fn calc_length(v: &str) -> Option<crate::style::Lp> {
+    let inner = v.strip_prefix("-fos-calc(")?.strip_suffix(')')?;
+    let ctx = ResolveContext { custom: None, font_size: 16.0, parent_font_size: 16.0, root_font_size: 16.0, viewport: (0.0, 0.0), ch_ex: (8.0, 8.0), parent_ch_ex: (8.0, 8.0), lh: (19.2, 19.2) };
+    let mut p = MathParser { s: inner.as_bytes(), i: 0, ctx: &ctx, percent_basis: None };
+    let Val::Tree(tree) = p.value()? else { return None };
+    if p.i != inner.len() {
+        return None;
+    }
+    let mut index = CALC_INDEX.get_or_init(Default::default).lock().ok()?;
+    let at = match index.get(inner) {
+        Some(&i) => i,
+        None => {
+            let mut calcs = CALCS.write().ok()?;
+            let i = calcs.len() as u32;
+            if i >= MAX_CALCS {
+                return None;
+            }
+            calcs.push(tree.clone());
+            index.insert(inner.to_string(), i);
+            i
+        }
+    };
+    Some(crate::style::Lp::calc(at, tree.eval(0.0)))
+}
+
+/// An interned math function's value for a percentage basis
+pub(crate) fn eval_calc(index: u32, basis: f32) -> f32 {
+    CALCS.read().ok().and_then(|c| c.get(index as usize).map(|t| t.eval(basis))).unwrap_or(0.0)
+}
+
+/// An interned math function as CSS (`min(1040px, 100%)`)
+pub(crate) fn calc_css(index: u32) -> String {
+    let text = CALCS.read().ok().and_then(|c| c.get(index as usize).map(|t| t.css())).unwrap_or_default();
+    text.replace(',', ", ").replace('+', " + ").replace('*', " * ")
+}
+
+/// A value being computed: a quantity, or a length kept as a tree
+#[derive(Debug, Clone)]
+enum Val {
+    Q(Quantity),
+    Tree(CalcNode),
+}
+
+impl Val {
+    fn node(self) -> Option<CalcNode> {
+        match self {
+            Val::Q(q) if !q.is_number => Some(CalcNode::Length { px: q.px, pct: q.percent }),
+            Val::Q(_) => None,
+            Val::Tree(t) => Some(t),
+        }
+    }
+
+    fn number(&self) -> Option<f32> {
+        match self {
+            Val::Q(q) if q.is_number => Some(q.number),
+            _ => None,
+        }
+    }
+
+    fn add(self, other: Val, sign: f32) -> Option<Val> {
+        match (self, other) {
+            (Val::Q(a), Val::Q(b)) => a.add(b, sign).map(Val::Q),
+            (a, b) => {
+                let b = b.node()?;
+                let b = if sign < 0.0 { CalcNode::Scale(Box::new(b), -1.0) } else { b };
+                Some(Val::Tree(CalcNode::Sum(vec![a.node()?, b])))
+            }
+        }
+    }
+
+    fn scale(self, k: f32) -> Val {
+        match self {
+            Val::Q(q) => Val::Q(q.scale(k)),
+            Val::Tree(t) => Val::Tree(CalcNode::Scale(Box::new(t), k)),
+        }
+    }
+}
+
 struct MathParser<'a, 'c> {
     s: &'a [u8],
     i: usize,
@@ -426,7 +576,7 @@ impl MathParser<'_, '_> {
         }
     }
 
-    fn sum(&mut self) -> Option<Quantity> {
+    fn sum(&mut self) -> Option<Val> {
         let mut acc = self.product()?;
         loop {
             self.ws();
@@ -441,7 +591,7 @@ impl MathParser<'_, '_> {
         }
     }
 
-    fn product(&mut self) -> Option<Quantity> {
+    fn product(&mut self) -> Option<Val> {
         let mut acc = self.value()?;
         loop {
             self.ws();
@@ -449,26 +599,26 @@ impl MathParser<'_, '_> {
                 Some(b'*') => {
                     self.i += 1;
                     let rhs = self.value()?;
-                    acc = match (acc.is_number, rhs.is_number) {
-                        (_, true) => acc.scale(rhs.number),
-                        (true, false) => rhs.scale(acc.number),
+                    acc = match (acc.number(), rhs.number()) {
+                        (_, Some(k)) => acc.scale(k),
+                        (Some(k), None) => rhs.scale(k),
                         _ => return None,
                     };
                 }
                 Some(b'/') => {
                     self.i += 1;
                     let rhs = self.value()?;
-                    if !rhs.is_number || rhs.number == 0.0 {
-                        return None;
+                    match rhs.number() {
+                        Some(k) if k != 0.0 => acc = acc.scale(1.0 / k),
+                        _ => return None,
                     }
-                    acc = acc.scale(1.0 / rhs.number);
                 }
                 _ => return Some(acc),
             }
         }
     }
 
-    fn args(&mut self) -> Option<Vec<Quantity>> {
+    fn args(&mut self) -> Option<Vec<Val>> {
         // After the `(`
         let mut out = vec![self.sum()?];
         loop {
@@ -487,7 +637,7 @@ impl MathParser<'_, '_> {
         }
     }
 
-    fn value(&mut self) -> Option<Quantity> {
+    fn value(&mut self) -> Option<Val> {
         self.ws();
         let rest = std::str::from_utf8(&self.s[self.i..]).ok()?;
         let lower = rest.to_ascii_lowercase();
@@ -495,26 +645,46 @@ impl MathParser<'_, '_> {
             if lower.starts_with(f) {
                 self.i += f.len();
                 let args = self.args()?;
-                return match (f, args.as_slice()) {
-                    ("calc(", [one]) => Some(*one),
-                    ("min(", list) | ("max(", list) if !list.is_empty() => {
-                        let mut best = list[0];
-                        for &q in &list[1..] {
-                            let (a, b) = (self.resolve_percent(best)?.comparable()?, self.resolve_percent(q)?.comparable()?);
-                            if (f == "min(" && b < a) || (f == "max(" && b > a) {
-                                best = q;
+                // Quantities that compare now (numbers, or lengths all in
+                // px or all in %), else lengths kept as a tree for layout
+                let quantities: Option<Vec<Quantity>> = args.iter().map(|a| match a {
+                    Val::Q(q) => self.resolve_percent(*q),
+                    Val::Tree(_) => None,
+                }).collect();
+                let comparable: Option<Vec<f32>> = quantities.as_ref().and_then(|qs| {
+                    let values: Option<Vec<f32>> = qs.iter().map(|q| q.comparable()).collect();
+                    // Px and % compare only once the basis is known
+                    let units = qs.iter().filter(|q| !q.is_number && q.px != 0.0).count();
+                    let pcts = qs.iter().filter(|q| !q.is_number && q.percent != 0.0).count();
+                    values.filter(|_| units == 0 || pcts == 0)
+                });
+                let tree = |args: Vec<Val>| -> Option<Vec<CalcNode>> { args.into_iter().map(|a| a.node()).collect() };
+                return match (f, args.len()) {
+                    ("calc(", 1) => args.into_iter().next(),
+                    ("min(", n) | ("max(", n) if n > 0 => match comparable {
+                        Some(c) => {
+                            let mut best = 0;
+                            for i in 1..n {
+                                if (f == "min(" && c[i] < c[best]) || (f == "max(" && c[i] > c[best]) {
+                                    best = i;
+                                }
                             }
+                            args.into_iter().nth(best)
                         }
-                        Some(best)
-                    }
-                    ("clamp(", [lo, v, hi]) => {
-                        let (l, x, h) = (
-                            self.resolve_percent(*lo)?.comparable()?,
-                            self.resolve_percent(*v)?.comparable()?,
-                            self.resolve_percent(*hi)?.comparable()?,
-                        );
-                        Some(if x < l { *lo } else if x > h.max(l) { *hi } else { *v })
-                    }
+                        None if f == "min(" => Some(Val::Tree(CalcNode::Min(tree(args)?))),
+                        None => Some(Val::Tree(CalcNode::Max(tree(args)?))),
+                    },
+                    ("clamp(", 3) => match comparable {
+                        Some(c) => {
+                            let (l, x, h) = (c[0], c[1], c[2]);
+                            let i = if x < l { 0 } else if x > h.max(l) { 2 } else { 1 };
+                            args.into_iter().nth(i)
+                        }
+                        None => {
+                            let [lo, v, hi]: [CalcNode; 3] = tree(args)?.try_into().ok()?;
+                            Some(Val::Tree(CalcNode::Clamp(Box::new([lo, v, hi]))))
+                        }
+                    },
                     _ => None,
                 };
             }
@@ -551,7 +721,7 @@ impl MathParser<'_, '_> {
         let unit = std::str::from_utf8(&self.s[unit_start..self.i]).ok()?.to_ascii_lowercase();
         let c = self.ctx;
         let (vw, vh) = c.viewport;
-        Some(match unit.as_str() {
+        Some(Val::Q(match unit.as_str() {
             "" => Quantity::number(n),
             "px" => Quantity::length(n, 0.0),
             "%" => Quantity::length(0.0, n),
@@ -571,7 +741,7 @@ impl MathParser<'_, '_> {
             "mm" => Quantity::length(n * 96.0 / 25.4, 0.0),
             "q" => Quantity::length(n * 96.0 / 101.6, 0.0),
             _ => return None,
-        })
+        }))
     }
 
     /// Fold the percentage into px when its basis is known
@@ -588,11 +758,19 @@ impl MathParser<'_, '_> {
 /// plus a percentage of a basis known only at layout; `None` if invalid
 fn evaluate_math(expr: &str, ctx: &ResolveContext, percent_basis: Option<f32>) -> Option<String> {
     let mut p = MathParser { s: expr.as_bytes(), i: 0, ctx, percent_basis };
-    let q = p.value()?;
+    let v = p.value()?;
     p.ws();
     if p.i != expr.len() {
         return None;
     }
+    let q = match v {
+        Val::Q(q) => q,
+        Val::Tree(t) => match percent_basis {
+            Some(basis) => Quantity::length(t.eval(basis), 0.0),
+            // For layout to finish once the basis is known
+            None => return Some(format!("-fos-calc({})", t.css())),
+        },
+    };
     let q = p.resolve_percent(q)?;
     if q.is_number {
         Some(format!("{}", q.number))
@@ -836,6 +1014,13 @@ mod tests {
         // Mixed with a percentage: both parts kept for layout
         assert_eq!(eval("calc(100% - 20px)").as_deref(), Some("-fos-mix(-20px 100%)"));
         assert_eq!(eval("calc(10px * 2px)"), None);
+        // Comparisons between px and % wait for layout, as a tree in px
+        // and % alone (em resolved now)
+        assert_eq!(eval("min(1040px, 100%)").as_deref(), Some("-fos-calc(min(1040px,100%))"));
+        assert_eq!(eval("calc(max(1em, (100% - 1000px) / 2) * 2)").as_deref(), Some("-fos-calc(calc(max(20px,calc(-500px+50%))*2))"));
+        assert_eq!(eval("min(10px, 5%, 1em)").as_deref(), Some("-fos-calc(min(10px,5%,20px))"));
+        // With the basis known, they compare now
+        assert_eq!(evaluate_math("min(1040px, 100%)", &c, Some(800.0)).as_deref(), Some("800px"));
         assert_eq!(eval("calc(1.5 * 2)").as_deref(), Some("3"));
     }
 

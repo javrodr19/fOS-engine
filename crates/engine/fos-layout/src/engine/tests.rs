@@ -1670,6 +1670,59 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn absolute_flex_children_align_as_sole_items() {
+    // An absolutely positioned child of a flex container with auto insets
+    // sits where it would as the only flex item (CSS Flexbox §4.1), as in
+    // Chromium: nextjs.org's wordmark is centered by align-items
+    let (mut tree, html, body) = doc();
+    let flex = |tree: &mut DomTree, style: &str, abs: &str| {
+        let f = el(tree, body, "div", &format!("display: flex; position: relative; width: 400px; height: 200px; padding: 5px; border: 2px solid; {style}"));
+        let a = el(tree, f, "div", &format!("position: absolute; width: 100px; height: 50px; {abs}"));
+        (f, a)
+    };
+    let cases = [
+        flex(&mut tree, "flex-direction: column; align-items: center", ""),
+        flex(&mut tree, "justify-content: center; align-items: flex-end", "margin: 4px 10px"),
+        flex(&mut tree, "flex-direction: row-reverse", ""),
+        flex(&mut tree, "justify-content: space-between; align-items: center", "align-self: flex-start"),
+        flex(&mut tree, "flex-direction: column; justify-content: flex-end; height: auto; min-height: 300px", ""),
+        flex(&mut tree, "align-items: center", "top: 3px"),
+    ];
+    let t = layout(&tree, html, 800.0);
+    let at: Vec<(f32, f32)> = cases.iter().map(|&(f, a)| (rect_of(&t, a).x - rect_of(&t, f).x, rect_of(&t, a).y - rect_of(&t, f).y)).collect();
+    assert_eq!(at, [(157.0, 7.0), (157.0, 153.0), (307.0, 7.0), (7.0, 7.0), (7.0, 257.0), (7.0, 5.0)]);
+}
+
+#[test]
+fn grid_rows_fill_the_min_height() {
+    // With an indefinite height, auto rows stretch and fr rows flex to the
+    // min-height (or down to the max-height), as in Chromium: remix.run's
+    // install bar is a grid with min-height: 58px
+    let (mut tree, html, body) = doc();
+    let grid = |tree: &mut DomTree, style: &str, kids: &[&str]| {
+        let g = el(tree, body, "div", &format!("display: grid; {style}"));
+        let ids: Vec<NodeId> = kids.iter().map(|k| el(tree, g, "div", k)).collect();
+        (g, ids)
+    };
+    let (a, ai) = grid(&mut tree, "min-height: 100px; border: 1px solid; box-sizing: border-box", &[""]);
+    let (b, bi) = grid(&mut tree, "min-height: 300px; grid-template-rows: auto 1fr auto", &["height: 20px", "", "height: 20px"]);
+    let (c, ci) = grid(&mut tree, "max-height: 50px; grid-template-rows: 1fr 1fr", &["overflow: hidden", "overflow: hidden"]);
+    for &i in &ci {
+        el(&mut tree, i, "div", "height: 40px");
+    }
+    let (d, di) = grid(&mut tree, "min-height: 100px; align-content: center", &["height: 20px"]);
+    let t = layout(&tree, html, 800.0);
+    let h = |n: NodeId| rect_of(&t, n).h;
+    assert_eq!((h(a), h(ai[0])), (100.0, 98.0));
+    assert_eq!((h(b), h(bi[0]), h(bi[1]), h(bi[2])), (300.0, 20.0, 260.0, 20.0));
+    assert_eq!(rect_of(&t, bi[2]).y, rect_of(&t, b).y + 280.0);
+    // Scroll containers have no automatic minimum, so their fr rows share
+    // the max-height
+    assert_eq!((h(c), rect_of(&t, ci[1]).y - rect_of(&t, c).y), (50.0, 25.0));
+    assert_eq!((h(d), rect_of(&t, di[0]).y - rect_of(&t, d).y), (100.0, 40.0));
+}
+
+#[test]
 fn text_box_trim_takes_off_the_half_leading() {
     // text-box-trim trims the first line to the font's over edge and the
     // last to its under edge: remix.run's headings, trimmed to cap and

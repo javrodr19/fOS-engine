@@ -1174,7 +1174,8 @@ fn convert(name: &str, value: &str, important: bool, out: &mut Vec<Declaration>)
         return;
     }
     let has_var = lower.contains("var(");
-    let has_math = ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&lower, f));
+    let maths = crate::values::without_deferred_math(&lower);
+    let has_math = ["calc", "min", "max", "clamp"].iter().any(|f| crate::values::has_function(&maths, f));
     // Math over a relative color's channels (`hsl(from red calc(h + 120)
     // s l)`) is the color parser's: such values need no per-element
     // resolution

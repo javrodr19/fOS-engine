@@ -1064,7 +1064,9 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
             if matches!(bx.width, LpAuto::Lp(l) if pct(&l)) || matches!(bx.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) || matches!(bx.min_width, LpAuto::Lp(l) if pct(&l)) {
                 let s = std::sync::Arc::make_mut(&mut style.to_mut().box_);
                 if matches!(s.width, LpAuto::Lp(l) if pct(&l)) {
-                    s.width = LpAuto::Auto;
+                    // Without a natural width, the default object size's
+                    // (as Chromium: an auto width adds nothing)
+                    s.width = if r.ratio_only { LpAuto::Lp(fos_css::style::Lp::px(300.0)) } else { LpAuto::Auto };
                 }
                 if matches!(s.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) {
                     s.max_width = fos_css::style::MaxSize::None;

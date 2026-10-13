@@ -1692,10 +1692,17 @@ fn replaced_sizes_without_percentages_or_natural_sizes() {
     let fill = img(&mut tree, wide, &[("data-ratio", "842 206"), ("style", "display: block")]);
     let c = el(&mut tree, body, "div", "float: left");
     img(&mut tree, c, &[("data-ratio", "842 206"), ("style", "display: block")]);
+    // With a percentage width, it adds the default object size's, within
+    // its limits (htmx.org's silver sponsors: width: 80%)
+    let d = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, d, &[("data-ratio", "842 206"), ("style", "display: block; width: 80%")]);
+    let e = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, e, &[("data-ratio", "842 206"), ("style", "display: block; width: 100%; max-width: 100px")]);
     let t = layout(&tree, html, 800.0);
     assert_eq!(rect_of(&t, a).w, 100.0);
     assert_eq!(rect_of(&t, b).w, 120.0);
     let f = rect_of(&t, fill);
     assert_eq!((f.w, (f.h * 10.0).round() / 10.0), (400.0, 97.9));
     assert_eq!(rect_of(&t, c).w, 0.0);
+    assert_eq!((rect_of(&t, d).w, rect_of(&t, e).w), (300.0, 100.0));
 }

@@ -67,6 +67,76 @@ impl CustomProperties {
     }
 }
 
+impl CustomProperties {
+    /// Names declared in the layers above `root` (by the element and its
+    /// ancestors below the root)
+    fn declared_above<'s>(&'s self, root: &CustomProperties) -> Vec<&'s str> {
+        let mut out = Vec::new();
+        let mut at = Some(self);
+        while let Some(c) = at {
+            if std::ptr::eq(c, root) {
+                break;
+            }
+            out.extend(c.own.keys().map(String::as_str));
+            at = c.parent.as_deref();
+        }
+        out
+    }
+}
+
+/// Custom properties registered by `@property` rules (CSS Properties and
+/// Values 1): their initial values, and whether they inherit
+#[derive(Debug, Default)]
+pub struct PropertyRegistry {
+    props: HashMap<String, (bool, Option<String>)>,
+    /// The initial values, as the root's custom properties
+    root: Option<std::sync::Arc<CustomProperties>>,
+}
+
+impl PropertyRegistry {
+    pub fn new(rules: Vec<(String, bool, Option<String>)>) -> Self {
+        let props: HashMap<String, (bool, Option<String>)> = rules.into_iter().map(|(n, inherits, initial)| (n, (inherits, initial))).collect();
+        let initials: Vec<(&str, &str)> = props.iter().filter_map(|(n, (_, v))| Some((n.as_str(), v.as_deref()?))).collect();
+        let root = (!initials.is_empty()).then(|| std::sync::Arc::new(compute_custom_properties(None, &initials)));
+        PropertyRegistry { props, root }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.props.is_empty()
+    }
+
+    /// An element's custom properties given those it inherits and those it
+    /// declares (`own`, in cascade order): the root starts from the initial
+    /// values, a property that does not inherit takes its initial value
+    /// where the element does not declare it, and `initial` is the
+    /// registered initial value
+    pub fn compute(&self, inherited: Option<&std::sync::Arc<CustomProperties>>, own: &[(&str, &str)]) -> Option<std::sync::Arc<CustomProperties>> {
+        let inherited = inherited.or(self.root.as_ref());
+        let mut decls: Vec<(&str, &str)> = Vec::new();
+        if let (Some(from), Some(root)) = (inherited, self.root.as_deref()) {
+            for name in from.declared_above(root) {
+                if let Some((false, initial)) = self.props.get(name) {
+                    let initial = initial.as_deref().unwrap_or("initial");
+                    if !own.iter().any(|(n, _)| *n == name) && from.get(name) != Some(initial) && !decls.iter().any(|(n, _)| *n == name) {
+                        decls.push((name, initial));
+                    }
+                }
+            }
+        }
+        for &(name, value) in own {
+            let value = match self.props.get(name) {
+                Some((_, Some(initial))) if value.trim().eq_ignore_ascii_case("initial") => initial.as_str(),
+                _ => value,
+            };
+            decls.push((name, value));
+        }
+        if decls.is_empty() {
+            return inherited.cloned();
+        }
+        Some(std::sync::Arc::new(compute_custom_properties(inherited, &decls)))
+    }
+}
+
 impl VarSource for CustomProperties {
     fn var(&self, name: &str) -> Option<&str> {
         self.get(name)
@@ -660,6 +730,25 @@ mod tests {
         assert!(matches!(d.first().map(|d| &d.value), Some(PropertyValue::Color(c)) if (c.r, c.g, c.b) == (0, 255, 0)), "{d:?}");
         // Still rejected when nothing understands it
         assert!(resolve_declaration("width", "calc(h + 1)", false, &ctx(None)).is_empty());
+    }
+
+    #[test]
+    fn registered_properties_start_from_initial_values() {
+        let reg = PropertyRegistry::new(vec![
+            ("--style".into(), false, Some("solid".into())),
+            ("--size".into(), true, Some("1px".into())),
+            ("--none".into(), false, None),
+        ]);
+        // The root has the initial values
+        let root = reg.compute(None, &[]).unwrap();
+        assert_eq!((root.get("--style"), root.get("--size"), root.get("--none")), (Some("solid"), Some("1px"), None));
+        // A parent's values: inheriting ones pass down, others do not
+        let parent = reg.compute(Some(&root), &[("--style", "dashed"), ("--size", "2px"), ("--none", "x")]).unwrap();
+        let child = reg.compute(Some(&parent), &[]).unwrap();
+        assert_eq!((child.get("--style"), child.get("--size"), child.get("--none")), (Some("solid"), Some("2px"), None));
+        // `initial` is the registered initial value
+        let own = reg.compute(Some(&parent), &[("--size", "initial")]).unwrap();
+        assert_eq!(own.get("--size"), Some("1px"));
     }
 
     #[test]

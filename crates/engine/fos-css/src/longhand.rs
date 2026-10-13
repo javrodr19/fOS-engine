@@ -1558,8 +1558,30 @@ fn color_stops_at(args: &[&str], pos: impl Fn(&str) -> Option<Lp>) -> Option<Arc
     (stops.len() >= 2).then(|| Arc::from(stops))
 }
 
-fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
+/// Gradient arguments without a color interpolation method (`in oklab`,
+/// `in hsl longer hue`, CSS Images 4 §3.1): colors are interpolated in
+/// sRGB here
+fn without_interpolation(args: &str) -> std::borrow::Cow<'_, str> {
     let parts = split_top(args, b',');
+    let Some(first) = parts.first() else { return args.into() };
+    let words = components(first.trim());
+    let Some(at) = words.iter().position(|w| w.eq_ignore_ascii_case("in")) else { return args.into() };
+    let mut end = (at + 2).min(words.len());
+    if words.get(end + 1).is_some_and(|w| w.eq_ignore_ascii_case("hue")) {
+        end += 2;
+    }
+    let kept: Vec<&str> = words[..at].iter().chain(&words[end..]).copied().collect();
+    let rest = &parts[1..];
+    if kept.is_empty() {
+        rest.join(",").into()
+    } else {
+        std::iter::once(kept.join(" ")).chain(rest.iter().map(|s| s.to_string())).collect::<Vec<_>>().join(",").into()
+    }
+}
+
+fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
     let first = parts.first()?.trim().to_ascii_lowercase();
     let side = |s: &str| -> Option<(i8, i8)> {
         let mut xy = (0i8, 0i8);
@@ -1608,7 +1630,8 @@ fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
 
 /// `conic-gradient([from <angle>] [at <position>], <angular stops>)`
 fn conic_gradient(args: &str, repeating: bool) -> Option<Image> {
-    let parts = split_top(args, b',');
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
     let first = parts.first()?.trim().to_ascii_lowercase();
     let words = components(&first);
     let mut from = 0.0;
@@ -1644,7 +1667,8 @@ fn conic_gradient(args: &str, repeating: bool) -> Option<Image> {
 }
 
 fn radial_gradient(args: &str, repeating: bool) -> Option<Image> {
-    let parts = split_top(args, b',');
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
     let first = parts.first()?.trim().to_ascii_lowercase();
     let mut circle = false;
     let mut size = RadialSize::FarthestCorner;

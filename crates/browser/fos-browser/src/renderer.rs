@@ -199,7 +199,7 @@ impl PageLayout {
             shadow_sheets: &self.styling.shadow,
             ancestors: AncestorFilter::default(),
             resolved: Default::default(),
-            ctx: self.styling.ctx,
+            ctx: self.styling.ctx.clone(),
             root_styled: true,
             viewport_overflow: None,
             quirks: self.styling.quirks,
@@ -539,7 +539,11 @@ impl Layouter {
             return None;
         }
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
-        let styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        let mut styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        let registered = fos_css::registered_properties(css_text, &media);
+        if !registered.is_empty() {
+            styles.registered = Some(Arc::new(fos_css::PropertyRegistry::new(registered)));
+        }
         log::debug!("Parsed {} CSS rules from page, buckets (id, class, tag+attr, universal) {:?}", styles.rule_count(), styles.bucket_sizes());
         Some(styles)
     }
@@ -1267,7 +1271,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
         shadow_sheets,
         ancestors: AncestorFilter::default(),
         resolved: Default::default(),
-        ctx: StyleContext { root_font_size: 16.0, viewport },
+        ctx: StyleContext { root_font_size: 16.0, viewport, registered: stylesheet.as_ref().and_then(|s| s.registered.clone()) },
         root_styled: false,
         viewport_overflow: Some(ViewportOverflow::Root(root)),
         quirks: document.is_quirks(),
@@ -1280,7 +1284,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
     } else {
         FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 }
     };
-    let ctx = styler.ctx;
+    let ctx = styler.ctx.clone();
     drop(styler);
 
     // Links and anchors
@@ -1669,6 +1673,17 @@ mod tests {
         let at = |x: usize, y: usize| page.pixels[y * 100 + x];
         assert_eq!([at(75, 25), at(75, 75), at(25, 75), at(25, 25)], [0xffff0000, 0xff0000ff, 0xff00ff00, 0xff000000]);
         assert_eq!([at(75, 175), at(25, 175), at(25, 125), at(75, 125)], [0xffff0000, 0xff0000ff, 0xff0000ff, 0xff0000ff]);
+    }
+
+    #[test]
+    fn test_registered_custom_properties_have_initial_values() {
+        // Tailwind 4's borders: border-style comes from a property @property
+        // registers (solid at first)
+        let html = r#"<html><head><style>@property --tw-border-style { syntax: "*"; inherits: false; initial-value: solid } .b { border-width: 4px; border-style: var(--tw-border-style); border-color: #f00; width: 20px; height: 20px }</style></head><body style="margin: 0"><div class="b"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[2 * 40 + 10], 0xffff0000);
     }
 
     #[test]

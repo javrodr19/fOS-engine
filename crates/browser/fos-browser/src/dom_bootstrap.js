@@ -2144,7 +2144,7 @@
   };
   global.CSS = {
     escape(s) { return String(s).replace(/([\0-\x1f\x7f]|^-?\d)|^-$|[^\0-\x1f\x7f-\uFFFF\w-]/g, (m, ctl) => ctl ? (m === '\0' ? '\uFFFD' : m.slice(0, -1) + '\\' + m.slice(-1).charCodeAt(0).toString(16) + ' ') : '\\' + m); },
-    supports: () => false,
+    supports(...args) { return __fosCssSupports(...args.map(String)); },
   };
   let currentScript = null;
   // document.write output, inserted after the running script by the browser

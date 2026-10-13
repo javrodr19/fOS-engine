@@ -176,6 +176,8 @@ pub struct PageStyles {
     has_host: bool,
     has_slotted: bool,
     has_part: bool,
+    /// Custom properties the sheet's `@property` rules register
+    pub registered: Option<std::sync::Arc<fos_css::PropertyRegistry>>,
 }
 
 /// Rules of other trees that reach an element: the `:host` rules of the
@@ -204,6 +206,7 @@ impl PageStyles {
             has_host: false,
             has_slotted: false,
             has_part: false,
+            registered: None,
         };
         let mut skipped = 0;
         for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {

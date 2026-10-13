@@ -1743,6 +1743,18 @@ fn metrics_of(vm: &mut Vm, id: NodeId) -> Option<[f32; 4]> {
     h.metrics.as_ref()?.get(&id.0).copied()
 }
 
+/// `__fosCssSupports(conditionOrProperty, value?)`: `CSS.supports()`
+fn css_supports(vm: &mut Vm, _: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
+    let first = arg_string(vm, args, 0)?;
+    let supported = if args.len() >= 2 {
+        let value = arg_string(vm, args, 1)?;
+        fos_css::supports_declaration(&first, &value)
+    } else {
+        fos_css::supports_condition(&first)
+    };
+    Ok(Value::bool(supported))
+}
+
 /// `__fosImageSource(img)`: the URL an `<img>` shows (from `srcset` or
 /// `src`) and, once it is loaded, its natural width and height; null
 /// without a source
@@ -2082,6 +2094,7 @@ pub fn install(vm: &mut Vm, doc: Arc<Mutex<Document>>, url: &str, cookies: fos_n
         ("__fosAssignedSlot", 1, assigned_slot),
         ("__fosParseDocument", 1, parse_document),
         ("__fosMatchMedia", 1, match_media),
+        ("__fosCssSupports", 2, css_supports),
         ("__fosDigest", 2, crate::web_crypto::digest_native),
         ("__fosHmac", 4, crate::web_crypto::hmac_native),
         ("__fosAesGcm", 6, crate::web_crypto::aes_gcm_native),

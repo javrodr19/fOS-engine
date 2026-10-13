@@ -269,6 +269,63 @@ fn collect_font_faces(css: &str, media: &MediaContext, out: &mut Vec<FontFace>) 
     }
 }
 
+/// The custom properties `@property` rules register (in matching `@media`,
+/// `@supports` and `@layer` blocks too): name, whether it inherits, and
+/// its initial value. Rules without `inherits` are invalid (CSS Properties
+/// and Values 1 §3).
+pub fn registered_properties(css: &str, media: &MediaContext) -> Vec<(String, bool, Option<String>)> {
+    let mut out = Vec::new();
+    collect_registered(css, media, &mut out);
+    out
+}
+
+fn collect_registered(css: &str, media: &MediaContext, out: &mut Vec<(String, bool, Option<String>)>) {
+    let b = css.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        i = skip_ws_and_comments(b, i);
+        if i >= b.len() {
+            break;
+        }
+        if b[i] != b'@' {
+            let end = find_top(b, i, b"{;}");
+            i = if end < b.len() && b[end] == b'{' { skip_token(b, end) } else { end + 1 };
+            continue;
+        }
+        let name_end = b[i + 1..].iter().position(|c| !(c.is_ascii_alphanumeric() || *c == b'-')).map_or(b.len(), |p| i + 1 + p);
+        let name = css[i + 1..name_end].to_ascii_lowercase();
+        let end = find_top(b, name_end, b";{}");
+        if end >= b.len() || b[end] != b'{' {
+            i = end + 1;
+            continue;
+        }
+        let prelude = css[name_end..end].trim();
+        let block_end = skip_token(b, end);
+        let block = &css[end + 1..block_end.saturating_sub(1).max(end + 1)];
+        match name.as_str() {
+            "property" if prelude.starts_with("--") => {
+                let (mut inherits, mut initial) = (None, None);
+                for decl in split_top(&strip_comments(block), b';') {
+                    let Some((n, v)) = decl.split_once(':') else { continue };
+                    match n.trim().to_ascii_lowercase().as_str() {
+                        "inherits" => inherits = Some(v.trim().eq_ignore_ascii_case("true")),
+                        "initial-value" => initial = Some(v.trim().to_string()).filter(|v| !v.is_empty()),
+                        _ => {}
+                    }
+                }
+                if let Some(inherits) = inherits {
+                    out.push((prelude.to_string(), inherits, initial));
+                }
+            }
+            "media" if media_matches(prelude, media) => collect_registered(block, media, out),
+            "supports" if supports(prelude) => collect_registered(block, media, out),
+            "layer" => collect_registered(block, media, out),
+            _ => {}
+        }
+        i = block_end;
+    }
+}
+
 fn unquote(s: &str) -> &str {
     let s = s.trim();
     s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).or_else(|| s.strip_prefix('\'').and_then(|r| r.strip_suffix('\''))).unwrap_or(s)
@@ -592,10 +649,125 @@ fn style_rule(texts: &[String], block: &str, media: &MediaContext, out: &mut Vec
     }
 }
 
-/// `@supports` conditions: assume support except for explicit negations of
-/// features that are in fact supported
+/// `@supports` conditions
 fn supports(prelude: &str) -> bool {
-    !prelude.trim_start().to_ascii_lowercase().starts_with("not ")
+    supports_condition(prelude)
+}
+
+/// Whether `property: value` is a declaration this engine understands (as
+/// `CSS.supports(property, value)` answers): custom properties take any
+/// value, and values with `var()` are valid until computed
+pub fn supports_declaration(property: &str, value: &str) -> bool {
+    let property = property.trim();
+    if property.starts_with("--") {
+        return true;
+    }
+    let value = value.trim();
+    if value.is_empty() || value.contains(['{', '}', ';']) {
+        return false;
+    }
+    let lower = property.to_ascii_lowercase();
+    if !crate::longhand::is_known(&lower) {
+        // Properties browsers support that this engine does not model:
+        // rules guarded by them still apply, as in browsers
+        return CHROMIUM_ONLY_PROPERTIES.contains(&lower.as_str());
+    }
+    !parse_declarations(&format!("{property}:{value}")).is_empty()
+}
+
+/// Properties browsers support but that this engine has no style for,
+/// and whose rules do no harm here: scroll-driven animations and anchor
+/// positioning are left out (rules relying on them would leave content
+/// hidden or misplaced; their fallbacks do better)
+const CHROMIUM_ONLY_PROPERTIES: &[&str] = &[
+    "-webkit-backdrop-filter", "backdrop-filter", "-webkit-mask", "-webkit-mask-image", "mask", "mask-image", "-webkit-line-clamp",
+    "accent-color", "backface-visibility", "caret-color", "color-scheme", "contain", "contain-intrinsic-size", "container-name",
+    "container-type", "content-visibility", "field-sizing", "font-variation-settings", "hyphens", "-webkit-hyphens", "image-rendering",
+    "interpolate-size", "mix-blend-mode", "overscroll-behavior", "paint-order", "perspective", "scroll-behavior", "scroll-snap-type",
+    "scrollbar-color", "scrollbar-gutter", "scrollbar-width", "text-decoration-thickness", "text-underline-offset", "text-size-adjust",
+    "-webkit-text-size-adjust", "touch-action", "user-select", "-webkit-user-select", "view-transition-name", "will-change",
+    "writing-mode", "zoom",
+];
+
+/// Whether a `@supports` condition holds (CSS Conditional 3 §2.1):
+/// `not`, `and` and `or` over parenthesized conditions, declarations,
+/// `selector()` and `font-format()`/`font-tech()`; anything else is false
+pub fn supports_condition(text: &str) -> bool {
+    let spaced = spaced_keywords(&strip_comments(text));
+    supports_eval(spaced.trim()).unwrap_or(false)
+}
+
+fn supports_eval(t: &str) -> Option<bool> {
+    let t = t.trim();
+    if let Some(rest) = keyword_prefix(t, "not") {
+        return Some(!supports_in_parens(rest)?);
+    }
+    // Operands joined by one kind of operator, at the top level
+    let b = t.as_bytes();
+    let (mut depth, mut parts, mut start, mut op) = (0i32, Vec::new(), 0usize, None);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if depth == 0 && c.is_ascii_whitespace() => {
+                let rest = &t[i..].trim_start();
+                for word in ["and", "or"] {
+                    if let Some(after) = keyword_prefix(rest, word) {
+                        if op.is_some_and(|o| o != word) {
+                            return None;
+                        }
+                        op = Some(word);
+                        parts.push(&t[start..i]);
+                        start = t.len() - after.len();
+                        i = start;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&t[start..]);
+    let mut values = parts.into_iter().map(supports_in_parens);
+    match op {
+        Some("and") => values.try_fold(true, |acc, v| Some(acc & v?)),
+        Some(_) => values.try_fold(false, |acc, v| Some(acc | v?)),
+        None => values.next()?,
+    }
+}
+
+/// `t` after a leading keyword `word` (and the whitespace or parenthesis
+/// that ends it)
+fn keyword_prefix<'t>(t: &'t str, word: &str) -> Option<&'t str> {
+    let head = t.get(..word.len())?;
+    let next = t[word.len()..].chars().next();
+    (head.eq_ignore_ascii_case(word) && next.is_some_and(|c| c.is_whitespace() || c == '(')).then(|| t[word.len()..].trim_start())
+}
+
+fn supports_in_parens(t: &str) -> Option<bool> {
+    let t = t.trim();
+    let lower = t.to_ascii_lowercase();
+    for (f, ok) in [("selector(", true), ("font-format(", true), ("font-tech(", false)] {
+        if lower.starts_with(f) && t.ends_with(')') {
+            let arg = lower[f.len()..lower.len() - 1].trim().to_string();
+            return Some(match f {
+                "font-format(" => matches!(arg.as_str(), "woff" | "woff2" | "truetype" | "opentype" | "collection"),
+                "font-tech(" => matches!(arg.as_str(), "variations" | "features-opentype" | "features-aat"),
+                _ => ok && !arg.is_empty(),
+            });
+        }
+    }
+    let inner = t.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if inner.starts_with('(') || keyword_prefix(inner, "not").is_some() {
+        return supports_eval(inner);
+    }
+    // A declaration, or a condition of its own (`(a) and (b)` inside)
+    match inner.split_once(':') {
+        Some((p, v)) if !p.contains('(') => Some(supports_declaration(p, v)),
+        _ => supports_eval(inner).or(Some(false)),
+    }
 }
 
 // ---- media queries ----
@@ -1560,6 +1732,33 @@ mod tests {
         CssParser::new().parse(css).unwrap()
     }
 
+
+    #[test]
+    fn supports_conditions() {
+        // vercel.com's browser check: a value with var() is valid
+        assert!(supports_declaration("color", "var(--v)"));
+        assert!(supports_declaration("display", "grid") && supports_declaration("--anything", "{ }"));
+        assert!(!supports_declaration("color", "notacolor") && !supports_declaration("margin-trim", "inline"));
+        assert!(supports_condition("(display: grid) and (not (display: blockish))"));
+        assert!(!supports_condition("not (display: grid)"));
+        assert!(supports_condition("(display: grid) or (margin-trim: inline)"));
+        assert!(!supports_condition("(display: grid) and (margin-trim: inline)"));
+        // Minified, nested, and the other kinds of test
+        assert!(supports_condition("(display:flex)and (gap:1px)"));
+        assert!(supports_condition("((display: flex) and (gap: 1px)) or (foo: bar)"));
+        assert!(supports_condition("selector(:has(a))") && supports_condition("font-format(woff2)"));
+        // Mixed operators without parentheses, and general enclosed, are false
+        assert!(!supports_condition("(display: grid) and (gap: 1px) or (color: red)"));
+        assert!(!supports_condition("(whatever)"));
+        // Browser features this engine draws without (rules still apply)
+        // or not at all (left to their fallbacks)
+        assert!(supports_condition("((-webkit-backdrop-filter:blur(0)) or (backdrop-filter:blur(0)))"));
+        assert!(!supports_condition("(animation-timeline: view(y))"));
+        assert!(supports_declaration("background-image", "linear-gradient(in lab, red, red)"));
+        assert!(supports_declaration("background-image", "linear-gradient(to right in oklch longer hue, red, blue)"));
+        let css = "@supports (display: grid) { a { color: red } } @supports not (display: grid) { b { color: red } }";
+        assert_eq!(parse(css).rules.len(), 1);
+    }
 
     #[test]
     fn functions_end_components() {

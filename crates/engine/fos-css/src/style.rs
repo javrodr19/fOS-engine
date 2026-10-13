@@ -966,17 +966,19 @@ impl PartialEq for Style {
 }
 
 /// What lengths are computed against
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StyleContext {
     /// The root element's font size (`rem`)
     pub root_font_size: f32,
     /// The viewport (`vw`, `vh`, `vmin`, `vmax`)
     pub viewport: (f32, f32),
+    /// Custom properties `@property` rules register
+    pub registered: Option<Arc<crate::values::PropertyRegistry>>,
 }
 
 impl Default for StyleContext {
     fn default() -> Self {
-        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0) }
+        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0), registered: None }
     }
 }
 
@@ -1149,9 +1151,13 @@ impl Style {
                 _ => None,
             })
             .collect();
-        if !own.is_empty() {
-            let computed = crate::values::compute_custom_properties(self.custom.as_ref(), &own);
-            self.custom = Some(Arc::new(computed));
+        match ctx.registered.as_deref().filter(|r| !r.is_empty()) {
+            Some(registry) => self.custom = registry.compute(self.custom.as_ref(), &own),
+            None if !own.is_empty() => {
+                let computed = crate::values::compute_custom_properties(self.custom.as_ref(), &own);
+                self.custom = Some(Arc::new(computed));
+            }
+            None => {}
         }
         let parent_font_size = parent.inherited.font_size;
         for font_pass in [true, false] {

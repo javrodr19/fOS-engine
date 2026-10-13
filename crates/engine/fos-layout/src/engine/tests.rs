@@ -1638,3 +1638,21 @@ fn contained_boxes() {
     });
     assert_eq!(scrolls, Some(false));
 }
+
+#[test]
+fn inline_boxes_ending_with_a_newline_end_on_its_line() {
+    let (mut tree, html, body) = doc();
+    // A highlighted code token ending in a newline ends on that line: it
+    // has no empty part starting the next (htmx.org's code samples)
+    let pre = el(&mut tree, body, "pre", "white-space: pre; margin: 0");
+    let token = el(&mut tree, pre, "span", "");
+    text(&mut tree, token, "abc\n");
+    let next = el(&mut tree, pre, "span", "");
+    text(&mut tree, next, "de");
+    let t = layout(&tree, html, 800.0);
+    let parts = rects_of(&t, token);
+    assert!(parts.iter().all(|r| r.y == parts[0].y), "{parts:?}");
+    let n = rect_of(&t, next);
+    assert!(n.y >= parts[0].y + parts[0].h - 0.5, "{parts:?} {n:?}");
+    assert_eq!(n.x, rect_of(&t, pre).x);
+}

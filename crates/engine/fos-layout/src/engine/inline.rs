@@ -217,7 +217,15 @@ fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
             last_opportunity = Some(i);
         }
         match p.kind {
-            PieceKind::Break => return i + 1,
+            // Inline boxes that end right after a forced break end on its
+            // line (a code token ending in a newline is not on the next)
+            PieceKind::Break => {
+                let mut end = i + 1;
+                while end < pieces.len() && matches!(pieces[end].kind, PieceKind::Close) {
+                    end += 1;
+                }
+                return end;
+            }
             // Spaces hang at line ends: they never overflow, except
             // break-spaces ones, which take room there
             PieceKind::Space { collapsible, trails } => {
@@ -399,7 +407,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         li += 1;
         let line = &pieces[a..b];
         let start_x = line_x + first_indent;
-        let ends_forced = matches!(line.last().map(|p| &p.kind), Some(PieceKind::Break));
+        let ends_forced = matches!(line.iter().rev().find(|p| !matches!(p.kind, PieceKind::Close)).map(|p| &p.kind), Some(PieceKind::Break));
         let last_line = b >= pieces.len();
 
         // Pass 1: the line's width and justification opportunities

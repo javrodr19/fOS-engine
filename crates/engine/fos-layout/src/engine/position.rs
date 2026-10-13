@@ -55,6 +55,8 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
 
 fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map: &HashMap<NodeId, &LayoutBox>) {
     let cb = if f.style.is_positioned() && f.kind != BoxFragmentKind::Placeholder { f.padding_box() } else { cb };
+    // Layout and paint containment contain fixed descendants too
+    let (cb, viewport) = if f.style.contains_layout() && f.kind != BoxFragmentKind::Placeholder { (f.padding_box(), f.padding_box()) } else { (cb, viewport) };
     let mut changed = false;
     for c in f.children.iter_mut() {
         let Fragment::Box(child) = c else { continue };

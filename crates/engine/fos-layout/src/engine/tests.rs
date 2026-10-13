@@ -1602,3 +1602,39 @@ fn stretched_grid_items_keep_their_max_sizes() {
     assert_eq!((r.w, r.h), (310.0, 60.0));
     assert_eq!(rect_of(&t, min).w, 150.0);
 }
+
+#[test]
+fn contained_boxes() {
+    let (mut tree, html, body) = doc();
+    // Layout containment: an independent formatting context, so a child's
+    // margin stays inside (vercel.com's content-visibility: auto sections)
+    let auto = el(&mut tree, body, "div", "content-visibility: auto");
+    let child = el(&mut tree, auto, "div", "margin-top: 20px; height: 30px");
+    // Size containment: contain-intrinsic-size, not the contents, sizes it
+    let sized = el(&mut tree, body, "div", "contain: size; contain-intrinsic-size: 40px 50px; float: left");
+    el(&mut tree, sized, "div", "width: 200px; height: 100px");
+    // content-visibility: hidden skips the contents
+    let hidden = el(&mut tree, body, "div", "content-visibility: hidden; clear: both");
+    el(&mut tree, hidden, "div", "height: 100px");
+    // A contained box is the containing block of positioned descendants
+    let paint = el(&mut tree, body, "div", "contain: paint; margin-left: 100px; height: 10px");
+    let abs = el(&mut tree, paint, "div", "position: absolute; left: 5px; top: 0; width: 10px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let (a, c) = (rect_of(&t, auto), rect_of(&t, child));
+    assert_eq!((a.y - rect_of(&t, body).y, a.h, c.y - a.y), (0.0, 50.0, 20.0));
+    let r = rect_of(&t, sized);
+    assert_eq!((r.w, r.h), (40.0, 50.0));
+    assert_eq!(rect_of(&t, hidden).h, 0.0);
+    assert_eq!(rect_of(&t, abs).x, rect_of(&t, paint).x + 5.0);
+    // Paint containment clips but does not scroll: a sticky box inside
+    // sticks to the viewport (Wikipedia's contents column)
+    let mut scrolls = None;
+    t.for_each(|f| {
+        if let Fragment::Box(b) = f {
+            if b.node == paint {
+                scrolls = Some(b.scroll_extent.is_some());
+            }
+        }
+    });
+    assert_eq!(scrolls, Some(false));
+}

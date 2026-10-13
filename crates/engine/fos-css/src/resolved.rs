@@ -14,7 +14,7 @@ pub const PROPERTIES: &[&str] = &[
     "border-collapse", "border-left-color", "border-left-style", "border-left-width", "border-right-color",
     "border-right-style", "border-right-width", "border-spacing", "border-top-color", "border-top-left-radius",
     "border-top-right-radius", "border-top-style", "border-top-width", "bottom", "box-shadow", "box-sizing",
-    "caption-side", "clear", "color", "column-gap", "content", "direction", "display", "flex-basis",
+    "caption-side", "clear", "color", "column-gap", "contain", "content", "content-visibility", "direction", "display", "flex-basis",
     "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-style",
     "font-weight", "height", "justify-content", "left", "letter-spacing", "line-height", "list-style-position",
     "list-style-type", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
@@ -306,6 +306,17 @@ impl Style {
                 if r == c { r } else { format!("{r} {c}") }
             }
             "object-fit" => b.object_fit.as_css().into(),
+            "content-visibility" => b.content_visibility.as_css().into(),
+            "contain" => {
+                use crate::style::contain::*;
+                let names = [(SIZE, "size"), (INLINE_SIZE, "inline-size"), (LAYOUT, "layout"), (STYLE, "style"), (PAINT, "paint")];
+                match b.contain {
+                    0 => "none".into(),
+                    c if c == SIZE | LAYOUT | STYLE | PAINT => "strict".into(),
+                    c if c == LAYOUT | STYLE | PAINT => "content".into(),
+                    c => names.iter().filter(|(bit, _)| c & bit != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(" "),
+                }
+            }
             "text-overflow" => b.text_overflow.as_css().into(),
             "table-layout" => b.table_layout.as_css().into(),
             "vertical-align" => match b.vertical_align {

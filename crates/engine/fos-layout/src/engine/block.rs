@@ -461,6 +461,9 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         }
         None => content_h,
     };
+    // Size containment: the contents do not size the box, its
+    // contain-intrinsic-height does (CSS Containment 2 §3.1)
+    let content_h = if style.containment() & fos_css::style::contain::SIZE != 0 { style.box_.contain_intrinsic[1].unwrap_or(0.0) } else { content_h };
     let through = through && content_h <= 0.0;
     let height = match forced.height {
         Some(_) => specified_h.unwrap_or(content_h),
@@ -1002,6 +1005,12 @@ pub fn intrinsic_content(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
 }
 
 fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
+    // Size containment in the inline axis: contain-intrinsic-width
+    use fos_css::style::contain::{INLINE_SIZE, SIZE};
+    if b.style.containment() & (SIZE | INLINE_SIZE) != 0 && !matches!(b.kind, BoxKind::Replaced(_)) {
+        let w = b.style.box_.contain_intrinsic[0].unwrap_or(0.0);
+        return (w, w);
+    }
     match &b.kind {
         BoxKind::Inline(content) => inline::intrinsic_inline(ctx, content),
         BoxKind::Block(children) => {

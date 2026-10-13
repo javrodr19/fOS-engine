@@ -223,6 +223,7 @@ impl LayoutBox {
             || b.overflow_y != fos_css::style::Overflow::Visible
             || b.float != fos_css::style::Float::None
             || self.style.is_out_of_flow()
+            || self.style.contains_layout()
     }
 }
 
@@ -522,6 +523,10 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         self.counters_for(Some(node), &style);
         if let Some(r) = self.replaced(node, &style) {
             return LayoutBox { node, style, kind: BoxKind::Replaced(r), marker: None };
+        }
+        // content-visibility: hidden skips the contents
+        if style.box_.content_visibility == fos_css::style::ContentVisibility::Hidden && style.containment() != 0 {
+            return LayoutBox { node, style, kind: BoxKind::Block(Vec::new()), marker: None };
         }
         let saved = self.deco;
         let own = own_decoration(&style);

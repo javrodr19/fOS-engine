@@ -233,17 +233,22 @@ impl BoxFragment {
             }
             let w = (content.right() - pad.x + self.padding[1]).max(pad.w);
             let h = (content.bottom() - pad.y + self.padding[2]).max(pad.h);
-            self.scroll_extent = Some((w, h));
+            // Paint containment clips without scrolling (sticky boxes inside
+            // stick to the scroll container further out)
+            let b = &self.style.box_;
+            let overflows = b.overflow_x != fos_css::style::Overflow::Visible || b.overflow_y != fos_css::style::Overflow::Visible;
+            self.scroll_extent = overflows.then_some((w, h));
             if let Some(m) = &self.marker {
                 ink = ink.union(&m.rect);
             }
             // Positioned children whose containing block is further out
             // are not clipped here
-            let positioned = self.style.is_positioned() || self.style.has_transform();
+            let contained = self.style.contains_layout();
+            let positioned = self.style.is_positioned() || self.style.has_transform() || contained;
             for c in &self.children {
                 if let Fragment::Box(cb) = c {
                     let p = cb.style.box_.position;
-                    if p == fos_css::style::Position::Fixed || (p == fos_css::style::Position::Absolute && !positioned) {
+                    if (p == fos_css::style::Position::Fixed && !contained) || (p == fos_css::style::Position::Absolute && !positioned) {
                         ink = ink.union(&cb.ink);
                     }
                 }

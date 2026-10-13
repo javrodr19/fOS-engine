@@ -572,7 +572,7 @@ impl<'a> Painter<'a> {
         let inner = self.inner_clip(b, clip);
         let saved = self.enter_scroll(b);
         let mut layers: Vec<Layer> = Vec::new();
-        self.collect_layers(b, inner, inner, alpha, &mut layers);
+        self.collect_layers(b, inner, inner, b.style.contains_layout().then_some(inner), alpha, &mut layers);
         layers.sort_by_key(|l| l.0);
         let here = self.at();
         for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 < 0) {
@@ -596,8 +596,9 @@ impl<'a> Painter<'a> {
     /// Each is clipped by the boxes around it up to its containing block:
     /// `clip` is the clip here, `layer_clip` the clip inside the layer
     /// being painted (what absolutely positioned boxes get) and fixed boxes
-    /// get the viewport's.
-    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, layer_clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
+    /// get the viewport's, or `fixed_clip` inside a box with layout or
+    /// paint containment (their containing block).
+    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, layer_clip: Clip, fixed_clip: Option<Clip>, alpha: f32, out: &mut Vec<Layer<'t>>) {
         use fos_css::style::Position;
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
@@ -606,7 +607,7 @@ impl<'a> Painter<'a> {
                 let mut at = self.at();
                 at.0 -= cb.sticky_offset(b.content_box(), self.view);
                 let clip = match cb.style.box_.position {
-                    Position::Fixed => Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32]),
+                    Position::Fixed => fixed_clip.unwrap_or(Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32])),
                     Position::Absolute => layer_clip,
                     _ => clip,
                 };
@@ -614,7 +615,10 @@ impl<'a> Painter<'a> {
             } else if self.find_fixed || !self.culled(cb, clip) {
                 let inner = self.inner_clip(cb, clip);
                 let saved = self.enter_scroll(cb);
-                self.collect_layers(cb, inner, layer_clip, alpha * cb.style.box_.opacity, out);
+                // A contained box is its positioned descendants' containing
+                // block: they are clipped by it
+                let (layer_clip, fixed_clip) = if cb.style.contains_layout() { (inner, Some(inner)) } else { (layer_clip, fixed_clip) };
+                self.collect_layers(cb, inner, layer_clip, fixed_clip, alpha * cb.style.box_.opacity, out);
                 self.go(saved);
             }
         }

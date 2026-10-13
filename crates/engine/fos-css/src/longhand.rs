@@ -35,6 +35,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "margin" => &[MarginTop, MarginRight, MarginBottom, MarginLeft],
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
+        "contain-intrinsic-size" => &[ContainIntrinsicWidth, ContainIntrinsicHeight],
         "margin-block" => &[MarginTop, MarginBottom],
         "inset-block" => &[Top, Bottom],
         "inset-inline" => &[Left, Right],
@@ -178,6 +179,10 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "row-gap" => RowGap,
         "column-gap" => ColumnGap,
         "object-fit" => ObjectFit,
+        "contain" => Contain,
+        "content-visibility" => ContentVisibility,
+        "contain-intrinsic-width" | "contain-intrinsic-inline-size" => ContainIntrinsicWidth,
+        "contain-intrinsic-height" | "contain-intrinsic-block-size" => ContainIntrinsicHeight,
         "text-overflow" => TextOverflow,
         "table-layout" => TableLayout,
         "text-decoration-line" => TextDecorationLine,
@@ -313,6 +318,22 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
                             push(out, id, PropertyValue::Grid(Arc::from(v.as_str())), important);
                         }
                     }
+                }
+            }
+            true
+        }
+        // [auto]? <length> | none, for each axis
+        "contain-intrinsic-size" => {
+            let mut sizes = Vec::new();
+            let mut tokens = lower.split_whitespace();
+            while let Some(t) = tokens.next() {
+                let t = if t == "auto" { tokens.next().unwrap_or("") } else { t };
+                sizes.push(contain_intrinsic(t));
+            }
+            if let [w, h] | [w @ h] = sizes.as_slice() {
+                if let (Some(w), Some(h)) = (w, h) {
+                    push(out, PropertyId::ContainIntrinsicWidth, w.clone(), important);
+                    push(out, PropertyId::ContainIntrinsicHeight, h.clone(), important);
                 }
             }
             true
@@ -548,6 +569,9 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::Order => v.parse::<i32>().ok().map(PropertyValue::Integer),
         P::RowGap | P::ColumnGap => gap(v),
         P::ObjectFit => enum_value::<ObjectFit>(v),
+        P::Contain => contain(v),
+        P::ContentVisibility => enum_value::<ContentVisibility>(v),
+        P::ContainIntrinsicWidth | P::ContainIntrinsicHeight => contain_intrinsic(v.strip_prefix("auto ").unwrap_or(v).trim()),
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
         // `none` (no box, no marker) differs from `normal` for markers
@@ -702,8 +726,51 @@ macro_rules! css_enum_impl {
 css_enum_impl!(
     Display, Position, Float, Clear, BoxSizing, Appearance, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
-    ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
+    ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword,
+    ContentVisibility
 );
+
+/// `contain`: none, strict, content, or size, inline-size, layout, style
+/// and paint (each once), as [`crate::style::contain`] bits
+fn contain(v: &str) -> Option<PropertyValue> {
+    use crate::style::contain::*;
+    let bits = match v {
+        "none" => 0,
+        "strict" => SIZE | LAYOUT | STYLE | PAINT,
+        "content" => LAYOUT | STYLE | PAINT,
+        _ => {
+            let mut bits = 0;
+            for t in v.split_whitespace() {
+                let bit = match t {
+                    "size" => SIZE,
+                    "inline-size" => INLINE_SIZE,
+                    "layout" => LAYOUT,
+                    "style" => STYLE,
+                    "paint" => PAINT,
+                    _ => return None,
+                };
+                if bits & bit != 0 {
+                    return None;
+                }
+                bits |= bit;
+            }
+            if bits & SIZE != 0 && bits & INLINE_SIZE != 0 {
+                return None;
+            }
+            bits
+        }
+    };
+    Some(PropertyValue::Integer(bits as i32))
+}
+
+/// One axis of `contain-intrinsic-size` (after any `auto`): a length or none
+fn contain_intrinsic(v: &str) -> Option<PropertyValue> {
+    if v == "none" {
+        Some(PropertyValue::Keyword(Keyword::None))
+    } else {
+        length(v, false, false, false)
+    }
+}
 
 fn enum_value<T: CssEnum>(v: &str) -> Option<PropertyValue> {
     T::parse(v).map(|e| PropertyValue::Enum(e.index()))
@@ -1823,6 +1890,27 @@ mod tests {
         assert_eq!(g.areas.as_ref().unwrap().columns, 2);
         let s = computed("grid-template-columns: repeat(2, calc(50% - 10px))");
         assert!(matches!(&s.box_.grid.template_columns[0], TemplateItem::Repeat(_, inner) if matches!(inner[0], TemplateItem::Track(t) if t.min == Breadth::Length(Lp { px: -10.0, pct: 50.0 }))));
+    }
+
+    #[test]
+    fn containment() {
+        use crate::style::contain::*;
+        use crate::style::ContentVisibility;
+        assert_eq!(computed("contain: layout paint").box_.contain, LAYOUT | PAINT);
+        assert_eq!(computed("contain: strict").box_.contain, SIZE | LAYOUT | STYLE | PAINT);
+        assert_eq!(computed("contain: content").resolved_value("contain", None).as_deref(), Some("content"));
+        // Repeats and size with inline-size are invalid
+        assert_eq!(computed("contain: paint paint").box_.contain, 0);
+        assert_eq!(computed("contain: size inline-size").box_.contain, 0);
+        // vercel.com's lower sections
+        let s = computed("display: block; content-visibility: auto; contain-intrinsic-size: auto 772px");
+        assert_eq!(s.box_.content_visibility, ContentVisibility::Auto);
+        assert_eq!(s.containment(), LAYOUT | STYLE | PAINT);
+        assert_eq!(s.box_.contain_intrinsic, [Some(772.0), Some(772.0)]);
+        assert_eq!(computed("contain-intrinsic-size: 10px auto 20px").box_.contain_intrinsic, [Some(10.0), Some(20.0)]);
+        assert_eq!(computed("display: block; content-visibility: hidden").containment(), SIZE | LAYOUT | STYLE | PAINT);
+        // Inline boxes are not contained
+        assert_eq!(computed("display: inline; contain: paint").containment(), 0);
     }
 
     #[test]

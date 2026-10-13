@@ -1726,6 +1726,22 @@ mod tests {
     }
 
     #[test]
+    fn test_paint_containment_clips() {
+        // Paint containment clips to the padding box, positioned
+        // descendants included (it is their containing block)
+        let html = r#"<html><body style="margin: 0; background: #fff">
+            <div style="contain: paint; width: 20px; height: 20px"><div style="width: 40px; height: 10px; background: #f00"></div>
+            <div style="position: absolute; left: 0; top: 10px; width: 40px; height: 10px; background: #00f"></div></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(60, 30);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 60 + x];
+        assert_eq!((px(10, 5), px(10, 15)), (0xffff0000, 0xff0000ff));
+        assert_eq!((px(30, 5), px(30, 15)), (0xffffffff, 0xffffffff));
+    }
+
+    #[test]
     fn test_closed_popovers_take_no_room() {
         // vercel.com's header keeps its menus as closed popovers
         let html = r#"<html><body style="margin: 0"><div style="display: flex"><div popover style="width: 300px; position: static">menu</div><div id="next" style="width: 10px; height: 10px; background: #f00"></div></div></body></html>"#;

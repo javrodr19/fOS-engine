@@ -378,6 +378,16 @@ css_enum!(WordBreak { Normal = "normal", BreakAll = "break-all", KeepAll = "keep
 css_enum!(OverflowWrap { Normal = "normal", Anywhere = "anywhere", BreakWord = "break-word" });
 css_enum!(TextOverflow { Clip = "clip", Ellipsis = "ellipsis" });
 css_enum!(ObjectFit { Fill = "fill", Contain = "contain", Cover = "cover", None = "none", ScaleDown = "scale-down" });
+css_enum!(ContentVisibility { Visible = "visible", Auto = "auto", Hidden = "hidden" });
+
+/// `contain` bits (CSS Containment 2)
+pub mod contain {
+    pub const SIZE: u8 = 1;
+    pub const INLINE_SIZE: u8 = 2;
+    pub const LAYOUT: u8 = 4;
+    pub const STYLE: u8 = 8;
+    pub const PAINT: u8 = 16;
+}
 css_enum!(TextDecorationStyle { Solid = "solid", Double = "double", Dotted = "dotted", Dashed = "dashed", Wavy = "wavy" });
 css_enum!(BackgroundClip { BorderBox = "border-box", PaddingBox = "padding-box", ContentBox = "content-box", Text = "text" });
 css_enum!(BackgroundRepeat { Repeat = "repeat", RepeatX = "repeat-x", RepeatY = "repeat-y", NoRepeat = "no-repeat", Space = "space", Round = "round" });
@@ -703,6 +713,11 @@ pub struct BoxStyle {
     pub row_gap: Option<Lp>,
     pub column_gap: Option<Lp>,
     pub object_fit: ObjectFit,
+    /// `contain` ([`contain`] bits)
+    pub contain: u8,
+    pub content_visibility: ContentVisibility,
+    /// `contain-intrinsic-width` and `-height` in pixels (`None`: none)
+    pub contain_intrinsic: [Option<f32>; 2],
     pub text_overflow: TextOverflow,
     pub table_layout: TableLayout,
     /// Grid container and item properties
@@ -825,6 +840,9 @@ impl Default for BoxStyle {
             row_gap: None,
             column_gap: None,
             object_fit: ObjectFit::Fill,
+            contain: 0,
+            content_visibility: ContentVisibility::Visible,
+            contain_intrinsic: [None, None],
             text_overflow: TextOverflow::Clip,
             table_layout: TableLayout::Auto,
             grid: Default::default(),
@@ -1061,6 +1079,29 @@ impl Style {
         self.box_.position != Position::Static
     }
 
+    /// The containment in effect ([`contain`] bits): `contain`'s, and
+    /// what `content-visibility` turns on (layout, style and paint; size
+    /// too when hidden). Inline boxes are not contained
+    pub fn containment(&self) -> u8 {
+        use contain::*;
+        let b = &self.box_;
+        if b.display == Display::Inline || b.display == Display::Contents || b.display == Display::None {
+            return 0;
+        }
+        b.contain
+            | match b.content_visibility {
+                ContentVisibility::Visible => 0,
+                ContentVisibility::Auto => LAYOUT | STYLE | PAINT,
+                ContentVisibility::Hidden => SIZE | LAYOUT | STYLE | PAINT,
+            }
+    }
+
+    /// Layout or paint containment: an independent formatting context
+    /// and the containing block of its positioned descendants
+    pub fn contains_layout(&self) -> bool {
+        self.containment() & (contain::LAYOUT | contain::PAINT) != 0
+    }
+
     /// The element's transform for a border box at (x, y), w × h, in the
     /// same coordinates; `None` when it has none
     pub fn transform_matrix(&self, x: f32, y: f32, w: f32, h: f32) -> Option<crate::transform::Matrix> {
@@ -1158,9 +1199,10 @@ impl Style {
         out
     }
 
-    /// Clips its content (overflow other than visible)
+    /// Clips its content (overflow other than visible, or paint
+    /// containment)
     pub fn clips(&self) -> bool {
-        self.box_.overflow_x != Overflow::Visible || self.box_.overflow_y != Overflow::Visible
+        self.box_.overflow_x != Overflow::Visible || self.box_.overflow_y != Overflow::Visible || self.containment() & contain::PAINT != 0
     }
 
     /// Establishes a stacking context
@@ -1547,6 +1589,23 @@ impl Style {
                 }
             }
             PropertyId::ObjectFit => set!(box_, [object_fit], enum_of!(ObjectFit)),
+            PropertyId::Contain => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [contain], *bits as u8);
+                }
+            }
+            PropertyId::ContentVisibility => set!(box_, [content_visibility], enum_of!(ContentVisibility)),
+            PropertyId::ContainIntrinsicWidth | PropertyId::ContainIntrinsicHeight => {
+                let size = match v {
+                    PropertyValue::Keyword(Keyword::None) => None,
+                    _ => match self.lp(v, ctx) {
+                        Some(l) if !l.has_percent() => Some(l.px.max(0.0)),
+                        _ => return,
+                    },
+                };
+                let axis = (id == PropertyId::ContainIntrinsicHeight) as usize;
+                set!(box_, [contain_intrinsic[axis]], size);
+            }
             PropertyId::TextOverflow => set!(box_, [text_overflow], enum_of!(TextOverflow)),
             PropertyId::TableLayout => set!(box_, [table_layout], enum_of!(TableLayout)),
             PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows | PropertyId::GridAutoColumns | PropertyId::GridAutoRows => {
@@ -2045,6 +2104,10 @@ impl Style {
             PropertyId::RowGap => copy!(box_, [row_gap]),
             PropertyId::ColumnGap => copy!(box_, [column_gap]),
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
+            PropertyId::Contain => copy!(box_, [contain]),
+            PropertyId::ContentVisibility => copy!(box_, [content_visibility]),
+            PropertyId::ContainIntrinsicWidth => copy!(box_, [contain_intrinsic[0]]),
+            PropertyId::ContainIntrinsicHeight => copy!(box_, [contain_intrinsic[1]]),
             PropertyId::TextOverflow => copy!(box_, [text_overflow]),
             PropertyId::TableLayout => copy!(box_, [table_layout]),
             PropertyId::GridTemplateColumns => copy!(box_, [grid.template_columns]),

@@ -6,6 +6,8 @@ use super::*;
 /// Tag defaults plus `style` attributes
 struct TestStyler;
 
+struct RatioOnly;
+
 impl Styler for TestStyler {
     fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
         let el = tree.get(node).and_then(|n| n.as_element()).expect("element");
@@ -25,6 +27,16 @@ impl Styler for TestStyler {
         let mut style = Style::inherit_from(parent);
         style.cascade(&refs, parent, &StyleContext::default(), &mut Default::default());
         style
+    }
+
+    /// `<img data-ratio="w h">`: a loaded image with only that ratio
+    fn image(&mut self, tree: &DomTree, node: NodeId) -> Option<((f32, f32), ImageHandle)> {
+        let mut ratio = tree.get_attribute(node, "data-ratio")?.split_whitespace().filter_map(|v| v.parse::<f32>().ok());
+        Some(((ratio.next()?, ratio.next()?), ImageHandle(std::sync::Arc::new(RatioOnly))))
+    }
+
+    fn ratio_only(&self, image: &ImageHandle) -> bool {
+        image.0.is::<RatioOnly>()
     }
 
     /// `::before` takes its declarations from `data-before`
@@ -1655,4 +1667,35 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
     let n = rect_of(&t, next);
     assert!(n.y >= parts[0].y + parts[0].h - 0.5, "{parts:?} {n:?}");
     assert_eq!(n.x, rect_of(&t, pre).x);
+}
+
+#[test]
+fn replaced_sizes_without_percentages_or_natural_sizes() {
+    let (mut tree, html, body) = doc();
+    let img = |tree: &mut DomTree, parent: NodeId, attrs: &[(&str, &str)]| {
+        let i = tree.create_element("img");
+        for (k, v) in attrs {
+            tree.set_attribute(i, k, v);
+        }
+        tree.append_child(parent, i);
+        i
+    };
+    // Intrinsic sizes take percentages as auto (CSS Sizing 3 §5.2.1): a
+    // max-width: 100% image still makes a float as wide as itself
+    let a = el(&mut tree, body, "div", "float: left");
+    img(&mut tree, a, &[("width", "100"), ("height", "50"), ("style", "max-width: 100%; display: block")]);
+    let b = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, b, &[("width", "200"), ("height", "50"), ("style", "width: 100%; max-width: 120px; display: block")]);
+    // An image with only a ratio fills the width it is given, and adds
+    // nothing to intrinsic sizes (htmx.org's sponsor logos)
+    let wide = el(&mut tree, body, "div", "width: 400px; clear: left");
+    let fill = img(&mut tree, wide, &[("data-ratio", "842 206"), ("style", "display: block")]);
+    let c = el(&mut tree, body, "div", "float: left");
+    img(&mut tree, c, &[("data-ratio", "842 206"), ("style", "display: block")]);
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, a).w, 100.0);
+    assert_eq!(rect_of(&t, b).w, 120.0);
+    let f = rect_of(&t, fill);
+    assert_eq!((f.w, (f.h * 10.0).round() / 10.0), (400.0, 97.9));
+    assert_eq!(rect_of(&t, c).w, 0.0);
 }

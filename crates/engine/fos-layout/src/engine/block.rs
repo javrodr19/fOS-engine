@@ -953,6 +953,12 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, ratio.map_or(natural.1, |r| w / r)),
         (None, Some(h)) => (ratio.map_or(natural.0, |r| h * r), h),
+        // Only a ratio: the available width (CSS 2.1 §10.3.2)
+        (None, None) if r.ratio_only && ratio.is_some() => {
+            let e = edges(style, cb_w);
+            let w = (cb_w - hbp - e.margin[1].unwrap_or(0.0) - e.margin[3].unwrap_or(0.0)).max(0.0);
+            (w, ratio.map_or(0.0, |r| w / r))
+        }
         (None, None) => natural,
     };
     let cw = clamp_width(style, w, cb_w, hbp);
@@ -1050,8 +1056,25 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
         BoxKind::Table(t) => super::table::intrinsic_table(ctx, &b.style, t),
         BoxKind::Grid(items) => super::grid::intrinsic_grid(ctx, &b.style, items),
         BoxKind::Replaced(r) => {
-            let e = edges(&b.style, 0.0);
-            let (w, _) = replaced_content_size(ctx, &b.style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());
+            // Percentages are of a width not known yet: as auto, none and 0
+            // (CSS Sizing 3 §5.2.1). An image with only a ratio adds nothing
+            let mut style = std::borrow::Cow::Borrowed(&b.style);
+            let pct = |l: &fos_css::style::Lp| l.has_percent();
+            let bx = &b.style.box_;
+            if matches!(bx.width, LpAuto::Lp(l) if pct(&l)) || matches!(bx.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) || matches!(bx.min_width, LpAuto::Lp(l) if pct(&l)) {
+                let s = std::sync::Arc::make_mut(&mut style.to_mut().box_);
+                if matches!(s.width, LpAuto::Lp(l) if pct(&l)) {
+                    s.width = LpAuto::Auto;
+                }
+                if matches!(s.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) {
+                    s.max_width = fos_css::style::MaxSize::None;
+                }
+                if matches!(s.min_width, LpAuto::Lp(l) if pct(&l)) {
+                    s.min_width = LpAuto::Auto;
+                }
+            }
+            let e = edges(&style, 0.0);
+            let (w, _) = replaced_content_size(ctx, &style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());
             (w, w)
         }
     }

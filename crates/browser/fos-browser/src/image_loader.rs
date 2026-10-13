@@ -35,6 +35,47 @@ pub struct LoadedImage {
     /// How an SVG with a `viewBox` fits a box of another shape
     /// (`preserveAspectRatio`); `None` stretches it to the box
     pub svg_fit: Option<SvgFit>,
+    /// Only the ratio of `natural` is the image's: an SVG with a viewBox
+    /// but no absolute width or height has no natural size
+    pub ratio_only: bool,
+}
+
+/// The root `<svg>` start tag of `markup`
+fn svg_root_tag(markup: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(&markup[..markup.len().min(64 * 1024)]);
+    let start = text.match_indices("<svg").map(|(i, _)| i).find(|&i| text[i + 4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'))?;
+    let tag = &text[start..];
+    Some(tag[..tag.find('>').unwrap_or(tag.len())].to_string())
+}
+
+/// An attribute's value in a start tag
+fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    tag_attr_span(tag, name).map(|(_, value)| value)
+}
+
+/// Where an attribute is in a start tag (from its name through its closing
+/// quote), and its value
+fn tag_attr_span<'a>(tag: &'a str, name: &str) -> Option<(std::ops::Range<usize>, &'a str)> {
+    let at = tag.match_indices(name).map(|(i, _)| i).find(|&i| tag[..i].ends_with(|c: char| c.is_ascii_whitespace()) && tag[i + name.len()..].trim_start().starts_with('='))?;
+    let after_eq = tag[at + name.len()..].trim_start()[1..].trim_start();
+    let quote = after_eq.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let value_at = tag.len() - after_eq.len() + 1;
+    let len = tag[value_at..].find(quote)?;
+    Some((at..value_at + len + 1, &tag[value_at..value_at + len]))
+}
+
+/// An SVG whose root has a viewBox but neither an absolute width nor
+/// height: as an image it has a ratio but no natural size
+fn svg_ratio_only(markup: &[u8]) -> bool {
+    let Some(tag) = svg_root_tag(markup) else { return false };
+    let absolute = |name: &str| {
+        tag_attr(&tag, name).is_some_and(|v| {
+            let v = v.trim();
+            let n = v.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            !v.ends_with('%') && n.parse::<f32>().is_ok_and(|n| n > 0.0)
+        })
+    };
+    tag_attr(&tag, "viewBox").is_some() && !absolute("width") && !absolute("height")
 }
 
 /// An SVG's `preserveAspectRatio`: its contents keep their shape,
@@ -50,17 +91,8 @@ impl SvgFit {
     /// From the root `<svg>` tag of `markup`: only an SVG with a `viewBox`
     /// scales to its box keeping its shape
     fn of(markup: &[u8]) -> Option<SvgFit> {
-        let text = String::from_utf8_lossy(&markup[..markup.len().min(64 * 1024)]);
-        let start = text.match_indices("<svg").map(|(i, _)| i).find(|&i| text[i + 4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'))?;
-        let tag = &text[start..];
-        let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
-        let attr = |name: &str| {
-            let at = tag.match_indices(name).map(|(i, _)| i).find(|&i| tag[..i].ends_with(|c: char| c.is_ascii_whitespace()) && tag[i + name.len()..].trim_start().starts_with('='))?;
-            let rest = tag[at + name.len()..].trim_start()[1..].trim_start();
-            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-            let rest = &rest[1..];
-            Some(&rest[..rest.find(quote)?])
-        };
+        let tag = svg_root_tag(markup)?;
+        let attr = |name: &str| tag_attr(&tag, name);
         attr("viewBox")?;
         let par = attr("preserveAspectRatio").unwrap_or("").trim();
         let mut words = par.split_ascii_whitespace();
@@ -418,7 +450,7 @@ pub fn decode(bytes: &[u8]) -> Option<LoadedImage> {
         }
     }
     let pixmap = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)?;
-    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap), svg_source: None, svg_fit: None })
+    Some(LoadedImage { natural: (w as f32, h as f32), pixmap: shrink(pixmap), svg_source: None, svg_fit: None, ratio_only: false })
 }
 
 /// Downscale a bitmap over the pixel budget
@@ -607,7 +639,24 @@ static SVG_FONTS: std::sync::LazyLock<(Arc<resvg::usvg::fontdb::Database>, Strin
 });
 
 fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
-    decode_svg_at(bytes, 0.0)
+    // One sized by its box is drawn at a size that box may well have, in
+    // its viewBox's shape (a percentage width or height there is of the
+    // box, not of the viewBox)
+    if !svg_ratio_only(bytes) {
+        return decode_svg_at(bytes, 0.0);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let start = text.match_indices("<svg").map(|(i, _)| i).find(|&i| text[i + 4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'))?;
+    let end = start + text[start..].find('>')?;
+    let mut tag = text[start..end].to_string();
+    for name in ["width", "height"] {
+        if let Some((span, _)) = tag_attr_span(&tag, name) {
+            tag.replace_range(span, "");
+        }
+    }
+    let markup = format!("{}{}{}", &text[..start], tag, &text[end..]);
+    let img = decode_svg_at(markup.as_bytes(), RELATIVE_SVG_SIDE)?;
+    Some(LoadedImage { ratio_only: true, svg_source: img.svg_source.and(Some(Arc::from(text.as_ref()))), ..img })
 }
 
 /// Rasterized with its longer side at least `min_side` pixels (within the
@@ -634,7 +683,7 @@ fn decode_svg_at(bytes: &[u8], min_side: f32) -> Option<LoadedImage> {
     let mut pixmap = Pixmap::new(pw, ph)?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h), &mut pixmap.as_mut());
     let svg_source = (bytes.len() <= MAX_SVG_SOURCE).then(|| String::from_utf8_lossy(bytes).into());
-    Some(LoadedImage { natural: (w, h), pixmap, svg_source, svg_fit: SvgFit::of(bytes) })
+    Some(LoadedImage { natural: (w, h), pixmap, svg_source, svg_fit: SvgFit::of(bytes), ratio_only: false })
 }
 
 /// Fetch and decode the images of `page` (in parallel, through the HTTP
@@ -768,9 +817,28 @@ mod tests {
     }
 
     #[test]
+    fn svgs_without_a_size_have_only_a_ratio() {
+        // As images, SVGs with a viewBox but no absolute width or height
+        // fill their box in the viewBox's shape (htmx.org's sponsor logos)
+        assert!(svg_ratio_only(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 842 206"/>"#));
+        assert!(svg_ratio_only(br#"<svg width="50%" stroke-width="2" viewBox="0 0 100 50"/>"#));
+        assert!(!svg_ratio_only(br#"<svg width="100" viewBox="0 0 100 50"/>"#));
+        assert!(!svg_ratio_only(br#"<svg width="10" height="10"/>"#));
+        assert!(!svg_ratio_only(br#"<svg/>"#));
+        let img = decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" width="50%" stroke-width="2" viewBox="0 0 100 50"><rect width="100" height="50"/></svg>"#).unwrap();
+        assert!(img.ratio_only);
+        assert_eq!(img.natural.0 / img.natural.1, 2.0);
+        // Drawn at a size a box may well have
+        assert!(img.pixmap.width() >= 512);
+        let sized = decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10"/></svg>"#).unwrap();
+        assert!(!sized.ratio_only);
+        assert_eq!(sized.natural, (20.0, 10.0));
+    }
+
+    #[test]
     fn loaded_images_are_found_by_element() {
         let doc = fos_html::parse_with_url(r#"<html><body><img id=a src="a.png"><img id=b src="b.png"><img id=c srcset="c.png 1x"><p>x</p></body></html>"#, "https://example.com/");
-        let image = Arc::new(LoadedImage { natural: (1.0, 1.0), pixmap: Pixmap::new(1, 1).unwrap(), svg_source: None, svg_fit: None });
+        let image = Arc::new(LoadedImage { natural: (1.0, 1.0), pixmap: Pixmap::new(1, 1).unwrap(), svg_source: None, svg_fit: None, ratio_only: false });
         let images: Images = Arc::new(["https://example.com/a.png", "https://example.com/c.png"].into_iter().map(|u| (u.to_string(), image.clone())).collect());
         let found = loaded_img_elements(&doc, &images, 800.0);
         let ids: Vec<&str> = found.iter().filter_map(|(n, _)| doc.tree().get_attribute(*n, "id")).collect();

@@ -46,6 +46,11 @@ pub trait Styler {
     fn content_image(&mut self, _url: &str) -> Option<((f32, f32), ImageHandle)> {
         None
     }
+    /// Whether only the ratio of an image's natural size is its own (an
+    /// SVG with a viewBox but no width or height)
+    fn ratio_only(&self, _image: &ImageHandle) -> bool {
+        false
+    }
 }
 
 /// A generated box's content: runs of text and images
@@ -116,6 +121,9 @@ impl std::fmt::Debug for ImageHandle {
 pub struct Replaced {
     /// Natural width and height (and their ratio, for auto sizes)
     pub natural: Option<(f32, f32)>,
+    /// Only the ratio of `natural` is natural: auto sizes fill the
+    /// available width
+    pub ratio_only: bool,
     pub what: ReplacedWhat,
     /// The image to draw, once loaded
     pub image: Option<ImageHandle>,
@@ -672,7 +680,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 };
                 let mut st = Style::inherit_from(&ps);
                 std::sync::Arc::make_mut(&mut st.box_).display = Display::Inline;
-                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image }), marker: None }));
+                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image, ratio_only: false }), marker: None }));
             }
         }
         Some((ps, out))
@@ -1084,7 +1092,9 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 }
             }
         };
-        Some(Replaced { natural, what, image })
+        // Width and height attributes give the size an image lacks
+        let ratio_only = w_attr.is_none() && h_attr.is_none() && image.as_ref().is_some_and(|i| self.styler.ratio_only(i));
+        Some(Replaced { natural, what, image, ratio_only })
     }
 
     /// A select's shown option text (the selected option's, else the

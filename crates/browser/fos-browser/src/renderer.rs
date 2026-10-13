@@ -832,7 +832,7 @@ impl PageRenderer {
         for (node, (w, h), pixmap) in updates {
             match pixmap {
                 Some(pixmap) => {
-                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None, svg_fit: None }));
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None, svg_fit: None, ratio_only: false }));
                 }
                 None => {
                     self.canvases.remove(&node);
@@ -1136,6 +1136,10 @@ impl layout_engine::Styler for BrowserStyler<'_> {
     fn content_image(&mut self, url: &str) -> Option<((f32, f32), layout_engine::ImageHandle)> {
         let img = self.images.get(url).or_else(|| self.images.get(&fos_net::url_util::resolve(&self.base, url)))?;
         Some((img.natural, layout_engine::ImageHandle(img.clone())))
+    }
+
+    fn ratio_only(&self, image: &layout_engine::ImageHandle) -> bool {
+        image.0.downcast_ref::<crate::image_loader::LoadedImage>().is_some_and(|i| i.ratio_only)
     }
 
     fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {

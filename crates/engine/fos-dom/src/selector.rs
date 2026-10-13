@@ -192,6 +192,12 @@ enum Pseudo {
     /// Standard elements, and custom elements once defined
     Defined,
     PopoverOpen,
+    /// A text field showing its placeholder (empty, with one)
+    PlaceholderShown,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
     /// `:host` or `:host(x)`: the shadow host, matched from its shadow tree
     Host(Option<SelectorList>),
     /// The element a query runs from (the root element otherwise)
@@ -676,6 +682,26 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo, at_ho
         Pseudo::Empty => tree.children(node).all(|(_, c)| !c.is_element() && c.as_text().is_none_or(str::is_empty)),
         Pseudo::Checked => attr(tree, e, "checked").is_some() || attr(tree, e, "selected").is_some(),
         Pseudo::Disabled => attr(tree, e, "disabled").is_some(),
+        Pseudo::PlaceholderShown => {
+            let field = text_field(tree, e);
+            let empty = if tree.resolve(e.name.local).eq_ignore_ascii_case("textarea") {
+                tree.children(node).all(|(_, n)| n.as_text().is_none_or(str::is_empty))
+            } else {
+                attr(tree, e, "value").is_none_or(str::is_empty)
+            };
+            field && empty && attr(tree, e, "placeholder").is_some_and(|p| !p.is_empty())
+        }
+        Pseudo::Required | Pseudo::Optional => {
+            let tag = tree.resolve(e.name.local);
+            let can_be = ["input", "select", "textarea"].iter().any(|t| tag.eq_ignore_ascii_case(t));
+            can_be && (attr(tree, e, "required").is_some() == matches!(p, Pseudo::Required))
+        }
+        // Text fields and contenteditable elements that can be edited
+        Pseudo::ReadOnly | Pseudo::ReadWrite => {
+            let editable = (text_field(tree, e) && attr(tree, e, "readonly").is_none() && attr(tree, e, "disabled").is_none())
+                || attr(tree, e, "contenteditable").is_some_and(|v| v.is_empty() || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("plaintext-only"));
+            editable == matches!(p, Pseudo::ReadWrite)
+        }
         Pseudo::Enabled => attr(tree, e, "disabled").is_none() && is_form_control(tree.resolve(e.name.local)),
         Pseudo::Link => {
             let tag = tree.resolve(e.name.local);
@@ -688,6 +714,18 @@ fn match_pseudo(tree: &DomTree, node: NodeId, e: &ElementData, p: &Pseudo, at_ho
         Pseudo::PopoverOpen => tree.is_popover_open(node),
         Pseudo::Never | Pseudo::PseudoElement => false,
     }
+}
+
+/// A textarea, or an input whose type takes text (and a placeholder)
+fn text_field(tree: &DomTree, e: &crate::node::ElementData) -> bool {
+    let tag = tree.resolve(e.name.local);
+    if tag.eq_ignore_ascii_case("textarea") {
+        return true;
+    }
+    tag.eq_ignore_ascii_case("input")
+        && attr(tree, e, "type").map(|t| t.to_ascii_lowercase()).is_none_or(|t| {
+            !matches!(t.as_str(), "hidden" | "checkbox" | "radio" | "file" | "submit" | "image" | "reset" | "button" | "range" | "color" | "date" | "datetime-local" | "month" | "time" | "week")
+        })
 }
 
 fn is_form_control(tag: &str) -> bool {
@@ -980,6 +1018,11 @@ impl Parser<'_> {
             "link" | "any-link" => Pseudo::Link,
             "defined" => Pseudo::Defined,
             "popover-open" => Pseudo::PopoverOpen,
+            "placeholder-shown" => Pseudo::PlaceholderShown,
+            "required" => Pseudo::Required,
+            "optional" => Pseudo::Optional,
+            "read-only" => Pseudo::ReadOnly,
+            "read-write" => Pseudo::ReadWrite,
             "host" => Pseudo::Host(None),
             "scope" => Pseudo::Scope,
             // Legacy single-colon pseudo-elements, user action and state
@@ -1043,6 +1086,33 @@ mod tests {
 
     fn all(t: &DomTree, sel: &str) -> Vec<NodeId> {
         SelectorList::parse(sel).unwrap_or_else(|| panic!("parse {sel}")).query_all(t, t.root())
+    }
+
+    #[test]
+    fn form_state_pseudo_classes() {
+        // htmx.org widens its search box with :not(:placeholder-shown)
+        let mut t = DomTree::new();
+        let root = t.root();
+        let el = |t: &mut DomTree, tag: &str, attrs: &[(&str, &str)]| {
+            let e = t.create_element(tag);
+            for (k, v) in attrs {
+                t.set_attribute(e, k, v);
+            }
+            t.append_child(root, e);
+            e
+        };
+        let empty = el(&mut t, "input", &[("placeholder", "search")]);
+        let typed = el(&mut t, "input", &[("placeholder", "search"), ("value", "x")]);
+        let bare = el(&mut t, "input", &[]);
+        let check = el(&mut t, "input", &[("type", "checkbox"), ("placeholder", "x"), ("required", "")]);
+        let area = el(&mut t, "textarea", &[("placeholder", "say"), ("readonly", "")]);
+        let editable = el(&mut t, "div", &[("contenteditable", "")]);
+        assert_eq!(all(&t, ":placeholder-shown"), vec![empty, area]);
+        assert_eq!(all(&t, "input:not(:placeholder-shown)"), vec![typed, bare, check]);
+        assert_eq!(all(&t, ":required"), vec![check]);
+        assert_eq!(all(&t, ":optional"), vec![empty, typed, bare, area]);
+        assert_eq!(all(&t, ":read-write"), vec![empty, typed, bare, editable]);
+        assert_eq!(all(&t, "input:read-only, textarea:read-only"), vec![check, area]);
     }
 
     #[test]

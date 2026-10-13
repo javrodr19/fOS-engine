@@ -134,7 +134,9 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let definite = |v: LpAuto| v.resolve_definite(main_size).map(border_box);
         let mut content_laid: Option<Laid> = None;
         let align = align_of(s, style);
-        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal) && (if row { s.box_.height.is_auto() } else { s.box_.auto_width() });
+        // (auto margins across keep it from stretching: go.dev's logos)
+        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal)
+            && (if row { s.box_.height.is_auto() && !auto_margin[0] && !auto_margin[2] } else { s.box_.auto_width() && !auto_margin[1] && !auto_margin[3] });
         // A replaced item with a definite height has its width through its
         // ratio (CSS Flexbox §9.2 step 3B, and the transferred size of its
         // automatic minimum): kit.svelte.dev's height: 100% logos
@@ -143,6 +145,13 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                 let (_, vbp) = bp(s, width);
                 Some(super::block::replaced_content_size(ctx, s, r, width, height, hbp, vbp).0 + hbp)
             }
+            _ => None,
+        };
+        // One with only a ratio (an <svg> with just a viewBox) starts as wide
+        // as the line, as it fills a block, and shrinks from there (as
+        // Chromium sizes remix.run's footer logo)
+        let fill_width = match &b.kind {
+            super::box_tree::BoxKind::Replaced(r) if row && r.ratio_only && s.box_.width.is_auto() && ratio_width.is_none() => Some((width - margin[1] - margin[3]).max(0.0)),
             _ => None,
         };
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
@@ -155,6 +164,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             _ => match definite(main_prop) {
                 Some(v) => v,
                 None if ratio_width.is_some() => ratio_width.unwrap_or(0.0),
+                None if fill_width.is_some() => fill_width.unwrap_or(0.0),
                 // `width: min-content` and the like
                 None if row => super::block::intrinsic_size(ctx, b, s.box_.intrinsic_width[0], main_size.unwrap_or(f32::INFINITY) - bp_main).unwrap_or_else(|| intrinsic_content(ctx, b).1) + bp_main,
                 None => {
@@ -172,8 +182,18 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             None if min_prop.is_auto() && !clips => {
                 // Automatic minimum: the content size, capped by a specified
                 // size
+                let natural_w = match &b.kind {
+                    // A replaced item's content size is its natural width,
+                    // whatever its own width (CSS Flexbox §4.5)
+                    // (form controls keep their intrinsic width)
+                    super::box_tree::BoxKind::Replaced(r) if r.ratio_only => Some(bp_main),
+                    super::box_tree::BoxKind::Replaced(r) => r.natural.map(|n| n.0 + bp_main),
+                    _ => None,
+                };
                 let content = if let Some(w) = ratio_width {
-                    w.min(intrinsic_content(ctx, b).0 + bp_main)
+                    w.min(natural_w.unwrap_or_else(|| intrinsic_content(ctx, b).0 + bp_main))
+                } else if let (true, Some(w)) = (row, natural_w) {
+                    w
                 } else if row {
                     intrinsic_content(ctx, b).0 + bp_main
                 } else {

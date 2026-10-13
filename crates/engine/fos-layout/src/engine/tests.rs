@@ -1670,6 +1670,41 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn replaced_flex_items_follow_their_ratio() {
+    // As in Chromium: a flexed image's height follows its used width; its
+    // automatic minimum is its natural width, not its own width; one with
+    // only a ratio starts as wide as the line (remix.run's footer logo)
+    let (mut tree, html, body) = doc();
+    let img = |tree: &mut DomTree, parent: NodeId, style: &str, attr: (&str, &str)| {
+        let i = el(tree, parent, "img", style);
+        tree.set_attribute(i, attr.0, attr.1);
+        i
+    };
+    let row = |tree: &mut DomTree, style: &str| el(tree, body, "div", &format!("display: flex; width: 600px; {style}"));
+    let r = row(&mut tree, "");
+    let grown = img(&mut tree, r, "flex: 1", ("data-natural", "100x50"));
+    let r = row(&mut tree, "align-items: flex-start");
+    let shrunk = img(&mut tree, r, "width: 300px", ("data-natural", "100x50"));
+    el(&mut tree, r, "div", "width: 400px; flex: none");
+    let r = row(&mut tree, "");
+    let fill = img(&mut tree, r, "", ("data-ratio", "440 43"));
+    let r = row(&mut tree, "");
+    let shared = img(&mut tree, r, "", ("data-ratio", "440 43"));
+    el(&mut tree, r, "div", "width: 100px; flex: none; height: 10px");
+    // Auto margins across keep a column's image from stretching (go.dev's
+    // case study logos)
+    let r = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 600px; height: 95px");
+    let centered = img(&mut tree, r, "margin: auto; max-height: 64px", ("data-natural", "56x49"));
+    let t = layout(&tree, html, 800.0);
+    let size = |n: NodeId| ((rect_of(&t, n).w * 100.0).round() / 100.0, (rect_of(&t, n).h * 100.0).round() / 100.0);
+    assert_eq!(size(centered), (56.0, 49.0));
+    assert_eq!(size(grown), (600.0, 300.0));
+    assert_eq!(size(shrunk), (200.0, 100.0));
+    assert_eq!(size(fill), (600.0, 58.64));
+    assert_eq!(size(shared), (500.0, 48.86));
+}
+
+#[test]
 fn absolute_flex_children_align_as_sole_items() {
     // An absolutely positioned child of a flex container with auto insets
     // sits where it would as the only flex item (CSS Flexbox §4.1), as in

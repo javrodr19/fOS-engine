@@ -751,6 +751,8 @@ pub struct BoxStyle {
     pub object_fit: ObjectFit,
     /// `contain` ([`contain`] bits)
     pub contain: u8,
+    /// `container-type`, as the size [`contain`] bit it applies
+    pub container_type: u8,
     /// `text-box-trim` ([`text_box`] trim bits)
     pub text_box_trim: u8,
     pub content_visibility: ContentVisibility,
@@ -879,6 +881,7 @@ impl Default for BoxStyle {
             column_gap: None,
             object_fit: ObjectFit::Fill,
             contain: 0,
+            container_type: 0,
             text_box_trim: 0,
             content_visibility: ContentVisibility::Visible,
             contain_intrinsic: [None, None],
@@ -1130,9 +1133,10 @@ impl Style {
         self.box_.position != Position::Static
     }
 
-    /// The containment in effect ([`contain`] bits): `contain`'s, and
-    /// what `content-visibility` turns on (layout, style and paint; size
-    /// too when hidden). Inline boxes are not contained
+    /// The containment in effect ([`contain`] bits): `contain`'s, what
+    /// `content-visibility` turns on (layout, style and paint; size too
+    /// when hidden), and a size container's (style and its size
+    /// containment). Inline boxes are not contained
     pub fn containment(&self) -> u8 {
         use contain::*;
         let b = &self.box_;
@@ -1140,6 +1144,7 @@ impl Style {
             return 0;
         }
         b.contain
+            | if b.container_type != 0 { b.container_type | STYLE } else { 0 }
             | match b.content_visibility {
                 ContentVisibility::Visible => 0,
                 ContentVisibility::Auto => LAYOUT | STYLE | PAINT,
@@ -1151,6 +1156,13 @@ impl Style {
     /// and the containing block of its positioned descendants
     pub fn contains_layout(&self) -> bool {
         self.containment() & (contain::LAYOUT | contain::PAINT) != 0
+    }
+
+    /// An independent formatting context for containment: layout or paint
+    /// containment, or a size container (CSS Conditional 5 §2.1), which is
+    /// not the containing block of positioned descendants
+    pub fn contains_formatting(&self) -> bool {
+        self.contains_layout() || (self.box_.container_type != 0 && self.containment() != 0)
     }
 
     /// The element's transform for a border box at (x, y), w × h, in the
@@ -1668,6 +1680,11 @@ impl Style {
                 }
             }
             PropertyId::ObjectFit => set!(box_, [object_fit], enum_of!(ObjectFit)),
+            PropertyId::ContainerType => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [container_type], *bits as u8);
+                }
+            }
             PropertyId::Contain => {
                 if let PropertyValue::Integer(bits) = v {
                     set!(box_, [contain], *bits as u8);
@@ -2195,6 +2212,7 @@ impl Style {
             PropertyId::ColumnGap => copy!(box_, [column_gap]),
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
             PropertyId::Contain => copy!(box_, [contain]),
+            PropertyId::ContainerType => copy!(box_, [container_type]),
             PropertyId::ContentVisibility => copy!(box_, [content_visibility]),
             PropertyId::TextBoxTrim => copy!(box_, [text_box_trim]),
             PropertyId::TextBoxEdge => copy!(inherited, [text_box_edge]),

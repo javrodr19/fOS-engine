@@ -68,14 +68,50 @@ fn tag_attr_span<'a>(tag: &'a str, name: &str) -> Option<(std::ops::Range<usize>
 /// height: as an image it has a ratio but no natural size
 fn svg_ratio_only(markup: &[u8]) -> bool {
     let Some(tag) = svg_root_tag(markup) else { return false };
-    let absolute = |name: &str| {
-        tag_attr(&tag, name).is_some_and(|v| {
-            let v = v.trim();
-            let n = v.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-            !v.ends_with('%') && n.parse::<f32>().is_ok_and(|n| n > 0.0)
-        })
+    tag_attr(&tag, "viewBox").is_some() && svg_absolute(&tag, "width").is_none() && svg_absolute(&tag, "height").is_none()
+}
+
+/// An absolute `width` or `height` on a root `<svg>` tag, in px (an em is
+/// taken as 16px, as SVG images have no font context)
+fn svg_absolute(tag: &str, name: &str) -> Option<f32> {
+    let v = tag_attr(tag, name)?.trim();
+    let split = v.find(|c: char| c.is_ascii_alphabetic() || c == '%').unwrap_or(v.len());
+    let n: f32 = v[..split].trim().parse().ok().filter(|n: &f32| *n > 0.0 && n.is_finite())?;
+    let per = match v[split..].to_ascii_lowercase().as_str() {
+        "" | "px" => 1.0,
+        "mm" => 96.0 / 25.4,
+        "cm" => 96.0 / 2.54,
+        "q" => 96.0 / 101.6,
+        "in" => 96.0,
+        "pt" => 4.0 / 3.0,
+        "pc" => 16.0,
+        "em" | "rem" => 16.0,
+        "ex" => 8.0,
+        _ => return None,
     };
-    tag_attr(&tag, "viewBox").is_some() && !absolute("width") && !absolute("height")
+    Some(n * per)
+}
+
+/// An SVG whose root has a viewBox and only one of width and height (and
+/// not the other at all): the other side follows the viewBox's shape
+/// (SVG 2 §8.2) rather than being the viewBox's own size. remix.run's
+/// footer logo is height="8" with a 440×43 viewBox, so 81.86px wide
+fn svg_with_derived_side(markup: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(markup);
+    let start = text.match_indices("<svg").map(|(i, _)| i).find(|&i| text[i + 4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/'))?;
+    let end = start + text[start..].find('>')?;
+    let tag = &text[start..end];
+    let vb: Vec<f32> = tag_attr(tag, "viewBox")?.split(|c: char| c.is_ascii_whitespace() || c == ',').filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
+    let [_, _, vw, vh] = vb[..] else { return None };
+    if !(vw > 0.0 && vh > 0.0) {
+        return None;
+    }
+    let added = match (svg_absolute(tag, "width"), svg_absolute(tag, "height")) {
+        (Some(w), None) if tag_attr(tag, "height").is_none() => format!(" height=\"{}\"", w * vh / vw),
+        (None, Some(h)) if tag_attr(tag, "width").is_none() => format!(" width=\"{}\"", h * vw / vh),
+        _ => return None,
+    };
+    Some(format!("{}{}{}", &text[..start + 4], added, &text[start + 4..]))
 }
 
 /// An SVG's `preserveAspectRatio`: its contents keep their shape,
@@ -508,7 +544,14 @@ pub fn inline_svg(tree: &DomTree, node: NodeId, color: [u8; 4], paint: &SvgStyle
     if let Some(hit) = cache.map.get(&key) {
         return hit.clone();
     }
-    let img = decode_svg_at(markup.as_bytes(), if relative { RELATIVE_SVG_SIDE } else { 0.0 }).map(Arc::new);
+    // With a viewBox but no absolute size, it has only a ratio, and fills
+    // the width it is given as an <img> of it would
+    let ratio_only = svg_ratio_only(markup.as_bytes());
+    let img = match svg_with_derived_side(markup.as_bytes()).filter(|_| !relative) {
+        Some(derived) => decode_svg_at(derived.as_bytes(), 0.0),
+        None => decode_svg_at(markup.as_bytes(), if relative || ratio_only { RELATIVE_SVG_SIDE } else { 0.0 }),
+    }
+    .map(|i| Arc::new(LoadedImage { ratio_only, ..i }));
     let size = img.as_ref().map_or(0, |i| i.pixmap.data().len());
     if cache.bytes + size > MAX_CACHED_SVG_BYTES || cache.map.len() >= 4096 {
         cache.map.clear();
@@ -643,6 +686,10 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
     // its viewBox's shape (a percentage width or height there is of the
     // box, not of the viewBox)
     if !svg_ratio_only(bytes) {
+        if let Some(markup) = svg_with_derived_side(bytes) {
+            let img = decode_svg_at(markup.as_bytes(), 0.0)?;
+            return Some(LoadedImage { svg_source: img.svg_source.and(Some(String::from_utf8_lossy(bytes).into())), ..img });
+        }
         return decode_svg_at(bytes, 0.0);
     }
     let text = String::from_utf8_lossy(bytes);
@@ -833,6 +880,24 @@ mod tests {
         let sized = decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10"/></svg>"#).unwrap();
         assert!(!sized.ratio_only);
         assert_eq!(sized.natural, (20.0, 10.0));
+    }
+
+    #[test]
+    fn svgs_with_one_side_take_the_other_from_the_viewbox() {
+        // remix.run's footer logo: height="8" and a 440×43 viewBox is
+        // 81.86px wide, not the viewBox's 440
+        let img = decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" height="8" viewBox="0 0 440 43"><rect width="440" height="43"/></svg>"#).unwrap();
+        assert!(!img.ratio_only);
+        assert_eq!(((img.natural.0 * 100.0).round(), img.natural.1), (8186.0, 8.0));
+        let img = decode_svg(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100px" viewBox="0,0,440,43"><rect width="440" height="43"/></svg>"#).unwrap();
+        assert_eq!((img.natural.0, (img.natural.1 * 100.0).round()), (100.0, 977.0));
+        // Both sides, or a percentage other side, leave it as it was
+        assert!(svg_with_derived_side(br#"<svg width="10" height="8" viewBox="0 0 440 43"/>"#).is_none());
+        assert!(svg_with_derived_side(br#"<svg width="50%" height="8" viewBox="0 0 440 43"/>"#).is_none());
+        // Absolute units are sizes too (sqlite.org's logo is in mm)
+        assert!(!svg_ratio_only(br#"<svg width="103.7mm" height="46.7mm" viewBox="0 0 103.7 46.7"/>"#));
+        assert_eq!(svg_absolute(r#"<svg width="1in" height="12pt""#, "width"), Some(96.0));
+        assert_eq!(svg_absolute(r#"<svg width="1in" height="12pt""#, "height"), Some(16.0));
     }
 
     #[test]

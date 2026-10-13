@@ -143,6 +143,7 @@ pub enum PropertyId {
     Direction,
     ObjectFit,
     Contain,
+    ContainerType,
     ContentVisibility,
     TextBoxTrim,
     TextBoxEdge,

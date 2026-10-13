@@ -234,7 +234,7 @@ impl LayoutBox {
             || b.overflow_y != fos_css::style::Overflow::Visible
             || b.float != fos_css::style::Float::None
             || self.style.is_out_of_flow()
-            || self.style.contains_layout()
+            || self.style.contains_formatting()
     }
 }
 

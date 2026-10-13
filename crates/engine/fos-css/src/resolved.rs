@@ -14,7 +14,7 @@ pub const PROPERTIES: &[&str] = &[
     "border-collapse", "border-left-color", "border-left-style", "border-left-width", "border-right-color",
     "border-right-style", "border-right-width", "border-spacing", "border-top-color", "border-top-left-radius",
     "border-top-right-radius", "border-top-style", "border-top-width", "bottom", "box-shadow", "box-sizing",
-    "caption-side", "clear", "color", "column-gap", "contain", "content", "content-visibility", "direction", "display", "flex-basis",
+    "caption-side", "clear", "color", "column-gap", "contain", "container-type", "content", "content-visibility", "direction", "display", "flex-basis",
     "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-style",
     "font-weight", "height", "justify-content", "left", "letter-spacing", "line-height", "list-style-position",
     "list-style-type", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
@@ -309,6 +309,12 @@ impl Style {
             }
             "object-fit" => b.object_fit.as_css().into(),
             "content-visibility" => b.content_visibility.as_css().into(),
+            "container-type" => match b.container_type {
+                crate::style::contain::SIZE => "size",
+                crate::style::contain::INLINE_SIZE => "inline-size",
+                _ => "normal",
+            }
+            .into(),
             "contain" => {
                 use crate::style::contain::*;
                 let names = [(SIZE, "size"), (INLINE_SIZE, "inline-size"), (LAYOUT, "layout"), (STYLE, "style"), (PAINT, "paint")];

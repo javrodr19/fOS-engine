@@ -1069,6 +1069,21 @@ mod tests {
     }
 
     #[test]
+    fn svg_attribute_names_keep_their_case() {
+        // Names are lowercased on HTML elements only: viewBox on an <svg>
+        let (mut rt, _doc) = page(r#"<html><body><p ID="p" data-X="1"></p><svg id="s" viewBox="0 0 4 2"></svg></body></html>"#);
+        let out = rt
+            .eval(
+                r#"var s = document.getElementById('s'), p = document.getElementById('p');
+                s.setAttribute('preserveAspectRatio', 'none');
+                [s.getAttribute('viewBox'), s.getAttribute('viewbox'), s.getAttributeNode('viewBox').value, s.hasAttribute('preserveAspectRatio'),
+                 s.attributes[s.attributes.length - 1].name, p.getAttribute('DATA-x'), p.hasAttribute('id')].join('|')"#,
+            )
+            .unwrap();
+        assert_eq!(out, "0 0 4 2||0 0 4 2|true|preserveAspectRatio|1|true");
+    }
+
+    #[test]
     fn attributes_are_live() {
         // React empties an element's attributes with
         // while (attrs.length) el.removeAttributeNode(attrs[0])

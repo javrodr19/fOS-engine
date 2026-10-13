@@ -683,9 +683,19 @@ fn tag_name(vm: &mut Vm, this: Value, a: &[Value], f: Gc<JsObject>) -> JsResult<
     node_name(vm, this, a, f)
 }
 
+/// An attribute name given to getAttribute and the like: lowercased on
+/// HTML elements only, as SVG and MathML names keep their case (viewBox)
+fn attr_name(vm: &mut Vm, id: NodeId, name: String) -> String {
+    let foreign = with_tree(vm, |t| {
+        t.get(id).and_then(|n| n.as_element()).is_some_and(|e| matches!(t.resolve(e.name.ns), SVG_NS | "http://www.w3.org/1998/Math/MathML"))
+    });
+    if foreign { name } else { name.to_ascii_lowercase() }
+}
+
 fn get_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
+    let name = arg_string(vm, args, 0)?;
+    let name = attr_name(vm, id, name);
     let v = with_tree(vm, |t| t.get_attribute(id, &name).map(str::to_string));
     Ok(match v {
         Some(s) => string(vm, &s),
@@ -695,7 +705,8 @@ fn get_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> J
 
 fn set_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
+    let name = arg_string(vm, args, 0)?;
+    let name = attr_name(vm, id, name);
     let value = arg_string(vm, args, 1)?;
     with_tree(vm, |t| t.set_attribute(id, &name, &value));
     crate::canvas_bindings::attribute_changed(vm, id, &name);
@@ -704,7 +715,8 @@ fn set_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> J
 
 fn remove_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
+    let name = arg_string(vm, args, 0)?;
+    let name = attr_name(vm, id, name);
     with_tree(vm, |t| t.remove_attribute(id, &name));
     crate::canvas_bindings::attribute_changed(vm, id, &name);
     Ok(Value::UNDEFINED)
@@ -712,7 +724,8 @@ fn remove_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -
 
 fn has_attribute(vm: &mut Vm, this: Value, args: &[Value], _: Gc<JsObject>) -> JsResult<Value> {
     let id = this_node(vm, this)?;
-    let name = arg_string(vm, args, 0)?.to_ascii_lowercase();
+    let name = arg_string(vm, args, 0)?;
+    let name = attr_name(vm, id, name);
     Ok(Value::bool(with_tree(vm, |t| t.get_attribute(id, &name).is_some())))
 }
 

@@ -36,6 +36,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
         "contain-intrinsic-size" => &[ContainIntrinsicWidth, ContainIntrinsicHeight],
+        "container" => &[ContainerType],
         "text-box" => &[TextBoxTrim, TextBoxEdge],
         "margin-block" => &[MarginTop, MarginBottom],
         "inset-block" => &[Top, Bottom],
@@ -181,6 +182,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "column-gap" => ColumnGap,
         "object-fit" => ObjectFit,
         "contain" => Contain,
+        "container-type" => ContainerType,
         "text-box-trim" => TextBoxTrim,
         "text-box-edge" => TextBoxEdge,
         "content-visibility" => ContentVisibility,
@@ -345,6 +347,14 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             if let (Some(t), Some(e)) = (trim, edge) {
                 push(out, PropertyId::TextBoxTrim, t, important);
                 push(out, PropertyId::TextBoxEdge, e, important);
+            }
+            true
+        }
+        // <name>+ [/ <type>]?: only the type has an effect here
+        "container" => {
+            let ty = lower.split_once('/').map_or("normal", |(_, t)| t.trim());
+            if let Some(v) = container_type(ty) {
+                push(out, PropertyId::ContainerType, v, important);
             }
             true
         }
@@ -601,6 +611,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::RowGap | P::ColumnGap => gap(v),
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::Contain => contain(v),
+        P::ContainerType => container_type(v),
         P::TextBoxTrim => text_box_trim(v),
         P::TextBoxEdge => text_box_edge(v),
         P::ContentVisibility => enum_value::<ContentVisibility>(v),
@@ -762,6 +773,23 @@ css_enum_impl!(
     ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword,
     ContentVisibility
 );
+
+/// `container-type`: normal, size or inline-size (scroll-state aside), as
+/// the size [`crate::style::contain`] bit it applies
+fn container_type(v: &str) -> Option<PropertyValue> {
+    use crate::style::contain::*;
+    let mut bits = 0;
+    for part in v.split_whitespace() {
+        bits |= match part {
+            "normal" if v.trim() == "normal" => 0,
+            "size" => SIZE,
+            "inline-size" => INLINE_SIZE,
+            "scroll-state" => 0,
+            _ => return None,
+        };
+    }
+    (bits != SIZE | INLINE_SIZE).then_some(PropertyValue::Integer(bits as i32))
+}
 
 /// `contain`: none, strict, content, or size, inline-size, layout, style
 /// and paint (each once), as [`crate::style::contain`] bits
@@ -2054,6 +2082,14 @@ mod tests {
         assert_eq!(computed("display: block; content-visibility: hidden").containment(), SIZE | LAYOUT | STYLE | PAINT);
         // Inline boxes are not contained
         assert_eq!(computed("display: inline; contain: paint").containment(), 0);
+        // Size containers: style and size containment, and their own
+        // formatting context (remix.run's newsletter form keeps its margin
+        // inside one), but not the containing block of fixed boxes
+        let s = computed("display: block; container-type: inline-size");
+        assert_eq!((s.containment(), s.contains_formatting(), s.contains_layout()), (INLINE_SIZE | STYLE, true, false));
+        assert_eq!(computed("display: block; container: card / size").containment(), SIZE | STYLE);
+        assert_eq!(computed("display: block; container: card").containment(), 0);
+        assert_eq!(computed("container-type: inline-size").resolved_value("container-type", None).as_deref(), Some("inline-size"));
     }
 
     #[test]

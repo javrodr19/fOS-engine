@@ -4399,7 +4399,12 @@
     configurable: true,
   });
   define(E, {
-    getAttributeNode(name) { name = String(name).toLowerCase(); return this.hasAttribute(name) ? makeAttr(this, name) : null; },
+    getAttributeNode(name) {
+      // Names are lowercased on HTML elements only (SVG's viewBox keeps its case)
+      name = String(name);
+      if (this.namespaceURI !== 'http://www.w3.org/2000/svg' && this.namespaceURI !== 'http://www.w3.org/1998/Math/MathML') name = name.toLowerCase();
+      return this.hasAttribute(name) ? makeAttr(this, name) : null;
+    },
     getAttributeNodeNS(ns, name) { return this.getAttributeNode(name); },
     setAttributeNode(a) {
       const s = attr(a);

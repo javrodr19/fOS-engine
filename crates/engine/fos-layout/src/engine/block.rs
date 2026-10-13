@@ -293,9 +293,17 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     if let BoxKind::Replaced(r) = &b.kind {
         let mut laid = layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
         if forced.width.is_some() || forced.height.is_some() {
+            // One size forced (a flexed main size): an auto other size
+            // follows it through the ratio
+            let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0 && !r.no_ratio).map(|n| n.0 / n.1);
+            let (fw, fh) = match (forced.width, forced.height, ratio) {
+                (Some(w), None, Some(k)) if style.box_.height.is_auto() => (Some(w), Some(clamp_height(style, ((w - hbp).max(0.0)) / k, cb_h, vbp) + vbp)),
+                (None, Some(h), Some(k)) if style.box_.auto_width() => (Some(clamp_width(style, (h - vbp).max(0.0) * k, cb_w, hbp) + hbp), Some(h)),
+                (w, h, _) => (w, h),
+            };
             let bb = &mut laid.frag.border_box;
-            bb.w = forced.width.unwrap_or(bb.w).max(hbp);
-            bb.h = forced.height.unwrap_or(bb.h).max(vbp);
+            bb.w = fw.unwrap_or(bb.w).max(hbp);
+            bb.h = fh.unwrap_or(bb.h).max(vbp);
             laid.frag.children.clear();
             laid.frag.update_ink();
         }

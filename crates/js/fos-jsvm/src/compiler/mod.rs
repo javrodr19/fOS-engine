@@ -275,6 +275,10 @@ enum TryKind<'a> {
 struct TryEntry<'a> {
     kind: TryKind<'a>,
     seg_start: u32,
+    /// The scopes and bindings around the try statement (what its
+    /// finally block sees)
+    scopes: usize,
+    bindings: usize,
     /// Indices into `handlers` of this entry's protected ranges
     handler_idxs: Vec<usize>,
     /// Register receiving the exception
@@ -1658,7 +1662,8 @@ impl<'a, 'h> Compiler<'a, 'h> {
 
     fn open_try(&mut self, kind: TryKind<'a>, reg: Reg) {
         let seg_start = self.pc();
-        self.f().tries.push(TryEntry { kind, seg_start, handler_idxs: Vec::new(), reg });
+        let (scopes, bindings) = (self.fr().scopes.len(), self.fr().bindings.len());
+        self.f().tries.push(TryEntry { kind, seg_start, scopes, bindings, handler_idxs: Vec::new(), reg });
     }
 
     fn close_segment(&mut self, entry: &mut TryEntry<'a>) {
@@ -1714,7 +1719,18 @@ impl<'a, 'h> Compiler<'a, 'h> {
                 TryKind::Finally(block) => {
                     let outer: Vec<TryEntry<'a>> = exited.drain(..k).collect();
                     self.f().tries.extend(outer);
-                    self.block(block)?;
+                    // Compiled where the jump leaves from, the block still
+                    // sees only the scopes around its try statement (not
+                    // the `let`s of the blocks being left)
+                    let (scopes_at, bindings_at) = (exited[0].scopes, exited[0].bindings);
+                    let f = self.f();
+                    let hidden_scopes: Vec<Scope> = f.scopes.drain(scopes_at..).collect();
+                    let hidden_bindings: Vec<Binding> = f.bindings.drain(bindings_at..).collect();
+                    let compiled = self.block(block);
+                    let f = self.f();
+                    f.bindings.splice(bindings_at..bindings_at, hidden_bindings);
+                    f.scopes.extend(hidden_scopes);
+                    compiled?;
                     let n = self.fr().tries.len();
                     let outer: Vec<TryEntry<'a>> = self.f().tries.drain(n - k..).collect();
                     exited.splice(0..0, outer);

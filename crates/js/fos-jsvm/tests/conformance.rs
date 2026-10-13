@@ -554,6 +554,12 @@ fn control_flow() {
         ("let r = []; try { try { throw 'inner'; } finally { r.push('f1'); } } catch (e) { r.push(e); } r", "[ 'f1', 'inner' ]"),
         ("let r = []; try { try { throw 1; } catch (e) { throw 2; } finally { r.push('f'); } } catch (e) { r.push(e); } r", "[ 'f', 2 ]"),
         ("function f() { for (const x of [1, 2]) { try { return x; } finally { log.push('f' + x); } } } var log = []; [f(), log]", "[ 1, [ 'f1' ] ]"),
+        // A finally run by return or break sees the scopes around its try,
+        // not the try block's own lets (Jotai's store names both n)
+        ("const n = 'outer'; let seen; function f() { try { let n = 'inner'; return n; } finally { seen = n; } } [f(), seen]", "[ 'inner', 'outer' ]"),
+        ("const n = 'outer'; let seen; for (;;) { try { let n = 'inner'; break; } finally { seen = n; } } seen", "'outer'"),
+        ("const n = 'outer'; let seen; function f() { try { let n = 1; const g = () => n; return g(); } finally { seen = n; } } [f(), seen]", "[ 1, 'outer' ]"),
+        ("let seen; function f() { let a = 'a'; try { let b = 'b'; try { let a = 'shadow'; return 1; } finally { seen = a + b; } } finally { seen += a; } } f(); seen", "'aba'"),
         ("let n = 0; try { n = 1; } finally { n += 10; } n", "11"),
         ("function g() { try { throw new Error('x'); } catch { return 'no binding'; } } g()", "'no binding'"),
         ("try { null.x; } catch (e) { e instanceof TypeError }", "true"),

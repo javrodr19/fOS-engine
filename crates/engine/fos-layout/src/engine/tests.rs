@@ -1740,3 +1740,57 @@ fn grid_items_take_percentage_heights_of_their_areas() {
     assert_eq!(rect_of(&t, half).h, 30.0);
     assert_eq!(rect_of(&t, inner).h, 30.0);
 }
+
+#[test]
+fn replaced_flex_items_take_their_width_from_a_definite_height() {
+    let (mut tree, html, body) = doc();
+    // A 408x250 logo at height: 100% of a 40px row is 65.28px wide, as
+    // its flex base size and its automatic minimum (CSS Flexbox §9.2 3B)
+    let row = el(&mut tree, body, "div", "display: flex; height: 40px; width: 100px");
+    let logo = tree.create_element("img");
+    tree.set_attribute(logo, "width", "408");
+    tree.set_attribute(logo, "height", "250");
+    tree.set_attribute(logo, "style", "height: 100%; width: auto");
+    tree.append_child(row, logo);
+    // A row of them sized by its contents (a marquee) is as wide as they are
+    let fit = el(&mut tree, body, "div", "display: flex; height: 40px; width: max-content");
+    for _ in 0..2 {
+        let i = tree.create_element("img");
+        tree.set_attribute(i, "width", "408");
+        tree.set_attribute(i, "height", "250");
+        tree.set_attribute(i, "style", "height: 100%");
+        tree.append_child(fit, i);
+    }
+    // So is an absolutely positioned one whose height is a percentage of
+    // its containing block
+    let wing = el(&mut tree, body, "div", "position: relative; height: 40px");
+    let marquee = el(&mut tree, wing, "div", "position: absolute; display: flex; height: 100%");
+    for _ in 0..2 {
+        let i = tree.create_element("img");
+        tree.set_attribute(i, "width", "408");
+        tree.set_attribute(i, "height", "250");
+        tree.set_attribute(i, "style", "height: 100%");
+        tree.append_child(marquee, i);
+    }
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, logo);
+    assert_eq!(((r.w * 100.0).round() / 100.0, r.h), (65.28, 40.0));
+    assert_eq!((rect_of(&t, fit).w * 100.0).round() / 100.0, 130.56);
+    assert_eq!((rect_of(&t, marquee).w * 100.0).round() / 100.0, 130.56);
+}
+
+#[test]
+fn videos_and_frames_have_a_default_size_but_no_ratio() {
+    let (mut tree, html, body) = doc();
+    // A video without its data (and an iframe) is 300x150 without being
+    // 2:1: at width: 100% it stays 150px tall, as a canvas does not
+    // (kit.svelte.dev's demo video)
+    let wide = el(&mut tree, body, "div", "width: 600px");
+    let video = el(&mut tree, wide, "video", "width: 100%; display: block");
+    let frame = el(&mut tree, wide, "iframe", "width: 100%; display: block");
+    let canvas = el(&mut tree, wide, "canvas", "width: 100%; display: block");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, video).h, 150.0);
+    assert_eq!(rect_of(&t, frame).h, 150.0);
+    assert_eq!(rect_of(&t, canvas).h, 300.0);
+}

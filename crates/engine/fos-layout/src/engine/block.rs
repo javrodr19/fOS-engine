@@ -944,11 +944,11 @@ fn control_text(ctx: &mut LayoutCtx, style: &Style, text: &str, content: Rect, c
 }
 
 /// A replaced element's used content size (§10.3.2, §10.6.2)
-fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w: f32, cb_h: Option<f32>, hbp: f32, vbp: f32) -> (f32, f32) {
+pub(super) fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w: f32, cb_h: Option<f32>, hbp: f32, vbp: f32) -> (f32, f32) {
     let sw = style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp));
     let sh = style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp));
     let natural = r.natural.unwrap_or_else(|| default_replaced_size(ctx, style, r));
-    let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0).map(|n| n.0 / n.1);
+    let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0 && !r.no_ratio).map(|n| n.0 / n.1);
     let (w, h) = match (sw, sh) {
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, ratio.map_or(natural.1, |r| w / r)),
@@ -1052,7 +1052,7 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
             }
             (min, max)
         }
-        BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items),
+        BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items, None),
         BoxKind::Table(t) => super::table::intrinsic_table(ctx, &b.style, t),
         BoxKind::Grid(items) => super::grid::intrinsic_grid(ctx, &b.style, items),
         BoxKind::Replaced(r) => {

@@ -109,7 +109,12 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
         (None, _, _) if ratio_w.is_some() => ratio_w,
         (None, _, _) => {
             let avail = (cb.w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr - hbp).max(0.0);
-            let (min, max) = intrinsic_content(ctx, b);
+            // A flex row's percentage height is of the containing block,
+            // known here (kit.svelte.dev's logo marquee is height: 100%)
+            let (min, max) = match &b.kind {
+                BoxKind::Flex(items) if !s.box_.height.is_auto() => super::flex::intrinsic_flex(ctx, s, items, Some(cb.h)),
+                _ => intrinsic_content(ctx, b),
+            };
             Some(clamp_width(s, max.min(avail).max(min), cb.w, hbp) + hbp)
         }
     };

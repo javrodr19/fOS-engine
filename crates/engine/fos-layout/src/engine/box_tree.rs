@@ -124,6 +124,9 @@ pub struct Replaced {
     /// Only the ratio of `natural` is natural: auto sizes fill the
     /// available width
     pub ratio_only: bool,
+    /// `natural` is a default size with no ratio to keep (a video without
+    /// both size attributes, a frame)
+    pub no_ratio: bool,
     pub what: ReplacedWhat,
     /// The image to draw, once loaded
     pub image: Option<ImageHandle>,
@@ -680,7 +683,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 };
                 let mut st = Style::inherit_from(&ps);
                 std::sync::Arc::make_mut(&mut st.box_).display = Display::Inline;
-                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image, ratio_only: false }), marker: None }));
+                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image, ratio_only: false, no_ratio: false }), marker: None }));
             }
         }
         Some((ps, out))
@@ -1094,7 +1097,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         };
         // Width and height attributes give the size an image lacks
         let ratio_only = w_attr.is_none() && h_attr.is_none() && image.as_ref().is_some_and(|i| self.styler.ratio_only(i));
-        Some(Replaced { natural, what, image, ratio_only })
+        let no_ratio = match what {
+            ReplacedWhat::Video => w_attr.is_none() || h_attr.is_none(),
+            ReplacedWhat::Frame => true,
+            _ => false,
+        };
+        Some(Replaced { natural, what, image, ratio_only, no_ratio })
     }
 
     /// A select's shown option text (the selected option's, else the

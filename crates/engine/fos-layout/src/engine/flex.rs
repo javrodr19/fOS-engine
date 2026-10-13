@@ -117,6 +117,16 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let mut content_laid: Option<Laid> = None;
         let align = align_of(s, style);
         let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal) && (if row { s.box_.height.is_auto() } else { s.box_.auto_width() });
+        // A replaced item with a definite height has its width through its
+        // ratio (CSS Flexbox §9.2 step 3B, and the transferred size of its
+        // automatic minimum): kit.svelte.dev's height: 100% logos
+        let ratio_width = match &b.kind {
+            super::box_tree::BoxKind::Replaced(r) if row && s.box_.width.is_auto() && s.box_.height.resolve_definite(height).is_some() => {
+                let (_, vbp) = bp(s, width);
+                Some(super::block::replaced_content_size(ctx, s, r, width, height, hbp, vbp).0 + hbp)
+            }
+            _ => None,
+        };
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
             // A column item's height at its cross size
             let cross_w = if stretch_cross { Some((width - margin[1] - margin[3]).max(0.0)) } else { None };
@@ -126,6 +136,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             (LpAuto::Lp(_), Some(v)) => v,
             _ => match definite(main_prop) {
                 Some(v) => v,
+                None if ratio_width.is_some() => ratio_width.unwrap_or(0.0),
                 // `width: min-content` and the like
                 None if row => super::block::intrinsic_size(ctx, b, s.box_.intrinsic_width[0], main_size.unwrap_or(f32::INFINITY) - bp_main).unwrap_or_else(|| intrinsic_content(ctx, b).1) + bp_main,
                 None => {
@@ -143,7 +154,9 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             None if min_prop.is_auto() && !clips => {
                 // Automatic minimum: the content size, capped by a specified
                 // size
-                let content = if row {
+                let content = if let Some(w) = ratio_width {
+                    w.min(intrinsic_content(ctx, b).0 + bp_main)
+                } else if row {
                     intrinsic_content(ctx, b).0 + bp_main
                 } else {
                     match &content_laid {
@@ -448,13 +461,26 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
 }
 
 /// A flex container's min-content and max-content widths
-pub fn intrinsic_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox]) -> (f32, f32) {
+/// `cb_h`: the containing block's height, when known (what a percentage
+/// height of the container is of)
+pub fn intrinsic_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], cb_h: Option<f32>) -> (f32, f32) {
     let row = style.box_.flex_direction.is_row();
     let gap = style.box_.column_gap.map_or(0.0, |g| g.resolve(0.0));
     let (mut min, mut max) = (0.0f32, 0.0f32);
     let mut n = 0;
+    // A definite row height sizes replaced items through their ratio here
+    // too
+    let cross = style.box_.height.resolve_definite(cb_h).filter(|_| row).map(|h| content_size(style, h, super::block::edges(style, 0.0).vertical_bp()));
     for b in items.iter().filter(|b| !b.style.is_out_of_flow()) {
-        let (bmin, bmax) = intrinsic_outer(ctx, b);
+        let (bmin, bmax) = match (&b.kind, cross) {
+            (super::box_tree::BoxKind::Replaced(r), Some(h)) if b.style.box_.width.is_auto() && b.style.box_.height.resolve_definite(Some(h)).is_some() => {
+                let e = super::block::edges(&b.style, 0.0);
+                let w = super::block::replaced_content_size(ctx, &b.style, r, 0.0, Some(h), e.horizontal_bp(), e.vertical_bp()).0;
+                let w = w + e.horizontal_bp() + e.margin[1].unwrap_or(0.0) + e.margin[3].unwrap_or(0.0);
+                (w, w)
+            }
+            _ => intrinsic_outer(ctx, b),
+        };
         if row {
             max += bmax;
             if style.box_.flex_wrap == FlexWrap::Nowrap {

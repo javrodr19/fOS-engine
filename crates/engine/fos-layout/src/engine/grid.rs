@@ -695,6 +695,12 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             if (target - l.frag.border_box.h).abs() > 0.01 {
                 l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: Some(target), root: true });
             }
+        } else if [b.style.box_.height, b.style.box_.min_height].iter().any(|h| matches!(h, fos_css::style::LpAuto::Lp(l) if l.has_percent()))
+            || matches!(b.style.box_.max_height, fos_css::style::MaxSize::Lp(l) if l.has_percent())
+        {
+            // Percentage heights are of the grid area, sized by now
+            // (kit.svelte.dev's nav items are height: 100%)
+            l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: None, root: true });
         }
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
         let (_, hfrac) = self_align(self_value(jself, justify_items));

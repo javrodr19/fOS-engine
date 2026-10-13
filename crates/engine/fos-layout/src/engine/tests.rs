@@ -1726,3 +1726,17 @@ fn the_page_scrolls_over_its_scrollable_overflow() {
     assert_eq!(page("height: 10px; transform: translateY(100px)"), 8.0 + 1000.0 + 110.0);
     assert_eq!(page("height: 10px; position: fixed; top: 2000px"), 8.0 + 1000.0 + 8.0);
 }
+
+#[test]
+fn grid_items_take_percentage_heights_of_their_areas() {
+    let (mut tree, html, body) = doc();
+    // Once the rows are sized, height: 100% is the grid area's
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px 100px; height: 60px");
+    let full = el(&mut tree, grid, "div", "height: 100%");
+    let half = el(&mut tree, grid, "div", "height: 50%; display: flex");
+    let inner = el(&mut tree, half, "div", "height: 100%; width: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, full).h, 60.0);
+    assert_eq!(rect_of(&t, half).h, 30.0);
+    assert_eq!(rect_of(&t, inner).h, 30.0);
+}

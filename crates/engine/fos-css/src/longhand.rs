@@ -56,6 +56,15 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "border-right" => &[BorderRightWidth, BorderRightStyle, BorderRightColor],
         "border-bottom" => &[BorderBottomWidth, BorderBottomStyle, BorderBottomColor],
         "border-left" => &[BorderLeftWidth, BorderLeftStyle, BorderLeftColor],
+        // Logical pairs, in horizontal writing (start side first)
+        "border-inline" => &[BorderLeftWidth, BorderRightWidth, BorderLeftStyle, BorderRightStyle, BorderLeftColor, BorderRightColor],
+        "border-block" => &[BorderTopWidth, BorderBottomWidth, BorderTopStyle, BorderBottomStyle, BorderTopColor, BorderBottomColor],
+        "border-inline-width" => &[BorderLeftWidth, BorderRightWidth],
+        "border-block-width" => &[BorderTopWidth, BorderBottomWidth],
+        "border-inline-style" => &[BorderLeftStyle, BorderRightStyle],
+        "border-block-style" => &[BorderTopStyle, BorderBottomStyle],
+        "border-inline-color" => &[BorderLeftColor, BorderRightColor],
+        "border-block-color" => &[BorderTopColor, BorderBottomColor],
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "background" => &[BackgroundColor, BackgroundImage, BackgroundRepeat, BackgroundPosition, BackgroundSize],
         "mask" => &[MaskImage, MaskRepeat, MaskPosition, MaskSize],
@@ -397,8 +406,29 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
-        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "outline" => {
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-inline" | "border-block" | "outline" => {
             border_shorthand(name, &lower, important, out);
+            true
+        }
+        // One value for both sides, or the start side's then the end's
+        "border-inline-width" | "border-block-width" | "border-inline-style" | "border-block-style" | "border-inline-color" | "border-block-color" => {
+            let ids = longhands_of(name).unwrap();
+            let parts: Option<Vec<PropertyValue>> = components(&lower)
+                .into_iter()
+                .map(|c| {
+                    if name.ends_with("-width") {
+                        border_width(c)
+                    } else if name.ends_with("-style") {
+                        enum_value::<BorderStyle>(c)
+                    } else {
+                        color(c)
+                    }
+                })
+                .collect();
+            if let Some(parts) = parts.filter(|p| (1..=2).contains(&p.len())) {
+                push(out, ids[0], parts[0].clone(), important);
+                push(out, ids[1], parts.get(1).unwrap_or(&parts[0]).clone(), important);
+            }
             true
         }
         "border-width" | "border-style" | "border-color" => {
@@ -1261,6 +1291,8 @@ fn border_shorthand(name: &str, v: &str, important: bool, out: Out) {
         "border-right" => (&[BorderRightWidth], &[BorderRightStyle], &[BorderRightColor]),
         "border-bottom" => (&[BorderBottomWidth], &[BorderBottomStyle], &[BorderBottomColor]),
         "border-left" => (&[BorderLeftWidth], &[BorderLeftStyle], &[BorderLeftColor]),
+        "border-inline" => (&[BorderLeftWidth, BorderRightWidth], &[BorderLeftStyle, BorderRightStyle], &[BorderLeftColor, BorderRightColor]),
+        "border-block" => (&[BorderTopWidth, BorderBottomWidth], &[BorderTopStyle, BorderBottomStyle], &[BorderTopColor, BorderBottomColor]),
         _ => (&[OutlineWidth], &[OutlineStyle], &[OutlineColor]),
     };
     // Omitted parts reset to their initial values
@@ -2043,6 +2075,20 @@ mod tests {
         assert_eq!(computed("border: solid").border.width, [3.0; 4]);
         assert_eq!(computed("outline-style: solid").border.outline_width, 3.0);
         assert_eq!(computed("border-style: solid; border-width: 0").border.width, [0.0; 4]);
+    }
+
+    #[test]
+    fn logical_border_pairs() {
+        // Tailwind's border-x-0 is border-inline-width: 0 (deno.com's code
+        // window title bar)
+        let s = computed("border: 1px solid; border-inline-width: 0");
+        assert_eq!(s.border.width, [1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(computed("border-style: solid; border-block-width: 2px 4px").border.width, [2.0, 3.0, 4.0, 3.0]);
+        assert_eq!(computed("border-inline: 2px solid").border.width, [0.0, 2.0, 0.0, 2.0]);
+        assert_eq!(computed("border-block-style: solid").border.width, [3.0, 0.0, 3.0, 0.0]);
+        let s = computed("border: 1px solid; border-inline-color: red blue");
+        use crate::properties::Color;
+        assert_eq!((s.border.color[1], s.border.color[3]), (Some(Color::rgb(0, 0, 255)), Some(Color::rgb(255, 0, 0))));
     }
 
     #[test]

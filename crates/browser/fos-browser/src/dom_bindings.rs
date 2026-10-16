@@ -222,6 +222,7 @@ pub fn wrap(vm: &mut Vm, id: NodeId) -> Value {
 }
 
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
+const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
 /// An element's key in `tag_protos`: its tag, prefixed "svg:" for SVG
 pub(crate) fn element_tag(t: &fos_dom::DomTree, e: &fos_dom::ElementData) -> String {
@@ -402,6 +403,9 @@ fn node_name(vm: &mut Vm, this: Value, _: &[Value], _: Gc<JsObject>) -> JsResult
     let id = this_node(vm, this)?;
     let s = with_tree(vm, |t| match t.get(id).map(|n| &n.data) {
         Some(NodeData::Element(e)) if t.resolve(e.name.local) == SHADOW_ROOT => FRAGMENT.into(),
+        // Uppercased in the HTML namespace only: an SVG or MathML element
+        // keeps its case (`svg`, `foreignObject`)
+        Some(NodeData::Element(e)) if matches!(t.resolve(e.name.ns), SVG_NS | MATHML_NS) => t.resolve(e.name.local).to_string(),
         Some(NodeData::Element(e)) => t.resolve(e.name.local).to_ascii_uppercase(),
         Some(NodeData::Text(_)) => "#text".into(),
         Some(NodeData::Comment(_)) => "#comment".into(),
@@ -687,7 +691,7 @@ fn tag_name(vm: &mut Vm, this: Value, a: &[Value], f: Gc<JsObject>) -> JsResult<
 /// HTML elements only, as SVG and MathML names keep their case (viewBox)
 fn attr_name(vm: &mut Vm, id: NodeId, name: String) -> String {
     let foreign = with_tree(vm, |t| {
-        t.get(id).and_then(|n| n.as_element()).is_some_and(|e| matches!(t.resolve(e.name.ns), SVG_NS | "http://www.w3.org/1998/Math/MathML"))
+        t.get(id).and_then(|n| n.as_element()).is_some_and(|e| matches!(t.resolve(e.name.ns), SVG_NS | MATHML_NS))
     });
     if foreign { name } else { name.to_ascii_lowercase() }
 }

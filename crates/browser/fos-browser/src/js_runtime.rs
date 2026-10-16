@@ -1081,6 +1081,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "0 0 4 2||0 0 4 2|true|preserveAspectRatio|1|true");
+        // And so are tag names: an SVG element's keeps its case
+        let names = rt.eval("[s.tagName, s.nodeName, p.tagName, document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject').tagName].join()").unwrap();
+        assert_eq!(names, "svg,svg,P,foreignObject");
     }
 
     #[test]

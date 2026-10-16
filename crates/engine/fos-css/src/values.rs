@@ -365,7 +365,9 @@ fn resolve_custom<'a>(
         } else if let Some(v) = done.get(referenced).cloned().or_else(|| inherited.and_then(|m| m.get(referenced)).map(str::to_string)) {
             local.insert(referenced.to_string(), v);
         }
-        at = close + 1;
+        // On inside it: its fallback may refer to others
+        // (`var(--a, var(--b))`)
+        at = start + 4;
     }
     resolving.pop();
     let result = if ok { substitute(value, Some(&local), 0) } else { None };
@@ -996,6 +998,15 @@ mod tests {
         assert_eq!(chain.get("--base"), Some("4px"));
         assert_eq!(chain.get("--v0"), Some("x"));
         assert!(chain.get("--x").is_none());
+    }
+
+    #[test]
+    fn custom_properties_resolve_references_in_fallbacks() {
+        // kotlinlang.org's tags: --h: var(--missing, var(--base)), across lines
+        let root = std::sync::Arc::new(compute_custom_properties(None, &[("--base", "4px")]));
+        let own = [("--b", "8px"), ("--h", "var(--missing, var(--b))"), ("--g", "var(\n    --missing,var(--base)\n  )"), ("--k", "var(--missing, var(--gone, 3px))")];
+        let m = compute_custom_properties(Some(&root), &own);
+        assert_eq!((m.get("--h"), m.get("--g"), m.get("--k")), (Some("8px"), Some("4px"), Some("3px")));
     }
 
     #[test]

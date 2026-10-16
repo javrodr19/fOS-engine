@@ -535,8 +535,12 @@ fn own_decoration(style: &Style) -> (u8, Color) {
 impl<S: Styler> BoxTreeBuilder<'_, S> {
     /// The box of element `node` (a block container, or replaced);
     /// `in_flow` boxes get their ancestors' text decorations
-    fn element_box(&mut self, node: NodeId, style: Style, in_flow: bool) -> LayoutBox {
+    fn element_box(&mut self, node: NodeId, mut style: Style, in_flow: bool) -> LayoutBox {
         self.counters_for(Some(node), &style);
+        // A fieldset establishes a block formatting context (HTML §15.3.13)
+        if style.box_.display == Display::Block && self.tag(node) == "fieldset" {
+            std::sync::Arc::make_mut(&mut style.box_).display = Display::FlowRoot;
+        }
         if let Some(r) = self.replaced(node, &style) {
             return LayoutBox { node, style, kind: BoxKind::Replaced(r), marker: None };
         }

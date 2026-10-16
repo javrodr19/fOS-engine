@@ -1794,6 +1794,22 @@ fn preserved_spaces_make_a_line() {
 }
 
 #[test]
+fn fieldsets_contain_their_floats() {
+    // A fieldset establishes a block formatting context, so it grows to
+    // its floats (archlinux.org's package search); a div does not
+    let (mut tree, html, body) = doc();
+    let boxed = |tree: &mut DomTree, tag: &str| {
+        let b = el(tree, body, tag, "display: block; margin: 0; padding: 0; border: 0; line-height: 20px");
+        el(tree, b, "div", "float: right; width: 50px; height: 30px");
+        text(tree, b, "Search");
+        b
+    };
+    let (fieldset, div) = (boxed(&mut tree, "fieldset"), boxed(&mut tree, "div"));
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, fieldset).h, rect_of(&t, div).h), (30.0, 20.0));
+}
+
+#[test]
 fn replaced_flex_items_follow_their_ratio() {
     // As in Chromium: a flexed image's height follows its used width; its
     // automatic minimum is its natural width, not its own width; one with

@@ -1300,6 +1300,19 @@ impl Style {
         // font pass has set it, this element's
         let parent_units = std::cell::OnceCell::new();
         let mut units: Option<(f32, f32, f32)> = None;
+        // Border and outline sides given a width (the others' initial width
+        // is medium once they have a style)
+        let mut widths_set = 0u8;
+        let mut note = |id: PropertyId| {
+            widths_set |= match id {
+                PropertyId::BorderTopWidth => 1,
+                PropertyId::BorderRightWidth => 2,
+                PropertyId::BorderBottomWidth => 4,
+                PropertyId::BorderLeftWidth => 8,
+                PropertyId::OutlineWidth => 16,
+                _ => 0,
+            }
+        };
         // The font first: other lengths are in its em, ch and ex; then the
         // line height (lh)
         for pass in 0..3 {
@@ -1307,7 +1320,7 @@ impl Style {
                 let of_pass = match &d.value {
                     PropertyValue::Custom(_) => continue,
                     PropertyValue::Unresolved(b) => match b.0.as_str() {
-                        "font-size" | "font" | "font-family" | "font-weight" | "font-style" => 0,
+                        "font-size" | "font" | "font-family" | "font-weight" | "font-style" | "font-stretch" | "font-width" => 0,
                         "line-height" => 1,
                         _ => 2,
                     },
@@ -1351,11 +1364,30 @@ impl Style {
                         };
                         let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &rctx).to_vec();
                         for r in &resolved {
+                            note(r.property);
                             self.apply(r.property, &r.value, parent, ctx);
                         }
                     }
-                    v => self.apply(d.property, v, parent, ctx),
+                    v => {
+                        note(d.property);
+                        self.apply(d.property, v, parent, ctx)
+                    }
                 }
+            }
+        }
+        // A side with a style but no width is medium (3px): mozilla.org's
+        // springboard links set border-bottom-width alone, so their sides
+        // are 3px
+        let b = &self.border;
+        let medium: Vec<usize> = (0..4).filter(|&i| widths_set & (1 << i) == 0 && !matches!(b.style[i], BorderStyle::None | BorderStyle::Hidden) && b.width[i] == 0.0).collect();
+        let outline_medium = widths_set & 16 == 0 && !matches!(b.outline_style, BorderStyle::None | BorderStyle::Hidden) && b.outline_width == 0.0;
+        if !medium.is_empty() || outline_medium {
+            let b = Arc::make_mut(&mut self.border);
+            for i in medium {
+                b.width[i] = 3.0;
+            }
+            if outline_medium {
+                b.outline_width = 3.0;
             }
         }
         self.finish();

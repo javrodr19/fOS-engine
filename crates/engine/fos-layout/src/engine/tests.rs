@@ -1670,6 +1670,51 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn spanning_items_fill_tracks_below_their_limits_first() {
+    // CSS Grid §11.5.1, as in Chromium (mozilla.org's donate grid): a
+    // media item spanning a heading's row and an empty one grows the empty
+    // one, the heading's row having reached its growth limit
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; grid-template-columns: repeat(12, 1fr); column-gap: 12px; width: 1232px");
+    let h = el(&mut tree, g, "div", "grid-column: 1 / 7; margin-bottom: 16px");
+    el(&mut tree, h, "div", "height: 128px");
+    let b = el(&mut tree, g, "div", "grid-row: 2 / 4; grid-column: 1 / 7; height: 167px");
+    let m = el(&mut tree, g, "div", "grid-row: 1 / 3; grid-column: 8 / 13; height: 253px");
+    let p = el(&mut tree, g, "div", "grid-column: 8 / 13; height: 58px");
+    let t = layout(&tree, html, 1280.0);
+    let at = |n: NodeId| (rect_of(&t, n).y - rect_of(&t, g).y, rect_of(&t, n).h);
+    assert_eq!([h, b, m, p].map(at), [(0.0, 128.0), (144.0, 167.0), (0.0, 253.0), (253.0, 58.0)]);
+}
+
+#[test]
+fn column_subgrids_share_their_parents_tracks() {
+    // As in Chromium (mozilla.org's springboard): rows of a list are column
+    // subgrids of an auto-column grid, so their cells line up and size the
+    // columns together; a subgrid's own gap is half extra margin on each
+    // side of its gutters, and its padding a margin on its edge items
+    let (mut tree, html, body) = doc();
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: repeat(3, auto); width: 600px");
+    let row = |tree: &mut DomTree, widths: [u32; 3], style: &str| {
+        let r = el(tree, grid, "div", &format!("display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; {style}"));
+        widths.map(|w| el(tree, r, "div", &format!("width: {w}px; height: 10px")))
+    };
+    let a = row(&mut tree, [50, 100, 30], "");
+    let b = row(&mut tree, [80, 20, 40], "column-gap: 20px; padding-left: 5px");
+    let t = layout(&tree, html, 800.0);
+    let x = |n: NodeId| ((rect_of(&t, n).x - rect_of(&t, grid).x) * 10.0).round() / 10.0;
+    // Chromium's positions for the same page
+    assert_eq!(a.map(x), [0.0, 213.3, 431.7]);
+    assert_eq!(b.map(x), [5.0, 223.3, 441.7]);
+    // Subgrid items stretch over their (narrowed) tracks when auto-sized
+    let (mut tree, html, body) = doc();
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px 200px; width: 300px");
+    let sub = el(&mut tree, grid, "div", "display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; column-gap: 10px");
+    let cells = [el(&mut tree, sub, "div", "height: 10px"), el(&mut tree, sub, "div", "height: 10px")];
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(cells.map(|c| (rect_of(&t, c).x - rect_of(&t, grid).x, rect_of(&t, c).w)), [(0.0, 95.0), (105.0, 195.0)]);
+}
+
+#[test]
 fn stretched_column_items_keep_their_min_and_max_widths() {
     // As in Chromium: bun.sh's max-w-[52ch] paragraphs in flex columns
     let (mut tree, html, body) = doc();

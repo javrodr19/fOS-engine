@@ -38,7 +38,7 @@ fn expand(template: &[TemplateItem], avail: Option<f32>, gap: f32) -> Explicit {
                     tracks.push(*t);
                     names.push(Vec::new());
                 }
-                TemplateItem::Repeat(..) => {}
+                TemplateItem::Repeat(..) | TemplateItem::Subgrid => {}
             }
         }
     }
@@ -323,11 +323,13 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
         };
     }
     let mut max_seen = vec![0.0f32; tracks.len()];
+    let mut has_items = vec![false; tracks.len()];
     // Items in one track
     for ((&(s, e), &(cmin, cmax)), &least) in spans.iter().zip(contrib).zip(minimum) {
         if e - s != 1 {
             continue;
         }
+        has_items[s] = true;
         let t = &mut tracks[s];
         match t.size.min {
             Breadth::Auto => t.base = t.base.max(least),
@@ -346,8 +348,10 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
             max_seen[s] = max_seen[s].max(cmax);
         }
     }
+    // (A track without items keeps an infinite growth limit while
+    // spanning items are placed, so it takes what they need first)
     for (i, t) in tracks.iter_mut().enumerate() {
-        if t.limit.is_infinite() && t.flex().is_none() {
+        if t.limit.is_infinite() && t.flex().is_none() && has_items[i] {
             t.limit = max_seen[i];
         }
         if let Some(fc) = t.size.fit_content {
@@ -355,12 +359,18 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
         }
         t.limit = t.limit.max(t.base);
     }
-    // Spanning items: what they need beyond their tracks goes evenly to
-    // the intrinsic ones. Items spanning a flexible track are left to the
-    // flexible tracks (they would otherwise inflate the auto tracks a
-    // later `fr` track should have grown into)
-    for ((&(s, e), &(_, cmax)), &cmin) in spans.iter().zip(contrib).zip(minimum) {
-        if e - s < 2 || tracks[s..e].iter().any(|t| t.flex().is_some()) {
+    // Spanning items, those spanning fewest tracks first (CSS Grid
+    // §11.5.1): what they need beyond their tracks goes evenly to the
+    // intrinsic ones, each up to its growth limit before any goes past it
+    // (mozilla.org's donate grid: a media item spanning a heading's row and
+    // an empty one grows the empty one). Items spanning a flexible track
+    // are left to the flexible tracks (they would otherwise inflate the
+    // auto tracks a later `fr` track should have grown into)
+    let mut spanning: Vec<usize> = (0..spans.len()).filter(|&k| spans[k].1 - spans[k].0 >= 2).collect();
+    spanning.sort_by_key(|&k| spans[k].1 - spans[k].0);
+    for k in spanning {
+        let ((s, e), cmax, cmin) = (spans[k], contrib[k].1, minimum[k]);
+        if tracks[s..e].iter().any(|t| t.flex().is_some()) {
             continue;
         }
         let gaps = gap * (e - s - 1) as f32;
@@ -370,11 +380,7 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
         }
         let have: f32 = tracks[s..e].iter().map(|t| t.base).sum::<f32>() + gaps;
         if cmin > have {
-            let each = (cmin - have) / intrinsic.len() as f32;
-            for &i in &intrinsic {
-                tracks[i].base += each;
-                tracks[i].limit = tracks[i].limit.max(tracks[i].base);
-            }
+            grow_bases(tracks, &intrinsic, cmin - have);
         }
         let have_limit: f32 = tracks[s..e].iter().map(|t| if t.limit.is_finite() { t.limit } else { t.base }).sum::<f32>() + gaps;
         if cmax > have_limit {
@@ -382,10 +388,14 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
             if !growable.is_empty() {
                 let each = (cmax - have_limit) / growable.len() as f32;
                 for i in growable {
-                    tracks[i].limit += each;
+                    let t = &mut tracks[i];
+                    t.limit = if t.limit.is_finite() { t.limit } else { t.base } + each;
                 }
             }
         }
+    }
+    for t in tracks.iter_mut().filter(|t| t.flex().is_none() && t.limit.is_infinite()) {
+        t.limit = t.base;
     }
     let gaps = gap * tracks.len().saturating_sub(1) as f32;
     // Grow tracks toward their limits with the free space
@@ -479,6 +489,42 @@ fn size_tracks(tracks: &mut [Track], spans: &[(usize, usize)], contrib: &[(f32, 
     }
 }
 
+/// Grow the base sizes of `affected` tracks by `space`, evenly, each up to
+/// its growth limit; what remains goes to those with an intrinsic maximum
+/// (or all of them) past their limits (CSS Grid §11.5.1)
+fn grow_bases(tracks: &mut [Track], affected: &[usize], mut space: f32) {
+    let mut open: Vec<usize> = affected.to_vec();
+    while space > 0.01 && !open.is_empty() {
+        let each = space / open.len() as f32;
+        let mut still = Vec::with_capacity(open.len());
+        for &i in &open {
+            let t = &mut tracks[i];
+            let add = each.min((t.limit - t.base).max(0.0));
+            t.base += add;
+            space -= add;
+            if add >= each - 1e-4 {
+                still.push(i);
+            }
+        }
+        if still.len() == open.len() {
+            break;
+        }
+        open = still;
+    }
+    if space > 0.01 {
+        let beyond: Vec<usize> = affected.iter().copied().filter(|&i| tracks[i].size.max.is_intrinsic()).collect();
+        let to = if beyond.is_empty() { affected } else { &beyond[..] };
+        let each = space / to.len() as f32;
+        for &i in to {
+            tracks[i].base += each;
+        }
+    }
+    for &i in affected {
+        let t = &mut tracks[i];
+        t.limit = t.limit.max(t.base);
+    }
+}
+
 /// Offsets of tracks with content distribution: (start, extra between)
 fn distribute(free: f32, n: usize, how: JustifyContent) -> (f32, f32) {
     if free <= 0.0 || n == 0 {
@@ -553,10 +599,15 @@ struct Prepared<'a> {
     rows: Vec<TrackSize>,
 }
 
-fn prepare<'a>(style: &Style, items: &'a [LayoutBox], width: Option<f32>, height: Option<f32>, gaps: (f32, f32)) -> Prepared<'a> {
+/// Place `items`; `subgrid_columns` is how many of its parent's columns a
+/// column subgrid spans (its columns, which no item extends)
+fn prepare<'a>(style: &Style, items: &'a [LayoutBox], width: Option<f32>, height: Option<f32>, gaps: (f32, f32), subgrid_columns: Option<usize>) -> Prepared<'a> {
     let g: &GridStyle = &style.box_.grid;
     let mut ec = expand(&g.template_columns, width, gaps.0);
     let mut er = expand(&g.template_rows, height, gaps.1);
+    if let Some(n) = subgrid_columns {
+        ec = Explicit { tracks: vec![TrackSize::AUTO; n.max(1)], names: vec![Vec::new(); n.max(1) + 1] };
+    }
     let mut col_areas = Vec::new();
     let mut row_areas = Vec::new();
     if let Some(a) = &g.areas {
@@ -587,7 +638,18 @@ fn prepare<'a>(style: &Style, items: &'a [LayoutBox], width: Option<f32>, height
         .collect();
     let col_shift = placed.iter().filter_map(|p| if let Place::Definite(s, _) = p.1 { Some((-s).max(0)) } else { None }).max().unwrap_or(0) as usize;
     let row_shift = placed.iter().filter_map(|p| if let Place::Definite(s, _) = p.2 { Some((-s).max(0)) } else { None }).max().unwrap_or(0) as usize;
-    let (areas, ncols, nrows) = place(&placed, ec.tracks.len(), g.flow_column, g.flow_dense);
+    let (mut areas, ncols, nrows) = place(&placed, ec.tracks.len(), g.flow_column, g.flow_dense);
+    let ncols = match subgrid_columns {
+        Some(n) => {
+            let n = n.max(1);
+            for a in &mut areas {
+                a.c0 = a.c0.min(n - 1);
+                a.c1 = a.c1.clamp(a.c0 + 1, n);
+            }
+            n
+        }
+        None => ncols,
+    };
     // Implicit tracks before (from negative lines) and after the explicit
     let track_list = |explicit: &[TrackSize], auto: &[TrackSize], before: usize, total: usize| -> Vec<TrackSize> {
         (0..total.max(explicit.len() + before))
@@ -658,27 +720,70 @@ fn new_tracks(sizes: &[TrackSize]) -> Vec<Track> {
 /// `bounds` are the min and max content heights, for an indefinite height
 pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, bounds: (f32, f32)) -> GridLayout {
     let (cgap, rgap) = gaps(style, width, height);
-    let p = prepare(style, items, Some(width), height, (cgap, rgap));
+    // A column subgrid's columns are those its parent passed down
+    let given = ctx.subgrid_columns.take().filter(|_| fos_css::grid::is_subgrid(&style.box_.grid.template_columns));
+    let p = prepare(style, items, Some(width), height, (cgap, rgap), given.as_ref().map(|g| g.len()));
     let mut frags = Vec::new();
     for b in items.iter().filter(|b| b.style.is_out_of_flow()) {
         frags.push(Fragment::Box(placeholder(b, Rect::default())));
     }
 
-    // Columns from the items' min/max-content widths
-    let col_spans: Vec<(usize, usize)> = p.areas.iter().map(|a| (a.c0, a.c1)).collect();
-    let col_contrib: Vec<(f32, f32)> = p.items.iter().map(|b| intrinsic_outer(ctx, b)).collect();
-    let col_minimum = minimum_contributions(&p.items, &col_spans, &col_contrib, &p.cols);
-    let mut cols = new_tracks(&p.cols);
+    // Columns from the items' min/max-content widths, and where they are
     let justify = style.box_.justify_content;
-    size_tracks(&mut cols, &col_spans, &col_contrib, &col_minimum, Some(width), (0.0, f32::INFINITY), cgap, matches!(justify, JustifyContent::Normal | JustifyContent::Stretch), false);
+    let (cols, col_x) = match &given {
+        Some(g) => (g.iter().map(|&(_, w)| Track { size: TrackSize::AUTO, base: w, limit: w }).collect::<Vec<_>>(), g.iter().map(|&(x, _)| x).collect::<Vec<_>>()),
+        None => {
+            let (col_spans, col_contrib, col_minimum) = column_inputs(ctx, &p, cgap);
+            let mut cols = new_tracks(&p.cols);
+            size_tracks(&mut cols, &col_spans, &col_contrib, &col_minimum, Some(width), (0.0, f32::INFINITY), cgap, matches!(justify, JustifyContent::Normal | JustifyContent::Stretch), false);
+            let cw = cols.iter().map(|t| t.base).sum::<f32>() + cgap * cols.len().saturating_sub(1) as f32;
+            let (cx0, cbetween) = distribute(width - cw, cols.len(), justify);
+            let mut at = cx0;
+            let col_x = cols.iter().map(|t| { let x = at; at += t.base + cgap + cbetween; x }).collect();
+            (cols, col_x)
+        }
+    };
     let span_size = |tracks: &[Track], s: usize, e: usize, gap: f32| tracks[s..e].iter().map(|t| t.base).sum::<f32>() + gap * (e - s).saturating_sub(1) as f32;
+    // An area's width: from its first column's start to its last's end
+    let area_width = |c0: usize, c1: usize| col_x[c1 - 1] + cols[c1 - 1].base - col_x[c0];
+    // A column subgrid item gets the tracks it spans, in its content box
+    // (its margin, border and padding are an extra margin on the items at
+    // its edges: the tracks are clipped to its content box)
+    let pass_columns = |ctx: &mut LayoutCtx, b: &LayoutBox, a: &Area, area_w: f32| {
+        if column_subgrid(b) {
+            let e = edges(&b.style, area_w);
+            let start = e.margin[3].unwrap_or(0.0) + e.border[3] + e.padding[3];
+            let end = e.margin[1].unwrap_or(0.0) + e.border[1] + e.padding[1];
+            let x0 = col_x[a.c0] + start;
+            let content_w = (area_w - start - end).max(0.0);
+            // A gap of its own: half the difference from this grid's at
+            // each side of its gutters
+            let half = b.style.box_.column_gap.map_or(0.0, |g| (g.resolve(area_w) - cgap) / 2.0);
+            ctx.subgrid_columns = Some(
+                (a.c0..a.c1)
+                    .map(|i| {
+                        let (mut x, mut w) = (col_x[i] - x0, cols[i].base);
+                        if i > a.c0 {
+                            x += half;
+                            w -= half;
+                        }
+                        if i + 1 < a.c1 {
+                            w -= half;
+                        }
+                        let (l, r) = (x.max(0.0), (x + w.max(0.0)).min(content_w));
+                        (l, (r - l).max(0.0))
+                    })
+                    .collect(),
+            );
+        }
+    };
 
     // Items at their column widths, for row heights
     let justify_items = AlignItems::from_u8(style.box_.grid.justify_items).unwrap_or(AlignItems::Normal);
     let mut laid = Vec::with_capacity(p.items.len());
     let mut row_contrib = Vec::with_capacity(p.items.len());
     for (b, a) in p.items.iter().zip(&p.areas) {
-        let area_w = span_size(&cols, a.c0, a.c1, cgap);
+        let area_w = area_width(a.c0, a.c1);
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
         let (stretch, _) = self_align(self_value(jself, justify_items));
         let m = b.style.box_.margin.map(|m| m.resolve(area_w));
@@ -689,7 +794,9 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             let w = (area_w - m[1].unwrap_or(0.0) - m[3].unwrap_or(0.0) - hbp).max(0.0);
             clamp_width(&b.style, w, area_w, hbp) + hbp
         });
+        pass_columns(ctx, b, a, area_w);
         let l = layout_sized(ctx, b, area_w, None, Sizing::Shrink, false, Forced { width: forced_w, height: None, root: true });
+        ctx.subgrid_columns = None;
         let outer = l.mt.size() + l.frag.border_box.h + l.mb.size();
         row_contrib.push((outer, outer));
         laid.push(l);
@@ -700,10 +807,9 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     let row_minimum = row_minimums(&p.items, &row_spans, &row_contrib, &p.rows, width);
     size_tracks(&mut rows, &row_spans, &row_contrib, &row_minimum, height, bounds, rgap, matches!(align_content, AlignContent::Normal | AlignContent::Stretch), false);
 
-    // Track positions with content distribution
+    // Row positions with content distribution
     let total = |tracks: &[Track], gap: f32| tracks.iter().map(|t| t.base).sum::<f32>() + gap * tracks.len().saturating_sub(1) as f32;
-    let (cw, rh) = (total(&cols, cgap), total(&rows, rgap));
-    let (cx0, cbetween) = distribute(width - cw, cols.len(), justify);
+    let rh = total(&rows, rgap);
     let content_h = height.unwrap_or(rh.min(bounds.1).max(bounds.0));
     let (ry0, rbetween) = distribute(content_h - rh, rows.len(), align_content_as_justify(align_content));
     let positions = |tracks: &[Track], start: f32, gap: f32| -> Vec<f32> {
@@ -717,12 +823,11 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             })
             .collect()
     };
-    let col_x = positions(&cols, cx0, cgap + cbetween);
     let row_y = positions(&rows, ry0, rgap + rbetween);
 
     let align_items = style.box_.align_items;
     for ((b, a), mut l) in p.items.iter().zip(&p.areas).zip(laid) {
-        let area_w = span_size(&cols, a.c0, a.c1, cgap + cbetween);
+        let area_w = area_width(a.c0, a.c1);
         let area_h = span_size(&rows, a.r0, a.r1, rgap + rbetween);
         // Stretch in the block axis: lay out again at the row height
         let (vstretch, vfrac) = self_align(self_value(b.style.box_.align_self, align_items));
@@ -733,14 +838,18 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             let target = (area_h - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - vbp).max(0.0);
             let target = clamp_height(&b.style, target, Some(area_h), vbp) + vbp;
             if (target - l.frag.border_box.h).abs() > 0.01 {
+                pass_columns(ctx, b, a, area_w);
                 l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: Some(target), root: true });
+                ctx.subgrid_columns = None;
             }
         } else if [b.style.box_.height, b.style.box_.min_height].iter().any(|h| matches!(h, fos_css::style::LpAuto::Lp(l) if l.has_percent()))
             || matches!(b.style.box_.max_height, fos_css::style::MaxSize::Lp(l) if l.has_percent())
         {
             // Percentage heights are of the grid area, sized by now
             // (kit.svelte.dev's nav items are height: 100%)
+            pass_columns(ctx, b, a, area_w);
             l = layout_sized(ctx, b, area_w, Some(area_h), Sizing::Shrink, false, Forced { width: Some(l.frag.border_box.w), height: None, root: true });
+            ctx.subgrid_columns = None;
         }
         let jself = AlignSelf::from_u8(b.style.box_.grid.justify_self).unwrap_or(AlignSelf::Auto);
         let (_, hfrac) = self_align(self_value(jself, justify_items));
@@ -767,13 +876,56 @@ pub fn layout_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     GridLayout { frags, height: if height.is_some() { content_h } else { rh } }
 }
 
+/// Whether a box is a grid whose columns are its parent grid's
+fn column_subgrid(b: &LayoutBox) -> bool {
+    matches!(b.kind, super::box_tree::BoxKind::Grid(_)) && fos_css::grid::is_subgrid(&b.style.box_.grid.template_columns)
+}
+
+/// What sizes a grid's columns: its items, or for a column subgrid its own
+/// items in the columns it spans, its margin, border and padding added at
+/// the ends (CSS Grid 2 §9). Spans, (min, max) contributions, minimum
+/// contributions
+fn column_inputs(ctx: &mut LayoutCtx, p: &Prepared, gap: f32) -> (Vec<(usize, usize)>, Vec<(f32, f32)>, Vec<f32>) {
+    type Found<'a> = Vec<(&'a LayoutBox, (usize, usize), (f32, f32))>;
+    fn collect<'a>(b: &'a LayoutBox, span: (usize, usize), ends: (f32, f32), gap: f32, out: &mut Found<'a>) {
+        let super::box_tree::BoxKind::Grid(children) = &b.kind else { return out.push((b, span, ends)) };
+        if !column_subgrid(b) {
+            return out.push((b, span, ends));
+        }
+        let e = edges(&b.style, 0.0);
+        let start = ends.0 + e.margin[3].unwrap_or(0.0) + e.border[3] + e.padding[3];
+        let end = ends.1 + e.margin[1].unwrap_or(0.0) + e.border[1] + e.padding[1];
+        // Its own column gap differing from its parent's: half the
+        // difference on each side of its gutters (CSS Grid 2 §9.1)
+        let own_gap = b.style.box_.column_gap.map(|g| g.resolve(0.0));
+        let half = own_gap.map_or(0.0, |g| (g - gap) / 2.0);
+        let n = span.1 - span.0;
+        let (cgap, rgap) = gaps(&b.style, 0.0, None);
+        let p = prepare(&b.style, children, None, None, (cgap, rgap), Some(n));
+        for (c, a) in p.items.iter().zip(&p.areas) {
+            let ends = (if a.c0 == 0 { start } else { half }, if a.c1 == n { end } else { half });
+            collect(c, (span.0 + a.c0, span.0 + a.c1), ends, own_gap.unwrap_or(gap), out);
+        }
+    }
+    let mut found = Vec::new();
+    for (b, a) in p.items.iter().zip(&p.areas) {
+        collect(b, (a.c0, a.c1), (0.0, 0.0), gap, &mut found);
+    }
+    let boxes: Vec<&LayoutBox> = found.iter().map(|f| f.0).collect();
+    let spans: Vec<(usize, usize)> = found.iter().map(|f| f.1).collect();
+    let own: Vec<(f32, f32)> = boxes.iter().map(|b| intrinsic_outer(ctx, b)).collect();
+    let minimum = minimum_contributions(&boxes, &spans, &own, &p.cols);
+    let ends = |i: usize| found[i].2 .0 + found[i].2 .1;
+    let contrib = own.iter().enumerate().map(|(i, c)| (c.0 + ends(i), c.1 + ends(i))).collect();
+    let minimum = minimum.iter().enumerate().map(|(i, m)| m + ends(i)).collect();
+    (spans, contrib, minimum)
+}
+
 /// A grid container's min- and max-content widths
 pub fn intrinsic_grid(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox]) -> (f32, f32) {
     let (cgap, _) = gaps(style, 0.0, None);
-    let p = prepare(style, items, None, None, (cgap, 0.0));
-    let spans: Vec<(usize, usize)> = p.areas.iter().map(|a| (a.c0, a.c1)).collect();
-    let contrib: Vec<(f32, f32)> = p.items.iter().map(|b| intrinsic_outer(ctx, b)).collect();
-    let minimum = minimum_contributions(&p.items, &spans, &contrib, &p.cols);
+    let p = prepare(style, items, None, None, (cgap, 0.0), None);
+    let (spans, contrib, minimum) = column_inputs(ctx, &p, cgap);
     // The min-content size: the tracks' base sizes, which `auto` minimums
     // take from the items' minimum contributions (as Blink sizes them)
     let mut min_tracks = new_tracks(&p.cols);

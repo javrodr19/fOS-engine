@@ -34,11 +34,14 @@ pub struct LayoutCtx<'a> {
     pub justify_in_parent: Option<f32>,
     /// The document is in quirks mode
     pub quirks: bool,
+    /// For the column subgrid about to be laid out: its parent grid's
+    /// tracks it spans, as positions in its content box and sizes
+    pub subgrid_columns: Option<Vec<(f32, f32)>>,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, justify_in_parent: None, quirks: false }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, justify_in_parent: None, quirks: false, subgrid_columns: None }
     }
 }
 

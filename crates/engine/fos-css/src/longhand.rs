@@ -2033,6 +2033,19 @@ mod tests {
     }
 
     #[test]
+    fn border_widths_default_to_medium() {
+        // A side with a style but no width is medium (3px); without a style
+        // it has none
+        let s = computed("border-bottom-width: 2px; border-style: solid");
+        assert_eq!(s.border.width, [3.0, 3.0, 2.0, 3.0]);
+        assert_eq!(computed("border-left-style: dashed").border.width, [0.0, 0.0, 0.0, 3.0]);
+        assert_eq!(computed("border-width: 5px").border.width, [0.0; 4]);
+        assert_eq!(computed("border: solid").border.width, [3.0; 4]);
+        assert_eq!(computed("outline-style: solid").border.outline_width, 3.0);
+        assert_eq!(computed("border-style: solid; border-width: 0").border.width, [0.0; 4]);
+    }
+
+    #[test]
     fn font_stretch_values() {
         // bun.sh's hero words are font-stretch: 75% of a variable face
         assert_eq!(computed("font-stretch: condensed").inherited.font_stretch, 75.0);

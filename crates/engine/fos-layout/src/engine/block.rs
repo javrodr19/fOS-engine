@@ -492,6 +492,21 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         None => clamp_height(style, specified_h.unwrap_or(content_h), cb_h, vbp),
     };
     let through = through && collapse_top && collapse_bottom && height <= 0.0;
+    // align-content in a block container moves its content as a whole, but
+    // never above the top (CSS Box Alignment 3 §5.3)
+    let align = match &b.kind {
+        BoxKind::Block(_) | BoxKind::Inline(_) => block_content_shift(style, height - content_h),
+        _ => 0.0,
+    };
+    if align > 0.0 {
+        for c in &mut frag.children {
+            c.translate(0.0, align);
+        }
+        if let Some((first, last)) = &mut frag.line_baselines {
+            *first += align;
+            *last += align;
+        }
+    }
     for c in &mut frag.children {
         // Absolutely positioned flex children align in the content box
         if let Fragment::Box(p) = c {
@@ -719,6 +734,18 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         line_baselines: None,
         static_align: None,
     }
+}
+
+/// How far `align-content` moves a block container's content down, given
+/// the room left below it (`free`; none when it overflows)
+fn block_content_shift(style: &Style, free: f32) -> f32 {
+    use fos_css::style::AlignContent;
+    let at = match style.box_.align_content {
+        AlignContent::Center | AlignContent::SpaceAround | AlignContent::SpaceEvenly => 0.5,
+        AlignContent::End | AlignContent::FlexEnd => 1.0,
+        _ => 0.0,
+    };
+    (free * at).max(0.0)
 }
 
 /// `position: relative` offsets

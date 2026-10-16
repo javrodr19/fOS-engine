@@ -235,6 +235,8 @@ impl LayoutBox {
             || b.float != fos_css::style::Float::None
             || self.style.is_out_of_flow()
             || self.style.contains_formatting()
+            // A block container aligning its content (CSS Box Alignment 3 §5.3)
+            || b.align_content != fos_css::style::AlignContent::Normal
     }
 }
 
@@ -540,6 +542,11 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         // A fieldset establishes a block formatting context (HTML §15.3.13)
         if style.box_.display == Display::Block && self.tag(node) == "fieldset" {
             std::sync::Arc::make_mut(&mut style.box_).display = Display::FlowRoot;
+        }
+        // A button's content is centered in it, whatever its align-content
+        // (HTML §15.5.3, as Chromium lays buttons out)
+        if matches!(style.box_.display, Display::Block | Display::InlineBlock | Display::FlowRoot | Display::ListItem) && self.tag(node) == "button" {
+            std::sync::Arc::make_mut(&mut style.box_).align_content = fos_css::style::AlignContent::Center;
         }
         if let Some(r) = self.replaced(node, &style) {
             return LayoutBox { node, style, kind: BoxKind::Replaced(r), marker: None };

@@ -1863,6 +1863,29 @@ fn table_captions_hold_their_own_floats() {
 }
 
 #[test]
+fn block_containers_align_their_content() {
+    // align-content moves a block container's content as a whole, never
+    // above its top (CSS Box Alignment 3 §5.3); a button centers its content
+    // whatever its align-content, as Chromium does (django's search button)
+    let (mut tree, html, body) = doc();
+    let mut case = |tree: &mut DomTree, tag: &str, style: &str, inner: f32| {
+        let b = el(tree, body, tag, &format!("display: block; margin: 0; padding: 0; border: 0; {style}"));
+        let c = el(tree, b, "div", &format!("margin: 5px 0; height: {inner}px"));
+        (b, c)
+    };
+    let cases = [
+        case(&mut tree, "div", "height: 60px; align-content: center", 20.0),
+        case(&mut tree, "div", "height: 60px; align-content: end", 20.0),
+        case(&mut tree, "div", "height: 60px; align-content: start", 20.0),
+        case(&mut tree, "div", "height: 20px; align-content: center", 60.0),
+        case(&mut tree, "button", "height: 60px; align-content: start", 20.0),
+    ];
+    let t = layout(&tree, html, 800.0);
+    // Its margins stay inside it: it is a formatting context root
+    assert_eq!(cases.map(|(b, c)| rect_of(&t, c).y - rect_of(&t, b).y), [20.0, 35.0, 5.0, 5.0, 20.0]);
+}
+
+#[test]
 fn replaced_flex_items_follow_their_ratio() {
     // As in Chromium: a flexed image's height follows its used width; its
     // automatic minimum is its natural width, not its own width; one with

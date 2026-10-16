@@ -261,13 +261,14 @@ impl PageLayout {
                 _ => chain.iter().find_map(|a| index.get(a)).map_or(Rect::new(0.0, 0.0, self.styling.ctx.viewport.0, self.styling.ctx.viewport.1), content),
             };
             let bx = &style.box_;
+            // An inline box's auto margins are 0
             let mut margin = [0.0f32; 4];
-            if !b.inline {
-                for (k, m) in bx.margin.iter().enumerate() {
-                    if let fos_css::style::LpAuto::Lp(l) = m {
-                        margin[k] = l.resolve(cb.w);
-                    }
+            for (k, m) in bx.margin.iter().enumerate() {
+                if let fos_css::style::LpAuto::Lp(l) = m {
+                    margin[k] = l.resolve(cb.w);
                 }
+            }
+            if !b.inline {
                 // Auto side margins take the rest of the line
                 let auto = |k: usize| bx.margin[k] == fos_css::style::LpAuto::Auto;
                 if position == Position::Static || position == Position::Relative {

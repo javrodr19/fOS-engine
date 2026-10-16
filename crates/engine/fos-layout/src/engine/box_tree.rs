@@ -717,6 +717,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else if display.is_inline_level() && !ps.is_out_of_flow() && ps.box_.float == fos_css::style::Float::None {
             let b = self.generated_block(parent, ps, content, after);
             c.inline.atomic(b);
+        } else if ps.is_out_of_flow() && !c.inline.content.is_blank() {
+            // Amid inline content, which it does not split
+            let mut ps = ps;
+            fade(&mut ps, c.inline.open_opacity());
+            let b = self.generated_block(parent, ps, content, after);
+            c.inline.out_of_flow(b);
         } else {
             c.flush_inline();
             let mut ps = ps;

@@ -1810,6 +1810,59 @@ fn fieldsets_contain_their_floats() {
 }
 
 #[test]
+fn positioned_inline_boxes_contain_absolute_boxes() {
+    // A relatively positioned inline box is the containing block of the
+    // absolute boxes in it: from its first fragment's padding box to its
+    // last's (CSS 2.1 §10.1). debian.org underlines links with one
+    let (mut tree, html, body) = doc();
+    let block = el(&mut tree, body, "div", "width: 300px; line-height: 20px");
+    text(&mut tree, block, "aaa ");
+    let link = el(&mut tree, block, "span", "position: relative; padding: 0 5px");
+    text(&mut tree, link, "bbb");
+    let line = el(&mut tree, link, "i", "position: absolute; left: 0; right: 0; bottom: 0; height: 2px");
+    let wide = el(&mut tree, body, "div", "width: 100px; line-height: 20px");
+    text(&mut tree, wide, "aaa ");
+    let span = el(&mut tree, wide, "span", "position: relative");
+    text(&mut tree, span, "bbbb cccc dddd eeee");
+    let fill = el(&mut tree, span, "i", "position: absolute; top: 0; left: 0; width: 100%; height: 100%");
+    // An absolute ::before amid the line does not break it
+    let generated = el(&mut tree, body, "div", "width: 300px; line-height: 20px");
+    text(&mut tree, generated, "aaa ");
+    let marked = el(&mut tree, generated, "span", "position: relative");
+    tree.set_attribute(marked, "data-before", "content: ''; position: absolute");
+    text(&mut tree, marked, "bbb");
+    text(&mut tree, generated, " ccc");
+    let t = layout(&tree, html, 800.0);
+    let (l, u) = (rect_of(&t, link), rect_of(&t, line));
+    assert_eq!((u.x, u.w, u.y + u.h), (l.x, l.w, l.y + l.h));
+    let parts = rects_of(&t, span);
+    let (first, last, f) = (parts[0], parts[parts.len() - 1], rect_of(&t, fill));
+    assert!(parts.len() > 1);
+    assert_eq!((f.x, f.y), (first.x, first.y));
+    assert_eq!(((f.x + f.w).max(first.x), f.y + f.h), ((last.x + last.w).max(first.x), last.y + last.h));
+    assert_eq!(rect_of(&t, generated).h, 20.0);
+}
+
+#[test]
+fn table_captions_hold_their_own_floats() {
+    // A caption establishes a block formatting context (CSS 2.1 §9.4.1):
+    // its floats are placed in it, not at a position left over from the
+    // layout before the table (Wikipedia's figures, whose captions float
+    // an icon, were as tall as the page above them)
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "height: 500px");
+    let table = el(&mut tree, body, "div", "display: table; width: 200px");
+    let caption = el(&mut tree, table, "div", "display: table-caption; line-height: 20px");
+    el(&mut tree, caption, "div", "float: right; width: 10px; height: 10px");
+    text(&mut tree, caption, "caption");
+    let row = el(&mut tree, table, "div", "display: table-row");
+    let cell = el(&mut tree, row, "div", "display: table-cell; height: 30px");
+    text(&mut tree, cell, "cell");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, table).h, 50.0);
+}
+
+#[test]
 fn replaced_flex_items_follow_their_ratio() {
     // As in Chromium: a flexed image's height follows its used width; its
     // automatic minimum is its natural width, not its own width; one with

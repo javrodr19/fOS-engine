@@ -484,7 +484,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // Pass 2: fragments, relative to the line's root baseline
         // (absolutely positioned boxes' places: index, x before and after
         // the pending space, and the content pieces placed before them)
-        let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
+        let mut placed: Vec<(usize, f32, f32, usize, NodeId)> = Vec::new();
         let mut placed_content = 0usize;
         // Atomic inlines aligned to the line box's top or bottom, placed once
         // the rest of the line is: node, where its top is now, its height,
@@ -639,7 +639,11 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     x += p.width;
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
-                PieceKind::OutOfFlow(i) => placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content)),
+                PieceKind::OutOfFlow(i) => {
+                    // The inline box it is in (`NONE`: the line's root)
+                    let parent = if stack.len() > 1 { stack.last().map_or(NodeId::NONE, |o| o.node) } else { NodeId::NONE };
+                    placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content, parent))
+                }
                 // A line break counts as text
                 PieceKind::Break => {
                     if let Some((t, b)) = stack.last_mut().and_then(|o| o.extents.take()) {
@@ -675,7 +679,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }
         // The space before an absolutely positioned box is before it when
         // content follows on the line (at the line's end, it is dropped)
-        let placed = placed.into_iter().map(|(i, x0, x1, n)| (i, if placed_content > n { x1 } else { x0 }));
+        let placed = placed.into_iter().map(|(i, x0, x1, n, parent)| (i, if placed_content > n { x1 } else { x0 }, parent));
         // An absolutely positioned box's static position: where it stands
         // in the line, or below the line if it was block-level
         let static_rect = |i: usize, x: f32, line_top: f32, line_bottom: f32| {
@@ -684,13 +688,23 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             Fragment::Box(placeholder(b, at))
         };
         if !has_content {
-            frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, y, y)));
+            frags.extend(placed.into_iter().map(|(i, x, _)| static_rect(i, x, y, y)));
             continue;
         }
         let baseline = y - top;
         baselines = Some((baselines.map_or(baseline, |b| b.0), baseline));
         let mut line_frags = root.children;
-        line_frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, top, bottom)));
+        for (i, x, parent) in placed {
+            // Inside its inline box's fragment, which is its containing
+            // block if positioned (CSS 2.1 §10.1)
+            let mut f = Some(static_rect(i, x, top, bottom));
+            if parent.is_valid() {
+                if let Some(part) = inline_part(&mut line_frags, parent) {
+                    part.children.push(f.take().expect("placeholder"));
+                }
+            }
+            line_frags.extend(f);
+        }
         for f in &mut line_frags {
             f.translate(0.0, baseline);
         }
@@ -698,6 +712,23 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         y += bottom - top;
     }
     InlineLayout { frags, height: y, baselines }
+}
+
+/// The fragment of inline box `node` among `frags` (on one line)
+fn inline_part(frags: &mut [Fragment], node: NodeId) -> Option<&mut BoxFragment> {
+    for f in frags {
+        if let Fragment::Box(b) = f {
+            if b.kind == BoxFragmentKind::InlinePart {
+                if b.node == node {
+                    return Some(b);
+                }
+                if let Some(part) = inline_part(&mut b.children, node) {
+                    return Some(part);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Move the atomic inline of `node` among `frags` down by `dy`

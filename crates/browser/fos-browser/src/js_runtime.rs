@@ -2229,7 +2229,7 @@ mod tests {
         let (mut rt, doc) = page(
             r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }
             #hidden { display: none } #hidden span { color: blue; font-size: 2em } p::before { content: "hi"; color: green }</style></head>
-            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p></body></html>"#,
+            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p><span id=m style="margin: 0 auto 0 .5em">m</span></body></html>"#,
         );
         rt.execute_scripts(&mut |_: &str| None).unwrap();
         let mut renderer = crate::renderer::PageRenderer::new(400, 600);
@@ -2242,6 +2242,8 @@ mod tests {
             // Inside display: none; a flex item; a pseudo-element; a variable
             ("[cs('s').color, cs('s').fontSize, cs('i').display, cs('p', '::before').content, cs('p', ':before').color].join()", "rgb(0, 0, 255),32px,block,\"hi\",rgb(0, 128, 0)"),
             ("getComputedStyle(document.documentElement).getPropertyValue('--brand')", "#0a0"),
+            // An inline box's margins: lengths as declared, auto as 0
+            ("[cs('m').marginLeft, cs('m').marginRight].join()", "8px,0px"),
             // Live: a style change shows at once
             ("document.getElementById('h').style.color = 'rgb(1, 2, 3)'; h.color", "rgb(1, 2, 3)"),
             // Detached elements have none; the declaration is read-only

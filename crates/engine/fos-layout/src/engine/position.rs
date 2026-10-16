@@ -23,7 +23,7 @@ pub fn place_absolutes(ctx: &mut LayoutCtx, root: &mut BoxFragment, boxes: &Layo
         return;
     }
     let icb = Rect::new(0.0, 0.0, ctx.viewport.0, ctx.viewport.1);
-    walk(ctx, root, icb, icb, &map);
+    walk(ctx, root, icb, icb, &map, &HashMap::new());
 }
 
 /// Out-of-flow boxes by element
@@ -53,8 +53,18 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
     }
 }
 
-fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map: &HashMap<NodeId, &LayoutBox>) {
-    let cb = if f.style.is_positioned() && f.kind != BoxFragmentKind::Placeholder { f.padding_box() } else { cb };
+/// `spans`: the containing blocks of the positioned inline boxes on the
+/// lines `f` is in
+fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map: &HashMap<NodeId, &LayoutBox>, spans: &HashMap<NodeId, Rect>) {
+    let own = if f.kind == BoxFragmentKind::InlinePart { spans.get(&f.node).copied().unwrap_or_else(|| f.padding_box()) } else { f.padding_box() };
+    let cb = if f.style.is_positioned() && f.kind != BoxFragmentKind::Placeholder { own } else { cb };
+    let lines;
+    let spans = if f.kind == BoxFragmentKind::InlinePart {
+        spans
+    } else {
+        lines = inline_spans(&f.children);
+        &lines
+    };
     // Layout and paint containment contain fixed descendants too
     let (cb, viewport) = if f.style.contains_layout() && f.kind != BoxFragmentKind::Placeholder { (f.padding_box(), f.padding_box()) } else { (cb, viewport) };
     let mut changed = false;
@@ -65,18 +75,46 @@ fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map:
             let containing = if b.style.box_.position == Position::Fixed { viewport } else { cb };
             let mut placed = layout_absolute(ctx, b, containing, child.border_box, child.static_align.unwrap_or((0.0, 0.0)));
             // Its own absolutely positioned descendants
-            walk(ctx, &mut placed, containing, viewport, map);
+            walk(ctx, &mut placed, containing, viewport, map, &HashMap::new());
             *child = placed;
             changed = true;
         } else {
             let before = child.ink;
-            walk(ctx, child, cb, viewport, map);
+            walk(ctx, child, cb, viewport, map, spans);
             changed |= child.ink != before;
         }
     }
     if changed {
         f.update_ink();
     }
+}
+
+/// The containing blocks of the positioned inline boxes on lines `frags`:
+/// from the top left of the padding box of each one's first fragment to
+/// the bottom right of its last's (CSS 2.1 §10.1)
+fn inline_spans(frags: &[Fragment]) -> HashMap<NodeId, Rect> {
+    fn parts(frags: &[Fragment], out: &mut HashMap<NodeId, (Rect, Rect)>) {
+        for f in frags {
+            if let Fragment::Box(b) = f {
+                if b.kind == BoxFragmentKind::InlinePart {
+                    if b.style.is_positioned() {
+                        let p = b.padding_box();
+                        out.entry(b.node).and_modify(|e| e.1 = p).or_insert((p, p));
+                    }
+                    parts(&b.children, out);
+                }
+            }
+        }
+    }
+    let mut found = HashMap::new();
+    parts(frags, &mut found);
+    found
+        .into_iter()
+        .map(|(node, (first, last))| {
+            let (right, bottom) = (last.x + last.w, last.y + last.h);
+            (node, Rect::new(first.x, first.y, (right - first.x).max(0.0), (bottom - first.y).max(0.0)))
+        })
+        .collect()
 }
 
 /// Lay out an absolutely positioned box against containing block `cb`;

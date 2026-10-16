@@ -236,10 +236,12 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
 
     let mut frags = Vec::new();
     let mut y = 0.0f32;
-    // Captions above the grid (caption-side: bottom ones below it)
+    // Captions above the grid (caption-side: bottom ones below it); each
+    // establishes a block formatting context (CSS 2.1 §9.4.1)
+    let caption = Forced { root: true, ..Forced::default() };
     let bottom = |c: &&LayoutBox| c.style.inherited.caption_side == fos_css::style::CaptionSide::Bottom;
     for c in t.captions.iter().filter(|c| !bottom(c)) {
-        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
+        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, caption);
         let top = laid.mt.size();
         laid.frag.translate(0.0, y + top);
         y += top + laid.frag.border_box.h + laid.mb.size();
@@ -342,7 +344,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
     }
     let mut y = grid_bottom;
     for c in t.captions.iter().filter(bottom) {
-        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
+        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, caption);
         let top = laid.mt.size();
         laid.frag.translate(0.0, y + top);
         y += top + laid.frag.border_box.h + laid.mb.size();

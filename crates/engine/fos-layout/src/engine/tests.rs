@@ -1670,6 +1670,58 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn top_and_bottom_align_to_the_line_box() {
+    // As in Chromium: an image aligned to the line's bottom (or top) sets
+    // the line's height when taller than it, with no strut below it
+    // (wordpress.org's vertical-align: bottom images in 30px lines)
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, kids: &[(u32, &str)]| {
+        let d = el(tree, body, "div", "font-size: 16px; line-height: 30px");
+        let ids: Vec<NodeId> = kids.iter().map(|(h, va)| el(tree, d, "span", &format!("display: inline-block; width: 20px; height: {h}px; vertical-align: {va}"))).collect();
+        (d, ids)
+    };
+    let (a, ai) = line(&mut tree, &[(144, "bottom")]);
+    let (b, bi) = line(&mut tree, &[(10, "bottom")]);
+    let (c, ci) = line(&mut tree, &[(60, "bottom"), (80, "top")]);
+    let t = layout(&tree, html, 800.0);
+    let at = |d: NodeId, n: NodeId| (rect_of(&t, n).y - rect_of(&t, d).y, rect_of(&t, n).h);
+    assert_eq!((rect_of(&t, a).h, at(a, ai[0])), (144.0, (0.0, 144.0)));
+    // A short one sits at the bottom of the strut's 30px line
+    assert_eq!((rect_of(&t, b).h, at(b, bi[0])), (30.0, (20.0, 10.0)));
+    assert_eq!((rect_of(&t, c).h, at(c, ci[0]), at(c, ci[1])), (80.0, (20.0, 60.0), (0.0, 80.0)));
+}
+
+#[test]
+fn flex_and_grid_containers_sit_on_their_first_item() {
+    // As in Chromium: an inline flex box sits on its first item's baseline,
+    // synthesized from the item's bottom when it has none (wordpress.org's
+    // logo link holds an <svg>); an inline-block ending in a column flex
+    // container sits on that container's first item too
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let a = el(&mut tree, p, "span", "display: inline-flex; padding: 15px 20px");
+    el(&mut tree, a, "div", "width: 30px; height: 30px");
+    let q = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let ib = el(&mut tree, q, "span", "display: inline-block");
+    let col = el(&mut tree, ib, "div", "display: flex; flex-direction: column");
+    el(&mut tree, col, "div", "height: 10px");
+    el(&mut tree, col, "div", "height: 20px");
+    let g = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let ig = el(&mut tree, g, "span", "display: inline-grid; grid-template-columns: auto auto");
+    for h in [10, 20, 40] {
+        el(&mut tree, ig, "div", &format!("height: {h}px; width: 5px"));
+    }
+    let t = layout(&tree, html, 800.0);
+    // Nothing of the line's strut reaches below the boxes' bottoms
+    assert_eq!((rect_of(&t, p).h, rect_of(&t, a).h), (60.0, 60.0));
+    assert_eq!((rect_of(&t, q).h, rect_of(&t, ib).h), (30.0, 30.0));
+    // The grid's first row is 20px: its baseline is the first item's bottom
+    // (10px), and its 60px reach 50px below the baseline
+    assert_eq!(rect_of(&t, ig).h, 60.0);
+    assert!(rect_of(&t, g).h >= 60.0 && rect_of(&t, ig).y - rect_of(&t, g).y < 10.0, "{:?} {:?}", rect_of(&t, g), rect_of(&t, ig));
+}
+
+#[test]
 fn spanning_items_fill_tracks_below_their_limits_first() {
     // CSS Grid §11.5.1, as in Chromium (mozilla.org's donate grid): a
     // media item spanning a heading's row and an empty one grows the empty

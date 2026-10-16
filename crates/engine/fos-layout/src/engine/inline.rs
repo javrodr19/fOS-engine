@@ -336,7 +336,10 @@ fn atomic_baseline(laid: &Laid) -> f32 {
     let f = &laid.frag;
     let mt = laid.mt.size();
     let bottom = mt + f.border_box.h + laid.mb.size();
+    use fos_css::style::Display;
     match f.kind {
+        // Inline flex and grid boxes sit on their first baseline
+        BoxFragmentKind::Block if matches!(f.style.box_.display, Display::InlineFlex | Display::InlineGrid) => f.first_baseline().map_or(bottom, |b| mt + b),
         // (a textarea scrolls: its baseline is its bottom)
         _ if clips(&f.style) => bottom,
         BoxFragmentKind::Replaced => f.first_baseline().map_or(bottom, |b| mt + b),
@@ -483,6 +486,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // the pending space, and the content pieces placed before them)
         let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
         let mut placed_content = 0usize;
+        // Atomic inlines aligned to the line box's top or bottom, placed once
+        // the rest of the line is: node, where its top is now, its height,
+        // and whether it is top-aligned
+        let mut line_aligned: Vec<(NodeId, f32, f32, bool)> = Vec::new();
         let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
         // The line height quirk: in quirks mode, an inline box (the root one
         // too) adds its line height to the line only when text goes in it
@@ -597,8 +604,13 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                         let h = laid.mt.size() + laid.frag.border_box.h + laid.mb.size();
                         let bl = atomic_baseline(&laid);
                         let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, ctx.fonts.resolve(st).line_height(st.inherited.line_height));
-                        top = top.min(shift - bl);
-                        bottom = bottom.max(shift - bl + h);
+                        match st.box_.vertical_align {
+                            VerticalAlign::Top | VerticalAlign::Bottom => line_aligned.push((laid.frag.node, shift - bl, h, st.box_.vertical_align == VerticalAlign::Top)),
+                            _ => {
+                                top = top.min(shift - bl);
+                                bottom = bottom.max(shift - bl + h);
+                            }
+                        }
                         // Inside its inline box (whose opacity, filter...
                         // cover it); moved down to the baseline with the line
                         let rel = relative_offset(st, avail, cb_h);
@@ -639,12 +651,28 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }
         if top > bottom {
             // Nothing gave the line a height
-            (top, bottom) = (root_top, root_bottom);
+            (top, bottom) = if line_aligned.is_empty() { (root_top, root_bottom) } else { (0.0, 0.0) };
+        }
+        // Boxes aligned to the line's top or bottom (CSS 2.1 §10.8): the
+        // line grows to hold them, then they go to its edge. wordpress.org's
+        // images are vertical-align: bottom in 30px lines
+        for &(_, _, h, at_top) in &line_aligned {
+            if bottom - top < h {
+                if at_top {
+                    bottom = top + h;
+                } else {
+                    top = bottom - h;
+                }
+            }
         }
         while stack.len() > 1 {
             close_box(&mut stack, ic, &fonts, x, false, avail);
         }
-        let root = stack.pop().expect("root box");
+        let mut root = stack.pop().expect("root box");
+        for &(node, now, h, at_top) in &line_aligned {
+            let to = if at_top { top } else { bottom - h };
+            move_atomic(&mut root.children, node, to - now);
+        }
         // The space before an absolutely positioned box is before it when
         // content follows on the line (at the line's end, it is dropped)
         let placed = placed.into_iter().map(|(i, x0, x1, n)| (i, if placed_content > n { x1 } else { x0 }));
@@ -670,6 +698,22 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         y += bottom - top;
     }
     InlineLayout { frags, height: y, baselines }
+}
+
+/// Move the atomic inline of `node` among `frags` down by `dy`
+fn move_atomic(frags: &mut [Fragment], node: NodeId, dy: f32) -> bool {
+    for f in frags {
+        if let Fragment::Box(b) = f {
+            if b.node == node && b.kind != BoxFragmentKind::InlinePart {
+                b.translate(0.0, dy);
+                return true;
+            }
+            if b.kind == BoxFragmentKind::InlinePart && move_atomic(&mut b.children, node, dy) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Bidi embedding levels of each byte of `text` (paragraph direction

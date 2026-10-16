@@ -456,12 +456,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
             let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = flex.frags;
+            frag.line_baselines = item_baselines(&frag.children, false);
             flex.height
         }
         BoxKind::Grid(items) => {
             let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
             let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = grid.frags;
+            frag.line_baselines = item_baselines(&frag.children, true);
             grid.height
         }
         BoxKind::Table(t) => {
@@ -1153,6 +1155,26 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         && (matches!(style.box_.width, LpAuto::Lp(l) if percent(&l)) || matches!(style.box_.max_width, fos_css::style::MaxSize::Lp(l) if percent(&l)));
     let min = if compressible { clamp(0.0) } else { clamp(min) };
     (min + hbp + margins, clamp(max) + hbp + margins)
+}
+
+/// A flex or grid container's baseline: its first item's (in a grid, the
+/// first in row order), synthesized from the bottom of the item's border
+/// box when it has none (CSS Flexbox §8.5, CSS Grid §11.9). Chromium uses
+/// it as the last baseline too (an inline-block ending in a flex or grid
+/// container sits on its first item). wordpress.org's logo link is an
+/// inline-flex box whose one item is an <svg>: it sits on the svg's bottom
+fn item_baselines(children: &[Fragment], grid: bool) -> Option<(f32, f32)> {
+    let items = children.iter().filter_map(|c| match c {
+        Fragment::Box(b) if b.kind != BoxFragmentKind::Placeholder => Some(b),
+        _ => None,
+    });
+    let first = if grid {
+        items.min_by(|a, b| a.border_box.y.total_cmp(&b.border_box.y).then(a.border_box.x.total_cmp(&b.border_box.x)))
+    } else {
+        items.into_iter().next()
+    }?;
+    let baseline = first.first_baseline().unwrap_or(first.border_box.y + first.border_box.h);
+    Some((baseline, baseline))
 }
 
 /// How much `text-box-trim` takes off the top of the first line and the

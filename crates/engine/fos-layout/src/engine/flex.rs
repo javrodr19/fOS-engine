@@ -54,6 +54,14 @@ impl Item<'_> {
 }
 
 /// Horizontal and vertical border + padding
+/// A column item stretched across `avail` (its margin box), within its
+/// min- and max-width (CSS Box Alignment §6.1): bun.sh's max-w-[52ch]
+/// paragraphs in flex columns
+fn stretched_width(style: &Style, avail: f32, cb_w: f32) -> f32 {
+    let (hbp, _) = bp(style, cb_w);
+    super::block::clamp_width(style, (avail - hbp).max(0.0), cb_w, hbp) + hbp
+}
+
 fn bp(style: &Style, cb_w: f32) -> (f32, f32) {
     let b = &style.border.width;
     let p = style.box_.padding.map(|p| p.resolve(cb_w).max(0.0));
@@ -156,7 +164,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         };
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
             // A column item's height at its cross size
-            let cross_w = if stretch_cross { Some((width - margin[1] - margin[3]).max(0.0)) } else { None };
+            let cross_w = if stretch_cross { Some(stretched_width(s, (width - margin[1] - margin[3]).max(0.0), width)) } else { None };
             layout_sized(ctx, b, width, height, Sizing::Shrink, false, Forced { width: cross_w, height: None, root: true })
         };
         let base = match (s.box_.flex_basis, definite(s.box_.flex_basis)) {
@@ -321,7 +329,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             Forced { width: Some(it.target), height: None, root: true }
         } else {
             let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.auto_width() && !it.auto_margin[1] && !it.auto_margin[3];
-            Forced { width: stretch.then(|| (width - it.margin[1] - it.margin[3]).max(0.0)), height: Some(it.target), root: true }
+            Forced { width: stretch.then(|| stretched_width(s, (width - it.margin[1] - it.margin[3]).max(0.0), width)), height: Some(it.target), root: true }
         };
         let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, forced);
         it.cross = if row { laid.frag.border_box.h } else { laid.frag.border_box.w };

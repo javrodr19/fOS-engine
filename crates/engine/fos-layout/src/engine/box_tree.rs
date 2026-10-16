@@ -269,10 +269,15 @@ pub enum InlineItem {
 }
 
 impl InlineContent {
-    /// Nothing but collapsible white space (dropped beside blocks)
+    /// Nothing but collapsible white space (dropped beside blocks): a
+    /// preserved space makes a line (bun.sh's blank code lines are
+    /// `<div> </div>` in a `<pre>`)
     fn is_blank(&self) -> bool {
         self.items.iter().all(|i| match i {
-            InlineItem::Text { start, end, .. } => self.text[*start..*end].trim_matches(' ').is_empty(),
+            InlineItem::Text { start, end, style, .. } => {
+                let text = &self.text[*start..*end];
+                text.is_empty() || (text.trim_matches(' ').is_empty() && self.styles[*style as usize].inherited.white_space.collapses_spaces())
+            }
             InlineItem::Open { .. } | InlineItem::Close => true,
             InlineItem::Atomic(_) | InlineItem::Break | InlineItem::OutOfFlow(_) => false,
         }) && !self.items.iter().any(|i| matches!(i, InlineItem::Open { style, .. } if has_edges(&self.styles[*style as usize])))

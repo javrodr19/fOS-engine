@@ -1670,6 +1670,33 @@ fn inline_boxes_ending_with_a_newline_end_on_its_line() {
 }
 
 #[test]
+fn stretched_column_items_keep_their_min_and_max_widths() {
+    // As in Chromium: bun.sh's max-w-[52ch] paragraphs in flex columns
+    let (mut tree, html, body) = doc();
+    let col = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 600px");
+    let narrow = el(&mut tree, col, "div", "max-width: 300px; height: 10px");
+    let wide = el(&mut tree, col, "div", "min-width: 700px; height: 10px");
+    let half = el(&mut tree, col, "div", "max-width: 50%; padding: 0 20px; box-sizing: border-box; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!([narrow, wide, half].map(|n| rect_of(&t, n).w), [300.0, 700.0, 300.0]);
+}
+
+#[test]
+fn preserved_spaces_make_a_line() {
+    // A block holding only preserved spaces has a line box (bun.sh's blank
+    // code lines); collapsible ones (pre-line too) make none
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, ws: &str, t: &str| {
+        let d = el(tree, body, "div", &format!("white-space: {ws}; line-height: 20px"));
+        text(tree, d, t);
+        d
+    };
+    let cases = [line(&mut tree, "pre", " "), line(&mut tree, "pre-wrap", "  "), line(&mut tree, "break-spaces", " "), line(&mut tree, "pre-line", " "), line(&mut tree, "normal", " ")];
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(cases.map(|d| rect_of(&t, d).h), [20.0, 20.0, 20.0, 0.0, 0.0]);
+}
+
+#[test]
 fn replaced_flex_items_follow_their_ratio() {
     // As in Chromium: a flexed image's height follows its used width; its
     // automatic minimum is its natural width, not its own width; one with

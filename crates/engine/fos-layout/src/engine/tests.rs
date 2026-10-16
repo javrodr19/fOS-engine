@@ -1911,6 +1911,10 @@ fn replaced_flex_items_follow_their_ratio() {
     // case study logos)
     let r = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 600px; height: 95px");
     let centered = img(&mut tree, r, "margin: auto; max-height: 64px", ("data-natural", "56x49"));
+    // A max-height that shrinks the natural height narrows the base size
+    // through the ratio (kotlinlang.org's Gradle logo, 878x200 at 30px)
+    let r = row(&mut tree, "align-items: center");
+    let capped = img(&mut tree, r, "max-width: 100%; max-height: 30px", ("data-natural", "878x200"));
     let t = layout(&tree, html, 800.0);
     let size = |n: NodeId| ((rect_of(&t, n).w * 100.0).round() / 100.0, (rect_of(&t, n).h * 100.0).round() / 100.0);
     assert_eq!(size(centered), (56.0, 49.0));
@@ -1918,6 +1922,7 @@ fn replaced_flex_items_follow_their_ratio() {
     assert_eq!(size(shrunk), (200.0, 100.0));
     assert_eq!(size(fill), (600.0, 58.64));
     assert_eq!(size(shared), (500.0, 48.86));
+    assert_eq!(size(capped), (131.7, 30.0));
 }
 
 #[test]

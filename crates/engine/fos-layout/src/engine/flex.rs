@@ -147,11 +147,14 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             && (if row { s.box_.height.is_auto() && !auto_margin[0] && !auto_margin[2] } else { s.box_.auto_width() && !auto_margin[1] && !auto_margin[3] });
         // A replaced item with a definite height has its width through its
         // ratio (CSS Flexbox §9.2 step 3B, and the transferred size of its
-        // automatic minimum): kit.svelte.dev's height: 100% logos
+        // automatic minimum): kit.svelte.dev's height: 100% logos. So has
+        // one whose natural height min/max-height constrains (CSS 2.1
+        // §10.4): kotlinlang.org's max-height: 30px logo
         let ratio_width = match &b.kind {
-            super::box_tree::BoxKind::Replaced(r) if row && s.box_.width.is_auto() && s.box_.height.resolve_definite(height).is_some() => {
+            super::box_tree::BoxKind::Replaced(r) if row && s.box_.width.is_auto() => {
                 let (_, vbp) = bp(s, width);
-                Some(super::block::replaced_content_size(ctx, s, r, width, height, hbp, vbp).0 + hbp)
+                let constrained = r.natural.filter(|_| !r.ratio_only && !r.no_ratio).is_some_and(|n| super::block::clamp_height(s, n.1, height, vbp) != n.1);
+                (s.box_.height.resolve_definite(height).is_some() || constrained).then(|| super::block::replaced_content_size(ctx, s, r, width, height, hbp, vbp).0 + hbp)
             }
             _ => None,
         };
@@ -182,6 +185,12 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                     h
                 }
             },
+        };
+        let max_prop = if row { s.box_.max_width } else { s.box_.max_height };
+        let max = match max_prop {
+            MaxSize::None => f32::INFINITY,
+            MaxSize::Lp(l) if l.has_percent() => main_size.map_or(f32::INFINITY, |m| border_box(l.resolve(m))),
+            MaxSize::Lp(l) => border_box(l.px),
         };
         let clips = s.box_.overflow_x != Overflow::Visible || s.box_.overflow_y != Overflow::Visible;
         let min_prop = if row { s.box_.min_width } else { s.box_.min_height };
@@ -215,15 +224,10 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                         }
                     }
                 };
-                definite(main_prop).map_or(content, |v| v.min(content))
+                // ... and by the max main size (CSS Flexbox §4.5)
+                definite(main_prop).map_or(content, |v| v.min(content)).min(max)
             }
             None => 0.0,
-        };
-        let max_prop = if row { s.box_.max_width } else { s.box_.max_height };
-        let max = match max_prop {
-            MaxSize::None => f32::INFINITY,
-            MaxSize::Lp(l) if l.has_percent() => main_size.map_or(f32::INFINITY, |m| border_box(l.resolve(m))),
-            MaxSize::Lp(l) => border_box(l.px),
         };
         let hypo = base.min(max).max(min);
         let _ = content_laid;

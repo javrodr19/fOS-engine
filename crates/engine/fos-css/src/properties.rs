@@ -130,6 +130,8 @@ pub enum PropertyId {
     Order,
     RowGap,
     ColumnGap,
+    ColumnCount,
+    ColumnWidth,
     BackgroundImage,
     BackgroundRepeat,
     BackgroundClip,

@@ -14,7 +14,7 @@ pub const PROPERTIES: &[&str] = &[
     "border-collapse", "border-left-color", "border-left-style", "border-left-width", "border-right-color",
     "border-right-style", "border-right-width", "border-spacing", "border-top-color", "border-top-left-radius",
     "border-top-right-radius", "border-top-style", "border-top-width", "bottom", "box-shadow", "box-sizing",
-    "caption-side", "clear", "color", "column-gap", "contain", "container-type", "content", "content-visibility", "direction", "display", "flex-basis",
+    "caption-side", "clear", "color", "column-count", "column-gap", "column-width", "contain", "container-type", "content", "content-visibility", "direction", "display", "flex-basis",
     "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-stretch", "font-style",
     "font-weight", "height", "justify-content", "left", "letter-spacing", "line-height", "list-style-position",
     "list-style-type", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
@@ -303,6 +303,8 @@ impl Style {
             "align-content" => b.align_content.as_css().into(),
             "row-gap" => gap(b.row_gap),
             "column-gap" => gap(b.column_gap),
+            "column-count" => b.column_count.map_or("auto".into(), |n| n.to_string()),
+            "column-width" => b.column_width.map_or("auto".into(), px),
             "gap" => {
                 let (r, c) = (gap(b.row_gap), gap(b.column_gap));
                 if r == c { r } else { format!("{r} {c}") }

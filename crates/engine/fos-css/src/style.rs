@@ -751,6 +751,10 @@ pub struct BoxStyle {
     pub order: i32,
     pub row_gap: Option<Lp>,
     pub column_gap: Option<Lp>,
+    /// Multi-column layout: `column-count` and `column-width` (px), `None`
+    /// for auto
+    pub column_count: Option<u32>,
+    pub column_width: Option<f32>,
     pub object_fit: ObjectFit,
     /// `contain` ([`contain`] bits)
     pub contain: u8,
@@ -882,6 +886,8 @@ impl Default for BoxStyle {
             order: 0,
             row_gap: None,
             column_gap: None,
+            column_count: None,
+            column_width: None,
             object_fit: ObjectFit::Fill,
             contain: 0,
             container_type: 0,
@@ -1714,6 +1720,19 @@ impl Style {
                     set!(box_, [column_gap], val)
                 }
             }
+            PropertyId::ColumnCount => match v {
+                PropertyValue::Keyword(Keyword::Auto) => set!(box_, [column_count], None),
+                PropertyValue::Integer(n) if *n >= 1 => set!(box_, [column_count], Some(*n as u32)),
+                _ => {}
+            },
+            PropertyId::ColumnWidth => match v {
+                PropertyValue::Keyword(Keyword::Auto) => set!(box_, [column_width], None),
+                _ => {
+                    if let Some(l) = self.lp(v, ctx).filter(|l| !l.has_percent()) {
+                        set!(box_, [column_width], Some(l.px.max(0.0)));
+                    }
+                }
+            },
             PropertyId::ObjectFit => set!(box_, [object_fit], enum_of!(ObjectFit)),
             PropertyId::ContainerType => {
                 if let PropertyValue::Integer(bits) = v {
@@ -2250,6 +2269,8 @@ impl Style {
             PropertyId::Order => copy!(box_, [order]),
             PropertyId::RowGap => copy!(box_, [row_gap]),
             PropertyId::ColumnGap => copy!(box_, [column_gap]),
+            PropertyId::ColumnCount => copy!(box_, [column_count]),
+            PropertyId::ColumnWidth => copy!(box_, [column_width]),
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
             PropertyId::Contain => copy!(box_, [contain]),
             PropertyId::ContainerType => copy!(box_, [container_type]),

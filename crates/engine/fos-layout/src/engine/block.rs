@@ -428,11 +428,18 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let mut escaped_top = Margin::default();
     let mut escaped_bottom = Margin::default();
     let mut through = false;
+    // A multi-column container lays its content out a column wide, then
+    // deals it into columns
+    let multicol = match &b.kind {
+        BoxKind::Block(_) | BoxKind::Inline(_) => columns(style, width),
+        _ => None,
+    };
+    let flow_w = multicol.map_or(width, |c| c.1);
     let content_h = match &b.kind {
         BoxKind::Block(children) => {
             let center = style.inherited.text_align == fos_css::style::TextAlign::WebkitCenter;
             let justify_items = fos_css::style::AlignItems::from_u8(style.box_.grid.justify_items).unwrap_or(fos_css::style::AlignItems::Normal);
-            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base, (center, justify_items));
+            let flow = layout_flow(ctx, children, flow_w, inner_cb_h, collapse_top, collapse_bottom, base, (center, justify_items));
             escaped_top = flow.top;
             escaped_bottom = flow.bottom;
             through = flow.through;
@@ -440,7 +447,7 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             flow.height
         }
         BoxKind::Inline(content) => {
-            let lines = inline::layout_inline(ctx, content, width, inner_cb_h, base);
+            let lines = inline::layout_inline(ctx, content, flow_w, inner_cb_h, base);
             frag.children = lines.frags;
             frag.line_baselines = lines.baselines;
             let (top, bottom) = text_box_trim(ctx, style, lines.height, lines.baselines);
@@ -473,6 +480,10 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             table.height
         }
         BoxKind::Replaced(_) => unreachable!(),
+    };
+    let content_h = match multicol {
+        Some((count, colw, gap)) if count > 1 => deal_columns(&mut frag.children, count, colw + gap, specified_h, matches!(b.kind, BoxKind::Inline(_)), content_h),
+        _ => content_h,
     };
     // Formatting context roots grow to contain their floats
     let content_h = match outer_floats {
@@ -734,6 +745,104 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         line_baselines: None,
         static_align: None,
     }
+}
+
+/// A multi-column container's column count, column width and gap, `avail`
+/// wide (CSS Multi-column 1 §3.4; a `normal` gap is 1em)
+fn columns(style: &Style, avail: f32) -> Option<(usize, f32, f32)> {
+    let b = &style.box_;
+    if b.column_count.is_none() && b.column_width.is_none() {
+        return None;
+    }
+    let gap = b.column_gap.map_or(style.inherited.font_size, |g| g.resolve(avail)).max(0.0);
+    let fit = |w: f32| (((avail + gap) / (w + gap)).floor() as usize).max(1);
+    let count = match (b.column_count, b.column_width) {
+        (Some(n), None) => n as usize,
+        (None, Some(w)) => fit(w),
+        (Some(n), Some(w)) => (n as usize).min(fit(w)),
+        (None, None) => return None,
+    };
+    Some((count, ((avail + gap) / count as f32 - gap).max(0.0), gap))
+}
+
+/// Deal content laid out in one column (`frags`, `content_h` tall) into
+/// columns `step` apart, balanced: as short as fits in `count` columns,
+/// and no taller than `height` when that is definite (more columns then
+/// overflow). Breaks fall between block-level boxes, or between line boxes
+/// in inline content (`lines`); a column after the first starts at its
+/// top, truncating the margin at the break. The height the columns take.
+fn deal_columns(frags: &mut [Fragment], count: usize, step: f32, height: Option<f32>, lines: bool, content_h: f32) -> f32 {
+    // Units no break may cross: runs of fragments that overlap vertically
+    let extent = |f: &Fragment| match f {
+        Fragment::Box(b) => (b.border_box.y, b.border_box.y + b.border_box.h),
+        Fragment::Text(t) => (t.rect.y, t.rect.y + t.rect.h),
+    };
+    let mut units: Vec<(f32, f32, Vec<usize>)> = Vec::new();
+    for (i, f) in frags.iter().enumerate() {
+        let (top, bottom) = extent(f);
+        match units.last_mut() {
+            Some(u) if top < u.1 - 0.01 => {
+                u.1 = u.1.max(bottom);
+                u.2.push(i);
+            }
+            _ => units.push((top, bottom, vec![i])),
+        }
+    }
+    if units.is_empty() {
+        return 0.0;
+    }
+    if lines {
+        // Line boxes tile the content: each starts as far above its text
+        // as the first line's does
+        let n = units.len();
+        let lead = units[0].0;
+        let bounds: Vec<f32> = (0..=n).map(|k| if k == 0 { 0.0 } else if k == n { content_h.max(units[n - 1].1) } else { (units[k].0 - lead).max(units[k - 1].0) }).collect();
+        for (k, u) in units.iter_mut().enumerate() {
+            (u.0, u.1) = (bounds[k], bounds[k + 1]);
+        }
+    }
+    // The first unit of each column, for columns `h` tall (the first
+    // column starts at the content's top)
+    let starts = |h: f32| -> Vec<usize> {
+        let mut out = vec![0];
+        let mut start = 0.0;
+        for (k, u) in units.iter().enumerate().skip(1) {
+            if u.1 - start > h + 0.01 {
+                out.push(k);
+                start = u.0;
+            }
+        }
+        out
+    };
+    let total = units.iter().map(|u| u.1).fold(0.0, f32::max);
+    let tallest = units.iter().map(|u| u.1 - u.0).fold(units[0].1, f32::max);
+    let (mut lo, mut hi) = (tallest.max(total / count as f32), total.max(tallest));
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if starts(mid).len() <= count {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let h = height.map_or(hi, |h| hi.min(h));
+    let starts = starts(h);
+    let mut used = 0.0f32;
+    for (c, &s) in starts.iter().enumerate() {
+        let end = starts.get(c + 1).copied().unwrap_or(units.len());
+        let top = if c == 0 { 0.0 } else { units[s].0 };
+        let bottom = units[s..end].iter().map(|u| u.1).fold(top, f32::max);
+        used = used.max(bottom - top);
+        if c == 0 {
+            continue;
+        }
+        for u in &units[s..end] {
+            for &i in &u.2 {
+                frags[i].translate(c as f32 * step, -top);
+            }
+        }
+    }
+    used
 }
 
 /// How far `align-content` moves a block container's content down, given

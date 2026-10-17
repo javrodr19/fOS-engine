@@ -237,6 +237,9 @@ impl LayoutBox {
             || self.style.contains_formatting()
             // A block container aligning its content (CSS Box Alignment 3 §5.3)
             || b.align_content != fos_css::style::AlignContent::Normal
+            // A multi-column container (CSS Multi-column 1 §2)
+            || b.column_count.is_some()
+            || b.column_width.is_some()
     }
 }
 

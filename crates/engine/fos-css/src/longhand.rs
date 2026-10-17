@@ -73,6 +73,7 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
+        "columns" => &[ColumnWidth, ColumnCount],
         "grid-row" => &[GridRowStart, GridRowEnd],
         "grid-column" => &[GridColumnStart, GridColumnEnd],
         "grid-area" => &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
@@ -189,6 +190,8 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "order" => Order,
         "row-gap" => RowGap,
         "column-gap" => ColumnGap,
+        "column-count" => ColumnCount,
+        "column-width" => ColumnWidth,
         "object-fit" => ObjectFit,
         "contain" => Contain,
         "container-type" => ContainerType,
@@ -452,6 +455,31 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             border_radius(&lower, important, out);
             true
         }
+        // A width and a count in either order; `auto` for either
+        "columns" => {
+            let (mut width, mut count) = (None, None);
+            let mut autos = 0;
+            for c in components(&lower) {
+                if c == "auto" {
+                    autos += 1;
+                } else if let Some(n) = c.parse::<i32>().ok().filter(|_| count.is_none()) {
+                    if n < 1 {
+                        return true;
+                    }
+                    count = Some(PropertyValue::Integer(n));
+                } else if let Some(l) = length(c, false, false, false).filter(|_| width.is_none()) {
+                    width = Some(l);
+                } else {
+                    return true;
+                }
+            }
+            if autos + width.is_some() as usize + count.is_some() as usize > 2 {
+                return true;
+            }
+            push(out, PropertyId::ColumnWidth, width.unwrap_or(PropertyValue::Keyword(Keyword::Auto)), important);
+            push(out, PropertyId::ColumnCount, count.unwrap_or(PropertyValue::Keyword(Keyword::Auto)), important);
+            true
+        }
         "background" => {
             background_shorthand(value.trim(), important, out);
             true
@@ -639,6 +667,14 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::AlignSelf => enum_value::<AlignSelf>(strip_safety(v)),
         P::AlignContent => enum_value::<AlignContent>(strip_safety(v)),
         P::Order => v.parse::<i32>().ok().map(PropertyValue::Integer),
+        P::ColumnCount => match v {
+            "auto" => Some(PropertyValue::Keyword(Keyword::Auto)),
+            _ => v.parse::<i32>().ok().filter(|&n| n >= 1).map(PropertyValue::Integer),
+        },
+        P::ColumnWidth => match v {
+            "auto" => Some(PropertyValue::Keyword(Keyword::Auto)),
+            _ => length(v, false, false, false),
+        },
         P::RowGap | P::ColumnGap => gap(v),
         P::ObjectFit => enum_value::<ObjectFit>(v),
         P::Contain => contain(v),
@@ -2096,6 +2132,20 @@ mod tests {
         let s = computed("border: 1px solid; border-inline-color: red blue");
         use crate::properties::Color;
         assert_eq!((s.border.color[1], s.border.color[3]), (Some(Color::rgb(0, 0, 255)), Some(Color::rgb(255, 0, 0))));
+    }
+
+    #[test]
+    fn multi_column_properties() {
+        let c = |css: &str| {
+            let s = computed(css);
+            (s.box_.column_count, s.box_.column_width)
+        };
+        assert_eq!(c("columns: 3"), (Some(3), None));
+        assert_eq!(c("columns: 7em auto"), (None, Some(112.0)));
+        assert_eq!(c("columns: 2 100px"), (Some(2), Some(100.0)));
+        assert_eq!(c("columns: 3; columns: 2 2"), (Some(3), None));
+        assert_eq!(c("column-count: 0; column-width: 10%"), (None, None));
+        assert_eq!(computed("columns: 3 12px").resolved_value("column-width", None).as_deref(), Some("12px"));
     }
 
     #[test]

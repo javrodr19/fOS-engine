@@ -1886,6 +1886,64 @@ fn block_containers_align_their_content() {
 }
 
 #[test]
+fn multi_column_layout_balances_columns() {
+    // Chromium's results: columns share the width (a normal gap is 1em),
+    // the content is balanced across them, even with a definite height,
+    // and a column after the first starts at its top (Wikipedia's language
+    // lists are column-width: 112px)
+    let (mut tree, html, body) = doc();
+    let multicol = |tree: &mut DomTree, style: &str, items: &[&str]| {
+        let m = el(tree, body, "div", &format!("width: 600px; font-size: 16px; line-height: 20px; {style}"));
+        let kids: Vec<NodeId> = items.iter().map(|st| el(tree, m, "div", st)).collect();
+        (m, kids)
+    };
+    let (three, items) = multicol(&mut tree, "columns: 3", &["height: 20px"; 8]);
+    let (wide, cols) = multicol(&mut tree, "column-width: 112px; column-gap: 20px", &["height: 20px"; 7]);
+    let (fixed, boxes) = multicol(&mut tree, "column-count: 3; height: 60px", &["height: 20px"; 5]);
+    let (paras, ps) = multicol(&mut tree, "columns: 2", &["margin: 10px 0; height: 20px"; 3]);
+    // Lines of inline content break between line boxes
+    let lines = el(&mut tree, body, "div", "width: 600px; columns: 2; line-height: 20px");
+    let spans: Vec<NodeId> = (0..4)
+        .map(|i| {
+            let s = el(&mut tree, lines, "span", "");
+            text(&mut tree, s, &format!("line{i}"));
+            if i < 3 {
+                el(&mut tree, lines, "br", "");
+            }
+            s
+        })
+        .collect();
+    let t = layout(&tree, html, 800.0);
+    // x from the containers' left edge
+    let x0 = rect_of(&t, three).x;
+    let at = |n: NodeId| {
+        let r = rect_of(&t, n);
+        (((r.x - x0) * 10.0).round() / 10.0, r.y, (r.w * 10.0).round() / 10.0)
+    };
+    let top = |n: NodeId| rect_of(&t, n).y;
+    let y = top(three);
+    assert_eq!(rect_of(&t, three).h, 60.0);
+    assert_eq!([at(items[0]), at(items[7])], [(0.0, y, 189.3), (410.7, y + 20.0, 189.3)]);
+    // 4 columns of 135px fit 600px with 20px gaps
+    let y = top(wide);
+    assert_eq!(rect_of(&t, wide).h, 40.0);
+    assert_eq!([at(cols[0]), at(cols[5]), at(cols[6])], [(0.0, y, 135.0), (310.0, y + 20.0, 135.0), (465.0, y, 135.0)]);
+    // Balanced 2, 2, 1 within the 60px height
+    let y = top(fixed);
+    assert_eq!(at(boxes[3]), (205.3, y + 20.0, 189.3));
+    // The first column keeps its first margin; the break truncates the
+    // margin of the second column's first box
+    let y = top(paras);
+    assert_eq!(rect_of(&t, paras).h, 50.0);
+    assert_eq!([at(ps[0]).1, at(ps[1]).1, at(ps[2]).1], [y + 10.0, y, y + 30.0]);
+    assert_eq!(at(ps[1]).0, 308.0);
+    // The third line heads the second column, level with the first
+    assert_eq!(rect_of(&t, lines).h, 40.0);
+    let (first, third) = (rects_of(&t, spans[0])[0], rects_of(&t, spans[2])[0]);
+    assert_eq!((third.x - x0, third.y), (308.0, first.y));
+}
+
+#[test]
 fn replaced_flex_items_follow_their_ratio() {
     // As in Chromium: a flexed image's height follows its used width; its
     // automatic minimum is its natural width, not its own width; one with

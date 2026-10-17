@@ -1455,20 +1455,27 @@ fn font_stretch(v: &str) -> Option<f32> {
     })
 }
 
+/// A font family as named in CSS: a string, or identifiers (whose white
+/// space collapses), with escapes resolved (`Font\ Awesome\ 5` names
+/// "Font Awesome 5")
+pub(crate) fn family_name(raw: &str) -> String {
+    let f = raw.trim();
+    match f.as_bytes().first() {
+        Some(&q @ (b'"' | b'\'')) => css_string(f, 1, q).map(|(s, _)| s).unwrap_or_default(),
+        _ => css_string(f, 0, 0).map(|(s, _)| s.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+    }
+}
+
 /// Families without quotes, generic names lowercase
 fn font_family(raw: &str) -> Option<PropertyValue> {
     let mut list = Vec::new();
     for f in split_top(raw, b',') {
         let f = f.trim();
-        let name = if (f.starts_with('"') && f.ends_with('"') || f.starts_with('\'') && f.ends_with('\'')) && f.len() >= 2 {
-            f[1..f.len() - 1].to_string()
-        } else {
-            let lower = f.to_ascii_lowercase();
-            match lower.as_str() {
-                "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace" | "math"
-                | "emoji" | "-apple-system" | "blinkmacsystemfont" => lower,
-                _ => f.split_whitespace().collect::<Vec<_>>().join(" "),
-            }
+        let lower = f.to_ascii_lowercase();
+        let name = match lower.as_str() {
+            "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace" | "math" | "emoji"
+            | "-apple-system" | "blinkmacsystemfont" => lower,
+            _ => family_name(f),
         };
         if !name.is_empty() {
             list.push(name);
@@ -2230,6 +2237,9 @@ mod tests {
         assert_eq!(i.line_height, LineHeight::Number(1.5));
         assert_eq!(&*i.font_family.iter().map(|f| f.to_string()).collect::<Vec<_>>(), ["Helvetica Neue", "Arial", "sans-serif"]);
         assert_eq!((i.text_align, i.white_space), (TextAlign::WebkitCenter, WhiteSpace::Nowrap));
+        // Escapes resolve, as postgresql.org names Font Awesome\ 5 Free
+        let s = computed(r#"font-family: Font Awesome\ 5 Free, "Q\"t", 'C\41 D', Serif"#);
+        assert_eq!(&*s.inherited.font_family.iter().map(|f| f.to_string()).collect::<Vec<_>>(), ["Font Awesome 5 Free", "Q\"t", "CAD", "serif"]);
         let s = computed("font-size: 20px; line-height: 150%; text-decoration: underline dotted red; letter-spacing: .1em");
         assert_eq!(s.inherited.line_height, LineHeight::Px(30.0));
         assert_eq!(s.inherited.letter_spacing, 2.0);

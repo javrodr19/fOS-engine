@@ -48,7 +48,9 @@ pub fn requests(css: &str, media: &fos_css::MediaContext, base: &str) -> Vec<Fon
     if faces.is_empty() {
         return Vec::new();
     }
-    let lower = css.to_ascii_lowercase();
+    // Escaped spaces as spaces: a family is named `Font Awesome\ 5 Free`
+    // as often as "Font Awesome 5 Free"
+    let lower = css.to_ascii_lowercase().replace("\\ ", " ");
     // A family is used when it is named more often than its own
     // @font-face rules name it
     let mut declared: HashMap<String, usize> = HashMap::new();
@@ -156,8 +158,11 @@ mod tests {
             css += &format!("@font-face {{ font-family: S{i}x; src: url(s{i}.woff2) }} :lang(x{i}) {{ font-family: S{i}x }}\n");
         }
         css += "@font-face { font-family: Text; src: url(t.woff2) } body { font-family: Text } h1, p { font-family: Text, sans-serif }";
+        css += r"@font-face { font-family: Icon\ 5 Font; src: url(i.woff2) } i { font-family: Icon\ 5 Font } b { font-family: 'Icon 5 Font' }";
         let reqs = requests(&css, &media, "https://example.com/");
         assert_eq!(reqs.len(), MAX_FONTS);
         assert_eq!(reqs[0].family, "Text");
+        // A family named with escaped spaces counts its uses either way
+        assert_eq!(reqs[1].family, "Icon 5 Font");
     }
 }

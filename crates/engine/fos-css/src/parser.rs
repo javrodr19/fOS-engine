@@ -339,7 +339,7 @@ fn font_face(block: &str) -> Option<FontFace> {
         let Some((name, value)) = decl.split_once(':') else { continue };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
-            "font-family" => family = Some(unquote(value).to_string()),
+            "font-family" => family = Some(crate::longhand::family_name(value)),
             "src" => {
                 for one in split_top(value, b',') {
                     let one = one.trim();
@@ -1801,6 +1801,7 @@ mod tests {
         assert_eq!(faces[0].src, vec![("/f/inter.woff2".to_string(), Some("woff2".to_string())), ("/f/inter.woff".to_string(), Some("woff".to_string()))]);
         assert_eq!(faces[0].weight, (100, 900));
         assert_eq!((faces[1].family.as_str(), faces[1].italic, faces[1].weight), ("Icons", true, (700, 700)));
+        assert_eq!(font_faces(r"@font-face { font-family: Font Awesome\ 5 Brands; src: url(b.woff2) }", &ctx)[0].family, "Font Awesome 5 Brands");
         let f = &font_faces("@font-face { font-family: L; src: url(l.woff2); unicode-range: U+0000-00FF, U+0131, U+20?? }", &ctx)[0];
         assert!(f.covers('a') && f.covers('\u{0131}') && f.covers('\u{20AC}') && !f.covers('\u{0400}'));
     }

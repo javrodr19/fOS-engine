@@ -94,6 +94,13 @@ pub struct BoxFragment {
     /// For boxes that clip their overflow: the size of their content
     /// (from the padding box's corner), which scrolling can reveal
     pub scroll_extent: Option<(f32, f32)>,
+    /// For a box whose content is lines: the first and last line boxes'
+    /// baselines (not those of text moved by vertical-align)
+    pub line_baselines: Option<(f32, f32)>,
+    /// For the placeholder of an absolutely positioned child of a flex
+    /// container: where in its border box (the container's content box)
+    /// the box aligns, as fractions of the free space in x and y
+    pub static_align: Option<(f32, f32)>,
 }
 
 impl BoxFragment {
@@ -141,6 +148,10 @@ impl BoxFragment {
         }
         self.border_box = self.border_box.translate(dx, dy);
         self.ink = self.ink.translate(dx, dy);
+        if let Some((first, last)) = &mut self.line_baselines {
+            *first += dy;
+            *last += dy;
+        }
         if let Some(m) = &mut self.marker {
             m.translate(dx, dy);
         }
@@ -151,6 +162,9 @@ impl BoxFragment {
 
     /// The first line's baseline inside the box, if it has lines
     pub fn first_baseline(&self) -> Option<f32> {
+        if let Some((first, _)) = self.line_baselines {
+            return Some(first);
+        }
         for c in &self.children {
             match c {
                 Fragment::Text(t) => return Some(t.baseline),
@@ -166,6 +180,9 @@ impl BoxFragment {
 
     /// The last line's baseline (inline-block baselines)
     pub fn last_baseline(&self) -> Option<f32> {
+        if let Some((_, last)) = self.line_baselines {
+            return Some(last);
+        }
         for c in self.children.iter().rev() {
             match c {
                 Fragment::Text(t) => return Some(t.baseline),
@@ -193,8 +210,41 @@ impl BoxFragment {
 
     /// Its ink as painted: the bounds of its transformed ink
     pub fn transformed_ink(&self) -> Rect {
-        let Some(m) = self.transform() else { return self.ink };
-        let r = self.ink;
+        self.transformed(self.ink)
+    }
+
+    /// What it adds to the scrollable overflow around it (CSS Overflow 3
+    /// §2.2): its border box and, unless it clips them, its descendants',
+    /// through its transform; not shadows or outlines (ink), nor fixed
+    /// boxes (the viewport's)
+    pub fn scrollable_overflow(&self) -> Rect {
+        let mut r = self.border_box;
+        let clips = self.style.clips() && self.kind != BoxFragmentKind::InlinePart;
+        // Positioned children whose containing block is further out escape
+        // a clip
+        let positioned = self.style.is_positioned() || self.style.has_transform() || self.style.contains_layout();
+        for c in &self.children {
+            match c {
+                Fragment::Box(cb) => {
+                    let p = cb.style.box_.position;
+                    if p == fos_css::style::Position::Fixed || (clips && !(p == fos_css::style::Position::Absolute && !positioned)) {
+                        continue;
+                    }
+                    r = r.union(&cb.transformed(cb.scrollable_overflow()));
+                }
+                Fragment::Text(t) if !clips => r = r.union(&t.rect),
+                Fragment::Text(_) => {}
+            }
+        }
+        if let Some(m) = self.marker.as_ref().filter(|_| !clips) {
+            r = r.union(&m.rect);
+        }
+        r
+    }
+
+    /// The bounds of `r` through the box's transform
+    fn transformed(&self, r: Rect) -> Rect {
+        let Some(m) = self.transform() else { return r };
         let pts = [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())].map(|p| fos_css::transform::apply(m, p));
         let (x0, x1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
         let (y0, y1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), p| (a.min(p.1), b.max(p.1)));
@@ -220,9 +270,25 @@ impl BoxFragment {
             }
             let w = (content.right() - pad.x + self.padding[1]).max(pad.w);
             let h = (content.bottom() - pad.y + self.padding[2]).max(pad.h);
-            self.scroll_extent = Some((w, h));
+            // Paint containment clips without scrolling (sticky boxes inside
+            // stick to the scroll container further out)
+            let b = &self.style.box_;
+            let overflows = b.overflow_x != fos_css::style::Overflow::Visible || b.overflow_y != fos_css::style::Overflow::Visible;
+            self.scroll_extent = overflows.then_some((w, h));
             if let Some(m) = &self.marker {
                 ink = ink.union(&m.rect);
+            }
+            // Positioned children whose containing block is further out
+            // are not clipped here
+            let contained = self.style.contains_layout();
+            let positioned = self.style.is_positioned() || self.style.has_transform() || contained;
+            for c in &self.children {
+                if let Fragment::Box(cb) = c {
+                    let p = cb.style.box_.position;
+                    if (p == fos_css::style::Position::Fixed && !contained) || (p == fos_css::style::Position::Absolute && !positioned) {
+                        ink = ink.union(&cb.ink);
+                    }
+                }
             }
             self.ink = ink;
             return;
@@ -248,6 +314,15 @@ pub enum ReplacedPaint {
     Check { radio: bool, checked: bool },
     /// A drop-down's arrow (its text is a child fragment)
     Select,
+    /// A file input's button, this wide from the content box's start (its
+    /// texts are child fragments)
+    File { button_w: f32 },
+    /// A range input's track and thumb, the thumb this far along (0 to 1)
+    Range(f32),
+    /// A color input's swatch
+    ColorWell(Color),
+    /// A progress bar or meter, filled this far (`None`: indeterminate)
+    Gauge { value: Option<f32>, meter: bool },
     /// Nothing to show (yet)
     Empty,
 }
@@ -564,6 +639,8 @@ impl BoxFragment {
             marker: self.marker.clone(),
             replaced: self.replaced.clone(),
             scroll_extent: self.scroll_extent,
+            line_baselines: self.line_baselines,
+            static_align: self.static_align,
         }
     }
 }

@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use fos_dom::{Document, DomTree, ElementData, InternedString, Node, NodeData, NodeId, QualName};
+use fos_dom::{Document, DomTree, ElementData, InternedString, NodeData, NodeId, QualName};
 use html5ever::interface::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{parse_document, Attribute, LocalName, Namespace};
@@ -42,7 +42,7 @@ impl HtmlParser {
 pub(crate) fn parse_fragment(html: &str, context: &str) -> Document {
     let name = html5ever::QualName::new(None, html5ever::ns!(html), LocalName::from(context.to_ascii_lowercase()));
     // Scripts made the markup: every text node is theirs to see
-    let sink = DomSink { keep_whitespace: true, ..DomSink::new("about:blank") };
+    let sink = DomSink::new("about:blank");
     html5ever::parse_fragment(sink, Default::default(), name, Vec::new(), true).one(html)
 }
 
@@ -50,50 +50,6 @@ impl Default for HtmlParser {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Whether `text` is only ASCII whitespace (HTML's definition: space, tab,
-/// LF, FF, CR). Non-breaking spaces are content.
-fn is_inter_element_whitespace(text: &str) -> bool {
-    text.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r'))
-}
-
-fn tag_of(tree: &DomTree, id: NodeId) -> Option<&str> {
-    tree.get(id).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))
-}
-
-/// Whether a whitespace-only text node can never render or matter: inside
-/// structural elements (tables, lists, the head), or between block-level
-/// elements. Whitespace next to inline content separates words, so it
-/// stays (as does any inside `pre`-like elements).
-fn whitespace_is_insignificant(tree: &DomTree, id: NodeId) -> bool {
-    let Some(node) = tree.get(id) else { return false };
-    match tag_of(tree, node.parent) {
-        None if node.parent == tree.root() => return true,
-        Some("html" | "head" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "colgroup" | "ul" | "ol" | "dl" | "select" | "optgroup" | "datalist" | "frameset" | "menu") => return true,
-        Some("pre" | "textarea" | "listing" | "plaintext" | "xmp" | "script" | "style") => return false,
-        _ => {}
-    }
-    let block_tag = |id: NodeId| -> bool {
-        match tree.get(id).map(|n| &n.data) {
-            Some(NodeData::Comment(_)) => true,
-            Some(NodeData::Element(_)) => matches!(
-                tag_of(tree, id).unwrap_or(""),
-                "address" | "article" | "aside" | "blockquote" | "body" | "center" | "details" | "dialog" | "dd" | "div" | "dl" | "dt"
-                    | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "head"
-                    | "header" | "hgroup" | "hr" | "li" | "main" | "menu" | "nav" | "ol" | "p" | "pre" | "section" | "summary"
-                    | "table" | "ul" | "script" | "style" | "link" | "meta" | "title" | "template" | "noscript" | "base" | "br"
-                    | "option" | "optgroup" | "caption" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "colgroup" | "col"
-                    | "iframe" | "video" | "audio" | "canvas" | "svg" | "search" | "legend"
-            ),
-            _ => false,
-        }
-    };
-    // The edges of an inline element are not block boundaries: its only
-    // space (`<span> </span>`) separates the words around it
-    let parent_is_block = node.parent == tree.root() || block_tag(node.parent) || tag_of(tree, node.parent).is_some_and(|t| matches!(t, "html" | "td" | "th"));
-    let blockish = |sibling: NodeId| if sibling.is_valid() { block_tag(sibling) } else { parent_is_block };
-    blockish(node.prev_sibling) && blockish(node.next_sibling)
 }
 
 /// An element name owned by the caller, so no borrow of the sink's state
@@ -124,9 +80,6 @@ struct DomSink {
     /// MathML `annotation-xml` elements that are HTML integration points
     integration_points: RefCell<HashSet<NodeId>>,
     quirks_mode: Cell<QuirksMode>,
-    /// Keep inter-element whitespace (fragments for `innerHTML`, whose
-    /// text nodes scripts count and whose newlines may be preformatted)
-    keep_whitespace: bool,
 }
 
 impl DomSink {
@@ -138,7 +91,6 @@ impl DomSink {
             template_contents: RefCell::new(HashMap::new()),
             integration_points: RefCell::new(HashSet::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
-            keep_whitespace: false,
         }
     }
 
@@ -200,25 +152,9 @@ impl TreeSink for DomSink {
             tree.append_child(template, contents);
         }
         // Drop what is not part of the document (nodes the tree builder
-        // removed) and inter-element whitespace, and store the rest in
-        // document order
-        let mut droppable = Vec::new();
-        let mut stack = vec![tree.root()];
-        while let Some(id) = stack.pop() {
-            let mut child = tree.get(id).map_or(NodeId::NONE, |n| n.first_child);
-            while child.is_valid() {
-                let Some(n) = tree.get(child) else { break };
-                match &n.data {
-                    NodeData::Text(t) if !self.keep_whitespace && is_inter_element_whitespace(&t.content) && whitespace_is_insignificant(&tree, child) => droppable.push(child),
-                    NodeData::Element(_) | NodeData::Document => stack.push(child),
-                    _ => {}
-                }
-                child = n.next_sibling;
-            }
-        }
-        for id in droppable {
-            tree.remove(id);
-        }
+        // removed), and store the rest in document order. White space
+        // between elements stays, as in browsers: scripts see it, and CSS
+        // can make the elements around it inline.
         tree.compact(|_| true);
 
         let mut contents = Vec::new();
@@ -509,20 +445,16 @@ mod tests {
 
     #[test]
     fn test_whitespace_and_templates() {
-        // Inter-element whitespace is dropped; &nbsp; is content
+        // Inter-element whitespace stays, as in browsers
         assert_eq!(
             parse_outline("<ul>\n  <li>a</li>\n  <li>&nbsp;</li>\n</ul>"),
-            "<html><head></><body><ul><li>'a'</><li>'\u{a0}'</></></></>"
+            "<html><head></><body><ul>'\n  '<li>'a'</>'\n  '<li>'\u{a0}'</>'\n'</></></>"
         );
-        // Whitespace between inline elements separates words
         assert_eq!(
             parse_outline("<div>\n<p><a>x</a> <span>y</span></p>\n</div>"),
-            "<html><head></><body><div><p><a>'x'</>' '<span>'y'</></></></></>"
+            "<html><head></><body><div>'\n'<p><a>'x'</>' '<span>'y'</></>'\n'</></></>"
         );
-        // An inline element's only whitespace is a word space (Pygments'
-        // <span class="w"> </span>), but a block's is not
         assert_eq!(parse_outline("<p>x<span> </span>y</p>"), "<html><head></><body><p>'x'<span>' '</>'y'</></></>");
-        assert_eq!(parse_outline("<div><div> </div></div>"), "<html><head></><body><div><div></></></></>");
         // Template contents are not part of the document tree
         assert_eq!(
             parse_outline("<template><p>inert</p></template><p>live</p>"),

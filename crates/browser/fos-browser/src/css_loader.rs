@@ -69,6 +69,28 @@ struct Import {
     media: String,
 }
 
+/// Where the statement `s` starts ends: its first `;` outside strings and
+/// parentheses (a Google Fonts URL has `;` between its axis ranges)
+fn statement_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0u32;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ';') if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The `@import` statements a stylesheet starts with (after `@charset`)
 fn imports(css: &str) -> Vec<Import> {
     let b = css.as_bytes();
@@ -96,7 +118,7 @@ fn imports(css: &str) -> Vec<Import> {
             return out;
         }
         let start = i;
-        let stmt_end = rest.find(';').map_or(b.len(), |p| i + p);
+        let stmt_end = statement_end(rest).map_or(b.len(), |p| i + p);
         let stmt = &css[i + 7..stmt_end.min(b.len())];
         i = (stmt_end + 1).min(b.len());
         let stmt = stmt.trim();
@@ -312,5 +334,18 @@ mod tests {
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{css}");
         // The self-import is dropped
         assert_eq!(css.matches("main {").count(), 1);
+    }
+
+    #[test]
+    fn import_urls_may_hold_semicolons() {
+        // vuejs.org imports Google Fonts with axis ranges split by `;`: the
+        // statement ends after the quoted URL, not inside it (the rest of
+        // its stylesheet was lost in an unterminated string)
+        let main = "@import \"https://f/css2?family=Inter:ital,wght@0,100..900;1,100..900&display=swap\";@import url(a;b.css);p{color:red}";
+        let files: HashMap<&str, &str> = [("https://x/main.css", main), ("https://f/css2?family=Inter:ital,wght@0,100..900;1,100..900&display=swap", "f { x: y }"), ("https://x/a;b.css", "a { x: y }")].into_iter().collect();
+        let sheets = load(&["https://x/main.css".to_string()], &mut |urls| urls.iter().map(|u| files.get(u.as_str()).map(|s| s.to_string())).collect());
+        let css = &sheets["https://x/main.css"];
+        assert!(css.contains("f { x: y }") && css.contains("a { x: y }") && css.ends_with("p{color:red}"), "{css}");
+        assert!(!css.contains("display=swap"), "{css}");
     }
 }

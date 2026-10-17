@@ -90,6 +90,41 @@ fn skia_color(c: CssColor, alpha: f32) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba8(c.r, c.g, c.b, (c.a as f32 * alpha).round().clamp(0.0, 255.0) as u8)
 }
 
+/// Chromium's form control colors: borders, button faces, and the accent
+/// of checked and filled controls
+const CONTROL_BORDER: CssColor = CssColor { r: 118, g: 118, b: 118, a: 255 };
+const CONTROL_FACE: CssColor = CssColor { r: 239, g: 239, b: 239, a: 255 };
+const ACCENT: CssColor = CssColor { r: 0, g: 117, b: 255, a: 255 };
+
+/// A form control the page left to the browser's styles (appearance:
+/// auto, and the UA sheet's border and background) is drawn natively: what
+/// it is filled with then
+fn native_control(b: &BoxFragment) -> Option<CssColor> {
+    use fos_css::style::{Appearance, BorderStyle};
+    let s = &b.style;
+    let border = &s.border;
+    if s.box_.appearance != Appearance::Auto || border.has_radius() || !s.background.images.is_empty() {
+        return None;
+    }
+    let w = border.width[0];
+    if !(0..4).all(|i| border.width[i] == w && border.style[i] == border.style[0] && border.color[i] == border.color[0]) {
+        return None;
+    }
+    let color = border.color[0].unwrap_or(s.color());
+    let (white, black) = (CssColor::WHITE, CssColor::rgba(0, 0, 0, 255));
+    let bg = s.background.color;
+    match (w, border.style[0]) {
+        // Text fields, buttons, drop-downs (drawn white), textareas, color
+        // inputs
+        (2.0, BorderStyle::Inset) if color == CONTROL_BORDER && bg == white => Some(white),
+        (2.0, BorderStyle::Outset) if color == black && bg == CONTROL_FACE => Some(CONTROL_FACE),
+        (1.0, BorderStyle::Solid) if color == CONTROL_BORDER && bg == CONTROL_FACE => Some(white),
+        (1.0, BorderStyle::Solid) if color == CONTROL_BORDER && bg == white => Some(white),
+        (1.0, BorderStyle::Solid) if color == black && bg == CONTROL_FACE => Some(CONTROL_FACE),
+        _ => None,
+    }
+}
+
 fn render_color(c: CssColor, alpha: f32) -> fos_render::Color {
     fos_render::Color::rgba(c.r, c.g, c.b, (c.a as f32 * alpha).round().clamp(0.0, 255.0) as u8)
 }
@@ -98,16 +133,22 @@ fn shade(c: CssColor, f: f32) -> CssColor {
     CssColor { r: (c.r as f32 * f) as u8, g: (c.g as f32 * f) as u8, b: (c.b as f32 * f) as u8, a: c.a }
 }
 
+/// Radii past this are as good as infinite
+const RADIUS_CAP: f32 = 1.0e7;
+
 /// Corner radii (horizontal, vertical): top-left, top-right, bottom-right,
-/// bottom-left, reduced so adjacent curves never overlap
+/// bottom-left, all scaled down alike so adjacent curves never overlap
+/// (CSS Backgrounds 3 §5.5)
 fn radii(b: &BoxFragment, r: Rect) -> [(f32, f32); 4] {
     let spec = &b.style.border.radius;
     let mut out = [(0.0, 0.0); 4];
     for i in 0..4 {
         let (h, v): (Lp, Lp) = spec[i];
-        // Huge radii (999em, 3.4e38px: "fully round") are capped at the
-        // box so the sums below stay finite
-        out[i] = (h.resolve(r.w).clamp(0.0, r.w.max(0.0)), v.resolve(r.h).clamp(0.0, r.h.max(0.0)));
+        // Huge radii (999em, 3.4e38px: "fully round") are capped so the
+        // sums below stay finite, alike on both axes: the scaling below
+        // keeps each corner's shape, so 9999px rounds a wide box's ends
+        // into half circles (a pill), not half ellipses
+        out[i] = (h.resolve(r.w).clamp(0.0, RADIUS_CAP), v.resolve(r.h).clamp(0.0, RADIUS_CAP));
         if out[i].0 == 0.0 || out[i].1 == 0.0 {
             out[i] = (0.0, 0.0);
         }
@@ -531,7 +572,7 @@ impl<'a> Painter<'a> {
         let inner = self.inner_clip(b, clip);
         let saved = self.enter_scroll(b);
         let mut layers: Vec<Layer> = Vec::new();
-        self.collect_layers(b, inner, alpha, &mut layers);
+        self.collect_layers(b, inner, inner, b.style.contains_layout().then_some(inner), alpha, &mut layers);
         layers.sort_by_key(|l| l.0);
         let here = self.at();
         for &(_, l, c, a, at) in layers.iter().filter(|l| l.0 < 0) {
@@ -551,19 +592,33 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// The positioned boxes under `b` that are not inside another layer
-    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, alpha: f32, out: &mut Vec<Layer<'t>>) {
+    /// The positioned boxes under `b` that are not inside another layer.
+    /// Each is clipped by the boxes around it up to its containing block:
+    /// `clip` is the clip here, `layer_clip` the clip inside the layer
+    /// being painted (what absolutely positioned boxes get) and fixed boxes
+    /// get the viewport's, or `fixed_clip` inside a box with layout or
+    /// paint containment (their containing block).
+    fn collect_layers<'t>(&mut self, b: &'t BoxFragment, clip: Clip, layer_clip: Clip, fixed_clip: Option<Clip>, alpha: f32, out: &mut Vec<Layer<'t>>) {
+        use fos_css::style::Position;
         for c in &b.children {
             let Fragment::Box(cb) = c else { continue };
             if Self::is_layer_in(b, cb) {
                 // A sticky box is drawn moved to stay in view
                 let mut at = self.at();
                 at.0 -= cb.sticky_offset(b.content_box(), self.view);
+                let clip = match cb.style.box_.position {
+                    Position::Fixed => fixed_clip.unwrap_or(Clip([0.0, 0.0, self.canvas.width() as f32, self.canvas.height() as f32])),
+                    Position::Absolute => layer_clip,
+                    _ => clip,
+                };
                 out.push((cb.style.box_.z_index.unwrap_or(0), cb, clip, alpha, at));
             } else if self.find_fixed || !self.culled(cb, clip) {
                 let inner = self.inner_clip(cb, clip);
                 let saved = self.enter_scroll(cb);
-                self.collect_layers(cb, inner, alpha * cb.style.box_.opacity, out);
+                // A contained box is its positioned descendants' containing
+                // block: they are clipped by it
+                let (layer_clip, fixed_clip) = if cb.style.contains_layout() { (inner, Some(inner)) } else { (layer_clip, fixed_clip) };
+                self.collect_layers(cb, inner, layer_clip, fixed_clip, alpha * cb.style.box_.opacity, out);
                 self.go(saved);
             }
         }
@@ -613,6 +668,14 @@ impl<'a> Painter<'a> {
         let shadows = b.style.box_.box_shadow.is_some();
         if shadows {
             self.shadows(b, clip, alpha, false);
+        }
+        if let Some(fill) = native_control(b) {
+            // Styled only by the browser: drawn as Chromium draws it
+            self.control_frame(self.dev(b.border_box), fill, clip, alpha);
+            if let Some(r) = &b.replaced {
+                self.replaced(b, r, clip, alpha);
+            }
+            return;
         }
         if b.style.background.clip == fos_css::style::BackgroundClip::Text {
             self.text_background(b, clip, alpha);
@@ -1058,12 +1121,21 @@ impl<'a> Painter<'a> {
                 }
                 for &tx in &xs {
                     let tile = Rect::new(tx, ty, tw, th);
+                    let conic;
                     let shader = match loaded {
                         Some(img) => {
                             let pm = &img.pixmap;
                             let t = Transform::from_row(tw / pm.width() as f32, 0.0, 0.0, th / pm.height() as f32, tx, ty);
                             tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, alpha, t)
                         }
+                        None if matches!(image, Image::Conic { .. }) => match conic_pixmap(image, tile, alpha) {
+                            Some(pm) => {
+                                conic = pm;
+                                let t = Transform::from_translate(tx.floor(), ty.floor());
+                                tiny_skia::Pattern::new(conic.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Nearest, 1.0, t)
+                            }
+                            None => continue,
+                        },
                         None => match gradient_shader(image, tile, alpha) {
                             Some(s) => s,
                             None => continue,
@@ -1256,6 +1328,42 @@ impl<'a> Painter<'a> {
     }
 
     /// Form controls drawn by the browser
+    /// A form control's frame as Chromium draws it: a 1px gray border with
+    /// 2px corners around `fill`
+    fn control_frame(&mut self, r: Rect, fill: CssColor, clip: Clip, alpha: f32) {
+        let Some(outer) = rounded_path(r, [(2.0, 2.0); 4]) else { return };
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(skia_color(fill, alpha));
+        self.fill(&outer, &paint, FillRule::Winding, clip);
+        let edge = Rect::new(r.x + 0.5, r.y + 0.5, (r.w - 1.0).max(0.0), (r.h - 1.0).max(0.0));
+        if let Some(ring) = rounded_path(edge, [(1.5, 1.5); 4]).and_then(|p| p.stroke(&Stroke { width: 1.0, ..Stroke::default() }, 1.0)) {
+            paint.set_color(skia_color(CONTROL_BORDER, alpha));
+            self.fill(&ring, &paint, FillRule::Winding, clip);
+        }
+    }
+
+    /// A rounded track (a range's, a progress bar's), filled with `fill`
+    /// up to `upto` and light gray with a gray edge after
+    fn gauge_track(&mut self, track: Rect, upto: f32, fill: CssColor, clip: Clip, alpha: f32) {
+        let rad = [(track.h / 2.0, track.h / 2.0); 4];
+        let Some(path) = rounded_path(track, rad) else { return };
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(skia_color(CONTROL_FACE, alpha));
+        self.fill(&path, &paint, FillRule::Winding, clip);
+        let edge = Rect::new(track.x + 0.5, track.y + 0.5, (track.w - 1.0).max(0.0), (track.h - 1.0).max(0.0));
+        if let Some(ring) = rounded_path(edge, [((track.h - 1.0) / 2.0, (track.h - 1.0) / 2.0); 4]).and_then(|p| p.stroke(&Stroke { width: 1.0, ..Stroke::default() }, 1.0)) {
+            paint.set_color(skia_color(CssColor::rgba(178, 178, 178, 255), alpha));
+            self.fill(&ring, &paint, FillRule::Winding, clip);
+        }
+        let filled = (upto - track.x).clamp(0.0, track.w);
+        if filled > 0.0 {
+            paint.set_color(skia_color(fill, alpha));
+            self.fill(&path, &paint, FillRule::Winding, clip.intersect(Rect::new(track.x, track.y, filled, track.h)));
+        }
+    }
+
     fn replaced(&mut self, b: &BoxFragment, r: &ReplacedPaint, clip: Clip, alpha: f32) {
         let c = self.dev(b.content_box());
         match r {
@@ -1295,20 +1403,53 @@ impl<'a> Painter<'a> {
                     }
                 }
             }
+            // A chevron, 8px wide, 4px in from the end of the content
             ReplacedPaint::Select => {
-                let s = (c.h * 0.3).clamp(3.0, 6.0);
-                let (cx, cy) = (c.right() - s - 2.0, c.y + c.h / 2.0);
+                let (x, cy) = (c.right() - 12.0, c.y + c.h / 2.0);
                 let mut pb = PathBuilder::new();
-                pb.move_to(cx - s, cy - s / 2.0);
-                pb.line_to(cx + s, cy - s / 2.0);
-                pb.line_to(cx, cy + s / 2.0);
-                pb.close();
-                if let Some(p) = pb.finish() {
+                pb.move_to(x + 0.5, cy - 1.75);
+                pb.line_to(x + 4.0, cy + 1.75);
+                pb.line_to(x + 7.5, cy - 1.75);
+                if let Some(p) = pb.finish().and_then(|p| p.stroke(&Stroke { width: 2.0, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() }, 1.0)) {
                     let mut paint = Paint::default();
                     paint.anti_alias = true;
                     paint.set_color(skia_color(b.style.color(), alpha));
                     self.fill(&p, &paint, FillRule::Winding, clip);
                 }
+            }
+            ReplacedPaint::File { button_w } => {
+                self.control_frame(Rect::new(c.x, c.y, *button_w, c.h), CONTROL_FACE, clip, alpha);
+            }
+            // A track 8px tall, filled to the thumb (16px across, kept 8px
+            // from the ends)
+            ReplacedPaint::Range(at) => {
+                let thumb_x = c.x + 8.0 + (c.w - 16.0).max(0.0) * at;
+                let track = Rect::new(c.x, c.y + (c.h - 8.0) / 2.0, c.w, 8.0);
+                self.gauge_track(track, thumb_x, ACCENT, clip, alpha);
+                let cy = c.y + c.h / 2.0;
+                if let Some(p) = PathBuilder::from_circle(thumb_x, cy, 8.0) {
+                    let mut paint = Paint::default();
+                    paint.anti_alias = true;
+                    paint.set_color(skia_color(ACCENT, alpha));
+                    self.fill(&p, &paint, FillRule::Winding, clip);
+                }
+            }
+            // A swatch inside the frame (inset 2px across, 4px down)
+            ReplacedPaint::ColorWell(color) => {
+                let r = Rect::new(c.x + 2.0, c.y + 4.0, (c.w - 4.0).max(0.0), (c.h - 8.0).max(0.0));
+                let mut paint = Paint::default();
+                for (r, c) in [(r, CssColor::rgba(119, 119, 119, 255)), (Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0), *color)] {
+                    if let Some(rect) = tiny_skia::Rect::from_xywh(r.x, r.y, r.w, r.h) {
+                        paint.set_color(skia_color(c, alpha));
+                        self.fill(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, clip);
+                    }
+                }
+            }
+            // An 8px track across the middle, filled from the start
+            ReplacedPaint::Gauge { value, meter } => {
+                let track = Rect::new(c.x, c.y + (c.h - 8.0) / 2.0, c.w, 8.0);
+                let fill = if *meter { CssColor::rgba(16, 124, 16, 255) } else { ACCENT };
+                self.gauge_track(track, c.x + c.w * value.unwrap_or(0.0), fill, clip, alpha);
             }
             ReplacedPaint::Image(handle) => {
                 if let Some(img) = handle.0.downcast_ref::<crate::image_loader::LoadedImage>() {
@@ -1351,7 +1492,13 @@ impl<'a> Painter<'a> {
         };
         // object-position (50% 50% by default) places it in the box
         let (px, py) = b.style.box_.object_position;
-        let dest = Rect::new(c.x + px.resolve(c.w - dw), c.y + py.resolve(c.h - dh), dw, dh);
+        let mut dest = Rect::new(c.x + px.resolve(c.w - dw), c.y + py.resolve(c.h - dh), dw, dh);
+        if let Some(fit) = img.svg_fit {
+            // An SVG's contents keep their shape in the box it is given
+            let (x, y, w, h) = fit.place(img.natural, (dest.x, dest.y, dest.w, dest.h));
+            dest = Rect::new(x, y, w, h);
+        }
+        let (dw, dh) = (dest.w, dest.h);
         let visible = clip.intersect(c).intersect(dest);
         if visible.is_empty() {
             return;
@@ -1579,13 +1726,45 @@ fn stop_fractions(stops: &[ColorStop], len: f32) -> Vec<f32> {
     pos.into_iter().map(|p| p.unwrap_or(0.0)).collect()
 }
 
+/// Gradient stops at `at(fraction)`, interpolating as CSS does: in
+/// premultiplied alpha (fading to `transparent` does not darken). Toward a
+/// fully transparent stop the other color's channels hold; between other
+/// alphas the segment is split into premultiplied steps.
+fn gradient_stops(stops: &[ColorStop], fr: &[f32], at: impl Fn(f32) -> f32, alpha: f32) -> Vec<GradientStop> {
+    let mut out = Vec::with_capacity(stops.len() * 2);
+    for (i, (s, &f)) in stops.iter().zip(fr).enumerate() {
+        let c = s.color;
+        if c.a == 0 {
+            // Each side of a transparent stop takes its neighbor's color
+            let before = i.checked_sub(1).map(|j| stops[j].color).unwrap_or(c);
+            let after = stops.get(i + 1).map(|n| n.color).unwrap_or(before);
+            out.push(GradientStop::new(at(f), skia_color(CssColor { a: 0, ..before }, alpha)));
+            out.push(GradientStop::new(at(f), skia_color(CssColor { a: 0, ..after }, alpha)));
+            continue;
+        }
+        if let (Some(prev), Some(&pf)) = (i.checked_sub(1).map(|j| stops[j].color), i.checked_sub(1).and_then(|j| fr.get(j))) {
+            if prev.a != 0 && prev.a != c.a && f > pf {
+                const STEPS: usize = 8;
+                for k in 1..STEPS {
+                    let t = k as f32 / STEPS as f32;
+                    let a = prev.a as f32 + (c.a as f32 - prev.a as f32) * t;
+                    let ch = |p: u8, q: u8| ((p as f32 * prev.a as f32 * (1.0 - t) + q as f32 * c.a as f32 * t) / a.max(1e-3)).round().clamp(0.0, 255.0) as u8;
+                    let mid = CssColor { r: ch(prev.r, c.r), g: ch(prev.g, c.g), b: ch(prev.b, c.b), a: a.round() as u8 };
+                    out.push(GradientStop::new(at(pf + (f - pf) * t), skia_color(mid, alpha)));
+                }
+            }
+        }
+        out.push(GradientStop::new(at(f), skia_color(c, alpha)));
+    }
+    out
+}
+
 /// Normalize stop fractions to 0..1, returning the stops and the start and
 /// end fractions they now map to
 fn normalized(stops: &[ColorStop], fr: &[f32], alpha: f32) -> (Vec<GradientStop>, f32, f32) {
     let (lo, hi) = (fr.first().copied().unwrap_or(0.0).min(0.0), fr.last().copied().unwrap_or(1.0).max(1.0));
     let span = (hi - lo).max(1e-6);
-    let gs = stops.iter().zip(fr).map(|(s, &f)| GradientStop::new((f - lo) / span, skia_color(s.color, alpha))).collect();
-    (gs, lo, hi)
+    (gradient_stops(stops, fr, |f| (f - lo) / span, alpha), lo, hi)
 }
 
 fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'static>> {
@@ -1610,7 +1789,7 @@ fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'stat
                 if b - a <= 1e-3 {
                     return None;
                 }
-                let gs = stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new((f - a) / (b - a), skia_color(s.color, alpha))).collect();
+                let gs = gradient_stops(stops, &fr, |f| (f - a) / (b - a), alpha);
                 let p = |t: f32| Point::from_xy(cx + vx * len * (t - 0.5), cy + vy * len * (t - 0.5));
                 return LinearGradient::new(p(a), p(b), gs, SpreadMode::Repeat, Transform::identity());
             }
@@ -1648,16 +1827,77 @@ fn gradient_shader(image: &Image, tile: Rect, alpha: f32) -> Option<Shader<'stat
                 if b - a <= 1e-3 {
                     return None;
                 }
-                (stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new(f / b, skia_color(s.color, alpha))).collect(), SpreadMode::Repeat, rx * b)
+                (gradient_stops(stops, &fr, |f| f / b, alpha), SpreadMode::Repeat, rx * b)
             } else {
                 let hi = fr.last().copied().unwrap_or(1.0).max(1.0);
-                (stops.iter().zip(&fr).map(|(s, &f)| GradientStop::new(f.max(0.0) / hi, skia_color(s.color, alpha))).collect(), SpreadMode::Pad, rx * hi)
+                (gradient_stops(stops, &fr, |f| f.max(0.0) / hi, alpha), SpreadMode::Pad, rx * hi)
             };
             let transform = Transform::from_translate(tile.x + cx, tile.y + cy).pre_scale(1.0, ry / rx);
             RadialGradient::new(Point::zero(), Point::zero(), radius, gs, mode, transform)
         }
-        Image::None | Image::Url(_) => None,
+        Image::None | Image::Url(_) | Image::Conic { .. } => None,
     }
+}
+
+/// Tiles larger than this are not drawn with conic gradients
+const MAX_CONIC_TILE: f32 = 8192.0;
+
+/// A conic gradient over `tile`, colored pixel by pixel (tiny-skia has no
+/// sweep shader): each pixel takes the color at its angle around the
+/// center, clockwise from `from`, interpolated in premultiplied alpha
+fn conic_pixmap(image: &Image, tile: Rect, alpha: f32) -> Option<tiny_skia::Pixmap> {
+    let Image::Conic { from, center, stops, repeating } = image else { return None };
+    if tile.w > MAX_CONIC_TILE || tile.h > MAX_CONIC_TILE {
+        return None;
+    }
+    let (x0, y0) = (tile.x.floor(), tile.y.floor());
+    let (w, h) = ((tile.x + tile.w).ceil() - x0, (tile.y + tile.h).ceil() - y0);
+    let mut pm = tiny_skia::Pixmap::new(w as u32, h as u32)?;
+    let (cx, cy) = (tile.x - x0 + center.0.resolve(tile.w), tile.y - y0 + center.1.resolve(tile.h));
+    let fr = stop_fractions(stops, 1.0);
+    let premul: Vec<[f32; 4]> = stops
+        .iter()
+        .map(|s| {
+            let a = s.color.a as f32 / 255.0 * alpha;
+            [s.color.r as f32 * a, s.color.g as f32 * a, s.color.b as f32 * a, a * 255.0]
+        })
+        .collect();
+    let (first, last) = (fr.first().copied()?, fr.last().copied()?);
+    let period = last - first;
+    if *repeating && period <= 1e-4 {
+        return None;
+    }
+    let sample = |t: f32| -> [f32; 4] {
+        if t <= fr[0] {
+            return premul[0];
+        }
+        for i in 1..fr.len() {
+            if t <= fr[i] {
+                let span = fr[i] - fr[i - 1];
+                if span <= 1e-6 {
+                    return premul[i];
+                }
+                let u = (t - fr[i - 1]) / span;
+                let (a, b) = (premul[i - 1], premul[i]);
+                return [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * u);
+            }
+        }
+        premul[premul.len() - 1]
+    };
+    let width = w as usize;
+    for (i, px) in pm.pixels_mut().iter_mut().enumerate() {
+        let (dx, dy) = ((i % width) as f32 + 0.5 - cx, (i / width) as f32 + 0.5 - cy);
+        // Clockwise from up, as a fraction of a turn past `from`
+        let turn = (dx.atan2(-dy).to_degrees() - from).rem_euclid(360.0) / 360.0;
+        let t = if *repeating { first + (turn - first).rem_euclid(period) } else { turn };
+        let c = sample(t);
+        let a = c[3].round().clamp(0.0, 255.0) as u8;
+        let ch = |v: f32| (v.round().clamp(0.0, 255.0) as u8).min(a);
+        if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(ch(c[0]), ch(c[1]), ch(c[2]), a) {
+            *px = p;
+        }
+    }
+    Some(pm)
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ pub mod table;
 
 pub use block::LayoutCtx;
 pub use box_tree::{build_box_tree, BoxKind, ImageHandle, LayoutBox, Styler};
-pub use fonts::{FontContext, FontMetrics, Glyph, ResolvedFont, ShapedWord};
+pub use fonts::{FontContext, FontMetrics, FontUnits, Glyph, ResolvedFont, ShapedWord};
 pub use fragment::{BoxFragment, BoxFragmentKind, Fragment, FragmentTree, Rect, ReplacedPaint, TextFragment};
 
 use fos_dom::{DomTree, NodeId};
@@ -37,8 +37,11 @@ pub fn layout_document<S: Styler>(tree: &DomTree, root: NodeId, styler: &mut S, 
     ctx.quirks = quirks;
     let (mut frag, bottom) = block::layout_root(&mut ctx, &boxes);
     position::place_absolutes(&mut ctx, &mut frag, &boxes);
-    let document_height = bottom.max(frag.ink.bottom()).max(viewport.1);
-    let document_width = frag.ink.right().max(viewport.0);
+    // The page scrolls over its scrollable overflow, not its ink (box
+    // shadows and outlines do not lengthen it)
+    let overflow = frag.scrollable_overflow();
+    let document_height = bottom.max(overflow.bottom()).max(viewport.1);
+    let document_width = overflow.right().max(viewport.0);
     FragmentTree { root: Some(frag), document_height, document_width, viewport_height: viewport.1 }
 }
 

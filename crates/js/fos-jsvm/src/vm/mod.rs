@@ -183,6 +183,17 @@ pub struct Vm {
     pub(crate) proto_epoch: u32,
     pub(crate) temp_roots: Vec<Value>,
     native_depth: u32,
+    /// How long one task (a script, a callback the embedder makes, and
+    /// the microtasks after it) may run before it is stopped; `None`:
+    /// forever
+    pub script_time_limit: Option<std::time::Duration>,
+    /// When the running task must stop
+    deadline: Option<std::time::Instant>,
+    /// Safepoints passed (the clock is read every 4096)
+    ticks: u32,
+    /// The task ran out of time: its error unwinds past every catch and
+    /// finally to the embedder
+    pub(crate) terminating: bool,
     pub(crate) symbol_registry: FxHashMap<Atom, Gc<Symbol>>,
     pub(crate) weak_maps: std::cell::RefCell<Vec<Gc<JsObject>>>,
     /// Live WeakRefs and FinalizationRegistries (pruned at each collection)
@@ -339,6 +350,10 @@ impl Vm {
             proto_epoch: 0,
             temp_roots: Vec::with_capacity(64),
             native_depth: 0,
+            script_time_limit: None,
+            deadline: None,
+            ticks: 0,
+            terminating: false,
             symbol_registry: FxHashMap::default(),
             weak_maps: Default::default(),
             weak_refs: Default::default(),
@@ -385,6 +400,9 @@ impl Vm {
     /// Run a compiled script with `this` = the global object
     pub fn run_script(&mut self, proto: Rc<FunctionProto>) -> JsResult<Value> {
         let top = self.frames.is_empty();
+        if top {
+            self.begin_task();
+        }
         let mark = self.temp_roots.len();
         let func = self.new_closure(proto, Box::new([]));
         let r = self.call(Value::object(func), Value::object(self.global), &[]);
@@ -394,6 +412,7 @@ impl Vm {
             // The result stays valid until the VM next runs code (only
             // running code collects garbage).
             self.temp_roots.truncate(mark);
+            self.end_task();
         }
         r
     }
@@ -403,13 +422,50 @@ impl Vm {
     /// is on the stack. The result stays valid until the VM next runs code.
     pub fn call_from_host(&mut self, f: Value, this: Value, args: &[Value]) -> JsResult<Value> {
         let top = self.frames.is_empty();
+        if top {
+            self.begin_task();
+        }
         let mark = self.temp_roots.len();
         let r = self.call(f, this, args);
         if top {
             self.run_jobs();
             self.temp_roots.truncate(mark);
+            self.end_task();
         }
         r
+    }
+
+    /// A task starts: its time runs from now
+    fn begin_task(&mut self) {
+        self.terminating = false;
+        self.deadline = self.script_time_limit.map(|l| std::time::Instant::now() + l);
+    }
+
+    fn end_task(&mut self) {
+        self.deadline = None;
+        self.terminating = false;
+    }
+
+    /// Whether the running task must stop now (checked at safepoints: the
+    /// clock is read every 4096 of them)
+    #[inline]
+    pub(crate) fn out_of_time(&mut self) -> bool {
+        if self.terminating {
+            return true;
+        }
+        let Some(deadline) = self.deadline else { return false };
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks & 0xfff != 0 || std::time::Instant::now() < deadline {
+            return false;
+        }
+        self.terminating = true;
+        true
+    }
+
+    /// The error that stops a task that ran out of time
+    pub(crate) fn timeout_error(&mut self) -> Value {
+        let secs = self.script_time_limit.map_or(0.0, |l| l.as_secs_f64());
+        self.make_error(ErrorKind::Error, &format!("Script stopped: it ran for over {secs} s"))
     }
 
     /// The embedder state, if it is a `T`
@@ -424,7 +480,8 @@ impl Vm {
 
     /// Run queued microtasks (promise reactions) until the queue is empty
     pub fn run_jobs(&mut self) {
-        while let Some(job) = self.jobs.pop_front() {
+        // (a task out of time leaves its microtasks for the next one)
+        while let Some(job) = (!self.terminating).then(|| self.jobs.pop_front()).flatten() {
             let mark = self.temp_roots.len();
             // The job's values are no longer reachable from the queue
             match &job {

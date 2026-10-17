@@ -82,9 +82,9 @@ fn column_kinds(g: &Grid) -> Vec<ColumnKind> {
         }
         if let LpAuto::Lp(l) = cell.b.style.box_.width {
             kinds[c] = match (kinds[c], l.has_percent()) {
-                (ColumnKind::Percent(p), true) => ColumnKind::Percent(p.max(l.pct)),
+                (ColumnKind::Percent(p), true) => ColumnKind::Percent(p.max(l.percent())),
                 (ColumnKind::Percent(p), false) => ColumnKind::Percent(p),
-                (_, true) => ColumnKind::Percent(l.pct),
+                (_, true) => ColumnKind::Percent(l.percent()),
                 (_, false) => ColumnKind::Fixed,
             };
         }
@@ -236,10 +236,12 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
 
     let mut frags = Vec::new();
     let mut y = 0.0f32;
-    // Captions above the grid (caption-side: bottom ones below it)
+    // Captions above the grid (caption-side: bottom ones below it); each
+    // establishes a block formatting context (CSS 2.1 §9.4.1)
+    let caption = Forced { root: true, ..Forced::default() };
     let bottom = |c: &&LayoutBox| c.style.inherited.caption_side == fos_css::style::CaptionSide::Bottom;
     for c in t.captions.iter().filter(|c| !bottom(c)) {
-        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
+        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, caption);
         let top = laid.mt.size();
         laid.frag.translate(0.0, y + top);
         y += top + laid.frag.border_box.h + laid.mb.size();
@@ -303,6 +305,8 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
             marker: None,
             replaced: None,
             scroll_extent: None,
+            line_baselines: None,
+            static_align: None,
         })
         .collect();
     for (r, c, rs, mut f, content) in laid_cells {
@@ -318,6 +322,10 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
         if shift > 0.0 {
             for ch in &mut f.children {
                 ch.translate(0.0, shift);
+            }
+            if let Some((first, last)) = &mut f.line_baselines {
+                *first += shift;
+                *last += shift;
             }
         }
         f.border_box.h = f.border_box.h.max(h);
@@ -336,7 +344,7 @@ pub fn layout_table(ctx: &mut LayoutCtx, style: &Style, t: &TableBox, width: f32
     }
     let mut y = grid_bottom;
     for c in t.captions.iter().filter(bottom) {
-        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, Forced::default());
+        let mut laid = layout_sized(ctx, c, used_width, None, Sizing::Stretch, false, caption);
         let top = laid.mt.size();
         laid.frag.translate(0.0, y + top);
         y += top + laid.frag.border_box.h + laid.mb.size();

@@ -176,6 +176,8 @@ pub struct PageStyles {
     has_host: bool,
     has_slotted: bool,
     has_part: bool,
+    /// Custom properties the sheet's `@property` rules register
+    pub registered: Option<std::sync::Arc<fos_css::PropertyRegistry>>,
 }
 
 /// Rules of other trees that reach an element: the `:host` rules of the
@@ -204,6 +206,7 @@ impl PageStyles {
             has_host: false,
             has_slotted: false,
             has_part: false,
+            registered: None,
         };
         let mut skipped = 0;
         for (rule_index, rule) in stylesheet.rules.iter_mut().enumerate() {
@@ -350,7 +353,7 @@ fn presentational_hints(tree: &DomTree, node: NodeId, element: &ElementData) -> 
     let relevant = matches!(
         tag,
         "body" | "table" | "tr" | "td" | "th" | "font" | "img" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "caption" | "canvas" | "video"
-            | "iframe" | "embed" | "object" | "col" | "hr" | "thead" | "tbody" | "tfoot" | "input" | "textarea" | "select" | "legend"
+            | "iframe" | "embed" | "object" | "col" | "hr" | "thead" | "tbody" | "tfoot" | "input" | "textarea" | "select" | "legend" | "svg"
     );
     // A cell takes its table's cellpadding and border attributes
     let cell_hints = if matches!(tag, "td" | "th") { table_cell_hints(tree, node) } else { String::new() };
@@ -392,6 +395,18 @@ fn presentational_hints(tree: &DomTree, node: NodeId, element: &ElementData) -> 
             ("height", "img" | "canvas" | "video" | "iframe" | "embed" | "object" | "table" | "td" | "th" | "tr") => {
                 if let Some(d) = dimension(value) {
                     css += &format!("height: {d};");
+                }
+            }
+            // An outer <svg>'s size attributes are presentation attributes
+            // (SVG 2 §8.2): lengths of any unit, so width="30%" is a share
+            // of the containing block, not of the SVG's own viewport
+            ("width" | "height", "svg") => {
+                let name = tree.resolve(a.name.local);
+                match value.parse::<f32>() {
+                    Ok(n) if n >= 0.0 => css += &format!("{name}: {n}px;"),
+                    Ok(_) => {}
+                    Err(_) if value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'%') => css += &format!("{name}: {value};"),
+                    Err(_) => {}
                 }
             }
             ("align", "table") => match value.to_ascii_lowercase().as_str() {

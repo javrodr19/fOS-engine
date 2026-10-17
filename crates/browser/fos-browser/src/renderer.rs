@@ -199,8 +199,9 @@ impl PageLayout {
             shadow_sheets: &self.styling.shadow,
             ancestors: AncestorFilter::default(),
             resolved: Default::default(),
-            ctx: self.styling.ctx,
+            ctx: self.styling.ctx.clone(),
             root_styled: true,
+            viewport_overflow: None,
             quirks: self.styling.quirks,
             images: &images,
             base: String::new(),
@@ -260,13 +261,14 @@ impl PageLayout {
                 _ => chain.iter().find_map(|a| index.get(a)).map_or(Rect::new(0.0, 0.0, self.styling.ctx.viewport.0, self.styling.ctx.viewport.1), content),
             };
             let bx = &style.box_;
+            // An inline box's auto margins are 0
             let mut margin = [0.0f32; 4];
-            if !b.inline {
-                for (k, m) in bx.margin.iter().enumerate() {
-                    if let fos_css::style::LpAuto::Lp(l) = m {
-                        margin[k] = l.resolve(cb.w);
-                    }
+            for (k, m) in bx.margin.iter().enumerate() {
+                if let fos_css::style::LpAuto::Lp(l) = m {
+                    margin[k] = l.resolve(cb.w);
                 }
+            }
+            if !b.inline {
                 // Auto side margins take the rest of the line
                 let auto = |k: usize| bx.margin[k] == fos_css::style::LpAuto::Auto;
                 if position == Position::Static || position == Position::Relative {
@@ -538,7 +540,11 @@ impl Layouter {
             return None;
         }
         let media = fos_css::MediaContext { width: self.viewport_width as f32, height: self.viewport_height as f32 };
-        let styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        let mut styles = PageStyles::new(fos_css::parse_stylesheet_for(css_text, media));
+        let registered = fos_css::registered_properties(css_text, &media);
+        if !registered.is_empty() {
+            styles.registered = Some(Arc::new(fos_css::PropertyRegistry::new(registered)));
+        }
         log::debug!("Parsed {} CSS rules from page, buckets (id, class, tag+attr, universal) {:?}", styles.rule_count(), styles.bucket_sizes());
         Some(styles)
     }
@@ -827,7 +833,7 @@ impl PageRenderer {
         for (node, (w, h), pixmap) in updates {
             match pixmap {
                 Some(pixmap) => {
-                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None }));
+                    self.canvases.insert(node, Arc::new(crate::image_loader::LoadedImage { natural: (w as f32, h as f32), pixmap, svg_source: None, svg_fit: None, ratio_only: false }));
                 }
                 None => {
                     self.canvases.remove(&node);
@@ -1006,6 +1012,15 @@ fn links_in(layout: &PageLayout, origin: f32, height: f32) -> Vec<LinkRegion> {
         .collect()
 }
 
+/// Which element's `overflow` the viewport has yet to take
+#[derive(Clone, Copy)]
+enum ViewportOverflow {
+    /// The root element's
+    Root(NodeId),
+    /// The body child of this root, the root's overflow being visible
+    Body(NodeId),
+}
+
 /// Computes element styles while the box tree is built: the UA's
 /// defaults, the page's matching rules, presentational hints and `style`
 /// attributes. Styles live only as long as layout needs them.
@@ -1020,6 +1035,10 @@ struct BrowserStyler<'a> {
     /// What lengths are computed against (the root's font size once known)
     ctx: StyleContext,
     root_styled: bool,
+    /// Whose `overflow` the viewport takes: the root's, or body's when the
+    /// root's is visible. That box itself then does not clip. `None` once
+    /// decided, or when styles are computed rather than laid out.
+    viewport_overflow: Option<ViewportOverflow>,
     /// The document is in quirks mode
     quirks: bool,
     /// Loaded images, and the URL their sources resolve against
@@ -1027,6 +1046,33 @@ struct BrowserStyler<'a> {
     base: String,
     /// Rasterized inline SVGs
     svgs: &'a mut crate::image_loader::SvgCache,
+}
+
+impl BrowserStyler<'_> {
+    /// The viewport takes the root's `overflow`, or body's when the root's
+    /// is visible (CSS Overflow 3 §3.3): that element does not clip
+    fn propagate_overflow(&mut self, tree: &DomTree, node: NodeId, tag: &str, style: &mut Style) {
+        use fos_css::style::Overflow;
+        let to_viewport = |style: &mut Style| {
+            let b = Arc::make_mut(&mut style.box_);
+            (b.overflow_x, b.overflow_y) = (Overflow::Visible, Overflow::Visible);
+        };
+        match self.viewport_overflow {
+            Some(ViewportOverflow::Root(root)) if root == node => {
+                self.viewport_overflow = if style.clips() {
+                    to_viewport(style);
+                    None
+                } else {
+                    Some(ViewportOverflow::Body(root))
+                };
+            }
+            Some(ViewportOverflow::Body(root)) if tree.get(node).is_some_and(|n| n.parent == root) && tag == "body" => {
+                self.viewport_overflow = None;
+                to_viewport(style);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl layout_engine::Styler for BrowserStyler<'_> {
@@ -1070,6 +1116,9 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             self.root_styled = true;
             self.ctx.root_font_size = style.font_size();
         }
+        if self.viewport_overflow.is_some() {
+            self.propagate_overflow(tree, node, tree.resolve(element.name.local), &mut style);
+        }
         style
     }
 
@@ -1078,9 +1127,11 @@ impl layout_engine::Styler for BrowserStyler<'_> {
             return None;
         }
         let tag = tree.get(node).and_then(|n| n.as_element()).map(|e| tree.resolve(e.name.local))?;
-        let src = if tag == "img" { crate::image_loader::image_source(tree, node, self.ctx.viewport.0)? } else { tree.get_attribute(node, "src")?.to_string() };
+        let (src, density) = if tag == "img" { crate::image_loader::image_source_density(tree, node, self.ctx.viewport.0)? } else { (tree.get_attribute(node, "src")?.to_string(), 1.0) };
         let img = self.images.get(&fos_net::url_util::resolve(&self.base, &src))?;
-        Some((img.natural, layout_engine::ImageHandle(img.clone())))
+        // A srcset candidate's pixels over its density
+        let natural = (img.natural.0 / density, img.natural.1 / density);
+        Some((natural, layout_engine::ImageHandle(img.clone())))
     }
 
     fn content_image(&mut self, url: &str) -> Option<((f32, f32), layout_engine::ImageHandle)> {
@@ -1088,14 +1139,19 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         Some((img.natural, layout_engine::ImageHandle(img.clone())))
     }
 
+    fn ratio_only(&self, image: &layout_engine::ImageHandle) -> bool {
+        image.0.downcast_ref::<crate::image_loader::LoadedImage>().is_some_and(|i| i.ratio_only)
+    }
+
     fn inline_svg(&mut self, tree: &DomTree, node: NodeId, style: &Style) -> Option<((f32, f32), layout_engine::ImageHandle)> {
         let c = style.color();
         // CSS fill and stroke beat presentation attributes: they go into
         // the elements' style attributes
-        let mut paint = std::collections::HashMap::new();
+        let mut paint = crate::image_loader::SvgStyles::default();
         if let Some(d) = svg_paint_decl(style) {
-            paint.insert(node, d);
+            paint.paint.insert(node, d);
         }
+        svg_attr_vars(tree, node, style, &mut paint.attrs);
         if self.stylesheet.is_some() {
             let mut budget = 2000;
             self.svg_paint(tree, node, style, &mut paint, &mut budget);
@@ -1122,6 +1178,25 @@ impl layout_engine::Styler for BrowserStyler<'_> {
         if self.stylesheet.is_some() {
             self.ancestors.pop();
         }
+    }
+}
+
+/// An SVG element's presentation attributes that use `var()`, with the
+/// element's custom properties substituted (as browsers parse them: as
+/// CSS values; Stripe colors its sign-in button so)
+fn svg_attr_vars(tree: &DomTree, node: NodeId, style: &Style, out: &mut HashMap<NodeId, Vec<(String, Option<String>)>>) {
+    let Some(e) = tree.get(node).and_then(|n| n.as_element()) else { return };
+    let subs: Vec<(String, Option<String>)> = e
+        .attrs
+        .iter()
+        .filter(|a| a.value.contains("var(") && tree.resolve(a.name.local) != "style")
+        .map(|a| {
+            let source = style.custom.as_deref().map(|c| c as &dyn fos_css::VarSource);
+            (tree.resolve(a.name.local).to_string(), fos_css::substitute_vars(&a.value, source).map(|v| v.trim().to_string()))
+        })
+        .collect();
+    if !subs.is_empty() {
+        out.insert(node, subs);
     }
 }
 
@@ -1172,7 +1247,7 @@ impl<'a> BrowserStyler<'a> {
 
     /// Styles of the elements of an inline SVG: those with fill or stroke
     /// declared (at most `budget` elements are styled)
-    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut std::collections::HashMap<NodeId, String>, budget: &mut u32) {
+    fn svg_paint(&mut self, tree: &DomTree, node: NodeId, style: &Style, out: &mut crate::image_loader::SvgStyles, budget: &mut u32) {
         use layout_engine::Styler;
         self.enter(tree, node);
         let kids: Vec<NodeId> = tree.children(node).filter(|(_, n)| n.is_element()).map(|(id, _)| id).collect();
@@ -1183,8 +1258,9 @@ impl<'a> BrowserStyler<'a> {
             *budget -= 1;
             let cs = self.style(tree, child, style);
             if let Some(d) = svg_paint_decl(&cs) {
-                out.insert(child, d);
+                out.paint.insert(child, d);
             }
+            svg_attr_vars(tree, child, &cs, &mut out.attrs);
             self.svg_paint(tree, child, &cs, out, budget);
         }
         self.leave();
@@ -1200,8 +1276,14 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
         shadow_sheets,
         ancestors: AncestorFilter::default(),
         resolved: Default::default(),
-        ctx: StyleContext { root_font_size: 16.0, viewport },
+        ctx: StyleContext {
+            root_font_size: 16.0,
+            viewport,
+            registered: stylesheet.as_ref().and_then(|s| s.registered.clone()),
+            font_units: Some(fos_css::style::FontUnitsHook(Arc::new(layout_engine::FontUnits::new(fonts.database().clone())))),
+        },
         root_styled: false,
+        viewport_overflow: Some(ViewportOverflow::Root(root)),
         quirks: document.is_quirks(),
         images,
         base: if images.is_empty() { String::new() } else { crate::css_loader::base_url(document) },
@@ -1212,7 +1294,7 @@ fn build_layout(document: &Document, stylesheet: Option<Arc<PageStyles>>, shadow
     } else {
         FragmentTree { root: None, document_height: viewport.1, document_width: viewport.0, viewport_height: viewport.1 }
     };
-    let ctx = styler.ctx;
+    let ctx = styler.ctx.clone();
     drop(styler);
 
     // Links and anchors
@@ -1452,6 +1534,47 @@ mod tests {
     }
 
     #[test]
+    fn test_form_controls_are_sized_as_chromium_sizes_them() {
+        let html = r#"<html><body style="margin: 0">
+            <input id=a><input id=b size=10><input id=e><br>
+            <select id=s><option>one</option><option>a longer option</option></select>
+            <select id=n style="appearance: none"><option>one</option><option>a longer option</option></select>
+            <select id=l multiple><option>one</option></select><br>
+            <input type=submit id=sub><input type=button id=btn><textarea id=t></textarea><textarea id=th style="overflow: hidden"></textarea>
+            <progress id=p></progress><meter id=m></meter><input type=range id=r style="width: 200px"></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 1000.0);
+        let boxes = layout.boxes();
+        let rect = |id: &str| {
+            let node = document.get_element_by_id(id).unwrap();
+            boxes.iter().find(|(n, _)| *n == node).map(|b| b.1).unwrap()
+        };
+        // Text fields: `size` whole average characters, 2px borders and
+        // 1px/2px padding around one line, empty or not on one baseline
+        let (a, b) = (rect("a"), rect("b"));
+        let per_char = (a.w - b.w) / 10.0;
+        assert!(per_char >= 5.0 && per_char.fract() == 0.0, "{a:?} {b:?}");
+        assert_eq!((a.y, a.h), (rect("e").y, rect("e").h));
+        // Drop-downs: the widest option, 4px before it and 16px for the
+        // arrow, in a 1px border (without them when not drawn natively)
+        let (s, n) = (rect("s"), rect("n"));
+        assert_eq!(s.w - n.w, 20.0, "{s:?} {n:?}");
+        assert!(s.w.fract() == 0.0 && s.w > 60.0);
+        assert_eq!(s.h - n.h, 2.0);
+        // A list box shows 4 rows
+        let l = rect("l");
+        assert!((l.h - 2.0 - 4.0 * (n.h - 2.0 + 2.0)).abs() < 0.01, "{l:?} {n:?}");
+        // Button inputs show their (default) label, or none
+        assert!(rect("sub").w > 30.0 && rect("btn").w == 16.0 && rect("btn").h == rect("sub").h);
+        // A textarea leaves room for a scrollbar unless it cannot scroll
+        assert_eq!(rect("t").w - rect("th").w, 15.0);
+        // Progress bars, meters and sliders take the size of their font
+        // and the UA sheet; a slider has no ratio to keep
+        assert_eq!((rect("p").w, rect("p").h, rect("m").w), (160.0, 16.0, 80.0));
+        assert_eq!((rect("r").w, rect("r").h), (200.0, 16.0));
+    }
+
+    #[test]
     fn test_layout_boxes_follow_the_document() {
         let document = fos_html::parse_with_url(PAGE, "https://example.com/");
         let layout = layout_of(&document, 320.0);
@@ -1495,6 +1618,186 @@ mod tests {
             assert!(red(x0 + 20, 30), "shape {i} center");
             assert!(!red(x0 + 2, 2) && !red(x0 + 37, 2), "shape {i} corners");
         }
+    }
+
+    #[test]
+    fn test_positioned_boxes_escape_clips_below_their_containing_block() {
+        // Body's overflow belongs to the viewport (the root's is visible),
+        // so the short body clips nothing; a fixed box escapes a clipping
+        // ancestor, as does an absolutely positioned box whose containing
+        // block is outside the clipping box, but not one inside it
+        let html = r#"<html><body style="margin: 0; height: 10px; overflow-x: hidden">
+            <div style="position: fixed; left: 0; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            <div style="overflow: hidden; height: 10px">
+              <div style="position: fixed; left: 10px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+              <div style="position: absolute; left: 20px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            </div>
+            <div style="position: relative; overflow: hidden; height: 10px">
+              <div style="position: absolute; left: 30px; top: 0; width: 10px; height: 100px; background: #f00"></div>
+            </div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(50, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 50 + x] == 0xffff0000;
+        assert!(red(5, 80), "fixed box under body");
+        assert!(red(15, 80), "fixed box in a clipping box");
+        assert!(red(25, 80), "absolute box in a clipping box below its containing block");
+        assert!(red(35, 15) && !red(35, 30), "absolute box clipped by its containing block");
+    }
+
+    #[test]
+    fn test_svgs_keep_their_shape_in_other_boxes() {
+        // A tall icon in a square box is drawn narrower, centered
+        let html = r##"<html><body style="margin: 0">
+            <svg viewBox="0 0 10 20" style="display: block; width: 40px; height: 40px; fill: #f00"><rect width="10" height="20"/></svg>
+            </body></html>"##;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let red = |x: usize, y: usize| page.pixels[y * 40 + x] == 0xffff0000;
+        assert!(red(20, 20) && red(11, 2) && red(28, 37));
+        assert!(!red(5, 20) && !red(35, 20));
+    }
+
+    #[test]
+    fn test_gradients_fade_to_transparent_without_darkening() {
+        // Halfway from rgb(200, 200, 200) to transparent over white: 50%
+        // of that gray (about 228), not 50% of a gray darkened toward black
+        let html = r#"<html><body style="margin: 0; background: white"><div style="height: 100px; background: linear-gradient(rgb(200, 200, 200), transparent)"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(10, 100);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let green = (page.pixels[50 * 10 + 5] >> 8) & 0xff;
+        assert!((225..=231).contains(&green), "{green}");
+    }
+
+    #[test]
+    fn test_conic_gradients_sweep_clockwise_from_up() {
+        // A quarter turn per color, from up; then the same turned a
+        // quarter by `from`
+        let html = r#"<html><body style="margin: 0"><div style="width: 100px; height: 100px; background: conic-gradient(red 0deg 90deg, blue 90deg 180deg, lime 180deg 270deg, black 270deg)"></div><div style="width: 100px; height: 100px; background: conic-gradient(from 90deg, red 0 25%, blue 0)"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(100, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 100 + x];
+        assert_eq!([at(75, 25), at(75, 75), at(25, 75), at(25, 25)], [0xffff0000, 0xff0000ff, 0xff00ff00, 0xff000000]);
+        assert_eq!([at(75, 175), at(25, 175), at(25, 125), at(75, 125)], [0xffff0000, 0xff0000ff, 0xff0000ff, 0xff0000ff]);
+    }
+
+    #[test]
+    fn test_registered_custom_properties_have_initial_values() {
+        // Tailwind 4's borders: border-style comes from a property @property
+        // registers (solid at first)
+        let html = r#"<html><head><style>@property --tw-border-style { syntax: "*"; inherits: false; initial-value: solid } .b { border-width: 4px; border-style: var(--tw-border-style); border-color: #f00; width: 20px; height: 20px }</style></head><body style="margin: 0"><div class="b"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[2 * 40 + 10], 0xffff0000);
+    }
+
+    #[test]
+    fn test_ch_and_ex_come_from_the_font() {
+        // ch is the advance of "0" and ex the x-height of the element's
+        // font (CSS Values 4 §6.1.1), in lengths, calc() and font-size;
+        // they were half an em: vercel.com's max-w-[18ch] headings wrapped
+        // too early
+        let html = r#"<html><body style="margin: 0">
+            <div style="font: 16px sans-serif"><div id="a" style="width: 10ch">x</div><div>0000000000</div><div id="x" style="width: 10ex">x</div></div>
+            <div style="font: bold 20px monospace"><div id="b" style="width: calc(5ch * 2)">x</div><div>00000</div></div>
+            <div style="font: 10px monospace"><div style="font-size: 2ch">0</div></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let layout = layout_of(&document, 640.0);
+        let width = |id: &str| layout.fragment_of(document.get_element_by_id(id).unwrap()).unwrap().border_box.w;
+        let text_width = |text: &str| texts(&document, &layout, text)[0].rect.w;
+        assert!((width("a") - text_width("0000000000")).abs() < 0.01, "{} {}", width("a"), text_width("0000000000"));
+        assert_ne!(width("a"), 80.0);
+        assert!((width("b") - 2.0 * text_width("00000")).abs() < 0.01, "{} {}", width("b"), text_width("00000"));
+        // 2ch of the parent's font
+        let size = texts(&document, &layout, "0")[0].font.size;
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = Arc::from([Arc::from("monospace")]);
+        i.font_size = 10.0;
+        let mut fonts = FontContext::default();
+        let mono = fonts.resolve(&style);
+        assert!((size - 2.0 * fonts.shape(&mono, "0").width).abs() < 0.01, "{size}");
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = Arc::from([Arc::from("sans-serif")]);
+        i.font_size = 16.0;
+        let x_height = fonts.resolve(&style).x_height();
+        assert!((width("x") - 10.0 * x_height).abs() < 0.01, "{} {}", width("x"), x_height);
+    }
+
+    #[test]
+    fn test_paint_containment_clips() {
+        // Paint containment clips to the padding box, positioned
+        // descendants included (it is their containing block)
+        let html = r#"<html><body style="margin: 0; background: #fff">
+            <div style="contain: paint; width: 20px; height: 20px"><div style="width: 40px; height: 10px; background: #f00"></div>
+            <div style="position: absolute; left: 0; top: 10px; width: 40px; height: 10px; background: #00f"></div></div>
+            </body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(60, 30);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 60 + x];
+        assert_eq!((px(10, 5), px(10, 15)), (0xffff0000, 0xff0000ff));
+        assert_eq!((px(30, 5), px(30, 15)), (0xffffffff, 0xffffffff));
+    }
+
+    #[test]
+    fn test_closed_popovers_take_no_room() {
+        // vercel.com's header keeps its menus as closed popovers
+        let html = r#"<html><body style="margin: 0"><div style="display: flex"><div popover style="width: 300px; position: static">menu</div><div id="next" style="width: 10px; height: 10px; background: #f00"></div></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(40, 20);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        assert_eq!(page.pixels[5 * 40 + 5], 0xffff0000);
+    }
+
+    #[test]
+    fn test_fully_rounded_boxes_are_pills() {
+        // A huge radius on a wide box rounds its ends into half circles
+        // (radius 20, half its height): its top edge is straight from x = 20
+        // on, where half ellipses would still be curving away from it
+        let html = r#"<html><body style="margin: 0; background: white"><div style="width: 200px; height: 40px; border-radius: 9999px; background: #00f"></div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 40);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        assert_eq!(at(30, 1), 0xff0000ff);
+        assert_eq!(at(1, 1), 0xffffffff);
+        assert_eq!(at(1, 20), 0xff0000ff);
+    }
+
+    #[test]
+    fn test_unstyled_controls_are_drawn_natively() {
+        // The UA's 2px inset border is drawn as Chromium draws text fields:
+        // 1px of gray inside rounded corners; an author's border is drawn
+        // as is
+        let html = r#"<html><body style="margin: 0"><input style="display: block"><input style="display: block; border: 2px solid #f00"></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 60);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 200 + x];
+        assert_eq!(at(20, 0), 0xff767676);
+        assert_eq!(at(20, 1), 0xffffffff);
+        assert_ne!(at(0, 0), 0xff767676, "rounded corner");
+        assert_eq!((at(20, 21), at(20, 22)), (0xffff0000, 0xffff0000));
+    }
+
+    #[test]
+    fn test_svg_presentation_attributes_take_css_variables() {
+        // Presentation attributes are CSS values: var() in them is
+        // substituted (Stripe's sign-in button), with fallbacks; one
+        // that cannot be is left out (black, the initial fill)
+        let html = r#"<html><head><style>svg { --blue: #0000ff }</style></head><body style="margin: 0"><svg width="30" height="10" style="display: block"><rect width="10" height="10" fill="var(--blue)"/><rect x="10" width="10" height="10" fill="var(--none, #00ff00)"/><rect x="20" width="10" height="10" fill="var(--none)"/></svg></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(30, 10);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let at = |x: usize, y: usize| page.pixels[y * 30 + x];
+        assert_eq!([at(5, 5), at(15, 5), at(25, 5)], [0xff0000ff, 0xff00ff00, 0xff000000]);
     }
 
     #[test]
@@ -2006,6 +2309,25 @@ mod tests {
         let before = renderer.layouter.borrow().svgs.map.len();
         renderer.render_document(&document, 0.0).unwrap();
         assert_eq!(renderer.layouter.borrow().svgs.map.len(), before);
+    }
+
+    #[test]
+    fn test_svg_percentage_sizes_are_of_the_containing_block() {
+        // width="50%" is CSS width: 50% (a presentation attribute), not a
+        // share of the SVG's own viewBox: vercel.com's hero triangle
+        let html = r#"<html><body style="margin:0; color: #f00">
+            <div style="position: relative; width: 100px; height: 100px">
+            <svg style="position: absolute; left: 0; top: 0" width="50%" height="50%" viewBox="0 0 0.5 0.5"><circle cx="0.25" cy="0.25" r="0.25" fill="currentColor"/></svg>
+            </div></body></html>"#;
+        let document = fos_html::parse_with_url(html, "https://example.com/");
+        let mut renderer = PageRenderer::new(200, 200);
+        let page = renderer.render_document(&document, 0.0).unwrap();
+        let px = |x: usize, y: usize| page.pixels[y * 200 + x];
+        // A 50px circle, drawn sharp
+        assert_eq!(px(25, 25), 0xffff0000);
+        assert_eq!(px(45, 25), 0xffff0000);
+        assert_ne!(px(2, 2), 0xffff0000);
+        assert_ne!(px(60, 25), 0xffff0000);
     }
 
     #[test]

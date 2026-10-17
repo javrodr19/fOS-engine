@@ -35,6 +35,9 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "margin" => &[MarginTop, MarginRight, MarginBottom, MarginLeft],
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
+        "contain-intrinsic-size" => &[ContainIntrinsicWidth, ContainIntrinsicHeight],
+        "container" => &[ContainerType],
+        "text-box" => &[TextBoxTrim, TextBoxEdge],
         "margin-block" => &[MarginTop, MarginBottom],
         "inset-block" => &[Top, Bottom],
         "inset-inline" => &[Left, Right],
@@ -53,14 +56,24 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "border-right" => &[BorderRightWidth, BorderRightStyle, BorderRightColor],
         "border-bottom" => &[BorderBottomWidth, BorderBottomStyle, BorderBottomColor],
         "border-left" => &[BorderLeftWidth, BorderLeftStyle, BorderLeftColor],
+        // Logical pairs, in horizontal writing (start side first)
+        "border-inline" => &[BorderLeftWidth, BorderRightWidth, BorderLeftStyle, BorderRightStyle, BorderLeftColor, BorderRightColor],
+        "border-block" => &[BorderTopWidth, BorderBottomWidth, BorderTopStyle, BorderBottomStyle, BorderTopColor, BorderBottomColor],
+        "border-inline-width" => &[BorderLeftWidth, BorderRightWidth],
+        "border-block-width" => &[BorderTopWidth, BorderBottomWidth],
+        "border-inline-style" => &[BorderLeftStyle, BorderRightStyle],
+        "border-block-style" => &[BorderTopStyle, BorderBottomStyle],
+        "border-inline-color" => &[BorderLeftColor, BorderRightColor],
+        "border-block-color" => &[BorderTopColor, BorderBottomColor],
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "background" => &[BackgroundColor, BackgroundImage, BackgroundRepeat, BackgroundPosition, BackgroundSize],
         "mask" => &[MaskImage, MaskRepeat, MaskPosition, MaskSize],
         "animation" | "-webkit-animation" => &[AnimationName, AnimationFillMode, AnimationIterationCount, AnimationDirection],
-        "font" => &[FontStyle, FontWeight, FontSize, LineHeight, FontFamily],
+        "font" => &[FontStyle, FontWeight, FontStretch, FontSize, LineHeight, FontFamily],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
+        "columns" => &[ColumnWidth, ColumnCount],
         "grid-row" => &[GridRowStart, GridRowEnd],
         "grid-column" => &[GridColumnStart, GridColumnEnd],
         "grid-area" => &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
@@ -69,9 +82,9 @@ fn longhands_of(name: &str) -> Option<&'static [PropertyId]> {
         "overflow" => &[OverflowX, OverflowY],
         "text-decoration" => &[TextDecorationLine, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition],
-        "place-items" => &[AlignItems],
+        "place-items" => &[AlignItems, JustifyItems],
         "place-content" => &[AlignContent, JustifyContent],
-        "place-self" => &[AlignSelf],
+        "place-self" => &[AlignSelf, JustifySelf],
         _ => return None,
     })
 }
@@ -141,6 +154,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "float" => Float,
         "clear" => Clear,
         "box-sizing" => BoxSizing,
+        "appearance" | "-webkit-appearance" | "-moz-appearance" => Appearance,
         "width" => Width,
         "height" => Height,
         "min-width" => MinWidth,
@@ -176,7 +190,16 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "order" => Order,
         "row-gap" => RowGap,
         "column-gap" => ColumnGap,
+        "column-count" => ColumnCount,
+        "column-width" => ColumnWidth,
         "object-fit" => ObjectFit,
+        "contain" => Contain,
+        "container-type" => ContainerType,
+        "text-box-trim" => TextBoxTrim,
+        "text-box-edge" => TextBoxEdge,
+        "content-visibility" => ContentVisibility,
+        "contain-intrinsic-width" | "contain-intrinsic-inline-size" => ContainIntrinsicWidth,
+        "contain-intrinsic-height" | "contain-intrinsic-block-size" => ContainIntrinsicHeight,
         "text-overflow" => TextOverflow,
         "table-layout" => TableLayout,
         "text-decoration-line" => TextDecorationLine,
@@ -213,6 +236,7 @@ fn longhand_id(name: &str) -> Option<PropertyId> {
         "font-size" => FontSize,
         "font-weight" => FontWeight,
         "font-style" => FontStyle,
+        "font-stretch" | "font-width" => FontStretch,
         "line-height" => LineHeight,
         "text-align" => TextAlign,
         "text-indent" => TextIndent,
@@ -316,6 +340,53 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
+        // normal | <text-box-trim> || <text-box-edge>; an edge alone trims
+        // both ends
+        "text-box" => {
+            let parts: Vec<&str> = lower.split_whitespace().collect();
+            let (trim, edge) = if parts == ["normal"] {
+                (Some(PropertyValue::Integer(0)), Some(PropertyValue::Integer(0)))
+            } else {
+                let trims: Vec<&str> = parts.iter().copied().filter(|p| p.starts_with("trim-") || *p == "none").collect();
+                let edges: Vec<&str> = parts.iter().copied().filter(|p| !p.starts_with("trim-") && *p != "none").collect();
+                let trim = match trims.as_slice() {
+                    [] => text_box_trim("trim-both"),
+                    [t] => text_box_trim(t),
+                    _ => None,
+                };
+                let edge = if edges.is_empty() { text_box_edge("auto") } else { text_box_edge(&edges.join(" ")) };
+                (trim, edge)
+            };
+            if let (Some(t), Some(e)) = (trim, edge) {
+                push(out, PropertyId::TextBoxTrim, t, important);
+                push(out, PropertyId::TextBoxEdge, e, important);
+            }
+            true
+        }
+        // <name>+ [/ <type>]?: only the type has an effect here
+        "container" => {
+            let ty = lower.split_once('/').map_or("normal", |(_, t)| t.trim());
+            if let Some(v) = container_type(ty) {
+                push(out, PropertyId::ContainerType, v, important);
+            }
+            true
+        }
+        // [auto]? <length> | none, for each axis
+        "contain-intrinsic-size" => {
+            let mut sizes = Vec::new();
+            let mut tokens = lower.split_whitespace();
+            while let Some(t) = tokens.next() {
+                let t = if t == "auto" { tokens.next().unwrap_or("") } else { t };
+                sizes.push(contain_intrinsic(t));
+            }
+            if let [w, h] | [w @ h] = sizes.as_slice() {
+                if let (Some(w), Some(h)) = (w, h) {
+                    push(out, PropertyId::ContainIntrinsicWidth, w.clone(), important);
+                    push(out, PropertyId::ContainIntrinsicHeight, h.clone(), important);
+                }
+            }
+            true
+        }
         "margin" | "padding" | "inset" => {
             let ids = longhands_of(name).unwrap();
             let negative = name != "padding";
@@ -338,8 +409,29 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
-        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "outline" => {
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-inline" | "border-block" | "outline" => {
             border_shorthand(name, &lower, important, out);
+            true
+        }
+        // One value for both sides, or the start side's then the end's
+        "border-inline-width" | "border-block-width" | "border-inline-style" | "border-block-style" | "border-inline-color" | "border-block-color" => {
+            let ids = longhands_of(name).unwrap();
+            let parts: Option<Vec<PropertyValue>> = components(&lower)
+                .into_iter()
+                .map(|c| {
+                    if name.ends_with("-width") {
+                        border_width(c)
+                    } else if name.ends_with("-style") {
+                        enum_value::<BorderStyle>(c)
+                    } else {
+                        color(c)
+                    }
+                })
+                .collect();
+            if let Some(parts) = parts.filter(|p| (1..=2).contains(&p.len())) {
+                push(out, ids[0], parts[0].clone(), important);
+                push(out, ids[1], parts.get(1).unwrap_or(&parts[0]).clone(), important);
+            }
             true
         }
         "border-width" | "border-style" | "border-color" => {
@@ -361,6 +453,31 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
         }
         "border-radius" => {
             border_radius(&lower, important, out);
+            true
+        }
+        // A width and a count in either order; `auto` for either
+        "columns" => {
+            let (mut width, mut count) = (None, None);
+            let mut autos = 0;
+            for c in components(&lower) {
+                if c == "auto" {
+                    autos += 1;
+                } else if let Some(n) = c.parse::<i32>().ok().filter(|_| count.is_none()) {
+                    if n < 1 {
+                        return true;
+                    }
+                    count = Some(PropertyValue::Integer(n));
+                } else if let Some(l) = length(c, false, false, false).filter(|_| width.is_none()) {
+                    width = Some(l);
+                } else {
+                    return true;
+                }
+            }
+            if autos + width.is_some() as usize + count.is_some() as usize > 2 {
+                return true;
+            }
+            push(out, PropertyId::ColumnWidth, width.unwrap_or(PropertyValue::Keyword(Keyword::Auto)), important);
+            push(out, PropertyId::ColumnCount, count.unwrap_or(PropertyValue::Keyword(Keyword::Auto)), important);
             true
         }
         "background" => {
@@ -453,15 +570,20 @@ pub(crate) fn expand(name: &str, value: &str, important: bool, out: Out) -> bool
             }
             true
         }
+        // <align> [<justify>]?, the justify value being the align one when
+        // omitted: grid place-items: center centers both ways
         "place-items" | "place-self" => {
-            let first = components(&lower).first().copied().unwrap_or("");
-            let (id, v) = if name == "place-items" {
-                (PropertyId::AlignItems, align_items(first))
+            let parts = components(&lower);
+            let first = parts.first().copied().unwrap_or("");
+            let second = parts.get(1).copied().unwrap_or(first);
+            let (align, justify) = if name == "place-items" {
+                ((PropertyId::AlignItems, align_items(first)), (PropertyId::JustifyItems, longhand(PropertyId::JustifyItems, second, second)))
             } else {
-                (PropertyId::AlignSelf, enum_value::<AlignSelf>(first))
+                ((PropertyId::AlignSelf, enum_value::<AlignSelf>(first)), (PropertyId::JustifySelf, longhand(PropertyId::JustifySelf, second, second)))
             };
-            if let Some(v) = v {
-                push(out, id, v, important);
+            if let (Some(a), Some(j)) = (align.1, justify.1) {
+                push(out, align.0, a, important);
+                push(out, justify.0, j, important);
             }
             true
         }
@@ -503,6 +625,13 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
             other => other,
         }),
         P::BoxSizing => enum_value::<BoxSizing>(v),
+        // Every widget keyword (menulist, button, textfield...) draws the
+        // control natively, as auto does
+        P::Appearance => enum_value::<Appearance>(match v {
+            "none" => "none",
+            "auto" | "menulist" | "menulist-button" | "button" | "push-button" | "square-button" | "textfield" | "textarea" | "searchfield" | "checkbox" | "radio" | "listbox" | "meter" | "progress-bar" | "slider-horizontal" | "slider-vertical" => "auto",
+            _ => return None,
+        }),
         P::Width | P::Height | P::FlexBasis => size(v, true),
         P::MinWidth | P::MinHeight => size(v, true),
         P::MaxWidth | P::MaxHeight => {
@@ -538,8 +667,22 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::AlignSelf => enum_value::<AlignSelf>(strip_safety(v)),
         P::AlignContent => enum_value::<AlignContent>(strip_safety(v)),
         P::Order => v.parse::<i32>().ok().map(PropertyValue::Integer),
+        P::ColumnCount => match v {
+            "auto" => Some(PropertyValue::Keyword(Keyword::Auto)),
+            _ => v.parse::<i32>().ok().filter(|&n| n >= 1).map(PropertyValue::Integer),
+        },
+        P::ColumnWidth => match v {
+            "auto" => Some(PropertyValue::Keyword(Keyword::Auto)),
+            _ => length(v, false, false, false),
+        },
         P::RowGap | P::ColumnGap => gap(v),
         P::ObjectFit => enum_value::<ObjectFit>(v),
+        P::Contain => contain(v),
+        P::ContainerType => container_type(v),
+        P::TextBoxTrim => text_box_trim(v),
+        P::TextBoxEdge => text_box_edge(v),
+        P::ContentVisibility => enum_value::<ContentVisibility>(v),
+        P::ContainIntrinsicWidth | P::ContainIntrinsicHeight => contain_intrinsic(v.strip_prefix("auto ").unwrap_or(v).trim()),
         P::TextOverflow => enum_value::<TextOverflow>(v),
         P::TableLayout => enum_value::<TableLayout>(v),
         // `none` (no box, no marker) differs from `normal` for markers
@@ -618,6 +761,7 @@ fn longhand(id: PropertyId, v: &str, raw: &str) -> Option<PropertyValue> {
         P::BackgroundSize | P::MaskSize => layers(v, background_size),
         P::FontFamily => font_family(raw),
         P::FontSize => font_size(v),
+        P::FontStretch => font_stretch(v).map(PropertyValue::Number),
         P::FontWeight => match v {
             "bolder" => Some(PropertyValue::Keyword(Keyword::Bolder)),
             "lighter" => Some(PropertyValue::Keyword(Keyword::Lighter)),
@@ -692,10 +836,111 @@ macro_rules! css_enum_impl {
     };
 }
 css_enum_impl!(
-    Display, Position, Float, Clear, BoxSizing, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
+    Display, Position, Float, Clear, BoxSizing, Appearance, Overflow, Visibility, TextAlign, WhiteSpace, TextWrapStyle, CaptionSide, TextTransform, FontStyle, BorderStyle, ListStyleType,
     ListStylePosition, FlexDirection, FlexWrap, JustifyContent, AlignItems, AlignSelf, AlignContent, Direction, WordBreak, OverflowWrap, TextOverflow,
-    ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword
+    ObjectFit, TextDecorationStyle, BackgroundRepeat, BackgroundClip, BorderCollapse, TableLayout, PointerEvents, VerticalAlignKeyword,
+    ContentVisibility
 );
+
+/// `container-type`: normal, size or inline-size (scroll-state aside), as
+/// the size [`crate::style::contain`] bit it applies
+fn container_type(v: &str) -> Option<PropertyValue> {
+    use crate::style::contain::*;
+    let mut bits = 0;
+    for part in v.split_whitespace() {
+        bits |= match part {
+            "normal" if v.trim() == "normal" => 0,
+            "size" => SIZE,
+            "inline-size" => INLINE_SIZE,
+            "scroll-state" => 0,
+            _ => return None,
+        };
+    }
+    (bits != SIZE | INLINE_SIZE).then_some(PropertyValue::Integer(bits as i32))
+}
+
+/// `contain`: none, strict, content, or size, inline-size, layout, style
+/// and paint (each once), as [`crate::style::contain`] bits
+fn contain(v: &str) -> Option<PropertyValue> {
+    use crate::style::contain::*;
+    let bits = match v {
+        "none" => 0,
+        "strict" => SIZE | LAYOUT | STYLE | PAINT,
+        "content" => LAYOUT | STYLE | PAINT,
+        _ => {
+            let mut bits = 0;
+            for t in v.split_whitespace() {
+                let bit = match t {
+                    "size" => SIZE,
+                    "inline-size" => INLINE_SIZE,
+                    "layout" => LAYOUT,
+                    "style" => STYLE,
+                    "paint" => PAINT,
+                    _ => return None,
+                };
+                if bits & bit != 0 {
+                    return None;
+                }
+                bits |= bit;
+            }
+            if bits & SIZE != 0 && bits & INLINE_SIZE != 0 {
+                return None;
+            }
+            bits
+        }
+    };
+    Some(PropertyValue::Integer(bits as i32))
+}
+
+/// `text-box-trim` as [`crate::style::text_box`] trim bits
+fn text_box_trim(v: &str) -> Option<PropertyValue> {
+    use crate::style::text_box::*;
+    Some(PropertyValue::Integer(match v {
+        "none" => 0,
+        "trim-start" => TRIM_START,
+        "trim-end" => TRIM_END,
+        "trim-both" => TRIM_START | TRIM_END,
+        _ => return None,
+    } as i32))
+}
+
+/// `text-box-edge`: auto, or an over edge and an under one (the missing
+/// one the same where it can be, else text), packed as over * 8 + under
+fn text_box_edge(v: &str) -> Option<PropertyValue> {
+    use crate::style::text_box::*;
+    let edge = |k: &str| match k {
+        "text" => Some(TEXT),
+        "cap" => Some(CAP),
+        "ex" => Some(EX),
+        "alphabetic" => Some(ALPHABETIC),
+        "ideographic" | "ideographic-ink" => Some(IDEOGRAPHIC),
+        _ => None,
+    };
+    let parts: Vec<&str> = v.split_whitespace().collect();
+    let (over, under) = match parts.as_slice() {
+        ["auto"] => (TEXT, TEXT),
+        [one] => {
+            let e = edge(one)?;
+            match e {
+                CAP | EX => (e, TEXT),
+                ALPHABETIC => return None,
+                _ => (e, e),
+            }
+        }
+        [o, u] => (edge(o).filter(|e| *e != ALPHABETIC)?, edge(u).filter(|e| matches!(*e, TEXT | ALPHABETIC | IDEOGRAPHIC))?),
+        _ => return None,
+    };
+    Some(PropertyValue::Integer((over * 8 + under) as i32))
+}
+
+/// One axis of `contain-intrinsic-size` (after any `auto`): a length or none
+fn contain_intrinsic(v: &str) -> Option<PropertyValue> {
+    if v == "none" {
+        Some(PropertyValue::Keyword(Keyword::None))
+    } else {
+        length(v, false, false, false)
+    }
+}
 
 fn enum_value<T: CssEnum>(v: &str) -> Option<PropertyValue> {
     T::parse(v).map(|e| PropertyValue::Enum(e.index()))
@@ -987,6 +1232,10 @@ fn color(v: &str) -> Option<PropertyValue> {
 /// `-fos-mix(<px>px <pct>%)`: what math functions mixing a percentage and
 /// pixels compute to
 fn mix(v: &str) -> Option<PropertyValue> {
+    if v.starts_with("-fos-calc(") {
+        let l = crate::values::calc_length(v)?;
+        return Some(PropertyValue::Mix { px: l.px, pct: l.pct });
+    }
     let inner = v.strip_prefix("-fos-mix(")?.strip_suffix(')')?;
     let mut parts = inner.split_whitespace();
     let px: f32 = parts.next()?.strip_suffix("px")?.parse().ok()?;
@@ -1003,7 +1252,7 @@ fn length(v: &str, allow_auto: bool, allow_none: bool, allow_negative: bool) -> 
     if allow_none && v == "none" {
         return Some(PropertyValue::Keyword(Keyword::None));
     }
-    if v.starts_with("-fos-mix(") {
+    if v.starts_with("-fos-mix(") || v.starts_with("-fos-calc(") {
         return mix(v);
     }
     if matches!(v, "0" | "-0" | "+0") {
@@ -1078,6 +1327,8 @@ fn border_shorthand(name: &str, v: &str, important: bool, out: Out) {
         "border-right" => (&[BorderRightWidth], &[BorderRightStyle], &[BorderRightColor]),
         "border-bottom" => (&[BorderBottomWidth], &[BorderBottomStyle], &[BorderBottomColor]),
         "border-left" => (&[BorderLeftWidth], &[BorderLeftStyle], &[BorderLeftColor]),
+        "border-inline" => (&[BorderLeftWidth, BorderRightWidth], &[BorderLeftStyle, BorderRightStyle], &[BorderLeftColor, BorderRightColor]),
+        "border-block" => (&[BorderTopWidth, BorderBottomWidth], &[BorderTopStyle, BorderBottomStyle], &[BorderTopColor, BorderBottomColor]),
         _ => (&[OutlineWidth], &[OutlineStyle], &[OutlineColor]),
     };
     // Omitted parts reset to their initial values
@@ -1160,8 +1411,9 @@ fn flex_shorthand(v: &str, important: bool, out: Out) {
             }
             let grow = numbers.first().copied().unwrap_or(1.0);
             let shrink = numbers.get(1).copied().unwrap_or(1.0);
-            // A unitless grow alone means a basis of 0
-            let basis = basis.unwrap_or(PropertyValue::Length(Length::px(0.0)));
+            // A unitless grow alone means a basis of 0% (as browsers
+            // compute it: the content's in a container of unknown size)
+            let basis = basis.unwrap_or(PropertyValue::Length(Length { value: 0.0, unit: LengthUnit::Percent }));
             (num(grow), num(shrink), basis)
         }
     };
@@ -1179,11 +1431,15 @@ fn font_shorthand(v: &str, important: bool, out: Out) {
     let Some(size_at) = parts.iter().position(|p| font_size(p.split('/').next().unwrap_or("")).is_some()) else { return };
     let mut style = PropertyValue::Enum(FontStyle::Normal as u8);
     let mut weight = PropertyValue::Integer(400);
+    let mut stretch = 100.0;
     for p in &parts[..size_at] {
         if let Some(s) = enum_value::<FontStyle>(p) {
             style = s;
         } else if let Some(w) = font_weight(p) {
             weight = PropertyValue::Integer(w);
+        } else if let Some(s) = font_stretch(p).filter(|_| !p.ends_with('%')) {
+            // (only keywords in the shorthand)
+            stretch = s;
         }
     }
     let (size, lh) = match parts[size_at].split_once('/') {
@@ -1211,10 +1467,38 @@ fn font_shorthand(v: &str, important: bool, out: Out) {
     let family = raw_parts.get(family_at..).map(|f| f.join(" ")).unwrap_or_default();
     push(out, PropertyId::FontStyle, style, important);
     push(out, PropertyId::FontWeight, weight, important);
+    push(out, PropertyId::FontStretch, PropertyValue::Number(stretch), important);
     push(out, PropertyId::FontSize, size, important);
     push(out, PropertyId::LineHeight, line, important);
     if let Some(f) = font_family(&family) {
         push(out, PropertyId::FontFamily, f, important);
+    }
+}
+
+/// `font-stretch`: a keyword or a percentage, as a percentage of normal
+fn font_stretch(v: &str) -> Option<f32> {
+    Some(match v.trim() {
+        "ultra-condensed" => 50.0,
+        "extra-condensed" => 62.5,
+        "condensed" => 75.0,
+        "semi-condensed" => 87.5,
+        "normal" => 100.0,
+        "semi-expanded" => 112.5,
+        "expanded" => 125.0,
+        "extra-expanded" => 150.0,
+        "ultra-expanded" => 200.0,
+        p => p.strip_suffix('%')?.trim().parse::<f32>().ok().filter(|p| *p >= 0.0 && p.is_finite())?,
+    })
+}
+
+/// A font family as named in CSS: a string, or identifiers (whose white
+/// space collapses), with escapes resolved (`Font\ Awesome\ 5` names
+/// "Font Awesome 5")
+pub(crate) fn family_name(raw: &str) -> String {
+    let f = raw.trim();
+    match f.as_bytes().first() {
+        Some(&q @ (b'"' | b'\'')) => css_string(f, 1, q).map(|(s, _)| s).unwrap_or_default(),
+        _ => css_string(f, 0, 0).map(|(s, _)| s.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default(),
     }
 }
 
@@ -1223,15 +1507,11 @@ fn font_family(raw: &str) -> Option<PropertyValue> {
     let mut list = Vec::new();
     for f in split_top(raw, b',') {
         let f = f.trim();
-        let name = if (f.starts_with('"') && f.ends_with('"') || f.starts_with('\'') && f.ends_with('\'')) && f.len() >= 2 {
-            f[1..f.len() - 1].to_string()
-        } else {
-            let lower = f.to_ascii_lowercase();
-            match lower.as_str() {
-                "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace" | "math"
-                | "emoji" | "-apple-system" | "blinkmacsystemfont" => lower,
-                _ => f.split_whitespace().collect::<Vec<_>>().join(" "),
-            }
+        let lower = f.to_ascii_lowercase();
+        let name = match lower.as_str() {
+            "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace" | "math" | "emoji"
+            | "-apple-system" | "blinkmacsystemfont" => lower,
+            _ => family_name(f),
         };
         if !name.is_empty() {
             list.push(name);
@@ -1491,6 +1771,7 @@ fn image(v: &str) -> Option<Image> {
         }
         "linear-gradient" | "repeating-linear-gradient" => linear_gradient(args, func.contains("repeating"), func.starts_with('-')),
         "radial-gradient" | "repeating-radial-gradient" => radial_gradient(args, func.contains("repeating")),
+        "conic-gradient" | "repeating-conic-gradient" => conic_gradient(args, func.contains("repeating")),
         _ => None,
     }
 }
@@ -1511,27 +1792,29 @@ fn angle(v: &str) -> Option<f32> {
 
 /// Color stops (the arguments after any direction)
 fn color_stops(args: &[&str]) -> Option<Arc<[ColorStop]>> {
+    color_stops_at(args, |s| match length(s, false, false, true)? {
+        PropertyValue::Length(l) => Some(match l.unit {
+            LengthUnit::Percent => Lp::pct(l.value),
+            LengthUnit::Px => Lp::px(l.value),
+            LengthUnit::Em | LengthUnit::Rem => Lp::px(l.value * 16.0),
+            _ => Lp::px(l.value),
+        }),
+        PropertyValue::Mix { px, pct } => Some(Lp { px, pct }),
+        _ => None,
+    })
+}
+
+/// Color stops at positions `pos` reads
+fn color_stops_at(args: &[&str], pos: impl Fn(&str) -> Option<Lp>) -> Option<Arc<[ColorStop]>> {
     let mut stops = Vec::new();
     for a in args {
         let parts = components(a.trim());
         let Some(c) = parts.first().and_then(|c| parse_color(c)) else {
-            // A transition hint (a bare length) shapes interpolation: skip
-            if parts.len() == 1 && length(parts[0], false, false, true).is_some() {
+            // A transition hint (a bare position) shapes interpolation: skip
+            if parts.len() == 1 && pos(parts[0]).is_some() {
                 continue;
             }
             return None;
-        };
-        let pos = |s: &str| -> Option<Lp> {
-            match length(s, false, false, true)? {
-                PropertyValue::Length(l) => Some(match l.unit {
-                    LengthUnit::Percent => Lp::pct(l.value),
-                    LengthUnit::Px => Lp::px(l.value),
-                    LengthUnit::Em | LengthUnit::Rem => Lp::px(l.value * 16.0),
-                    _ => Lp::px(l.value),
-                }),
-                PropertyValue::Mix { px, pct } => Some(Lp { px, pct }),
-                _ => None,
-            }
         };
         match parts.len() {
             1 => stops.push(ColorStop { color: c, position: None }),
@@ -1546,8 +1829,30 @@ fn color_stops(args: &[&str]) -> Option<Arc<[ColorStop]>> {
     (stops.len() >= 2).then(|| Arc::from(stops))
 }
 
-fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
+/// Gradient arguments without a color interpolation method (`in oklab`,
+/// `in hsl longer hue`, CSS Images 4 §3.1): colors are interpolated in
+/// sRGB here
+fn without_interpolation(args: &str) -> std::borrow::Cow<'_, str> {
     let parts = split_top(args, b',');
+    let Some(first) = parts.first() else { return args.into() };
+    let words = components(first.trim());
+    let Some(at) = words.iter().position(|w| w.eq_ignore_ascii_case("in")) else { return args.into() };
+    let mut end = (at + 2).min(words.len());
+    if words.get(end + 1).is_some_and(|w| w.eq_ignore_ascii_case("hue")) {
+        end += 2;
+    }
+    let kept: Vec<&str> = words[..at].iter().chain(&words[end..]).copied().collect();
+    let rest = &parts[1..];
+    if kept.is_empty() {
+        rest.join(",").into()
+    } else {
+        std::iter::once(kept.join(" ")).chain(rest.iter().map(|s| s.to_string())).collect::<Vec<_>>().join(",").into()
+    }
+}
+
+fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
     let first = parts.first()?.trim().to_ascii_lowercase();
     let side = |s: &str| -> Option<(i8, i8)> {
         let mut xy = (0i8, 0i8);
@@ -1594,8 +1899,47 @@ fn linear_gradient(args: &str, repeating: bool, legacy: bool) -> Option<Image> {
     Some(Image::Linear { direction, stops, repeating })
 }
 
+/// `conic-gradient([from <angle>] [at <position>], <angular stops>)`
+fn conic_gradient(args: &str, repeating: bool) -> Option<Image> {
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
+    let first = parts.first()?.trim().to_ascii_lowercase();
+    let words = components(&first);
+    let mut from = 0.0;
+    let mut center = (Lp::pct(50.0), Lp::pct(50.0));
+    let stops_from = if matches!(words.first(), Some(&"from" | &"at")) {
+        let at = words.iter().position(|w| *w == "at");
+        if words[0] == "from" {
+            from = angle(words.get(1)?)?;
+            if words.len() > 2 && at != Some(2) {
+                return None;
+            }
+        }
+        if let Some(i) = at {
+            let Some(PropertyValue::List(xy)) = background_position(&words[i + 1..]) else { return None };
+            let lp = |v: &PropertyValue| match v {
+                PropertyValue::Length(l) if l.unit == LengthUnit::Percent => Some(Lp::pct(l.value)),
+                PropertyValue::Length(l) => Some(Lp::px(l.value)),
+                PropertyValue::Mix { px, pct } => Some(Lp { px: *px, pct: *pct }),
+                _ => None,
+            };
+            center = (lp(&xy[0])?, lp(&xy[1])?);
+        }
+        1
+    } else {
+        0
+    };
+    // Angles as percentages of a turn
+    let stops = color_stops_at(&parts[stops_from..], |s| match s.strip_suffix('%') {
+        Some(p) => p.parse().ok().map(Lp::pct),
+        None => angle(s).map(|deg| Lp::pct(deg / 3.6)),
+    })?;
+    Some(Image::Conic { from, center, stops, repeating })
+}
+
 fn radial_gradient(args: &str, repeating: bool) -> Option<Image> {
-    let parts = split_top(args, b',');
+    let args = without_interpolation(args);
+    let parts = split_top(&args, b',');
     let first = parts.first()?.trim().to_ascii_lowercase();
     let mut circle = false;
     let mut size = RadialSize::FarthestCorner;
@@ -1753,6 +2097,166 @@ mod tests {
     }
 
     #[test]
+    fn place_shorthands_set_both_axes() {
+        // place-items: center centers grid items both ways (remix.run's
+        // loading overlay); a second value is the justify one
+        use crate::style::{AlignItems, AlignSelf};
+        let s = computed("place-items: center");
+        assert_eq!((s.box_.align_items, AlignItems::from_u8(s.box_.grid.justify_items)), (AlignItems::Center, Some(AlignItems::Center)));
+        let s = computed("place-self: start end");
+        assert_eq!((s.box_.align_self, AlignSelf::from_u8(s.box_.grid.justify_self)), (AlignSelf::Start, Some(AlignSelf::End)));
+    }
+
+    #[test]
+    fn border_widths_default_to_medium() {
+        // A side with a style but no width is medium (3px); without a style
+        // it has none
+        let s = computed("border-bottom-width: 2px; border-style: solid");
+        assert_eq!(s.border.width, [3.0, 3.0, 2.0, 3.0]);
+        assert_eq!(computed("border-left-style: dashed").border.width, [0.0, 0.0, 0.0, 3.0]);
+        assert_eq!(computed("border-width: 5px").border.width, [0.0; 4]);
+        assert_eq!(computed("border: solid").border.width, [3.0; 4]);
+        assert_eq!(computed("outline-style: solid").border.outline_width, 3.0);
+        assert_eq!(computed("border-style: solid; border-width: 0").border.width, [0.0; 4]);
+    }
+
+    #[test]
+    fn logical_border_pairs() {
+        // Tailwind's border-x-0 is border-inline-width: 0 (deno.com's code
+        // window title bar)
+        let s = computed("border: 1px solid; border-inline-width: 0");
+        assert_eq!(s.border.width, [1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(computed("border-style: solid; border-block-width: 2px 4px").border.width, [2.0, 3.0, 4.0, 3.0]);
+        assert_eq!(computed("border-inline: 2px solid").border.width, [0.0, 2.0, 0.0, 2.0]);
+        assert_eq!(computed("border-block-style: solid").border.width, [3.0, 0.0, 3.0, 0.0]);
+        let s = computed("border: 1px solid; border-inline-color: red blue");
+        use crate::properties::Color;
+        assert_eq!((s.border.color[1], s.border.color[3]), (Some(Color::rgb(0, 0, 255)), Some(Color::rgb(255, 0, 0))));
+    }
+
+    #[test]
+    fn multi_column_properties() {
+        let c = |css: &str| {
+            let s = computed(css);
+            (s.box_.column_count, s.box_.column_width)
+        };
+        assert_eq!(c("columns: 3"), (Some(3), None));
+        assert_eq!(c("columns: 7em auto"), (None, Some(112.0)));
+        assert_eq!(c("columns: 2 100px"), (Some(2), Some(100.0)));
+        assert_eq!(c("columns: 3; columns: 2 2"), (Some(3), None));
+        assert_eq!(c("column-count: 0; column-width: 10%"), (None, None));
+        assert_eq!(computed("columns: 3 12px").resolved_value("column-width", None).as_deref(), Some("12px"));
+    }
+
+    #[test]
+    fn font_stretch_values() {
+        // bun.sh's hero words are font-stretch: 75% of a variable face
+        assert_eq!(computed("font-stretch: condensed").inherited.font_stretch, 75.0);
+        assert_eq!(computed("font-width: 62.5%").inherited.font_stretch, 62.5);
+        assert_eq!(computed("font: condensed bold 12px serif").inherited.font_stretch, 75.0);
+        assert_eq!(computed("font-stretch: 75%; font: 12px serif").inherited.font_stretch, 100.0);
+        assert_eq!(computed("font-stretch: -5%").inherited.font_stretch, 100.0);
+        assert_eq!(computed("font-stretch: expanded").resolved_value("font-stretch", None).as_deref(), Some("125%"));
+    }
+
+    #[test]
+    fn math_mixing_px_and_percentages() {
+        // min(1040px, 100%) compares once layout knows the basis
+        // (remix.run's content cards); equal values stay equal
+        let w = |s: &Style| match s.box_.width {
+            LpAuto::Lp(l) => (l.resolve(1260.0), l.resolve(800.0)),
+            LpAuto::Auto => (f32::NAN, f32::NAN),
+        };
+        let a = computed("width: min(1040px, 100%)");
+        assert_eq!(w(&a), (1040.0, 800.0));
+        assert_eq!(a.box_.width, computed("width: min(1040px, 100%)").box_.width);
+        assert_ne!(a.box_.width, computed("width: max(1040px, 100%)").box_.width);
+        let s = computed("padding-left: max(16px, calc((100% - 1000px) / 2)); margin-left: clamp(10px, 10%, 50px)");
+        assert_eq!((s.box_.padding[3].resolve(1260.0), s.box_.padding[3].resolve(800.0)), (130.0, 16.0));
+        let LpAuto::Lp(m) = s.box_.margin[3] else { panic!() };
+        assert_eq!((m.resolve(1260.0), m.resolve(300.0), m.resolve(50.0)), (50.0, 30.0, 10.0));
+        // Ignoring the percentage, it is its value at a zero basis
+        assert_eq!(m.px, 10.0);
+    }
+
+    #[test]
+    fn text_box_properties() {
+        // The shorthand without a trim trims both; one edge keyword is both
+        // edges where it can be, else the under one is text
+        use crate::style::text_box::*;
+        let s = computed("text-box: cap alphabetic");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_START | TRIM_END, (CAP, ALPHABETIC)));
+        let s = computed("text-box-trim: trim-end; text-box-edge: ex");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_END, (EX, TEXT)));
+        let s = computed("text-box: trim-start");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (TRIM_START, (TEXT, TEXT)));
+        let s = computed("text-box: normal");
+        assert_eq!((s.box_.text_box_trim, s.inherited.text_box_edge), (0, (TEXT, TEXT)));
+        // An under-only keyword is invalid alone
+        assert_eq!(computed("text-box-edge: alphabetic").inherited.text_box_edge, (TEXT, TEXT));
+    }
+
+    #[test]
+    fn line_height_units() {
+        // lh is the element's line height (kit.svelte.dev's paragraphs have
+        // margin: 0.5lh 0), in calc() too, and in font-size the parent's;
+        // line-height applies before the declarations that use it
+        let px = |s: &Style, i: usize| match s.box_.margin[i] {
+            LpAuto::Lp(l) => l.px,
+            LpAuto::Auto => f32::NAN,
+        };
+        let s = computed("margin: 0.5lh 0 calc(1lh + 1px); font-size: 18px; line-height: 27px");
+        assert_eq!((px(&s, 0), px(&s, 2)), (13.5, 28.0));
+        let s = computed("line-height: 2; font-size: 10px; margin-top: 1lh");
+        assert_eq!(px(&s, 0), 20.0);
+        // normal is 1.2 em without fonts to measure
+        assert_eq!(px(&computed("font-size: 10px; margin-top: 1lh"), 0), 12.0);
+    }
+
+    #[test]
+    fn containment() {
+        use crate::style::contain::*;
+        use crate::style::ContentVisibility;
+        assert_eq!(computed("contain: layout paint").box_.contain, LAYOUT | PAINT);
+        assert_eq!(computed("contain: strict").box_.contain, SIZE | LAYOUT | STYLE | PAINT);
+        assert_eq!(computed("contain: content").resolved_value("contain", None).as_deref(), Some("content"));
+        // Repeats and size with inline-size are invalid
+        assert_eq!(computed("contain: paint paint").box_.contain, 0);
+        assert_eq!(computed("contain: size inline-size").box_.contain, 0);
+        // vercel.com's lower sections
+        let s = computed("display: block; content-visibility: auto; contain-intrinsic-size: auto 772px");
+        assert_eq!(s.box_.content_visibility, ContentVisibility::Auto);
+        assert_eq!(s.containment(), LAYOUT | STYLE | PAINT);
+        assert_eq!(s.box_.contain_intrinsic, [Some(772.0), Some(772.0)]);
+        assert_eq!(computed("contain-intrinsic-size: 10px auto 20px").box_.contain_intrinsic, [Some(10.0), Some(20.0)]);
+        assert_eq!(computed("display: block; content-visibility: hidden").containment(), SIZE | LAYOUT | STYLE | PAINT);
+        // Inline boxes are not contained
+        assert_eq!(computed("display: inline; contain: paint").containment(), 0);
+        // Size containers: style and size containment, and their own
+        // formatting context (remix.run's newsletter form keeps its margin
+        // inside one), but not the containing block of fixed boxes
+        let s = computed("display: block; container-type: inline-size");
+        assert_eq!((s.containment(), s.contains_formatting(), s.contains_layout()), (INLINE_SIZE | STYLE, true, false));
+        assert_eq!(computed("display: block; container: card / size").containment(), SIZE | STYLE);
+        assert_eq!(computed("display: block; container: card").containment(), 0);
+        assert_eq!(computed("container-type: inline-size").resolved_value("container-type", None).as_deref(), Some("inline-size"));
+    }
+
+    #[test]
+    fn conic_gradients() {
+        // react.dev's section backdrop
+        let s = computed("background-image: conic-gradient(from 90deg at -10% 100%, #bcc1cd 0deg, #bcc1cd 90deg, #fff 360deg)");
+        let Image::Conic { from, center, stops, repeating } = &s.background.images[0] else { panic!("{:?}", s.background.images) };
+        assert_eq!((*from, *center, *repeating), (90.0, (Lp::pct(-10.0), Lp::pct(100.0)), false));
+        let at: Vec<f32> = stops.iter().map(|s| s.position.unwrap().pct).collect();
+        assert_eq!(at, [0.0, 25.0, 100.0]);
+        // Stops in turns and percentages, two positions, no configuration
+        let s = computed("background-image: repeating-conic-gradient(red 0 0.25turn, blue 25% 50%)");
+        assert!(matches!(&s.background.images[0], Image::Conic { from: 0.0, repeating: true, stops, .. } if stops.len() == 4 && stops[1].position == Some(Lp::pct(25.0))));
+        assert_eq!(computed("background-image: conic-gradient(from 45deg, red, blue 50%)").resolved_value("background-image", None).as_deref(), Some("conic-gradient(from 45deg at 50% 50%, rgb(255, 0, 0), rgb(0, 0, 255) 180deg)"));
+    }
+
+    #[test]
     fn shorthands_expand() {
         let s = computed("margin: 1px 2px 3px; padding: 4px; border: 2px solid red; border-left: none; border-radius: 4px / 8px 2px");
         assert_eq!(s.box_.margin, [LpAuto::Lp(Lp::px(1.0)), LpAuto::Lp(Lp::px(2.0)), LpAuto::Lp(Lp::px(3.0)), LpAuto::Lp(Lp::px(2.0))]);
@@ -1763,7 +2267,9 @@ mod tests {
         assert_eq!(s.border.radius[0], (Lp::px(4.0), Lp::px(8.0)));
         assert_eq!(s.border.radius[1], (Lp::px(4.0), Lp::px(2.0)));
         let s = computed("flex: 1; gap: 10px 5%; overflow: hidden auto; inset: 0 auto");
-        assert_eq!((s.box_.flex_grow, s.box_.flex_shrink, s.box_.flex_basis), (1.0, 1.0, LpAuto::ZERO));
+        // A basis of 0% (not 0px) when only the grow factor is given
+        assert_eq!((s.box_.flex_grow, s.box_.flex_shrink, s.box_.flex_basis), (1.0, 1.0, LpAuto::Lp(Lp::pct(0.0))));
+        assert_ne!(s.box_.flex_basis, LpAuto::ZERO);
         assert_eq!((s.box_.row_gap, s.box_.column_gap), (Some(Lp::px(10.0)), Some(Lp::pct(5.0))));
         assert_eq!((s.box_.overflow_x, s.box_.overflow_y), (Overflow::Hidden, Overflow::Auto));
         assert_eq!(s.box_.inset, [LpAuto::ZERO, LpAuto::Auto, LpAuto::ZERO, LpAuto::Auto]);
@@ -1781,6 +2287,9 @@ mod tests {
         assert_eq!(i.line_height, LineHeight::Number(1.5));
         assert_eq!(&*i.font_family.iter().map(|f| f.to_string()).collect::<Vec<_>>(), ["Helvetica Neue", "Arial", "sans-serif"]);
         assert_eq!((i.text_align, i.white_space), (TextAlign::WebkitCenter, WhiteSpace::Nowrap));
+        // Escapes resolve, as postgresql.org names Font Awesome\ 5 Free
+        let s = computed(r#"font-family: Font Awesome\ 5 Free, "Q\"t", 'C\41 D', Serif"#);
+        assert_eq!(&*s.inherited.font_family.iter().map(|f| f.to_string()).collect::<Vec<_>>(), ["Font Awesome 5 Free", "Q\"t", "CAD", "serif"]);
         let s = computed("font-size: 20px; line-height: 150%; text-decoration: underline dotted red; letter-spacing: .1em");
         assert_eq!(s.inherited.line_height, LineHeight::Px(30.0));
         assert_eq!(s.inherited.letter_spacing, 2.0);

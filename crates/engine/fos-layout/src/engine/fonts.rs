@@ -15,11 +15,25 @@ pub struct FontMetrics {
     /// Below the baseline (positive)
     pub descent: f32,
     pub line_gap: f32,
+    /// The height of lowercase letters (what `vertical-align: middle`
+    /// centers on)
+    pub x_height: f32,
+    /// The x-height was measured from the "x" glyph, whose hinted outline
+    /// has it in whole pixels
+    pub x_height_measured: bool,
+    /// The height of capital letters (`text-box-edge: cap`)
+    pub cap_height: f32,
+    /// The OS/2 table's average character width (0 when absent) and the
+    /// width of the face's bounding box: what text fields are sized by
+    pub avg_char_width: f32,
+    pub max_char_width: f32,
+    /// Every glyph is as wide (the post table's isFixedPitch)
+    pub fixed_pitch: bool,
 }
 
 impl FontMetrics {
     /// When no font is available
-    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0 };
+    pub const FALLBACK: FontMetrics = FontMetrics { ascent: 0.8, descent: 0.2, line_gap: 0.0, x_height: 0.448, x_height_measured: false, cap_height: 0.56, avg_char_width: 0.0, max_char_width: 0.0, fixed_pitch: false };
 
     /// The content-area height of `normal` line height, per em
     pub fn normal_line_height(&self) -> f32 {
@@ -91,6 +105,16 @@ impl ResolvedFont {
         (self.metrics.descent * self.size).round()
     }
 
+    /// The x-height in pixels
+    pub fn x_height(&self) -> f32 {
+        let x = self.metrics.x_height * self.size;
+        if self.metrics.x_height_measured {
+            x.round()
+        } else {
+            x
+        }
+    }
+
     /// `line-height` in pixels: `normal` is the font's own line spacing
     /// (ascent, descent and line gap, each rounded)
     pub fn line_height(&self, lh: fos_css::style::LineHeight) -> f32 {
@@ -103,6 +127,58 @@ impl ResolvedFont {
 
 /// Shaped words kept before the cache starts over
 const MAX_WORDS: usize = 50_000;
+
+/// What `ch` and `ex` are for styling, from the faces text is drawn with
+pub struct FontUnits {
+    fonts: std::sync::Mutex<FontContext>,
+    /// (families, weight, italic, size) -> (ch, ex) in pixels
+    units: std::sync::Mutex<HashMap<(Arc<[Arc<str>]>, u16, bool, u32, u32), (f32, f32)>>,
+}
+
+impl FontUnits {
+    pub fn new(db: Arc<FontDatabase>) -> Self {
+        FontUnits { fonts: std::sync::Mutex::new(FontContext::new(db)), units: Default::default() }
+    }
+}
+
+impl fos_css::style::FontUnits for FontUnits {
+    fn ch_ex(&self, font: &fos_css::style::InheritedStyle, size: f32) -> (f32, f32) {
+        let key = (font.font_family.clone(), font.font_weight, font.font_style != FontStyle::Normal, size.to_bits(), font.font_stretch.to_bits());
+        if let Some(units) = self.units.lock().map_or(None, |u| u.get(&key).copied()) {
+            return units;
+        }
+        let Ok(mut fonts) = self.fonts.lock() else { return (size * 0.5, size * 0.5) };
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = font.font_family.clone();
+        i.font_weight = font.font_weight;
+        i.font_style = font.font_style;
+        i.font_stretch = font.font_stretch;
+        i.font_size = size;
+        // At the size asked for: a variable face's optical size changes
+        // its advances. "0" is half an em without a face; the x-height is
+        // as text is laid out with it (a measured one in whole pixels)
+        let f = fonts.resolve(&style);
+        let ch = if f.id.is_some() { fonts.shape(&f, "0").width } else { 0.0 };
+        let units = (if ch > 0.0 { ch } else { size * 0.5 }, f.x_height());
+        if let Ok(mut u) = self.units.lock() {
+            u.insert(key, units);
+        }
+        units
+    }
+
+    fn normal_line_height(&self, font: &fos_css::style::InheritedStyle, size: f32) -> f32 {
+        let Ok(mut fonts) = self.fonts.lock() else { return size * 1.2 };
+        let mut style = Style::default();
+        let i = Arc::make_mut(&mut style.inherited);
+        i.font_family = font.font_family.clone();
+        i.font_weight = font.font_weight;
+        i.font_style = font.font_style;
+        i.font_stretch = font.font_stretch;
+        i.font_size = size;
+        fonts.resolve(&style).line_height(fos_css::style::LineHeight::Normal)
+    }
+}
 
 pub struct FontContext {
     db: Arc<FontDatabase>,
@@ -118,7 +194,7 @@ pub struct FontContext {
     /// Faces to try for fallback, best first (built on first need)
     fallback_order: Option<Vec<FontId>>,
     /// (face, weight, size) -> the face to draw (a variable face's instance)
-    instances: HashMap<(FontId, u16, u16), FontId>,
+    instances: HashMap<(FontId, u16, u16, u16), FontId>,
 }
 
 impl Default for FontContext {
@@ -171,8 +247,8 @@ impl FontContext {
         // A variable face is drawn through its instance at the weight and
         // (font-optical-sizing: auto) the size asked for
         let id = id.map(|id| {
-            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16);
-            *self.instances.entry(key).or_insert_with(|| self.db.instance(id, key.1, key.2))
+            let key = (id, i.font_weight, i.font_size.round().clamp(1.0, 1000.0) as u16, (i.font_stretch * 10.0).round().clamp(0.0, 10000.0) as u16);
+            *self.instances.entry(key).or_insert_with(|| self.db.instance_at(id, key.1, key.2, key.3))
         });
         let metrics = id.map_or(FontMetrics::FALLBACK, |id| self.metrics_of(id));
         ResolvedFont { id, size: i.font_size, metrics, synthesis }
@@ -188,8 +264,34 @@ impl FontContext {
                 let p = FontParser::parse_index(data, index).ok()?;
                 let upem = p.units_per_em().max(1) as f32;
                 let (a, d, g) = (p.ascender() as f32 / upem, -(p.descender() as f32) / upem, p.line_gap() as f32 / upem);
+                // As Skia: OS/2's sxHeight (table version 2 and up), else
+                // the height of the "x" glyph, else (Blink) 56% of the ascent
+                let os2 = p.table_data(b"OS/2").filter(|t| t.len() >= 88 && u16::from_be_bytes([t[0], t[1]]) >= 2).map(|t| i16::from_be_bytes([t[86], t[87]]));
+                let glyph = || p.glyph_index('x').and_then(|g| p.glyph_bounding_box(g)).map(|b| b.y_max);
+                let os2 = os2.filter(|&h| h > 0);
+                let measured = if os2.is_none() { glyph() } else { None };
+                let x = os2.or(measured).map(|h| h as f32 / upem).filter(|&x| x > 0.0 && x < a);
                 // Faces with broken metrics get sane ones
-                (a > 0.0 && d >= 0.0 && a + d < 4.0).then_some(FontMetrics { ascent: a, descent: d, line_gap: g.max(0.0) })
+                (a > 0.0 && d >= 0.0 && a + d < 4.0).then_some(FontMetrics {
+                    ascent: a,
+                    descent: d,
+                    line_gap: g.max(0.0),
+                    x_height: x.unwrap_or(a * 0.56),
+                    x_height_measured: x.is_some() && measured.is_some(),
+                    // OS/2's sCapHeight, else the "H" glyph's top
+                    cap_height: p
+                        .table_data(b"OS/2")
+                        .filter(|t| t.len() >= 90 && u16::from_be_bytes([t[0], t[1]]) >= 2)
+                        .map(|t| i16::from_be_bytes([t[88], t[89]]))
+                        .filter(|&h| h > 0)
+                        .or_else(|| p.glyph_index('H').and_then(|g| p.glyph_bounding_box(g)).map(|b| b.y_max))
+                        .map(|h| h as f32 / upem)
+                        .filter(|&c| c > 0.0 && c <= a)
+                        .unwrap_or(a * 0.7),
+                    avg_char_width: p.table_data(b"OS/2").filter(|t| t.len() >= 4).map_or(0.0, |t| i16::from_be_bytes([t[2], t[3]]).max(0) as f32 / upem),
+                    max_char_width: p.table_data(b"head").filter(|t| t.len() >= 44).map_or(0.0, |t| (i16::from_be_bytes([t[40], t[41]]) as f32 - i16::from_be_bytes([t[36], t[37]]) as f32).max(0.0) / upem),
+                    fixed_pitch: p.table_data(b"post").filter(|t| t.len() >= 16).is_some_and(|t| t[12..16] != [0, 0, 0, 0]),
+                })
             })
             .flatten()
             .unwrap_or(FontMetrics::FALLBACK);

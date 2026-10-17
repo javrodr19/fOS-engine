@@ -6,6 +6,8 @@ use super::*;
 /// Tag defaults plus `style` attributes
 struct TestStyler;
 
+struct RatioOnly;
+
 impl Styler for TestStyler {
     fn style(&mut self, tree: &DomTree, node: NodeId, parent: &Style) -> Style {
         let el = tree.get(node).and_then(|n| n.as_element()).expect("element");
@@ -25,6 +27,16 @@ impl Styler for TestStyler {
         let mut style = Style::inherit_from(parent);
         style.cascade(&refs, parent, &StyleContext::default(), &mut Default::default());
         style
+    }
+
+    /// `<img data-ratio="w h">`: a loaded image with only that ratio
+    fn image(&mut self, tree: &DomTree, node: NodeId) -> Option<((f32, f32), ImageHandle)> {
+        let mut ratio = tree.get_attribute(node, "data-ratio")?.split_whitespace().filter_map(|v| v.parse::<f32>().ok());
+        Some(((ratio.next()?, ratio.next()?), ImageHandle(std::sync::Arc::new(RatioOnly))))
+    }
+
+    fn ratio_only(&self, image: &ImageHandle) -> bool {
+        image.0.is::<RatioOnly>()
     }
 
     /// `::before` takes its declarations from `data-before`
@@ -699,6 +711,117 @@ fn floats_share_max_content_with_inline_content() {
 }
 
 #[test]
+fn justify_self_aligns_blocks_in_block_layout() {
+    let (mut tree, html, body) = doc();
+    let wrap = |tree: &mut DomTree, style: &str| el(tree, body, "div", &format!("width: 300px; {style}"));
+    // Aligned blocks are as wide as their content and placed in the free
+    // space; justify-items stands in for auto
+    let p = wrap(&mut tree, "");
+    let center = el(&mut tree, p, "div", "justify-self: center; width: 100px; height: 10px");
+    let p = wrap(&mut tree, "justify-items: end");
+    let end = el(&mut tree, p, "div", "width: 100px; height: 10px; margin-right: 20px");
+    let p = wrap(&mut tree, "");
+    let shrunk = el(&mut tree, p, "div", "justify-self: start; display: flex");
+    el(&mut tree, shrunk, "div", "width: 40px; height: 10px");
+    // Auto margins win; stretch fills
+    let p = wrap(&mut tree, "");
+    let auto = el(&mut tree, p, "div", "justify-self: left; margin: 0 auto; width: 100px; height: 10px");
+    let p = wrap(&mut tree, "");
+    let stretch = el(&mut tree, p, "div", "justify-self: stretch; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let x = |n| rect_of(&t, n).x - 8.0;
+    assert_eq!((x(center), rect_of(&t, center).w), (100.0, 100.0));
+    assert_eq!(x(end), 180.0);
+    assert_eq!((x(shrunk), rect_of(&t, shrunk).w), (0.0, 40.0));
+    assert_eq!(x(auto), 100.0);
+    assert_eq!(rect_of(&t, stretch).w, 300.0);
+}
+
+#[test]
+fn margins_collapsing_through_empty_boxes_move_what_follows() {
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "height: 10px");
+    // An empty box's margins go through its parent's top, even when a
+    // cleared box follows: the parent and its floats start below them
+    let a = el(&mut tree, body, "div", "");
+    let empty = el(&mut tree, a, "div", "margin: 20px 0");
+    let float = el(&mut tree, a, "div", "float: left; width: 10px; height: 10px");
+    let cleared = el(&mut tree, a, "div", "clear: both");
+    // In a formatting context root they stay inside, above its floats
+    let b = el(&mut tree, body, "div", "overflow: hidden");
+    el(&mut tree, b, "div", "margin: 20px 0");
+    let inner = el(&mut tree, b, "div", "float: left; width: 10px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let y = |n| rect_of(&t, n).y - 8.0;
+    assert_eq!((y(a), y(empty), y(float), y(cleared)), (30.0, 30.0, 30.0, 40.0));
+    assert_eq!(y(inner) - y(b), 20.0);
+}
+
+#[test]
+fn images_keep_their_ratio_when_a_given_size_is_clamped() {
+    // width="1024" (a hint) and max-width: 100% in a 598px box, height
+    // auto: the height follows the clamped width
+    let (mut tree, html, body) = doc();
+    let wrap = el(&mut tree, body, "div", "width: 598px");
+    let img = el(&mut tree, wrap, "img", "width: 1024px; max-width: 100%; height: auto");
+    tree.set_attribute(img, "data-natural", "1024x576");
+    let tall = el(&mut tree, wrap, "img", "height: 576px; max-height: 288px; display: block");
+    tree.set_attribute(tall, "data-natural", "1024x576");
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, img);
+    assert_eq!(r.w, 598.0);
+    assert!((r.h - 598.0 * 576.0 / 1024.0).abs() < 0.01, "{r:?}");
+    assert_eq!((rect_of(&t, tall).w, rect_of(&t, tall).h), (512.0, 288.0));
+}
+
+#[test]
+fn percentage_sized_images_add_nothing_to_min_content() {
+    // A wrapping flex row of two flex: 1 columns stays one line when one
+    // holds a 1024px wide image (its width attribute's) that max-width: 95%
+    // can shrink, or one that width: 50% sizes, but not a fixed one
+    let (mut tree, html, body) = doc();
+    let row = |tree: &mut DomTree, img_style: &str| {
+        let r = el(tree, body, "div", "display: flex; flex-wrap: wrap; width: 600px");
+        let a = el(tree, r, "div", "flex: 1");
+        let img = el(tree, a, "img", img_style);
+        tree.set_attribute(img, "data-natural", "1024x10");
+        let b = el(tree, r, "div", "flex: 1; height: 10px");
+        (a, b)
+    };
+    let max = row(&mut tree, "width: 1024px; max-width: 95%");
+    let pct = row(&mut tree, "width: 50%");
+    let fixed = row(&mut tree, "width: 1024px");
+    let t = layout(&tree, html, 800.0);
+    for (a, b) in [max, pct] {
+        assert_eq!((rect_of(&t, a).w, rect_of(&t, b).y), (300.0, rect_of(&t, a).y));
+    }
+    assert!(rect_of(&t, fixed.1).y > rect_of(&t, fixed.0).y);
+}
+
+#[test]
+fn trailing_spaces_in_inline_boxes_take_no_room() {
+    let (mut tree, html, body) = doc();
+    // `<b>x </b> ` ends its line with a space inside the box and one after
+    // it: neither widens the shrink-to-fit float
+    let a = el(&mut tree, body, "div", "float: left");
+    let b = el(&mut tree, a, "b", "");
+    text(&mut tree, b, "x ");
+    text(&mut tree, a, " ");
+    // Followed by more on the line, the space stays inside its box: before
+    // the box's padding
+    let c = el(&mut tree, body, "div", "clear: both");
+    let tag = el(&mut tree, c, "span", "padding: 0 5px");
+    text(&mut tree, tag, "x ");
+    text(&mut tree, c, " y ");
+    let bare = el(&mut tree, c, "span", "padding: 0 5px");
+    text(&mut tree, bare, "x");
+    let t = layout(&tree, html, 800.0);
+    assert!((rect_of(&t, a).w - rects_of(&t, b)[0].w).abs() < 0.01, "{:?} {:?}", rect_of(&t, a), rects_of(&t, b));
+    let space = rects_of(&t, tag)[0].w - rects_of(&t, bare)[0].w;
+    assert!(space > 2.0 && space < 6.0, "{space}");
+}
+
+#[test]
 fn absolute_boxes_stay_in_their_line() {
     let (mut tree, html, body) = doc();
     // An absolutely positioned label between inline blocks does not
@@ -809,6 +932,51 @@ fn quirks_mode_line_height() {
     assert_eq!(rect_of(&quirks, r).h, 40.0);
     let standard = layout(&tree, html, 800.0);
     assert_eq!((rect_of(&standard, p).h, rect_of(&standard, q).h, rect_of(&standard, r).h), (40.0, 40.0, 40.0));
+}
+
+#[test]
+fn vertical_align_offsets_as_blink() {
+    // Spans in their parent's font and line height: sub and super move by
+    // a fifth and a third of the font size and a pixel; middle puts the
+    // box's middle half an x-height above the baseline
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, va: &str| {
+        let p = el(tree, body, "div", "font-size: 16px; line-height: 20px");
+        let base = el(tree, p, "span", "");
+        text(tree, base, "x");
+        let s = el(tree, p, "span", &format!("vertical-align: {va}"));
+        text(tree, s, "x");
+        (base, s)
+    };
+    let sub = line(&mut tree, "sub");
+    let sup = line(&mut tree, "super");
+    let mid = line(&mut tree, "middle");
+    let t = layout(&tree, html, 800.0);
+    let shift = |(p, s): (NodeId, NodeId)| rects_of(&t, s)[0].y - rects_of(&t, p)[0].y;
+    assert!((shift(sub) - 4.2).abs() < 0.01, "{}", shift(sub));
+    assert!((shift(sup) + 16.0 / 3.0 + 1.0).abs() < 0.01, "{}", shift(sup));
+    let mut fonts = FontContext::default();
+    let mut style = Style::default();
+    std::sync::Arc::make_mut(&mut style.inherited).font_size = 16.0;
+    let font = fonts.resolve(&style);
+    let (a, d) = (font.ascent(), font.descent());
+    let above = ((20.0 - a - d) / 2.0).floor();
+    let expected = (a + above - (20.0 - a - above)) / 2.0 - font.x_height() / 2.0;
+    assert!((shift(mid) - expected).abs() < 0.01, "{} {expected}", shift(mid));
+}
+
+#[test]
+fn inline_blocks_sit_on_their_line_boxes_baseline() {
+    // An inline block whose text is moved by vertical-align still has its
+    // line box's baseline: beside the same text, it adds no height
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "font-size: 16px; line-height: 23px");
+    text(&mut tree, p, "x ");
+    let ib = el(&mut tree, p, "span", "display: inline-block");
+    let tag = el(&mut tree, ib, "span", "font-size: 10px; vertical-align: middle");
+    text(&mut tree, tag, "tag");
+    let t = layout(&tree, html, 800.0);
+    assert!((rect_of(&t, p).h - rect_of(&t, ib).h).abs() < 0.01, "{:?} {:?}", rect_of(&t, p), rect_of(&t, ib));
 }
 
 #[test]
@@ -1251,4 +1419,782 @@ fn nowrap_flex_items_keep_their_text_width() {
     let texts: Vec<Rect> = t.element_rects().into_iter().filter(|(n, r)| *n == a && r.w > 0.0).map(|(_, r)| r).collect();
     let text_right = texts.iter().map(|r| r.right()).fold(0.0f32, f32::max);
     assert!(rb.x >= text_right - 0.5, "{ra:?} {rb:?} text ends at {text_right}");
+}
+
+#[test]
+fn white_space_between_flex_and_grid_items_is_not_rendered() {
+    let (mut tree, html, body) = doc();
+    // Even preserved, white space between items makes no item of its own
+    // (CSS Grid §6.1, Flexbox §4): shiki's code lines are grid items with
+    // newlines between them
+    let grid = el(&mut tree, body, "div", "display: grid; white-space: pre");
+    let a = el(&mut tree, grid, "div", "height: 10px");
+    text(&mut tree, grid, "\n  ");
+    let b = el(&mut tree, grid, "div", "height: 10px");
+    let flex = el(&mut tree, body, "div", "display: flex; flex-direction: column; white-space: pre-wrap");
+    let c = el(&mut tree, flex, "div", "height: 10px");
+    text(&mut tree, flex, "\n");
+    let d = el(&mut tree, flex, "div", "height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, b).y - rect_of(&t, a).y, 10.0);
+    assert_eq!(rect_of(&t, grid).h, 20.0);
+    assert_eq!(rect_of(&t, d).y - rect_of(&t, c).y, 10.0);
+}
+
+#[test]
+fn grid_min_content_comes_from_minimum_contributions() {
+    let (mut tree, html, body) = doc();
+    // A minmax(0, 1fr) column needs nothing at min-content: its flex
+    // fraction is zero there
+    let fr = el(&mut tree, body, "div", "display: grid; grid-template-columns: minmax(0, 1fr); width: min-content");
+    el(&mut tree, fr, "div", "width: 200px; height: 10px");
+    // A scroll container has no automatic minimum, so an auto column's
+    // min-content is what its other items need, and its max-content what
+    // the scroll container's content does
+    let scrolls = |tree: &mut DomTree, width: &str| {
+        let g = el(tree, body, "div", &format!("display: grid; {width}"));
+        let s = el(tree, g, "div", "overflow-x: auto");
+        el(tree, s, "div", "width: 300px; height: 10px");
+        let o = el(tree, g, "div", "");
+        el(tree, o, "div", "width: 120px; height: 10px");
+        (g, s)
+    };
+    let (min, _) = scrolls(&mut tree, "width: min-content");
+    let (max, _) = scrolls(&mut tree, "width: max-content");
+    // In a narrower container the column fits it, and the scroll
+    // container scrolls
+    let narrow = el(&mut tree, body, "div", "width: 200px");
+    let g = el(&mut tree, narrow, "div", "display: grid");
+    let s = el(&mut tree, g, "div", "overflow-x: auto");
+    el(&mut tree, s, "div", "width: 300px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, fr).w, 0.0);
+    assert_eq!(rect_of(&t, min).w, 120.0);
+    assert_eq!(rect_of(&t, max).w, 300.0);
+    assert_eq!((rect_of(&t, g).w, rect_of(&t, s).w), (200.0, 200.0));
+}
+
+#[test]
+fn intrinsic_widths_size_flex_and_grid_items() {
+    let (mut tree, html, body) = doc();
+    let words = |tree: &mut DomTree, parent: NodeId| {
+        el(tree, parent, "div", "display: inline-block; width: 50px; height: 10px");
+        text(tree, parent, " ");
+        el(tree, parent, "div", "display: inline-block; width: 80px; height: 10px");
+    };
+    // A row item's flex base size, and a column or grid item's width, are
+    // the keyword's rather than stretched
+    let row = el(&mut tree, body, "div", "display: flex; width: 400px");
+    let in_row = el(&mut tree, row, "div", "width: min-content");
+    words(&mut tree, in_row);
+    let column = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 400px");
+    let in_column = el(&mut tree, column, "div", "width: max-content");
+    words(&mut tree, in_column);
+    let grid = el(&mut tree, body, "div", "display: grid; width: 400px");
+    let in_grid = el(&mut tree, grid, "div", "width: min-content");
+    words(&mut tree, in_grid);
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, in_row).w, 80.0);
+    let w = rect_of(&t, in_column).w;
+    assert!(w > 130.0 && w < 150.0, "{w}");
+    assert_eq!(rect_of(&t, in_grid).w, 80.0);
+}
+
+#[test]
+fn preserved_spaces_take_room_at_line_ends_and_starts() {
+    let (mut tree, html, body) = doc();
+    // Under pre, spaces at a line's end take room rather than hang (CSS
+    // Text 3 §4.1.3): Tailwind's "text-8xl " labels sit apart
+    let row = el(&mut tree, body, "div", "display: flex; white-space: pre");
+    let a = el(&mut tree, row, "span", "");
+    text(&mut tree, a, "ab ");
+    let b = el(&mut tree, row, "span", "");
+    text(&mut tree, b, "cd");
+    let keep = el(&mut tree, body, "div", "white-space: pre; width: min-content");
+    text(&mut tree, keep, "ab   ");
+    // pre-wrap's hang
+    let hang = el(&mut tree, body, "div", "white-space: pre-wrap; width: min-content");
+    text(&mut tree, hang, "ab   ");
+    // Spaces starting a line indent the inline box after them (a code
+    // line's first token)
+    let line = el(&mut tree, body, "div", "white-space: pre");
+    text(&mut tree, line, "  ");
+    let token = el(&mut tree, line, "span", "");
+    text(&mut tree, token, "x");
+    let t = layout(&tree, html, 800.0);
+    let ab = rect_of(&t, hang).w;
+    assert!(ab > 0.0);
+    assert!(rect_of(&t, a).w > ab + 1.0);
+    assert_eq!(rect_of(&t, b).x, rect_of(&t, a).x + rect_of(&t, a).w);
+    assert!(rect_of(&t, keep).w > rect_of(&t, a).w + 1.0);
+    assert!(rect_of(&t, token).x > rect_of(&t, line).x + 1.0);
+}
+
+#[test]
+fn percentage_flex_bases_of_an_unknown_height_are_the_contents() {
+    let (mut tree, html, body) = doc();
+    // In a column of unknown height a basis of 0% (flex: 1's) cannot
+    // resolve, so it is the content's (CSS Flexbox §9.2.3): react.dev's
+    // code panels were collapsed to nothing. 0px is 0
+    let column = |tree: &mut DomTree, item: &str| {
+        let c = el(tree, body, "div", "display: flex; flex-direction: column");
+        let i = el(tree, c, "div", item);
+        el(tree, i, "div", "height: 100px");
+        i
+    };
+    let pct = column(&mut tree, "flex: 1 1 0%; overflow: auto");
+    let shorthand = column(&mut tree, "flex: 1; overflow: hidden");
+    let px = column(&mut tree, "flex: 1 1 0px; overflow: auto");
+    // With a height the percentage resolves, and the item grows into it
+    let sized = el(&mut tree, body, "div", "display: flex; flex-direction: column; height: 50px");
+    let grows = el(&mut tree, sized, "div", "flex: 1 1 0%");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, pct).h, 100.0);
+    assert_eq!(rect_of(&t, shorthand).h, 100.0);
+    assert_eq!(rect_of(&t, px).h, 0.0);
+    assert_eq!(rect_of(&t, grows).h, 50.0);
+}
+
+#[test]
+fn automatic_column_heights_are_clamped_before_flexing() {
+    let (mut tree, html, body) = doc();
+    // A column whose height comes from min-height grows its flexible
+    // items into it (CSS Flexbox §9.2 #4): vercel.com's hero is a
+    // min-height column with a flex: 1 child
+    let tall = el(&mut tree, body, "div", "display: flex; flex-direction: column; min-height: 300px");
+    let grows = el(&mut tree, tall, "div", "flex: 1");
+    el(&mut tree, grows, "div", "height: 18px");
+    el(&mut tree, tall, "div", "height: 20px");
+    // max-height shrinks them, and justify-content shares what is left
+    let short = el(&mut tree, body, "div", "display: flex; flex-direction: column; max-height: 100px");
+    let mut shrinks = Vec::new();
+    for _ in 0..2 {
+        let i = el(&mut tree, short, "div", "min-height: 0; overflow: hidden");
+        el(&mut tree, i, "div", "height: 100px");
+        shrinks.push(i);
+    }
+    let centered = el(&mut tree, body, "div", "display: flex; flex-direction: column; min-height: 200px; justify-content: center");
+    let middle = el(&mut tree, centered, "div", "height: 50px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, tall).h, 300.0);
+    assert_eq!(rect_of(&t, grows).h, 280.0);
+    assert_eq!(rect_of(&t, short).h, 100.0);
+    assert_eq!(shrinks.iter().map(|&i| rect_of(&t, i).h).collect::<Vec<_>>(), [50.0, 50.0]);
+    assert_eq!(rect_of(&t, middle).y - rect_of(&t, centered).y, 75.0);
+}
+
+#[test]
+fn absolutely_positioned_boxes_take_their_width_from_aspect_ratio() {
+    let (mut tree, html, body) = doc();
+    // An automatic width follows a definite height through aspect-ratio,
+    // within max-width
+    let cb = el(&mut tree, body, "div", "position: relative; width: 400px; height: 200px");
+    let art = el(&mut tree, cb, "div", "position: absolute; left: 50%; height: 100%; aspect-ratio: 3 / 2");
+    let capped = el(&mut tree, cb, "div", "position: absolute; left: 0; height: 100px; aspect-ratio: 4; max-width: 300px");
+    // Both insets still stretch it
+    let stretched = el(&mut tree, cb, "div", "position: absolute; left: 10px; right: 10px; height: 50px; aspect-ratio: 1");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, art).w, rect_of(&t, art).h), (300.0, 200.0));
+    assert_eq!(rect_of(&t, capped).w, 300.0);
+    assert_eq!(rect_of(&t, stretched).w, 380.0);
+}
+
+#[test]
+fn stretched_grid_items_keep_their_max_sizes() {
+    let (mut tree, html, body) = doc();
+    // Stretching fills the grid area within min/max-width and
+    // min/max-height (CSS Box Alignment §6.1): vercel.com's col-span-8
+    // headings have a max-width
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 600px; grid-template-rows: 200px");
+    let item = el(&mut tree, grid, "div", "max-width: 300px; max-height: 50px; padding: 5px");
+    let wide = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px");
+    let min = el(&mut tree, wide, "div", "min-width: 150px");
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, item);
+    assert_eq!((r.w, r.h), (310.0, 60.0));
+    assert_eq!(rect_of(&t, min).w, 150.0);
+}
+
+#[test]
+fn contained_boxes() {
+    let (mut tree, html, body) = doc();
+    // Layout containment: an independent formatting context, so a child's
+    // margin stays inside (vercel.com's content-visibility: auto sections)
+    let auto = el(&mut tree, body, "div", "content-visibility: auto");
+    let child = el(&mut tree, auto, "div", "margin-top: 20px; height: 30px");
+    // Size containment: contain-intrinsic-size, not the contents, sizes it
+    let sized = el(&mut tree, body, "div", "contain: size; contain-intrinsic-size: 40px 50px; float: left");
+    el(&mut tree, sized, "div", "width: 200px; height: 100px");
+    // content-visibility: hidden skips the contents
+    let hidden = el(&mut tree, body, "div", "content-visibility: hidden; clear: both");
+    el(&mut tree, hidden, "div", "height: 100px");
+    // A contained box is the containing block of positioned descendants
+    let paint = el(&mut tree, body, "div", "contain: paint; margin-left: 100px; height: 10px");
+    let abs = el(&mut tree, paint, "div", "position: absolute; left: 5px; top: 0; width: 10px; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    let (a, c) = (rect_of(&t, auto), rect_of(&t, child));
+    assert_eq!((a.y - rect_of(&t, body).y, a.h, c.y - a.y), (0.0, 50.0, 20.0));
+    let r = rect_of(&t, sized);
+    assert_eq!((r.w, r.h), (40.0, 50.0));
+    assert_eq!(rect_of(&t, hidden).h, 0.0);
+    assert_eq!(rect_of(&t, abs).x, rect_of(&t, paint).x + 5.0);
+    // Paint containment clips but does not scroll: a sticky box inside
+    // sticks to the viewport (Wikipedia's contents column)
+    let mut scrolls = None;
+    t.for_each(|f| {
+        if let Fragment::Box(b) = f {
+            if b.node == paint {
+                scrolls = Some(b.scroll_extent.is_some());
+            }
+        }
+    });
+    assert_eq!(scrolls, Some(false));
+}
+
+#[test]
+fn inline_boxes_ending_with_a_newline_end_on_its_line() {
+    let (mut tree, html, body) = doc();
+    // A highlighted code token ending in a newline ends on that line: it
+    // has no empty part starting the next (htmx.org's code samples)
+    let pre = el(&mut tree, body, "pre", "white-space: pre; margin: 0");
+    let token = el(&mut tree, pre, "span", "");
+    text(&mut tree, token, "abc\n");
+    let next = el(&mut tree, pre, "span", "");
+    text(&mut tree, next, "de");
+    let t = layout(&tree, html, 800.0);
+    let parts = rects_of(&t, token);
+    assert!(parts.iter().all(|r| r.y == parts[0].y), "{parts:?}");
+    let n = rect_of(&t, next);
+    assert!(n.y >= parts[0].y + parts[0].h - 0.5, "{parts:?} {n:?}");
+    assert_eq!(n.x, rect_of(&t, pre).x);
+}
+
+#[test]
+fn top_and_bottom_align_to_the_line_box() {
+    // As in Chromium: an image aligned to the line's bottom (or top) sets
+    // the line's height when taller than it, with no strut below it
+    // (wordpress.org's vertical-align: bottom images in 30px lines)
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, kids: &[(u32, &str)]| {
+        let d = el(tree, body, "div", "font-size: 16px; line-height: 30px");
+        let ids: Vec<NodeId> = kids.iter().map(|(h, va)| el(tree, d, "span", &format!("display: inline-block; width: 20px; height: {h}px; vertical-align: {va}"))).collect();
+        (d, ids)
+    };
+    let (a, ai) = line(&mut tree, &[(144, "bottom")]);
+    let (b, bi) = line(&mut tree, &[(10, "bottom")]);
+    let (c, ci) = line(&mut tree, &[(60, "bottom"), (80, "top")]);
+    let t = layout(&tree, html, 800.0);
+    let at = |d: NodeId, n: NodeId| (rect_of(&t, n).y - rect_of(&t, d).y, rect_of(&t, n).h);
+    assert_eq!((rect_of(&t, a).h, at(a, ai[0])), (144.0, (0.0, 144.0)));
+    // A short one sits at the bottom of the strut's 30px line
+    assert_eq!((rect_of(&t, b).h, at(b, bi[0])), (30.0, (20.0, 10.0)));
+    assert_eq!((rect_of(&t, c).h, at(c, ci[0]), at(c, ci[1])), (80.0, (20.0, 60.0), (0.0, 80.0)));
+}
+
+#[test]
+fn flex_and_grid_containers_sit_on_their_first_item() {
+    // As in Chromium: an inline flex box sits on its first item's baseline,
+    // synthesized from the item's bottom when it has none (wordpress.org's
+    // logo link holds an <svg>); an inline-block ending in a column flex
+    // container sits on that container's first item too
+    let (mut tree, html, body) = doc();
+    let p = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let a = el(&mut tree, p, "span", "display: inline-flex; padding: 15px 20px");
+    el(&mut tree, a, "div", "width: 30px; height: 30px");
+    let q = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let ib = el(&mut tree, q, "span", "display: inline-block");
+    let col = el(&mut tree, ib, "div", "display: flex; flex-direction: column");
+    el(&mut tree, col, "div", "height: 10px");
+    el(&mut tree, col, "div", "height: 20px");
+    let g = el(&mut tree, body, "div", "font-size: 10px; line-height: 10px");
+    let ig = el(&mut tree, g, "span", "display: inline-grid; grid-template-columns: auto auto");
+    for h in [10, 20, 40] {
+        el(&mut tree, ig, "div", &format!("height: {h}px; width: 5px"));
+    }
+    let t = layout(&tree, html, 800.0);
+    // Nothing of the line's strut reaches below the boxes' bottoms
+    assert_eq!((rect_of(&t, p).h, rect_of(&t, a).h), (60.0, 60.0));
+    assert_eq!((rect_of(&t, q).h, rect_of(&t, ib).h), (30.0, 30.0));
+    // The grid's first row is 20px: its baseline is the first item's bottom
+    // (10px), and its 60px reach 50px below the baseline
+    assert_eq!(rect_of(&t, ig).h, 60.0);
+    assert!(rect_of(&t, g).h >= 60.0 && rect_of(&t, ig).y - rect_of(&t, g).y < 10.0, "{:?} {:?}", rect_of(&t, g), rect_of(&t, ig));
+}
+
+#[test]
+fn spanning_items_fill_tracks_below_their_limits_first() {
+    // CSS Grid §11.5.1, as in Chromium (mozilla.org's donate grid): a
+    // media item spanning a heading's row and an empty one grows the empty
+    // one, the heading's row having reached its growth limit
+    let (mut tree, html, body) = doc();
+    let g = el(&mut tree, body, "div", "display: grid; grid-template-columns: repeat(12, 1fr); column-gap: 12px; width: 1232px");
+    let h = el(&mut tree, g, "div", "grid-column: 1 / 7; margin-bottom: 16px");
+    el(&mut tree, h, "div", "height: 128px");
+    let b = el(&mut tree, g, "div", "grid-row: 2 / 4; grid-column: 1 / 7; height: 167px");
+    let m = el(&mut tree, g, "div", "grid-row: 1 / 3; grid-column: 8 / 13; height: 253px");
+    let p = el(&mut tree, g, "div", "grid-column: 8 / 13; height: 58px");
+    let t = layout(&tree, html, 1280.0);
+    let at = |n: NodeId| (rect_of(&t, n).y - rect_of(&t, g).y, rect_of(&t, n).h);
+    assert_eq!([h, b, m, p].map(at), [(0.0, 128.0), (144.0, 167.0), (0.0, 253.0), (253.0, 58.0)]);
+}
+
+#[test]
+fn column_subgrids_share_their_parents_tracks() {
+    // As in Chromium (mozilla.org's springboard): rows of a list are column
+    // subgrids of an auto-column grid, so their cells line up and size the
+    // columns together; a subgrid's own gap is half extra margin on each
+    // side of its gutters, and its padding a margin on its edge items
+    let (mut tree, html, body) = doc();
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: repeat(3, auto); width: 600px");
+    let row = |tree: &mut DomTree, widths: [u32; 3], style: &str| {
+        let r = el(tree, grid, "div", &format!("display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; {style}"));
+        widths.map(|w| el(tree, r, "div", &format!("width: {w}px; height: 10px")))
+    };
+    let a = row(&mut tree, [50, 100, 30], "");
+    let b = row(&mut tree, [80, 20, 40], "column-gap: 20px; padding-left: 5px");
+    let t = layout(&tree, html, 800.0);
+    let x = |n: NodeId| ((rect_of(&t, n).x - rect_of(&t, grid).x) * 10.0).round() / 10.0;
+    // Chromium's positions for the same page
+    assert_eq!(a.map(x), [0.0, 213.3, 431.7]);
+    assert_eq!(b.map(x), [5.0, 223.3, 441.7]);
+    // Subgrid items stretch over their (narrowed) tracks when auto-sized
+    let (mut tree, html, body) = doc();
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px 200px; width: 300px");
+    let sub = el(&mut tree, grid, "div", "display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; column-gap: 10px");
+    let cells = [el(&mut tree, sub, "div", "height: 10px"), el(&mut tree, sub, "div", "height: 10px")];
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(cells.map(|c| (rect_of(&t, c).x - rect_of(&t, grid).x, rect_of(&t, c).w)), [(0.0, 95.0), (105.0, 195.0)]);
+}
+
+#[test]
+fn stretched_column_items_keep_their_min_and_max_widths() {
+    // As in Chromium: bun.sh's max-w-[52ch] paragraphs in flex columns
+    let (mut tree, html, body) = doc();
+    let col = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 600px");
+    let narrow = el(&mut tree, col, "div", "max-width: 300px; height: 10px");
+    let wide = el(&mut tree, col, "div", "min-width: 700px; height: 10px");
+    let half = el(&mut tree, col, "div", "max-width: 50%; padding: 0 20px; box-sizing: border-box; height: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!([narrow, wide, half].map(|n| rect_of(&t, n).w), [300.0, 700.0, 300.0]);
+}
+
+#[test]
+fn preserved_spaces_make_a_line() {
+    // A block holding only preserved spaces has a line box (bun.sh's blank
+    // code lines); collapsible ones (pre-line too) make none
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, ws: &str, t: &str| {
+        let d = el(tree, body, "div", &format!("white-space: {ws}; line-height: 20px"));
+        text(tree, d, t);
+        d
+    };
+    let cases = [line(&mut tree, "pre", " "), line(&mut tree, "pre-wrap", "  "), line(&mut tree, "break-spaces", " "), line(&mut tree, "pre-line", " "), line(&mut tree, "normal", " ")];
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(cases.map(|d| rect_of(&t, d).h), [20.0, 20.0, 20.0, 0.0, 0.0]);
+}
+
+#[test]
+fn fieldsets_contain_their_floats() {
+    // A fieldset establishes a block formatting context, so it grows to
+    // its floats (archlinux.org's package search); a div does not
+    let (mut tree, html, body) = doc();
+    let boxed = |tree: &mut DomTree, tag: &str| {
+        let b = el(tree, body, tag, "display: block; margin: 0; padding: 0; border: 0; line-height: 20px");
+        el(tree, b, "div", "float: right; width: 50px; height: 30px");
+        text(tree, b, "Search");
+        b
+    };
+    let (fieldset, div) = (boxed(&mut tree, "fieldset"), boxed(&mut tree, "div"));
+    let t = layout(&tree, html, 800.0);
+    assert_eq!((rect_of(&t, fieldset).h, rect_of(&t, div).h), (30.0, 20.0));
+}
+
+#[test]
+fn positioned_inline_boxes_contain_absolute_boxes() {
+    // A relatively positioned inline box is the containing block of the
+    // absolute boxes in it: from its first fragment's padding box to its
+    // last's (CSS 2.1 §10.1). debian.org underlines links with one
+    let (mut tree, html, body) = doc();
+    let block = el(&mut tree, body, "div", "width: 300px; line-height: 20px");
+    text(&mut tree, block, "aaa ");
+    let link = el(&mut tree, block, "span", "position: relative; padding: 0 5px");
+    text(&mut tree, link, "bbb");
+    let line = el(&mut tree, link, "i", "position: absolute; left: 0; right: 0; bottom: 0; height: 2px");
+    let wide = el(&mut tree, body, "div", "width: 100px; line-height: 20px");
+    text(&mut tree, wide, "aaa ");
+    let span = el(&mut tree, wide, "span", "position: relative");
+    text(&mut tree, span, "bbbb cccc dddd eeee");
+    let fill = el(&mut tree, span, "i", "position: absolute; top: 0; left: 0; width: 100%; height: 100%");
+    // An absolute ::before amid the line does not break it
+    let generated = el(&mut tree, body, "div", "width: 300px; line-height: 20px");
+    text(&mut tree, generated, "aaa ");
+    let marked = el(&mut tree, generated, "span", "position: relative");
+    tree.set_attribute(marked, "data-before", "content: ''; position: absolute");
+    text(&mut tree, marked, "bbb");
+    text(&mut tree, generated, " ccc");
+    let t = layout(&tree, html, 800.0);
+    let (l, u) = (rect_of(&t, link), rect_of(&t, line));
+    assert_eq!((u.x, u.w, u.y + u.h), (l.x, l.w, l.y + l.h));
+    let parts = rects_of(&t, span);
+    let (first, last, f) = (parts[0], parts[parts.len() - 1], rect_of(&t, fill));
+    assert!(parts.len() > 1);
+    assert_eq!((f.x, f.y), (first.x, first.y));
+    assert_eq!(((f.x + f.w).max(first.x), f.y + f.h), ((last.x + last.w).max(first.x), last.y + last.h));
+    assert_eq!(rect_of(&t, generated).h, 20.0);
+}
+
+#[test]
+fn table_captions_hold_their_own_floats() {
+    // A caption establishes a block formatting context (CSS 2.1 §9.4.1):
+    // its floats are placed in it, not at a position left over from the
+    // layout before the table (Wikipedia's figures, whose captions float
+    // an icon, were as tall as the page above them)
+    let (mut tree, html, body) = doc();
+    el(&mut tree, body, "div", "height: 500px");
+    let table = el(&mut tree, body, "div", "display: table; width: 200px");
+    let caption = el(&mut tree, table, "div", "display: table-caption; line-height: 20px");
+    el(&mut tree, caption, "div", "float: right; width: 10px; height: 10px");
+    text(&mut tree, caption, "caption");
+    let row = el(&mut tree, table, "div", "display: table-row");
+    let cell = el(&mut tree, row, "div", "display: table-cell; height: 30px");
+    text(&mut tree, cell, "cell");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, table).h, 50.0);
+}
+
+#[test]
+fn block_containers_align_their_content() {
+    // align-content moves a block container's content as a whole, never
+    // above its top (CSS Box Alignment 3 §5.3); a button centers its content
+    // whatever its align-content, as Chromium does (django's search button)
+    let (mut tree, html, body) = doc();
+    let mut case = |tree: &mut DomTree, tag: &str, style: &str, inner: f32| {
+        let b = el(tree, body, tag, &format!("display: block; margin: 0; padding: 0; border: 0; {style}"));
+        let c = el(tree, b, "div", &format!("margin: 5px 0; height: {inner}px"));
+        (b, c)
+    };
+    let cases = [
+        case(&mut tree, "div", "height: 60px; align-content: center", 20.0),
+        case(&mut tree, "div", "height: 60px; align-content: end", 20.0),
+        case(&mut tree, "div", "height: 60px; align-content: start", 20.0),
+        case(&mut tree, "div", "height: 20px; align-content: center", 60.0),
+        case(&mut tree, "button", "height: 60px; align-content: start", 20.0),
+    ];
+    let t = layout(&tree, html, 800.0);
+    // Its margins stay inside it: it is a formatting context root
+    assert_eq!(cases.map(|(b, c)| rect_of(&t, c).y - rect_of(&t, b).y), [20.0, 35.0, 5.0, 5.0, 20.0]);
+}
+
+#[test]
+fn multi_column_layout_balances_columns() {
+    // Chromium's results: columns share the width (a normal gap is 1em),
+    // the content is balanced across them, even with a definite height,
+    // and a column after the first starts at its top (Wikipedia's language
+    // lists are column-width: 112px)
+    let (mut tree, html, body) = doc();
+    let multicol = |tree: &mut DomTree, style: &str, items: &[&str]| {
+        let m = el(tree, body, "div", &format!("width: 600px; font-size: 16px; line-height: 20px; {style}"));
+        let kids: Vec<NodeId> = items.iter().map(|st| el(tree, m, "div", st)).collect();
+        (m, kids)
+    };
+    let (three, items) = multicol(&mut tree, "columns: 3", &["height: 20px"; 8]);
+    let (wide, cols) = multicol(&mut tree, "column-width: 112px; column-gap: 20px", &["height: 20px"; 7]);
+    let (fixed, boxes) = multicol(&mut tree, "column-count: 3; height: 60px", &["height: 20px"; 5]);
+    let (paras, ps) = multicol(&mut tree, "columns: 2", &["margin: 10px 0; height: 20px"; 3]);
+    // Lines of inline content break between line boxes
+    let lines = el(&mut tree, body, "div", "width: 600px; columns: 2; line-height: 20px");
+    let spans: Vec<NodeId> = (0..4)
+        .map(|i| {
+            let s = el(&mut tree, lines, "span", "");
+            text(&mut tree, s, &format!("line{i}"));
+            if i < 3 {
+                el(&mut tree, lines, "br", "");
+            }
+            s
+        })
+        .collect();
+    let t = layout(&tree, html, 800.0);
+    // x from the containers' left edge
+    let x0 = rect_of(&t, three).x;
+    let at = |n: NodeId| {
+        let r = rect_of(&t, n);
+        (((r.x - x0) * 10.0).round() / 10.0, r.y, (r.w * 10.0).round() / 10.0)
+    };
+    let top = |n: NodeId| rect_of(&t, n).y;
+    let y = top(three);
+    assert_eq!(rect_of(&t, three).h, 60.0);
+    assert_eq!([at(items[0]), at(items[7])], [(0.0, y, 189.3), (410.7, y + 20.0, 189.3)]);
+    // 4 columns of 135px fit 600px with 20px gaps
+    let y = top(wide);
+    assert_eq!(rect_of(&t, wide).h, 40.0);
+    assert_eq!([at(cols[0]), at(cols[5]), at(cols[6])], [(0.0, y, 135.0), (310.0, y + 20.0, 135.0), (465.0, y, 135.0)]);
+    // Balanced 2, 2, 1 within the 60px height
+    let y = top(fixed);
+    assert_eq!(at(boxes[3]), (205.3, y + 20.0, 189.3));
+    // The first column keeps its first margin; the break truncates the
+    // margin of the second column's first box
+    let y = top(paras);
+    assert_eq!(rect_of(&t, paras).h, 50.0);
+    assert_eq!([at(ps[0]).1, at(ps[1]).1, at(ps[2]).1], [y + 10.0, y, y + 30.0]);
+    assert_eq!(at(ps[1]).0, 308.0);
+    // The third line heads the second column, level with the first
+    assert_eq!(rect_of(&t, lines).h, 40.0);
+    let (first, third) = (rects_of(&t, spans[0])[0], rects_of(&t, spans[2])[0]);
+    assert_eq!((third.x - x0, third.y), (308.0, first.y));
+}
+
+#[test]
+fn replaced_flex_items_follow_their_ratio() {
+    // As in Chromium: a flexed image's height follows its used width; its
+    // automatic minimum is its natural width, not its own width; one with
+    // only a ratio starts as wide as the line (remix.run's footer logo)
+    let (mut tree, html, body) = doc();
+    let img = |tree: &mut DomTree, parent: NodeId, style: &str, attr: (&str, &str)| {
+        let i = el(tree, parent, "img", style);
+        tree.set_attribute(i, attr.0, attr.1);
+        i
+    };
+    let row = |tree: &mut DomTree, style: &str| el(tree, body, "div", &format!("display: flex; width: 600px; {style}"));
+    let r = row(&mut tree, "");
+    let grown = img(&mut tree, r, "flex: 1", ("data-natural", "100x50"));
+    let r = row(&mut tree, "align-items: flex-start");
+    let shrunk = img(&mut tree, r, "width: 300px", ("data-natural", "100x50"));
+    el(&mut tree, r, "div", "width: 400px; flex: none");
+    let r = row(&mut tree, "");
+    let fill = img(&mut tree, r, "", ("data-ratio", "440 43"));
+    let r = row(&mut tree, "");
+    let shared = img(&mut tree, r, "", ("data-ratio", "440 43"));
+    el(&mut tree, r, "div", "width: 100px; flex: none; height: 10px");
+    // Auto margins across keep a column's image from stretching (go.dev's
+    // case study logos)
+    let r = el(&mut tree, body, "div", "display: flex; flex-direction: column; width: 600px; height: 95px");
+    let centered = img(&mut tree, r, "margin: auto; max-height: 64px", ("data-natural", "56x49"));
+    // A max-height that shrinks the natural height narrows the base size
+    // through the ratio (kotlinlang.org's Gradle logo, 878x200 at 30px)
+    let r = row(&mut tree, "align-items: center");
+    let capped = img(&mut tree, r, "max-width: 100%; max-height: 30px", ("data-natural", "878x200"));
+    let t = layout(&tree, html, 800.0);
+    let size = |n: NodeId| ((rect_of(&t, n).w * 100.0).round() / 100.0, (rect_of(&t, n).h * 100.0).round() / 100.0);
+    assert_eq!(size(centered), (56.0, 49.0));
+    assert_eq!(size(grown), (600.0, 300.0));
+    assert_eq!(size(shrunk), (200.0, 100.0));
+    assert_eq!(size(fill), (600.0, 58.64));
+    assert_eq!(size(shared), (500.0, 48.86));
+    assert_eq!(size(capped), (131.7, 30.0));
+}
+
+#[test]
+fn absolute_flex_children_align_as_sole_items() {
+    // An absolutely positioned child of a flex container with auto insets
+    // sits where it would as the only flex item (CSS Flexbox §4.1), as in
+    // Chromium: nextjs.org's wordmark is centered by align-items
+    let (mut tree, html, body) = doc();
+    let flex = |tree: &mut DomTree, style: &str, abs: &str| {
+        let f = el(tree, body, "div", &format!("display: flex; position: relative; width: 400px; height: 200px; padding: 5px; border: 2px solid; {style}"));
+        let a = el(tree, f, "div", &format!("position: absolute; width: 100px; height: 50px; {abs}"));
+        (f, a)
+    };
+    let cases = [
+        flex(&mut tree, "flex-direction: column; align-items: center", ""),
+        flex(&mut tree, "justify-content: center; align-items: flex-end", "margin: 4px 10px"),
+        flex(&mut tree, "flex-direction: row-reverse", ""),
+        flex(&mut tree, "justify-content: space-between; align-items: center", "align-self: flex-start"),
+        flex(&mut tree, "flex-direction: column; justify-content: flex-end; height: auto; min-height: 300px", ""),
+        flex(&mut tree, "align-items: center", "top: 3px"),
+    ];
+    let t = layout(&tree, html, 800.0);
+    let at: Vec<(f32, f32)> = cases.iter().map(|&(f, a)| (rect_of(&t, a).x - rect_of(&t, f).x, rect_of(&t, a).y - rect_of(&t, f).y)).collect();
+    assert_eq!(at, [(157.0, 7.0), (157.0, 153.0), (307.0, 7.0), (7.0, 7.0), (7.0, 257.0), (7.0, 5.0)]);
+}
+
+#[test]
+fn grid_rows_fill_the_min_height() {
+    // With an indefinite height, auto rows stretch and fr rows flex to the
+    // min-height (or down to the max-height), as in Chromium: remix.run's
+    // install bar is a grid with min-height: 58px
+    let (mut tree, html, body) = doc();
+    let grid = |tree: &mut DomTree, style: &str, kids: &[&str]| {
+        let g = el(tree, body, "div", &format!("display: grid; {style}"));
+        let ids: Vec<NodeId> = kids.iter().map(|k| el(tree, g, "div", k)).collect();
+        (g, ids)
+    };
+    let (a, ai) = grid(&mut tree, "min-height: 100px; border: 1px solid; box-sizing: border-box", &[""]);
+    let (b, bi) = grid(&mut tree, "min-height: 300px; grid-template-rows: auto 1fr auto", &["height: 20px", "", "height: 20px"]);
+    let (c, ci) = grid(&mut tree, "max-height: 50px; grid-template-rows: 1fr 1fr", &["overflow: hidden", "overflow: hidden"]);
+    for &i in &ci {
+        el(&mut tree, i, "div", "height: 40px");
+    }
+    let (d, di) = grid(&mut tree, "min-height: 100px; align-content: center", &["height: 20px"]);
+    let t = layout(&tree, html, 800.0);
+    let h = |n: NodeId| rect_of(&t, n).h;
+    assert_eq!((h(a), h(ai[0])), (100.0, 98.0));
+    assert_eq!((h(b), h(bi[0]), h(bi[1]), h(bi[2])), (300.0, 20.0, 260.0, 20.0));
+    assert_eq!(rect_of(&t, bi[2]).y, rect_of(&t, b).y + 280.0);
+    // Scroll containers have no automatic minimum, so their fr rows share
+    // the max-height
+    assert_eq!((h(c), rect_of(&t, ci[1]).y - rect_of(&t, c).y), (50.0, 25.0));
+    assert_eq!((h(d), rect_of(&t, di[0]).y - rect_of(&t, d).y), (100.0, 40.0));
+}
+
+#[test]
+fn text_box_trim_takes_off_the_half_leading() {
+    // text-box-trim trims the first line to the font's over edge and the
+    // last to its under edge: remix.run's headings, trimmed to cap and
+    // alphabetic, are a cap height tall per line less a line's leading
+    let (mut tree, html, body) = doc();
+    let line = |tree: &mut DomTree, trim: &str| {
+        let p = el(tree, body, "div", &format!("font-size: 16px; line-height: 100px; {trim}"));
+        let s = el(tree, p, "span", "");
+        text(tree, s, "Hx");
+        (p, s)
+    };
+    let text_edges = line(&mut tree, "text-box: trim-both");
+    let cap = line(&mut tree, "text-box: trim-both cap alphabetic");
+    let start = line(&mut tree, "text-box-trim: trim-start");
+    let two = el(&mut tree, body, "div", "font-size: 16px; line-height: 100px; width: 0; text-box: cap alphabetic");
+    text(&mut tree, two, "H H");
+    let after = el(&mut tree, body, "div", "height: 1px");
+    let t = layout(&tree, html, 800.0);
+    let mut fonts = FontContext::default();
+    let mut style = Style::default();
+    std::sync::Arc::make_mut(&mut style.inherited).font_size = 16.0;
+    let font = fonts.resolve(&style);
+    let (a, d, c) = (font.ascent(), font.descent(), font.metrics.cap_height * 16.0);
+    let half = ((100.0 - a - d) / 2.0).floor();
+    let (p, s) = text_edges;
+    assert!((rect_of(&t, p).h - (a + d)).abs() < 0.5, "{:?} {a} {d}", rect_of(&t, p));
+    // The text moves up with the trimmed edge
+    assert!((rect_of(&t, s).y - rect_of(&t, p).y).abs() < 0.5, "{:?} {:?}", rect_of(&t, s), rect_of(&t, p));
+    assert!((rect_of(&t, cap.0).h - c).abs() < 0.5, "{:?} {c}", rect_of(&t, cap.0));
+    assert!((rect_of(&t, cap.1).y - (rect_of(&t, cap.0).y - (a - c))).abs() < 0.5);
+    assert!((rect_of(&t, start.0).h - (100.0 - half)).abs() < 0.5, "{:?} {half}", rect_of(&t, start.0));
+    // Only the first line's top and the last's bottom are trimmed
+    assert!((rect_of(&t, two).h - (100.0 + c)).abs() < 0.5, "{:?}", rect_of(&t, two));
+    assert!((rect_of(&t, after).y - (rect_of(&t, two).y + rect_of(&t, two).h)).abs() < 0.01);
+}
+
+#[test]
+fn replaced_sizes_without_percentages_or_natural_sizes() {
+    let (mut tree, html, body) = doc();
+    let img = |tree: &mut DomTree, parent: NodeId, attrs: &[(&str, &str)]| {
+        let i = tree.create_element("img");
+        for (k, v) in attrs {
+            tree.set_attribute(i, k, v);
+        }
+        tree.append_child(parent, i);
+        i
+    };
+    // Intrinsic sizes take percentages as auto (CSS Sizing 3 §5.2.1): a
+    // max-width: 100% image still makes a float as wide as itself
+    let a = el(&mut tree, body, "div", "float: left");
+    img(&mut tree, a, &[("width", "100"), ("height", "50"), ("style", "max-width: 100%; display: block")]);
+    let b = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, b, &[("width", "200"), ("height", "50"), ("style", "width: 100%; max-width: 120px; display: block")]);
+    // An image with only a ratio fills the width it is given, and adds
+    // nothing to intrinsic sizes (htmx.org's sponsor logos)
+    let wide = el(&mut tree, body, "div", "width: 400px; clear: left");
+    let fill = img(&mut tree, wide, &[("data-ratio", "842 206"), ("style", "display: block")]);
+    let c = el(&mut tree, body, "div", "float: left");
+    img(&mut tree, c, &[("data-ratio", "842 206"), ("style", "display: block")]);
+    // With a percentage width, it adds the default object size's, within
+    // its limits (htmx.org's silver sponsors: width: 80%)
+    let d = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, d, &[("data-ratio", "842 206"), ("style", "display: block; width: 80%")]);
+    let e = el(&mut tree, body, "div", "float: left; clear: left");
+    img(&mut tree, e, &[("data-ratio", "842 206"), ("style", "display: block; width: 100%; max-width: 100px")]);
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, a).w, 100.0);
+    assert_eq!(rect_of(&t, b).w, 120.0);
+    let f = rect_of(&t, fill);
+    assert_eq!((f.w, (f.h * 10.0).round() / 10.0), (400.0, 97.9));
+    assert_eq!(rect_of(&t, c).w, 0.0);
+    assert_eq!((rect_of(&t, d).w, rect_of(&t, e).w), (300.0, 100.0));
+}
+
+#[test]
+fn the_page_scrolls_over_its_scrollable_overflow() {
+    // Box shadows are ink, not scrollable overflow (CSS Overflow 3 §2.2):
+    // djangoproject.com's footer shadow made the page 137px longer.
+    // Transformed boxes count where they are drawn; fixed ones are the
+    // viewport's
+    let page = |style: &str| {
+        let (mut tree, html, body) = doc();
+        el(&mut tree, body, "div", "height: 1000px");
+        el(&mut tree, body, "div", style);
+        layout(&tree, html, 800.0).document_height
+    };
+    let plain = page("height: 10px");
+    assert_eq!(plain, 8.0 + 1000.0 + 10.0 + 8.0);
+    assert_eq!(page("height: 10px; box-shadow: 0 0 0 300px black"), plain);
+    assert_eq!(page("height: 10px; outline: 200px solid"), plain);
+    assert_eq!(page("height: 10px; transform: translateY(100px)"), 8.0 + 1000.0 + 110.0);
+    assert_eq!(page("height: 10px; position: fixed; top: 2000px"), 8.0 + 1000.0 + 8.0);
+}
+
+#[test]
+fn grid_items_take_percentage_heights_of_their_areas() {
+    let (mut tree, html, body) = doc();
+    // Once the rows are sized, height: 100% is the grid area's
+    let grid = el(&mut tree, body, "div", "display: grid; grid-template-columns: 100px 100px; height: 60px");
+    let full = el(&mut tree, grid, "div", "height: 100%");
+    let half = el(&mut tree, grid, "div", "height: 50%; display: flex");
+    let inner = el(&mut tree, half, "div", "height: 100%; width: 10px");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, full).h, 60.0);
+    assert_eq!(rect_of(&t, half).h, 30.0);
+    assert_eq!(rect_of(&t, inner).h, 30.0);
+}
+
+#[test]
+fn replaced_flex_items_take_their_width_from_a_definite_height() {
+    let (mut tree, html, body) = doc();
+    // A 408x250 logo at height: 100% of a 40px row is 65.28px wide, as
+    // its flex base size and its automatic minimum (CSS Flexbox §9.2 3B)
+    let row = el(&mut tree, body, "div", "display: flex; height: 40px; width: 100px");
+    let logo = tree.create_element("img");
+    tree.set_attribute(logo, "width", "408");
+    tree.set_attribute(logo, "height", "250");
+    tree.set_attribute(logo, "style", "height: 100%; width: auto");
+    tree.append_child(row, logo);
+    // A row of them sized by its contents (a marquee) is as wide as they are
+    let fit = el(&mut tree, body, "div", "display: flex; height: 40px; width: max-content");
+    for _ in 0..2 {
+        let i = tree.create_element("img");
+        tree.set_attribute(i, "width", "408");
+        tree.set_attribute(i, "height", "250");
+        tree.set_attribute(i, "style", "height: 100%");
+        tree.append_child(fit, i);
+    }
+    // So is an absolutely positioned one whose height is a percentage of
+    // its containing block
+    let wing = el(&mut tree, body, "div", "position: relative; height: 40px");
+    let marquee = el(&mut tree, wing, "div", "position: absolute; display: flex; height: 100%");
+    for _ in 0..2 {
+        let i = tree.create_element("img");
+        tree.set_attribute(i, "width", "408");
+        tree.set_attribute(i, "height", "250");
+        tree.set_attribute(i, "style", "height: 100%");
+        tree.append_child(marquee, i);
+    }
+    let t = layout(&tree, html, 800.0);
+    let r = rect_of(&t, logo);
+    assert_eq!(((r.w * 100.0).round() / 100.0, r.h), (65.28, 40.0));
+    assert_eq!((rect_of(&t, fit).w * 100.0).round() / 100.0, 130.56);
+    assert_eq!((rect_of(&t, marquee).w * 100.0).round() / 100.0, 130.56);
+}
+
+#[test]
+fn videos_and_frames_have_a_default_size_but_no_ratio() {
+    let (mut tree, html, body) = doc();
+    // A video without its data (and an iframe) is 300x150 without being
+    // 2:1: at width: 100% it stays 150px tall, as a canvas does not
+    // (kit.svelte.dev's demo video)
+    let wide = el(&mut tree, body, "div", "width: 600px");
+    let video = el(&mut tree, wide, "video", "width: 100%; display: block");
+    let frame = el(&mut tree, wide, "iframe", "width: 100%; display: block");
+    let canvas = el(&mut tree, wide, "canvas", "width: 100%; display: block");
+    let t = layout(&tree, html, 800.0);
+    assert_eq!(rect_of(&t, video).h, 150.0);
+    assert_eq!(rect_of(&t, frame).h, 150.0);
+    assert_eq!(rect_of(&t, canvas).h, 300.0);
 }

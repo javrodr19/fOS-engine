@@ -21,12 +21,15 @@ use super::fragment::{BoxFragment, BoxFragmentKind, Fragment, Rect, TextFragment
 pub struct InlineLayout {
     pub frags: Vec<Fragment>,
     pub height: f32,
+    /// The first and last line boxes' baselines (lines with content)
+    pub baselines: Option<(f32, f32)>,
 }
 
 enum PieceKind {
     Word { style: u32, node: NodeId, word: Arc<ShapedWord> },
-    /// Spaces (`collapsible` ones vanish at line starts)
-    Space { collapsible: bool },
+    /// Spaces (`collapsible` ones vanish at line starts; ones that `trail`
+    /// take room at line ends, where others hang)
+    Space { collapsible: bool, trails: bool },
     Open { style: u32, node: NodeId },
     Close,
     Atomic(usize),
@@ -79,6 +82,8 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                 let font = &fonts[*style as usize];
                 let wraps = inh.white_space.wraps();
                 let collapsible = inh.white_space.collapses_spaces();
+                let trails = inh.white_space.keeps_trailing_spaces();
+                let break_spaces = inh.white_space == fos_css::style::WhiteSpace::BreakSpaces;
                 let break_all = inh.word_break == WordBreak::BreakAll;
                 let text = &ic.text[*start..*end];
                 let mut rest = text;
@@ -86,10 +91,17 @@ fn build_pieces(ctx: &mut LayoutCtx, ic: &InlineContent, fonts: &[ResolvedFont],
                     let at = *start + text.len() - rest.len();
                     let spaces = rest.len() - rest.trim_start_matches(' ').len();
                     if spaces > 0 {
-                        let n = spaces as f32;
-                        let w = ctx.fonts.shape(font, " ").width * n + (inh.word_spacing + inh.letter_spacing) * n;
-                        out.push(Piece { kind: PieceKind::Space { collapsible }, width: w, break_before: false, at });
-                        opportunity = wraps;
+                        let one = ctx.fonts.shape(font, " ").width + inh.word_spacing + inh.letter_spacing;
+                        if break_spaces {
+                            // A line may break after every space
+                            for k in 0..spaces {
+                                out.push(Piece { kind: PieceKind::Space { collapsible, trails }, width: one, break_before: opportunity, at: at + k });
+                                opportunity = true;
+                            }
+                        } else {
+                            out.push(Piece { kind: PieceKind::Space { collapsible, trails }, width: one * spaces as f32, break_before: false, at });
+                            opportunity = wraps;
+                        }
                         rest = &rest[spaces..];
                         continue;
                     }
@@ -205,11 +217,28 @@ fn next_line(pieces: &[Piece], start: usize, avail: f32, indent: f32) -> usize {
             last_opportunity = Some(i);
         }
         match p.kind {
-            PieceKind::Break => return i + 1,
-            // Spaces hang at line ends: they never overflow
-            PieceKind::Space { collapsible } => {
+            // Inline boxes that end right after a forced break end on its
+            // line (a code token ending in a newline is not on the next)
+            PieceKind::Break => {
+                let mut end = i + 1;
+                while end < pieces.len() && matches!(pieces[end].kind, PieceKind::Close) {
+                    end += 1;
+                }
+                return end;
+            }
+            // Spaces hang at line ends: they never overflow, except
+            // break-spaces ones, which take room there
+            PieceKind::Space { collapsible, trails } => {
                 if content || !collapsible {
                     x += p.width;
+                }
+                if trails {
+                    if x > avail + 0.01 {
+                        if let Some(o) = last_opportunity {
+                            return o;
+                        }
+                    }
+                    content = true;
                 }
             }
             PieceKind::Word { .. } | PieceKind::Atomic(_) => {
@@ -290,10 +319,12 @@ fn baseline_shift(va: VerticalAlign, parent: &ResolvedFont, parent_shift: f32, t
     let size = parent.size;
     match va {
         VerticalAlign::Baseline => parent_shift,
-        VerticalAlign::Sub => parent_shift + size * 0.2,
-        VerticalAlign::Super => parent_shift - size * 0.34,
+        // As Blink: a fifth of the parent's font size and a pixel down,
+        // a third and a pixel up
+        VerticalAlign::Sub => parent_shift + size / 5.0 + 1.0,
+        VerticalAlign::Super => parent_shift - (size / 3.0 + 1.0),
         // The box's middle at the parent's baseline plus half an x-height
-        VerticalAlign::Middle => parent_shift - size * 0.25 - height / 2.0 + top_to_baseline,
+        VerticalAlign::Middle => parent_shift - parent.x_height() / 2.0 - height / 2.0 + top_to_baseline,
         VerticalAlign::TextTop | VerticalAlign::Top => parent_shift - parent.ascent() + top_to_baseline,
         VerticalAlign::TextBottom | VerticalAlign::Bottom => parent_shift + parent.descent() - (height - top_to_baseline),
         VerticalAlign::Length(l) => parent_shift - l.resolve(line_height),
@@ -305,9 +336,13 @@ fn atomic_baseline(laid: &Laid) -> f32 {
     let f = &laid.frag;
     let mt = laid.mt.size();
     let bottom = mt + f.border_box.h + laid.mb.size();
+    use fos_css::style::Display;
     match f.kind {
-        BoxFragmentKind::Replaced => f.first_baseline().map_or(bottom, |b| mt + b),
+        // Inline flex and grid boxes sit on their first baseline
+        BoxFragmentKind::Block if matches!(f.style.box_.display, Display::InlineFlex | Display::InlineGrid) => f.first_baseline().map_or(bottom, |b| mt + b),
+        // (a textarea scrolls: its baseline is its bottom)
         _ if clips(&f.style) => bottom,
+        BoxFragmentKind::Replaced => f.first_baseline().map_or(bottom, |b| mt + b),
         _ => f.last_baseline().map_or(bottom, |b| mt + b),
     }
 }
@@ -337,6 +372,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
     let align = container.inherited.text_align;
 
     let mut frags: Vec<Fragment> = Vec::new();
+    let mut baselines: Option<(f32, f32)> = None;
     let mut y = 0.0f32;
     // Inline boxes open across line ends: (style, node)
     let mut carried: Vec<(u32, NodeId)> = Vec::new();
@@ -374,7 +410,7 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         li += 1;
         let line = &pieces[a..b];
         let start_x = line_x + first_indent;
-        let ends_forced = matches!(line.last().map(|p| &p.kind), Some(PieceKind::Break));
+        let ends_forced = matches!(line.iter().rev().find(|p| !matches!(p.kind, PieceKind::Close)).map(|p| &p.kind), Some(PieceKind::Break));
         let last_line = b >= pieces.len();
 
         // Pass 1: the line's width and justification opportunities
@@ -383,10 +419,20 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         let mut end = start_x;
         for p in line {
             match &p.kind {
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
                         pending_n += 1;
+                    }
+                    // Preserved spaces make a line, and in pre text take
+                    // room at its end
+                    has_content |= !collapsible;
+                    if *trails {
+                        x += pending;
+                        opportunities += pending_n;
+                        pending = 0.0;
+                        pending_n = 0;
+                        end = x;
                     }
                 }
                 PieceKind::Word { .. } | PieceKind::Atomic(_) => {
@@ -399,11 +445,10 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     content = true;
                     has_content = true;
                 }
+                // (Only preserved spaces are pending before any content)
                 PieceKind::Open { .. } => {
-                    if content {
-                        x += pending;
-                        opportunities += pending_n;
-                    }
+                    x += pending;
+                    opportunities += pending_n;
                     pending = 0.0;
                     pending_n = 0;
                     x += p.width;
@@ -439,8 +484,12 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         // Pass 2: fragments, relative to the line's root baseline
         // (absolutely positioned boxes' places: index, x before and after
         // the pending space, and the content pieces placed before them)
-        let mut placed: Vec<(usize, f32, f32, usize)> = Vec::new();
+        let mut placed: Vec<(usize, f32, f32, usize, NodeId)> = Vec::new();
         let mut placed_content = 0usize;
+        // Atomic inlines aligned to the line box's top or bottom, placed once
+        // the rest of the line is: node, where its top is now, its height,
+        // and whether it is top-aligned
+        let mut line_aligned: Vec<(NodeId, f32, f32, bool)> = Vec::new();
         let (root_top, root_bottom) = half_leading_extents(&root_font, root_lh, 0.0);
         // The line height quirk: in quirks mode, an inline box (the root one
         // too) adds its line height to the line only when text goes in it
@@ -473,10 +522,18 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             }
             open
         };
+        // Whether words or atomic boxes come later on the line: spaces
+        // before a box's end then stay in that box
+        let mut content_after = vec![false; order.len()];
+        let mut seen = false;
+        for (k, v) in order.iter().enumerate().rev() {
+            content_after[k] = seen;
+            seen |= matches!(v, Visual::Piece(i) if matches!(line[*i].kind, PieceKind::Word { .. } | PieceKind::Atomic(_)));
+        }
         let mut content = false;
         let mut pending = 0.0f32;
         let mut pending_n = 0usize;
-        for v in order {
+        for (k, v) in order.into_iter().enumerate() {
             let p = match v {
                 Visual::Piece(i) => &line[i],
                 Visual::OpenCarried(style, node) => {
@@ -491,10 +548,15 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                 }
             };
             match &p.kind {
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
                         pending_n += 1;
+                    }
+                    if *trails {
+                        x += pending + extra * pending_n as f32;
+                        pending = 0.0;
+                        pending_n = 0;
                     }
                 }
                 PieceKind::Word { style, node, word } => {
@@ -542,8 +604,13 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                         let h = laid.mt.size() + laid.frag.border_box.h + laid.mb.size();
                         let bl = atomic_baseline(&laid);
                         let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, bl, h, ctx.fonts.resolve(st).line_height(st.inherited.line_height));
-                        top = top.min(shift - bl);
-                        bottom = bottom.max(shift - bl + h);
+                        match st.box_.vertical_align {
+                            VerticalAlign::Top | VerticalAlign::Bottom => line_aligned.push((laid.frag.node, shift - bl, h, st.box_.vertical_align == VerticalAlign::Top)),
+                            _ => {
+                                top = top.min(shift - bl);
+                                bottom = bottom.max(shift - bl + h);
+                            }
+                        }
                         // Inside its inline box (whose opacity, filter...
                         // cover it); moved down to the baseline with the line
                         let rel = relative_offset(st, avail, cb_h);
@@ -555,20 +622,28 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
                     content = true;
                     placed_content += 1;
                 }
+                // (Only preserved spaces are pending before any content)
                 PieceKind::Open { style, node } => {
-                    if content {
-                        x += pending + extra * pending_n as f32;
-                    }
+                    x += pending + extra * pending_n as f32;
                     pending = 0.0;
                     pending_n = 0;
                     open_box(&mut stack, ic, &fonts, *style, *node, x, true, quirks, &mut top, &mut bottom);
                     x += p.width;
                 }
                 PieceKind::Close => {
+                    if content && content_after[k] {
+                        x += pending + extra * pending_n as f32;
+                        pending = 0.0;
+                        pending_n = 0;
+                    }
                     x += p.width;
                     close_box(&mut stack, ic, &fonts, x, true, avail);
                 }
-                PieceKind::OutOfFlow(i) => placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content)),
+                PieceKind::OutOfFlow(i) => {
+                    // The inline box it is in (`NONE`: the line's root)
+                    let parent = if stack.len() > 1 { stack.last().map_or(NodeId::NONE, |o| o.node) } else { NodeId::NONE };
+                    placed.push((*i, x, x + pending + extra * pending_n as f32, placed_content, parent))
+                }
                 // A line break counts as text
                 PieceKind::Break => {
                     if let Some((t, b)) = stack.last_mut().and_then(|o| o.extents.take()) {
@@ -580,15 +655,31 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
         }
         if top > bottom {
             // Nothing gave the line a height
-            (top, bottom) = (root_top, root_bottom);
+            (top, bottom) = if line_aligned.is_empty() { (root_top, root_bottom) } else { (0.0, 0.0) };
+        }
+        // Boxes aligned to the line's top or bottom (CSS 2.1 §10.8): the
+        // line grows to hold them, then they go to its edge. wordpress.org's
+        // images are vertical-align: bottom in 30px lines
+        for &(_, _, h, at_top) in &line_aligned {
+            if bottom - top < h {
+                if at_top {
+                    bottom = top + h;
+                } else {
+                    top = bottom - h;
+                }
+            }
         }
         while stack.len() > 1 {
             close_box(&mut stack, ic, &fonts, x, false, avail);
         }
-        let root = stack.pop().expect("root box");
+        let mut root = stack.pop().expect("root box");
+        for &(node, now, h, at_top) in &line_aligned {
+            let to = if at_top { top } else { bottom - h };
+            move_atomic(&mut root.children, node, to - now);
+        }
         // The space before an absolutely positioned box is before it when
         // content follows on the line (at the line's end, it is dropped)
-        let placed = placed.into_iter().map(|(i, x0, x1, n)| (i, if placed_content > n { x1 } else { x0 }));
+        let placed = placed.into_iter().map(|(i, x0, x1, n, parent)| (i, if placed_content > n { x1 } else { x0 }, parent));
         // An absolutely positioned box's static position: where it stands
         // in the line, or below the line if it was block-level
         let static_rect = |i: usize, x: f32, line_top: f32, line_bottom: f32| {
@@ -597,19 +688,63 @@ pub fn layout_inline(ctx: &mut LayoutCtx, ic: &InlineContent, avail: f32, cb_h: 
             Fragment::Box(placeholder(b, at))
         };
         if !has_content {
-            frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, y, y)));
+            frags.extend(placed.into_iter().map(|(i, x, _)| static_rect(i, x, y, y)));
             continue;
         }
         let baseline = y - top;
+        baselines = Some((baselines.map_or(baseline, |b| b.0), baseline));
         let mut line_frags = root.children;
-        line_frags.extend(placed.into_iter().map(|(i, x)| static_rect(i, x, top, bottom)));
+        for (i, x, parent) in placed {
+            // Inside its inline box's fragment, which is its containing
+            // block if positioned (CSS 2.1 §10.1)
+            let mut f = Some(static_rect(i, x, top, bottom));
+            if parent.is_valid() {
+                if let Some(part) = inline_part(&mut line_frags, parent) {
+                    part.children.push(f.take().expect("placeholder"));
+                }
+            }
+            line_frags.extend(f);
+        }
         for f in &mut line_frags {
             f.translate(0.0, baseline);
         }
         frags.extend(line_frags);
         y += bottom - top;
     }
-    InlineLayout { frags, height: y }
+    InlineLayout { frags, height: y, baselines }
+}
+
+/// The fragment of inline box `node` among `frags` (on one line)
+fn inline_part(frags: &mut [Fragment], node: NodeId) -> Option<&mut BoxFragment> {
+    for f in frags {
+        if let Fragment::Box(b) = f {
+            if b.kind == BoxFragmentKind::InlinePart {
+                if b.node == node {
+                    return Some(b);
+                }
+                if let Some(part) = inline_part(&mut b.children, node) {
+                    return Some(part);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Move the atomic inline of `node` among `frags` down by `dy`
+fn move_atomic(frags: &mut [Fragment], node: NodeId, dy: f32) -> bool {
+    for f in frags {
+        if let Fragment::Box(b) = f {
+            if b.node == node && b.kind != BoxFragmentKind::InlinePart {
+                b.translate(0.0, dy);
+                return true;
+            }
+            if b.kind == BoxFragmentKind::InlinePart && move_atomic(&mut b.children, node, dy) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Bidi embedding levels of each byte of `text` (paragraph direction
@@ -747,7 +882,10 @@ fn open_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont]
     let font = fonts[style as usize];
     let pfont = fonts[parent.style as usize];
     let lh = font.line_height(st.inherited.line_height);
-    let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, font.ascent(), font.ascent() + font.descent(), lh);
+    // Aligned by its extents with the leading (as Blink: the half above
+    // floored), whose middle is not quite the text's
+    let (above, _) = half_leading_extents(&font, lh, 0.0);
+    let shift = baseline_shift(st.box_.vertical_align, &pfont, parent.shift, -above, lh, lh);
     let (t, b) = half_leading_extents(&font, lh, shift);
     // (in quirks mode, boxes with vertical borders or padding count at once)
     let edges = st.border.width[0] + st.border.width[2] + st.box_.padding[0].resolve(0.0) + st.box_.padding[2].resolve(0.0);
@@ -791,6 +929,8 @@ fn close_box(stack: &mut Vec<OpenBox>, ic: &InlineContent, fonts: &[ResolvedFont
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
+        static_align: None,
     };
     frag.update_ink();
     // `position: relative` moves the box and its content, not the line
@@ -833,12 +973,19 @@ pub fn intrinsic_inline(ctx: &mut LayoutCtx, ic: &InlineContent) -> (f32, f32) {
                 // Spaces count unless a line can break right after them
                 // (the next piece's break opportunity drops them): in
                 // nowrap text they are part of the min-content width
-                PieceKind::Space { collapsible } => {
+                PieceKind::Space { collapsible, trails } => {
                     if content || !collapsible {
                         pending += p.width;
                     }
+                    if trails {
+                        x += pending;
+                        pending = 0.0;
+                    }
                 }
                 PieceKind::OutOfFlow(_) => {}
+                // An inline box's edges keep the spaces before them pending:
+                // at the end of a line they still go
+                PieceKind::Open { .. } | PieceKind::Close => x += p.width,
                 _ => {
                     x += pending + p.width;
                     pending = 0.0;

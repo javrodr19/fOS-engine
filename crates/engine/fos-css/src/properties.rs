@@ -59,6 +59,7 @@ pub enum PropertyId {
     FontSize,
     FontWeight,
     FontStyle,
+    FontStretch,
     TextAlign,
     TextDecoration,
     LineHeight,
@@ -118,6 +119,7 @@ pub enum PropertyId {
     OutlineColor,
     OutlineOffset,
     BoxSizing,
+    Appearance,
     VerticalAlign,
     ListStyleType,
     ListStylePosition,
@@ -128,6 +130,8 @@ pub enum PropertyId {
     Order,
     RowGap,
     ColumnGap,
+    ColumnCount,
+    ColumnWidth,
     BackgroundImage,
     BackgroundRepeat,
     BackgroundClip,
@@ -141,6 +145,13 @@ pub enum PropertyId {
     WordBreak,
     Direction,
     ObjectFit,
+    Contain,
+    ContainerType,
+    ContentVisibility,
+    TextBoxTrim,
+    TextBoxEdge,
+    ContainIntrinsicWidth,
+    ContainIntrinsicHeight,
     BorderCollapse,
     BorderSpacing,
     TableLayout,
@@ -190,12 +201,14 @@ impl PropertyId {
                 | Self::FontSize
                 | Self::FontWeight
                 | Self::FontStyle
+                | Self::FontStretch
                 | Self::LineHeight
                 | Self::TextAlign
                 | Self::TextIndent
                 | Self::TextTransform
                 | Self::WhiteSpace
                 | Self::TextWrapStyle
+                | Self::TextBoxEdge
                 | Self::CaptionSide
                 | Self::LetterSpacing
                 | Self::WordSpacing
@@ -264,6 +277,7 @@ impl PropertyId {
             "font-size" => Self::FontSize,
             "font-weight" => Self::FontWeight,
             "font-style" => Self::FontStyle,
+            "font-stretch" | "font-width" => Self::FontStretch,
             "text-align" => Self::TextAlign,
             "text-decoration" => Self::TextDecoration,
             "line-height" => Self::LineHeight,
@@ -512,6 +526,8 @@ pub enum LengthUnit {
     Vmax,
     Ch,
     Ex,
+    /// The element's line height
+    Lh,
 }
 
 /// CSS color

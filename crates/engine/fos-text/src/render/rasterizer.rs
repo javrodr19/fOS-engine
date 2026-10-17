@@ -257,3 +257,26 @@ impl OutlineBuilder for PathBuilder {
         self.builder.close();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An OpenType font with PostScript (CFF) outlines, whose "A" is a
+    /// 500x700 square 50 units from the origin (tests/data, made with
+    /// fontTools)
+    const CFF_FONT: &[u8] = include_bytes!("../../tests/data/cff-square.otf");
+
+    #[test]
+    fn cff_glyphs_are_drawn() {
+        // Web fonts such as Source Code Pro ship as CFF: their text was
+        // laid out but never drawn
+        let parser = FontParser::parse(CFF_FONT).unwrap();
+        let a = parser.glyph_index('A').unwrap();
+        let bbox = parser.glyph_bounding_box(a).unwrap();
+        assert_eq!((bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max), (50, 0, 550, 700));
+        let glyph = GlyphRasterizer::new().rasterize_from_parser(&parser, a.0, 100.0).unwrap();
+        assert_eq!((glyph.width, glyph.height), (50, 70));
+        assert!(glyph.bitmap.iter().all(|&c| c == 255));
+    }
+}

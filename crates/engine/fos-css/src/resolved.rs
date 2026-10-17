@@ -14,14 +14,14 @@ pub const PROPERTIES: &[&str] = &[
     "border-collapse", "border-left-color", "border-left-style", "border-left-width", "border-right-color",
     "border-right-style", "border-right-width", "border-spacing", "border-top-color", "border-top-left-radius",
     "border-top-right-radius", "border-top-style", "border-top-width", "bottom", "box-shadow", "box-sizing",
-    "caption-side", "clear", "color", "column-gap", "content", "direction", "display", "flex-basis",
-    "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-style",
+    "caption-side", "clear", "color", "column-count", "column-gap", "column-width", "contain", "container-type", "content", "content-visibility", "direction", "display", "flex-basis",
+    "flex-direction", "flex-grow", "flex-shrink", "flex-wrap", "float", "font-family", "font-size", "font-stretch", "font-style",
     "font-weight", "height", "justify-content", "left", "letter-spacing", "line-height", "list-style-position",
     "list-style-type", "margin-bottom", "margin-left", "margin-right", "margin-top", "max-height", "max-width",
     "min-height", "min-width", "object-fit", "opacity", "order", "outline-color", "outline-offset", "outline-style",
     "outline-width", "overflow-wrap", "overflow-x", "overflow-y", "padding-bottom", "padding-left", "padding-right",
     "padding-top", "pointer-events", "position", "right", "row-gap", "table-layout", "text-align",
-    "text-decoration-color", "text-decoration-line", "text-decoration-style", "text-indent", "text-overflow",
+    "text-box-edge", "text-box-trim", "text-decoration-color", "text-decoration-line", "text-decoration-style", "text-indent", "text-overflow",
     "text-transform", "text-wrap-style", "top", "transform", "transform-origin", "vertical-align", "visibility",
     "white-space", "width", "word-break", "word-spacing", "z-index",
 ];
@@ -75,7 +75,9 @@ pub fn color(c: Color) -> String {
 }
 
 fn lp(v: Lp) -> String {
-    if v.pct == 0.0 {
+    if let Some(i) = v.calc_index() {
+        crate::values::calc_css(i)
+    } else if !v.has_percent() {
         px(v.px)
     } else if v.px == 0.0 {
         format!("{}%", number(v.pct))
@@ -134,6 +136,17 @@ fn image(i: &Image) -> String {
             let name = if *repeating { "repeating-radial-gradient" } else { "radial-gradient" };
             let shape = if *circle { "circle" } else { "ellipse" };
             format!("{name}({shape} at {} {}, {})", lp(center.0), lp(center.1), stops(s))
+        }
+        Image::Conic { from, center, stops: s, repeating } => {
+            let name = if *repeating { "repeating-conic-gradient" } else { "conic-gradient" };
+            let stops: Vec<String> = s
+                .iter()
+                .map(|st| match st.position {
+                    Some(p) => format!("{} {}deg", color(st.color), number(p.pct * 3.6)),
+                    None => color(st.color),
+                })
+                .collect();
+            format!("{name}(from {}deg at {} {}, {})", number(*from), lp(center.0), lp(center.1), stops.join(", "))
         }
     }
 }
@@ -290,12 +303,56 @@ impl Style {
             "align-content" => b.align_content.as_css().into(),
             "row-gap" => gap(b.row_gap),
             "column-gap" => gap(b.column_gap),
+            "column-count" => b.column_count.map_or("auto".into(), |n| n.to_string()),
+            "column-width" => b.column_width.map_or("auto".into(), px),
             "gap" => {
                 let (r, c) = (gap(b.row_gap), gap(b.column_gap));
                 if r == c { r } else { format!("{r} {c}") }
             }
             "object-fit" => b.object_fit.as_css().into(),
+            "content-visibility" => b.content_visibility.as_css().into(),
+            "container-type" => match b.container_type {
+                crate::style::contain::SIZE => "size",
+                crate::style::contain::INLINE_SIZE => "inline-size",
+                _ => "normal",
+            }
+            .into(),
+            "contain" => {
+                use crate::style::contain::*;
+                let names = [(SIZE, "size"), (INLINE_SIZE, "inline-size"), (LAYOUT, "layout"), (STYLE, "style"), (PAINT, "paint")];
+                match b.contain {
+                    0 => "none".into(),
+                    c if c == SIZE | LAYOUT | STYLE | PAINT => "strict".into(),
+                    c if c == LAYOUT | STYLE | PAINT => "content".into(),
+                    c => names.iter().filter(|(bit, _)| c & bit != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(" "),
+                }
+            }
             "text-overflow" => b.text_overflow.as_css().into(),
+            "text-box-trim" => {
+                use crate::style::text_box::*;
+                match b.text_box_trim {
+                    0 => "none",
+                    TRIM_START => "trim-start",
+                    TRIM_END => "trim-end",
+                    _ => "trim-both",
+                }
+                .into()
+            }
+            "text-box-edge" => {
+                use crate::style::text_box::*;
+                let name = |e: u8| match e {
+                    CAP => "cap",
+                    EX => "ex",
+                    ALPHABETIC => "alphabetic",
+                    IDEOGRAPHIC => "ideographic",
+                    _ => "text",
+                };
+                match i.text_box_edge {
+                    (TEXT, TEXT) => "auto".into(),
+                    (CAP | EX, TEXT) | (IDEOGRAPHIC, IDEOGRAPHIC) => name(i.text_box_edge.0).into(),
+                    (over, under) => format!("{} {}", name(over), name(under)),
+                }
+            }
             "table-layout" => b.table_layout.as_css().into(),
             "vertical-align" => match b.vertical_align {
                 VerticalAlign::Baseline => "baseline".into(),
@@ -378,6 +435,7 @@ impl Style {
             "font-family" => i.font_family.iter().map(|f| family(f)).collect::<Vec<_>>().join(", "),
             "font-size" => px(i.font_size),
             "font-weight" => i.font_weight.to_string(),
+            "font-stretch" => format!("{}%", number(i.font_stretch)),
             "font-style" => i.font_style.as_css().into(),
             "line-height" => match i.line_height {
                 LineHeight::Normal => "normal".into(),

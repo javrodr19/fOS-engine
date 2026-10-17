@@ -46,6 +46,11 @@ pub trait Styler {
     fn content_image(&mut self, _url: &str) -> Option<((f32, f32), ImageHandle)> {
         None
     }
+    /// Whether only the ratio of an image's natural size is its own (an
+    /// SVG with a viewBox but no width or height)
+    fn ratio_only(&self, _image: &ImageHandle) -> bool {
+        false
+    }
 }
 
 /// A generated box's content: runs of text and images
@@ -116,6 +121,12 @@ impl std::fmt::Debug for ImageHandle {
 pub struct Replaced {
     /// Natural width and height (and their ratio, for auto sizes)
     pub natural: Option<(f32, f32)>,
+    /// Only the ratio of `natural` is natural: auto sizes fill the
+    /// available width
+    pub ratio_only: bool,
+    /// `natural` is a default size with no ratio to keep (a video without
+    /// both size attributes, a frame)
+    pub no_ratio: bool,
     pub what: ReplacedWhat,
     /// The image to draw, once loaded
     pub image: Option<ImageHandle>,
@@ -128,11 +139,27 @@ pub enum ReplacedWhat {
     Video,
     Frame,
     Svg,
-    /// A text field: value or placeholder, and whether it is a placeholder
-    TextField(String, bool),
+    /// A text field: value or placeholder, whether it is a placeholder,
+    /// and how many characters wide it is (`size`)
+    TextField(String, bool, u32),
+    /// A textarea: its text or placeholder, whether it is a placeholder,
+    /// and its `cols` and `rows`
+    TextArea { text: String, placeholder: bool, cols: u32, rows: u32 },
     Check { radio: bool, checked: bool },
-    /// A select: the selected option's text
-    Select(String),
+    /// A drop-down: the selected option's text and every option's (which
+    /// it is as wide as); a list box (`multiple` or `size`) shows `rows`
+    Select { shown: String, options: Vec<String>, rows: Option<u32> },
+    /// A button input (submit, reset, button): its label
+    Button(String),
+    /// A file input
+    File,
+    /// A range input: where its thumb is, 0 to 1
+    Range(f32),
+    /// A color input's color (RGBA)
+    ColorWell([u8; 4]),
+    /// A progress bar (`meter: false`) or meter: how full, 0 to 1
+    /// (`None`: indeterminate)
+    Gauge { value: Option<f32>, meter: bool },
 }
 
 /// A list marker
@@ -207,6 +234,12 @@ impl LayoutBox {
             || b.overflow_y != fos_css::style::Overflow::Visible
             || b.float != fos_css::style::Float::None
             || self.style.is_out_of_flow()
+            || self.style.contains_formatting()
+            // A block container aligning its content (CSS Box Alignment 3 §5.3)
+            || b.align_content != fos_css::style::AlignContent::Normal
+            // A multi-column container (CSS Multi-column 1 §2)
+            || b.column_count.is_some()
+            || b.column_width.is_some()
     }
 }
 
@@ -241,13 +274,28 @@ pub enum InlineItem {
 }
 
 impl InlineContent {
-    /// Nothing but collapsible white space (dropped beside blocks)
+    /// Nothing but collapsible white space (dropped beside blocks): a
+    /// preserved space makes a line (bun.sh's blank code lines are
+    /// `<div> </div>` in a `<pre>`)
     fn is_blank(&self) -> bool {
         self.items.iter().all(|i| match i {
-            InlineItem::Text { start, end, .. } => self.text[*start..*end].trim_matches(' ').is_empty(),
+            InlineItem::Text { start, end, style, .. } => {
+                let text = &self.text[*start..*end];
+                text.is_empty() || (text.trim_matches(' ').is_empty() && self.styles[*style as usize].inherited.white_space.collapses_spaces())
+            }
             InlineItem::Open { .. } | InlineItem::Close => true,
             InlineItem::Atomic(_) | InlineItem::Break | InlineItem::OutOfFlow(_) => false,
         }) && !self.items.iter().any(|i| matches!(i, InlineItem::Open { style, .. } if has_edges(&self.styles[*style as usize])))
+    }
+
+    /// Nothing but white space, preserved or not: such a run between flex
+    /// or grid items is not rendered (CSS Flexbox §4, Grid §6.1)
+    fn is_white_space(&self) -> bool {
+        self.items.iter().all(|i| match i {
+            InlineItem::Text { start, end, .. } => self.text[*start..*end].chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')),
+            InlineItem::Open { .. } | InlineItem::Close | InlineItem::Break => true,
+            InlineItem::Atomic(_) | InlineItem::OutOfFlow(_) => false,
+        })
     }
 }
 
@@ -492,10 +540,23 @@ fn own_decoration(style: &Style) -> (u8, Color) {
 impl<S: Styler> BoxTreeBuilder<'_, S> {
     /// The box of element `node` (a block container, or replaced);
     /// `in_flow` boxes get their ancestors' text decorations
-    fn element_box(&mut self, node: NodeId, style: Style, in_flow: bool) -> LayoutBox {
+    fn element_box(&mut self, node: NodeId, mut style: Style, in_flow: bool) -> LayoutBox {
         self.counters_for(Some(node), &style);
+        // A fieldset establishes a block formatting context (HTML §15.3.13)
+        if style.box_.display == Display::Block && self.tag(node) == "fieldset" {
+            std::sync::Arc::make_mut(&mut style.box_).display = Display::FlowRoot;
+        }
+        // A button's content is centered in it, whatever its align-content
+        // (HTML §15.5.3, as Chromium lays buttons out)
+        if matches!(style.box_.display, Display::Block | Display::InlineBlock | Display::FlowRoot | Display::ListItem) && self.tag(node) == "button" {
+            std::sync::Arc::make_mut(&mut style.box_).align_content = fos_css::style::AlignContent::Center;
+        }
         if let Some(r) = self.replaced(node, &style) {
             return LayoutBox { node, style, kind: BoxKind::Replaced(r), marker: None };
+        }
+        // content-visibility: hidden skips the contents
+        if style.box_.content_visibility == fos_css::style::ContentVisibility::Hidden && style.containment() != 0 {
+            return LayoutBox { node, style, kind: BoxKind::Block(Vec::new()), marker: None };
         }
         let saved = self.deco;
         let own = own_decoration(&style);
@@ -519,7 +580,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
             self.flex_items(node, &style, &mut items, &mut text);
             self.leave();
             let content = text.take(&style);
-            if !content.is_blank() {
+            if !content.is_white_space() {
                 items.push(LayoutBox::anonymous(&style, BoxKind::Inline(content)));
             }
             self.deco = saved;
@@ -641,7 +702,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 };
                 let mut st = Style::inherit_from(&ps);
                 std::sync::Arc::make_mut(&mut st.box_).display = Display::Inline;
-                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image }), marker: None }));
+                out.push(Generated::Image(LayoutBox { node: NodeId::NONE, style: st, kind: BoxKind::Replaced(Replaced { natural, what: ReplacedWhat::Image, image, ratio_only: false, no_ratio: false }), marker: None }));
             }
         }
         Some((ps, out))
@@ -666,6 +727,12 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
         } else if display.is_inline_level() && !ps.is_out_of_flow() && ps.box_.float == fos_css::style::Float::None {
             let b = self.generated_block(parent, ps, content, after);
             c.inline.atomic(b);
+        } else if ps.is_out_of_flow() && !c.inline.content.is_blank() {
+            // Amid inline content, which it does not split
+            let mut ps = ps;
+            fade(&mut ps, c.inline.open_opacity());
+            let b = self.generated_block(parent, ps, content, after);
+            c.inline.out_of_flow(b);
         } else {
             c.flush_inline();
             let mut ps = ps;
@@ -878,7 +945,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
     fn generated_item(&mut self, parent: NodeId, parent_style: &Style, items: &mut Vec<LayoutBox>, text: &mut InlineBuilder, after: bool) {
         let Some((mut ps, generated)) = self.pseudo_box(parent, parent_style, after) else { return };
         let content = text.take(parent_style);
-        if !content.is_blank() {
+        if !content.is_white_space() {
             items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
         }
         let blockified = ps.display().blockified();
@@ -915,7 +982,7 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 continue;
             }
             let content = text.take(parent_style);
-            if !content.is_blank() {
+            if !content.is_white_space() {
                 items.push(LayoutBox::anonymous(parent_style, BoxKind::Inline(content)));
             }
             let blockified = display.blockified();
@@ -929,8 +996,8 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
 
     fn is_replaced(&self, node: NodeId) -> bool {
         match self.tag(node) {
-            "img" | "canvas" | "video" | "iframe" | "embed" | "object" | "svg" | "textarea" | "select" => true,
-            "input" => !matches!(self.tree.get_attribute(node, "type").map(|t| t.to_ascii_lowercase()).as_deref(), Some("hidden" | "button" | "submit" | "reset")),
+            "img" | "canvas" | "video" | "iframe" | "embed" | "object" | "svg" | "textarea" | "select" | "progress" | "meter" => true,
+            "input" => !matches!(self.tree.get_attribute(node, "type").map(|t| t.to_ascii_lowercase()).as_deref(), Some("hidden")),
             _ => false,
         }
     }
@@ -967,17 +1034,40 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                 None => (ReplacedWhat::Svg, Some((w_attr.unwrap_or(300.0), h_attr.unwrap_or(150.0)))),
             },
             "select" => {
-                let selected = self.selected_option(node);
-                (ReplacedWhat::Select(selected), None)
+                let (shown, options) = self.options(node);
+                let size = self.tree.get_attribute(node, "size").and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0);
+                let multiple = self.tree.get_attribute(node, "multiple").is_some();
+                // A list box: `multiple` (4 rows) or a size over 1
+                let rows = match size {
+                    Some(n) if n > 1 => Some(n),
+                    Some(_) if !multiple => None,
+                    _ if multiple => Some(size.unwrap_or(4)),
+                    _ => None,
+                };
+                (ReplacedWhat::Select { shown, options, rows }, None)
             }
             "textarea" => {
                 let text: String = self.tree.children(node).filter_map(|(_, n)| n.as_text()).collect();
-                let (shown, placeholder) = if text.is_empty() {
+                let (text, placeholder) = if text.is_empty() {
                     (self.tree.get_attribute(node, "placeholder").unwrap_or("").to_string(), true)
                 } else {
                     (text, false)
                 };
-                (ReplacedWhat::TextField(shown, placeholder), None)
+                let count = |name: &str, default: u32| self.tree.get_attribute(node, name).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(default);
+                (ReplacedWhat::TextArea { text, placeholder, cols: count("cols", 20), rows: count("rows", 2) }, None)
+            }
+            "progress" | "meter" => {
+                let num = |name: &str| self.tree.get_attribute(node, name).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
+                let meter = tag == "meter";
+                let value = if meter {
+                    let (min, max) = (num("min").unwrap_or(0.0), num("max").unwrap_or(1.0));
+                    let v = num("value").unwrap_or(0.0).clamp(min, max.max(min));
+                    Some(if max > min { (v - min) / (max - min) } else { 0.0 })
+                } else {
+                    let max = num("max").filter(|&m| m > 0.0).unwrap_or(1.0);
+                    num("value").map(|v| (v / max).clamp(0.0, 1.0))
+                };
+                (ReplacedWhat::Gauge { value, meter }, None)
             }
             _ => {
                 let ty = self.tree.get_attribute(node, "type").map(|t| t.to_ascii_lowercase()).unwrap_or_default();
@@ -993,6 +1083,28 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                         }
                         None => (ReplacedWhat::Image, Some((w_attr.unwrap_or(0.0), h_attr.unwrap_or(0.0)))),
                     },
+                    "submit" | "reset" | "button" => {
+                        let label = match self.tree.get_attribute(node, "value") {
+                            Some(v) => v.to_string(),
+                            None if ty == "submit" => "Submit".to_string(),
+                            None if ty == "reset" => "Reset".to_string(),
+                            None => String::new(),
+                        };
+                        (ReplacedWhat::Button(label), None)
+                    }
+                    "file" => (ReplacedWhat::File, None),
+                    "range" => {
+                        let num = |name: &str, default: f32| self.tree.get_attribute(node, name).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(default);
+                        let (min, max) = (num("min", 0.0), num("max", 100.0));
+                        let value = num("value", min + (max - min) / 2.0);
+                        let at = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
+                        (ReplacedWhat::Range(at), None)
+                    }
+                    "color" => {
+                        let value = self.tree.get_attribute(node, "value").unwrap_or("#000000");
+                        let c = fos_css::properties::Color::from_hex(value.trim().trim_start_matches('#')).unwrap_or(fos_css::properties::Color::BLACK);
+                        (ReplacedWhat::ColorWell([c.r, c.g, c.b, c.a]), None)
+                    }
                     _ => {
                         let value = self.tree.get_attribute(node, "value").unwrap_or("");
                         let (shown, placeholder) = if value.is_empty() {
@@ -1002,32 +1114,43 @@ impl<S: Styler> BoxTreeBuilder<'_, S> {
                         } else {
                             (value.to_string(), false)
                         };
-                        (ReplacedWhat::TextField(shown, placeholder), None)
+                        let size = self.tree.get_attribute(node, "size").and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(20);
+                        (ReplacedWhat::TextField(shown, placeholder, size), None)
                     }
                 }
             }
         };
-        Some(Replaced { natural, what, image })
+        // Width and height attributes give the size an image lacks
+        let ratio_only = w_attr.is_none() && h_attr.is_none() && image.as_ref().is_some_and(|i| self.styler.ratio_only(i));
+        let no_ratio = match what {
+            ReplacedWhat::Video => w_attr.is_none() || h_attr.is_none(),
+            ReplacedWhat::Frame => true,
+            _ => false,
+        };
+        Some(Replaced { natural, what, image, ratio_only, no_ratio })
     }
 
-    fn selected_option(&self, select: NodeId) -> String {
-        let mut first = None;
+    /// A select's shown option text (the selected option's, else the
+    /// first's) and every option's text
+    fn options(&self, select: NodeId) -> (String, Vec<String>) {
+        let mut shown = None;
+        let mut all = Vec::new();
         let mut stack = vec![select];
         while let Some(n) = stack.pop() {
             let kids: Vec<NodeId> = self.tree.children(n).map(|(id, _)| id).collect();
             for k in kids.into_iter().rev() {
                 stack.push(k);
             }
-            if self.tag(n) == "option" {
+            if self.tag(n) == "option" && all.len() < 1000 {
                 let text: String = self.tree.children(n).filter_map(|(_, c)| c.as_text()).collect();
                 let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if self.tree.get_attribute(n, "selected").is_some() {
-                    return text;
+                if shown.is_none() && self.tree.get_attribute(n, "selected").is_some() {
+                    shown = Some(text.clone());
                 }
-                first.get_or_insert(text);
+                all.push(text);
             }
         }
-        first.unwrap_or_default()
+        (shown.or_else(|| all.first().cloned()).unwrap_or_default(), all)
     }
 
     fn marker(&mut self, node: NodeId, style: &Style) -> Option<Marker> {

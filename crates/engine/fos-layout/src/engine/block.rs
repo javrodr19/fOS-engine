@@ -28,13 +28,20 @@ pub struct LayoutCtx<'a> {
     /// The box about to be laid out is in a block whose text-align is
     /// -webkit-center (<center>, align=center): it is centered
     pub center_in_parent: bool,
+    /// The box about to be laid out is aligned in its block container by
+    /// `justify-self` (the container's `justify-items` for `auto`), not
+    /// stretched: where in the free space it goes (0 start, 1 end)
+    pub justify_in_parent: Option<f32>,
     /// The document is in quirks mode
     pub quirks: bool,
+    /// For the column subgrid about to be laid out: its parent grid's
+    /// tracks it spans, as positions in its content box and sizes
+    pub subgrid_columns: Option<Vec<(f32, f32)>>,
 }
 
 impl<'a> LayoutCtx<'a> {
     pub fn new(fonts: &'a mut FontContext, viewport: (f32, f32)) -> Self {
-        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, quirks: false }
+        LayoutCtx { fonts, viewport, floats: FloatList::default(), origin: (0.0, 0.0), intrinsic: Default::default(), center_in_parent: false, justify_in_parent: None, quirks: false, subgrid_columns: None }
     }
 }
 
@@ -49,6 +56,23 @@ pub struct FloatList {
 impl FloatList {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// How many floats there are (a mark for [`FloatList::shift_from`])
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Move the floats placed since `mark` down by `dy`: they were placed
+    /// inside a box laid out higher than where it went
+    pub fn shift_from(&mut self, mark: usize, dy: f32) {
+        if dy == 0.0 || mark >= self.items.len() {
+            return;
+        }
+        for (r, _) in &mut self.items[mark..] {
+            r.y += dy;
+        }
+        self.last_top = self.items.iter().map(|(r, _)| r.y).fold(f32::NEG_INFINITY, f32::max);
     }
 
     /// The free span of `[left, right)` beside floats between `top` and
@@ -267,13 +291,22 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let vbp = e.vertical_bp();
     let sizing = if forced.width.is_some() { Sizing::Shrink } else { sizing };
     let centered = std::mem::take(&mut ctx.center_in_parent);
+    let justify = std::mem::take(&mut ctx.justify_in_parent).filter(|_| sizing == Sizing::Stretch && forced.width.is_none());
 
     if let BoxKind::Replaced(r) = &b.kind {
         let mut laid = layout_replaced(ctx, b.node, style, r, e, cb_w, cb_h, sizing);
         if forced.width.is_some() || forced.height.is_some() {
+            // One size forced (a flexed main size): an auto other size
+            // follows it through the ratio
+            let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0 && !r.no_ratio).map(|n| n.0 / n.1);
+            let (fw, fh) = match (forced.width, forced.height, ratio) {
+                (Some(w), None, Some(k)) if style.box_.height.is_auto() => (Some(w), Some(clamp_height(style, ((w - hbp).max(0.0)) / k, cb_h, vbp) + vbp)),
+                (None, Some(h), Some(k)) if style.box_.auto_width() => (Some(clamp_width(style, (h - vbp).max(0.0) * k, cb_w, hbp) + hbp), Some(h)),
+                (w, h, _) => (w, h),
+            };
             let bb = &mut laid.frag.border_box;
-            bb.w = forced.width.unwrap_or(bb.w).max(hbp);
-            bb.h = forced.height.unwrap_or(bb.h).max(vbp);
+            bb.w = fw.unwrap_or(bb.w).max(hbp);
+            bb.h = fh.unwrap_or(bb.h).max(vbp);
             laid.frag.children.clear();
             laid.frag.update_ink();
         }
@@ -309,7 +342,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         None => {
             let avail = (cb_w - ml - mr - hbp).max(0.0);
             let w = match sizing {
-                Sizing::Stretch if !is_table => avail,
+                // Aligned rather than stretched: as wide as its content
+                Sizing::Stretch if !is_table && justify.is_none() => avail,
                 _ => {
                     let (min, max) = intrinsic_content(ctx, b);
                     max.min(avail).max(min)
@@ -338,7 +372,14 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             }
             (true, false) => ml = free,
             (false, true) => mr = free,
-            // Inside <center> (and align=center) blocks are centered
+            // Aligned by justify-self, or centered inside <center> (and
+            // align=center)
+            (false, false) if free > 0.0 && justify.is_some() => {
+                let at = justify.unwrap_or(0.0);
+                let at = if style.inherited.direction == fos_css::style::Direction::Rtl { 1.0 - at } else { at };
+                ml += free * at;
+                mr += free * (1.0 - at);
+            }
             (false, false) if free > 0.0 && centered => {
                 ml += free / 2.0;
                 mr += free / 2.0;
@@ -377,6 +418,8 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
+        static_align: None,
     };
     let (content_x, content_y) = (ml + e.border[3] + e.padding[3], e.border[0] + e.padding[0]);
     // A new formatting context has its own floats and coordinates
@@ -385,10 +428,18 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
     let mut escaped_top = Margin::default();
     let mut escaped_bottom = Margin::default();
     let mut through = false;
+    // A multi-column container lays its content out a column wide, then
+    // deals it into columns
+    let multicol = match &b.kind {
+        BoxKind::Block(_) | BoxKind::Inline(_) => columns(style, width),
+        _ => None,
+    };
+    let flow_w = multicol.map_or(width, |c| c.1);
     let content_h = match &b.kind {
         BoxKind::Block(children) => {
             let center = style.inherited.text_align == fos_css::style::TextAlign::WebkitCenter;
-            let flow = layout_flow(ctx, children, width, inner_cb_h, collapse_top, collapse_bottom, base, center);
+            let justify_items = fos_css::style::AlignItems::from_u8(style.box_.grid.justify_items).unwrap_or(fos_css::style::AlignItems::Normal);
+            let flow = layout_flow(ctx, children, flow_w, inner_cb_h, collapse_top, collapse_bottom, base, (center, justify_items));
             escaped_top = flow.top;
             escaped_bottom = flow.bottom;
             through = flow.through;
@@ -396,19 +447,30 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
             flow.height
         }
         BoxKind::Inline(content) => {
-            let lines = inline::layout_inline(ctx, content, width, inner_cb_h, base);
+            let lines = inline::layout_inline(ctx, content, flow_w, inner_cb_h, base);
             frag.children = lines.frags;
-            lines.height
+            frag.line_baselines = lines.baselines;
+            let (top, bottom) = text_box_trim(ctx, style, lines.height, lines.baselines);
+            if top != 0.0 {
+                for c in &mut frag.children {
+                    c.translate(0.0, -top);
+                }
+                frag.line_baselines = frag.line_baselines.map(|(a, b)| (a - top, b - top));
+            }
+            (lines.height - top - bottom).max(0.0)
         }
         BoxKind::Flex(items) => {
             let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
             let flex = super::flex::layout_flex(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = flex.frags;
+            frag.line_baselines = item_baselines(&frag.children, false);
             flex.height
         }
         BoxKind::Grid(items) => {
-            let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h);
+            let bounds = (clamp_height(style, 0.0, cb_h, vbp), clamp_height(style, f32::INFINITY, cb_h, vbp));
+            let grid = super::grid::layout_grid(ctx, style, items, width, inner_cb_h, bounds);
             frag.children = grid.frags;
+            frag.line_baselines = item_baselines(&frag.children, true);
             grid.height
         }
         BoxKind::Table(t) => {
@@ -419,6 +481,10 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         }
         BoxKind::Replaced(_) => unreachable!(),
     };
+    let content_h = match multicol {
+        Some((count, colw, gap)) if count > 1 => deal_columns(&mut frag.children, count, colw + gap, specified_h, matches!(b.kind, BoxKind::Inline(_)), content_h),
+        _ => content_h,
+    };
     // Formatting context roots grow to contain their floats
     let content_h = match outer_floats {
         Some(outer) => {
@@ -428,14 +494,42 @@ pub fn layout_sized(ctx: &mut LayoutCtx, b: &LayoutBox, cb_w: f32, cb_h: Option<
         }
         None => content_h,
     };
+    // Size containment: the contents do not size the box, its
+    // contain-intrinsic-height does (CSS Containment 2 §3.1)
+    let content_h = if style.containment() & fos_css::style::contain::SIZE != 0 { style.box_.contain_intrinsic[1].unwrap_or(0.0) } else { content_h };
     let through = through && content_h <= 0.0;
     let height = match forced.height {
         Some(_) => specified_h.unwrap_or(content_h),
         None => clamp_height(style, specified_h.unwrap_or(content_h), cb_h, vbp),
     };
     let through = through && collapse_top && collapse_bottom && height <= 0.0;
+    // align-content in a block container moves its content as a whole, but
+    // never above the top (CSS Box Alignment 3 §5.3)
+    let align = match &b.kind {
+        BoxKind::Block(_) | BoxKind::Inline(_) => block_content_shift(style, height - content_h),
+        _ => 0.0,
+    };
+    if align > 0.0 {
+        for c in &mut frag.children {
+            c.translate(0.0, align);
+        }
+        if let Some((first, last)) = &mut frag.line_baselines {
+            *first += align;
+            *last += align;
+        }
+    }
     for c in &mut frag.children {
+        // Absolutely positioned flex children align in the content box
+        if let Fragment::Box(p) = c {
+            if p.static_align.is_some() {
+                p.border_box = Rect::new(0.0, 0.0, width, height);
+            }
+        }
         c.translate(content_x, content_y);
+    }
+    if let Some((first, last)) = &mut frag.line_baselines {
+        *first += content_y;
+        *last += content_y;
     }
     frag.border_box = Rect::new(ml, 0.0, width + hbp, height + vbp);
 
@@ -523,7 +617,10 @@ fn flow_order(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32) -> Vec<us
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), center: bool) -> Flow {
+/// `align`: whether the container centers its blocks (`<center>`), and its
+/// `justify-items`
+fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Option<f32>, collapse_top: bool, collapse_bottom: bool, base: (f32, f32), align: (bool, fos_css::style::AlignItems)) -> Flow {
+    let (center, justify_items) = align;
     let mut frags = Vec::with_capacity(children.len());
     let mut y = 0.0f32;
     let mut pending = Margin::default();
@@ -543,7 +640,9 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             // Beside earlier floats, as high as the current position
             let mut laid = layout_block_level(ctx, child, width, cb_h, Sizing::Shrink, false);
             let (w, h) = (laid.margin_box_width(), laid.mt.size() + laid.frag.border_box.h + laid.mb.size());
-            let mut y_min = base.1 + y + if placed { pending.size() } else { 0.0 };
+            // (below margins collapsed so far, unless they go through the
+            // top of this box)
+            let mut y_min = base.1 + y + if placed || !collapse_top { pending.size() } else { 0.0 };
             if let Some(c) = clear_at {
                 y_min = y_min.max(c + base.1);
             }
@@ -568,11 +667,17 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             shift = l - base.0;
         }
         ctx.center_in_parent = center;
+        ctx.justify_in_parent = super::grid::block_justify(&child.style, justify_items);
+        let mark = ctx.floats.len();
         let mut laid = layout_block_level(ctx, child, cw, cb_h, Sizing::Stretch, false);
         laid.frag.translate(shift, 0.0);
         if let Some(c) = cleared {
             // Clearance: the child starts below the floats; margins above
-            // it no longer collapse through
+            // it no longer collapse through (those of empty boxes before
+            // it still go through the top of this box)
+            if !placed && collapse_top {
+                top = pending;
+            }
             let h = laid.frag.border_box.h;
             laid.frag.translate(rel.0, c + rel.1);
             frags.push(Fragment::Box(laid.frag));
@@ -582,8 +687,11 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
             continue;
         }
         if laid.through {
-            let at = y + pending.adjoin(laid.mt).size();
+            // An empty box: at this box's top when its margins go through
+            // it, else where it would be with a bottom border
+            let at = if !placed && collapse_top { y } else { y + pending.adjoin(laid.mt).size() };
             pending = pending.adjoin(laid.mt);
+            ctx.floats.shift_from(mark, at - est_y);
             laid.frag.translate(rel.0, at + rel.1);
             frags.push(Fragment::Box(laid.frag));
             continue;
@@ -595,6 +703,8 @@ fn layout_flow(ctx: &mut LayoutCtx, children: &[LayoutBox], width: f32, cb_h: Op
         } else {
             y + m.size()
         };
+        // Floats inside it were placed where it was expected to start
+        ctx.floats.shift_from(mark, child_y - est_y);
         let h = laid.frag.border_box.h;
         laid.frag.translate(rel.0, child_y + rel.1);
         frags.push(Fragment::Box(laid.frag));
@@ -632,7 +742,119 @@ pub fn placeholder(b: &LayoutBox, at: Rect) -> BoxFragment {
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
+        static_align: None,
     }
+}
+
+/// A multi-column container's column count, column width and gap, `avail`
+/// wide (CSS Multi-column 1 §3.4; a `normal` gap is 1em)
+fn columns(style: &Style, avail: f32) -> Option<(usize, f32, f32)> {
+    let b = &style.box_;
+    if b.column_count.is_none() && b.column_width.is_none() {
+        return None;
+    }
+    let gap = b.column_gap.map_or(style.inherited.font_size, |g| g.resolve(avail)).max(0.0);
+    let fit = |w: f32| (((avail + gap) / (w + gap)).floor() as usize).max(1);
+    let count = match (b.column_count, b.column_width) {
+        (Some(n), None) => n as usize,
+        (None, Some(w)) => fit(w),
+        (Some(n), Some(w)) => (n as usize).min(fit(w)),
+        (None, None) => return None,
+    };
+    Some((count, ((avail + gap) / count as f32 - gap).max(0.0), gap))
+}
+
+/// Deal content laid out in one column (`frags`, `content_h` tall) into
+/// columns `step` apart, balanced: as short as fits in `count` columns,
+/// and no taller than `height` when that is definite (more columns then
+/// overflow). Breaks fall between block-level boxes, or between line boxes
+/// in inline content (`lines`); a column after the first starts at its
+/// top, truncating the margin at the break. The height the columns take.
+fn deal_columns(frags: &mut [Fragment], count: usize, step: f32, height: Option<f32>, lines: bool, content_h: f32) -> f32 {
+    // Units no break may cross: runs of fragments that overlap vertically
+    let extent = |f: &Fragment| match f {
+        Fragment::Box(b) => (b.border_box.y, b.border_box.y + b.border_box.h),
+        Fragment::Text(t) => (t.rect.y, t.rect.y + t.rect.h),
+    };
+    let mut units: Vec<(f32, f32, Vec<usize>)> = Vec::new();
+    for (i, f) in frags.iter().enumerate() {
+        let (top, bottom) = extent(f);
+        match units.last_mut() {
+            Some(u) if top < u.1 - 0.01 => {
+                u.1 = u.1.max(bottom);
+                u.2.push(i);
+            }
+            _ => units.push((top, bottom, vec![i])),
+        }
+    }
+    if units.is_empty() {
+        return 0.0;
+    }
+    if lines {
+        // Line boxes tile the content: each starts as far above its text
+        // as the first line's does
+        let n = units.len();
+        let lead = units[0].0;
+        let bounds: Vec<f32> = (0..=n).map(|k| if k == 0 { 0.0 } else if k == n { content_h.max(units[n - 1].1) } else { (units[k].0 - lead).max(units[k - 1].0) }).collect();
+        for (k, u) in units.iter_mut().enumerate() {
+            (u.0, u.1) = (bounds[k], bounds[k + 1]);
+        }
+    }
+    // The first unit of each column, for columns `h` tall (the first
+    // column starts at the content's top)
+    let starts = |h: f32| -> Vec<usize> {
+        let mut out = vec![0];
+        let mut start = 0.0;
+        for (k, u) in units.iter().enumerate().skip(1) {
+            if u.1 - start > h + 0.01 {
+                out.push(k);
+                start = u.0;
+            }
+        }
+        out
+    };
+    let total = units.iter().map(|u| u.1).fold(0.0, f32::max);
+    let tallest = units.iter().map(|u| u.1 - u.0).fold(units[0].1, f32::max);
+    let (mut lo, mut hi) = (tallest.max(total / count as f32), total.max(tallest));
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if starts(mid).len() <= count {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let h = height.map_or(hi, |h| hi.min(h));
+    let starts = starts(h);
+    let mut used = 0.0f32;
+    for (c, &s) in starts.iter().enumerate() {
+        let end = starts.get(c + 1).copied().unwrap_or(units.len());
+        let top = if c == 0 { 0.0 } else { units[s].0 };
+        let bottom = units[s..end].iter().map(|u| u.1).fold(top, f32::max);
+        used = used.max(bottom - top);
+        if c == 0 {
+            continue;
+        }
+        for u in &units[s..end] {
+            for &i in &u.2 {
+                frags[i].translate(c as f32 * step, -top);
+            }
+        }
+    }
+    used
+}
+
+/// How far `align-content` moves a block container's content down, given
+/// the room left below it (`free`; none when it overflows)
+fn block_content_shift(style: &Style, free: f32) -> f32 {
+    use fos_css::style::AlignContent;
+    let at = match style.box_.align_content {
+        AlignContent::Center | AlignContent::SpaceAround | AlignContent::SpaceEvenly => 0.5,
+        AlignContent::End | AlignContent::FlexEnd => 1.0,
+        _ => 0.0,
+    };
+    (free * at).max(0.0)
 }
 
 /// `position: relative` offsets
@@ -657,13 +879,68 @@ pub fn relative_offset(style: &Style, cb_w: f32, cb_h: Option<f32>) -> (f32, f32
     (dx, dy)
 }
 
+/// The character width text fields are sized by, and how much wider than
+/// it their widest glyph is (as Blink: the OS/2 average, rounded, for a
+/// proportional face; the "0"'s width for a fixed-pitch one)
+fn field_char_width(ctx: &mut LayoutCtx, font: &super::fonts::ResolvedFont) -> (f32, Option<f32>) {
+    let m = font.metrics;
+    let mut zero = || ctx.fonts.shape(font, "0").width;
+    if m.avg_char_width <= 0.0 {
+        return (zero(), None);
+    }
+    let avg = if m.fixed_pitch { zero() } else { (m.avg_char_width * font.size).round() };
+    (avg, Some((m.max_char_width * font.size).round() - avg))
+}
+
+/// The room a drop-down's arrow takes after its text, and the padding
+/// before the text and above and below it (none when not drawn natively)
+fn select_chrome(style: &Style) -> (f32, f32, f32) {
+    if style.box_.appearance == fos_css::style::Appearance::Auto {
+        (16.0, 4.0, 1.0)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
+}
+
+/// How far a scrollbar takes from a box that may scroll
+const SCROLLBAR: f32 = 15.0;
+
 /// A replaced element's default size when it has no natural one
 fn default_replaced_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced) -> (f32, f32) {
+    use fos_css::style::Overflow;
     let font = ctx.fonts.resolve(style);
     let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
+    let text_w = |ctx: &mut LayoutCtx, t: &str| ctx.fonts.shape(&font, t).width;
     match &r.what {
-        ReplacedWhat::TextField(..) => (font.size * 11.25, line),
-        ReplacedWhat::Select(text) => (ctx.fonts.shape(&font, text).width + font.size * 1.5, line),
+        // `size` characters, and the widest glyph's excess
+        ReplacedWhat::TextField(_, _, size) => {
+            let (cw, extra) = field_char_width(ctx, &font);
+            ((cw * *size as f32).ceil() + extra.unwrap_or(0.0), line)
+        }
+        // `cols` characters and a scrollbar, `rows` lines
+        ReplacedWhat::TextArea { cols, rows, .. } => {
+            let (cw, _) = field_char_width(ctx, &font);
+            let bar = if matches!(style.box_.overflow_y, Overflow::Auto | Overflow::Scroll) { SCROLLBAR } else { 0.0 };
+            ((cw * *cols as f32).ceil() + bar, line * *rows as f32)
+        }
+        // As wide as the widest option: a drop-down with its arrow, a list
+        // box with its rows' padding
+        ReplacedWhat::Select { options, rows, .. } => {
+            let widest = options.iter().map(|o| text_w(ctx, o)).fold(0.0f32, f32::max);
+            match rows {
+                Some(n) => (widest + 4.0, (font.ascent() + font.descent() + 2.0) * *n as f32),
+                None => {
+                    let (arrow, start, vpad) = select_chrome(style);
+                    (widest.ceil() + start + arrow, font.ascent() + font.descent() + 2.0 * vpad)
+                }
+            }
+        }
+        ReplacedWhat::Button(label) => (text_w(ctx, label), line),
+        // Room for 34 digits (its button and "No file chosen" fit in that)
+        ReplacedWhat::File => ((text_w(ctx, "0") * 34.0).ceil(), line + 6.0),
+        ReplacedWhat::Range(_) => (129.0, 16.0),
+        ReplacedWhat::ColorWell(_) => (44.0, 23.0),
+        ReplacedWhat::Gauge { meter, .. } => (if *meter { 80.0 } else { 160.0 }, 16.0),
         _ => (300.0, 150.0),
     }
 }
@@ -697,6 +974,8 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         marker: None,
         replaced: None,
         scroll_extent: None,
+        line_baselines: None,
+        static_align: None,
     };
     let content = frag.content_box();
     let paint = match &r.what {
@@ -704,26 +983,109 @@ fn layout_replaced(ctx: &mut LayoutCtx, node: NodeId, style: &Style, r: &Replace
         // Frames show their documents' pictures, supplied like canvases'
         ReplacedWhat::Canvas | ReplacedWhat::Video | ReplacedWhat::Svg | ReplacedWhat::Frame => ReplacedPaint::Bitmap,
         ReplacedWhat::Check { radio, checked } => ReplacedPaint::Check { radio: *radio, checked: *checked },
-        ReplacedWhat::TextField(text, placeholder) => {
+        ReplacedWhat::TextField(text, placeholder, _) => {
             if !text.is_empty() {
-                let color = if *placeholder { Color::rgba(117, 117, 117, 255) } else { style.color() };
+                let color = if *placeholder { PLACEHOLDER } else { style.color() };
                 frag.children.push(Fragment::Text(control_text(ctx, style, text, content, color)));
             }
             ReplacedPaint::Empty
         }
-        ReplacedWhat::Select(text) => {
-            if !text.is_empty() {
-                frag.children.push(Fragment::Text(control_text(ctx, style, text, content, style.color())));
-            }
-            ReplacedPaint::Select
+        ReplacedWhat::TextArea { text, placeholder, .. } => {
+            let color = if *placeholder { PLACEHOLDER } else { style.color() };
+            control_lines(ctx, style, text, content, color, &mut frag.children);
+            ReplacedPaint::Empty
         }
+        ReplacedWhat::Select { shown, options, rows } => match rows {
+            None => {
+                let (_, start, _) = select_chrome(style);
+                if !shown.is_empty() {
+                    let inner = Rect::new(content.x + start, content.y, (content.w - start).max(0.0), content.h);
+                    frag.children.push(Fragment::Text(control_text(ctx, style, shown, inner, style.color())));
+                }
+                if start > 0.0 { ReplacedPaint::Select } else { ReplacedPaint::Empty }
+            }
+            // A list box's options, a row each
+            Some(n) => {
+                let font = ctx.fonts.resolve(style);
+                let row = font.ascent() + font.descent() + 2.0;
+                for (i, o) in options.iter().take(*n as usize).enumerate() {
+                    let r = Rect::new(content.x + 2.0, content.y + i as f32 * row, (content.w - 4.0).max(0.0), row);
+                    frag.children.push(Fragment::Text(control_text(ctx, style, o, r, style.color())));
+                }
+                ReplacedPaint::Empty
+            }
+        },
+        ReplacedWhat::Button(label) => {
+            if !label.is_empty() {
+                let font = ctx.fonts.resolve(style);
+                let w = ctx.fonts.shape(&font, label).width;
+                let x = content.x + ((content.w - w) / 2.0).max(0.0);
+                frag.children.push(Fragment::Text(control_text(ctx, style, label, Rect::new(x, content.y, (content.right() - x).max(0.0), content.h), style.color())));
+            }
+            ReplacedPaint::Empty
+        }
+        // A button (its label padded 6px across, 1px down, in a 2px
+        // border), then the note that no file is chosen
+        ReplacedWhat::File => {
+            let font = ctx.fonts.resolve(style);
+            let label = "Choose File";
+            let w = (ctx.fonts.shape(&font, label).width + 16.0).min(content.w);
+            let button = Rect::new(content.x, content.y, w, content.h);
+            frag.children.push(Fragment::Text(control_text(ctx, style, label, Rect::new(button.x + 8.0, button.y, (w - 8.0).max(0.0), button.h), style.color())));
+            let x = button.right() + 4.0;
+            frag.children.push(Fragment::Text(control_text(ctx, style, "No file chosen", Rect::new(x, content.y, (content.right() - x).max(0.0), content.h), style.color())));
+            ReplacedPaint::File { button_w: w }
+        }
+        ReplacedWhat::Range(at) => ReplacedPaint::Range(*at),
+        ReplacedWhat::ColorWell([r, g, b, a]) => ReplacedPaint::ColorWell(Color::rgba(*r, *g, *b, *a)),
+        ReplacedWhat::Gauge { value, meter } => ReplacedPaint::Gauge { value: *value, meter: *meter },
     };
+    // One-line controls have their text's baseline, text or not (a list
+    // box, its first row's)
+    let one_line = match &r.what {
+        ReplacedWhat::TextField(..) | ReplacedWhat::Button(_) | ReplacedWhat::File | ReplacedWhat::ColorWell(_) => Some(content),
+        ReplacedWhat::Select { rows: None, .. } => Some(content),
+        ReplacedWhat::Select { rows: Some(_), .. } => {
+            let font = ctx.fonts.resolve(style);
+            Some(Rect::new(content.x, content.y, content.w, font.ascent() + font.descent() + 2.0))
+        }
+        _ => None,
+    };
+    if let Some(line) = one_line {
+        let font = ctx.fonts.resolve(style);
+        let baseline = line.y + (line.h - font.ascent() - font.descent()) / 2.0 + font.ascent();
+        frag.line_baselines = Some((baseline, baseline));
+    }
+    // Checkboxes, radio buttons and sliders sit on their border box's
+    // bottom (their bottom margin hangs below the baseline)
+    if matches!(r.what, ReplacedWhat::Check { .. } | ReplacedWhat::Range(_)) {
+        let bottom = frag.border_box.bottom();
+        frag.line_baselines = Some((bottom, bottom));
+    }
     frag.replaced = Some(Arc::new(paint));
     frag.update_ink();
     let mt = Margin::new(e.margin[0].unwrap_or(0.0));
     let mb = Margin::new(e.margin[2].unwrap_or(0.0));
     let content_h = frag.content_box().h;
     Laid { frag, mt, mb, through: false, ml, mr, content_h }
+}
+
+/// Placeholder text's color
+const PLACEHOLDER: Color = Color { r: 117, g: 117, b: 117, a: 255 };
+
+/// A textarea's lines, from the top of its content box (those that fit)
+fn control_lines(ctx: &mut LayoutCtx, style: &Style, text: &str, content: Rect, color: Color, out: &mut Vec<Fragment>) {
+    let font = ctx.fonts.resolve(style);
+    let line = font.line_height(style.inherited.line_height).max(font.ascent() + font.descent());
+    for (i, l) in text.lines().enumerate() {
+        let y = content.y + i as f32 * line;
+        if y + line > content.bottom() + 0.5 {
+            break;
+        }
+        if !l.is_empty() {
+            out.push(Fragment::Text(control_text(ctx, style, l, Rect::new(content.x, y, content.w, line), color)));
+        }
+    }
 }
 
 /// One line of a form control's text, vertically centered and clipped to
@@ -748,15 +1110,21 @@ fn control_text(ctx: &mut LayoutCtx, style: &Style, text: &str, content: Rect, c
 }
 
 /// A replaced element's used content size (§10.3.2, §10.6.2)
-fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w: f32, cb_h: Option<f32>, hbp: f32, vbp: f32) -> (f32, f32) {
+pub(super) fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w: f32, cb_h: Option<f32>, hbp: f32, vbp: f32) -> (f32, f32) {
     let sw = style.box_.width.resolve(cb_w).map(|w| content_size(style, w, hbp));
     let sh = style.box_.height.resolve_definite(cb_h).map(|h| content_size(style, h, vbp));
     let natural = r.natural.unwrap_or_else(|| default_replaced_size(ctx, style, r));
-    let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0).map(|n| n.0 / n.1);
+    let ratio = r.natural.filter(|n| n.0 > 0.0 && n.1 > 0.0 && !r.no_ratio).map(|n| n.0 / n.1);
     let (w, h) = match (sw, sh) {
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => (w, ratio.map_or(natural.1, |r| w / r)),
         (None, Some(h)) => (ratio.map_or(natural.0, |r| h * r), h),
+        // Only a ratio: the available width (CSS 2.1 §10.3.2)
+        (None, None) if r.ratio_only && ratio.is_some() => {
+            let e = edges(style, cb_w);
+            let w = (cb_w - hbp - e.margin[1].unwrap_or(0.0) - e.margin[3].unwrap_or(0.0)).max(0.0);
+            (w, ratio.map_or(0.0, |r| w / r))
+        }
         (None, None) => natural,
     };
     let cw = clamp_width(style, w, cb_w, hbp);
@@ -764,6 +1132,9 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
     // Keep the ratio when only one dimension was clamped, or when both
     // were the same way, by the limit that constrains most (CSS 2.1 §10.4)
     match (sw, sh, ratio) {
+        // One size given: the other follows it once min/max clamped it
+        (Some(_), None, Some(r)) => (cw, clamp_height(style, cw / r, cb_h, vbp)),
+        (None, Some(_), Some(r)) => (clamp_width(style, ch * r, cb_w, hbp), ch),
         (None, None, Some(r)) if cw != w && ch == h => (cw, clamp_height(style, cw / r, cb_h, vbp)),
         (None, None, Some(r)) if ch != h && cw == w => (clamp_width(style, ch * r, cb_w, hbp), ch),
         (None, None, Some(r)) if cw != w && ch != h && w > 0.0 && h > 0.0 && (cw < w) == (ch < h) => {
@@ -781,7 +1152,7 @@ fn replaced_content_size(ctx: &mut LayoutCtx, style: &Style, r: &Replaced, cb_w:
 
 /// The content width an intrinsic size keyword gives a box, `avail` wide
 /// at most for fit-content (`None` for no keyword)
-fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
+pub(super) fn intrinsic_size(ctx: &mut LayoutCtx, b: &LayoutBox, k: fos_css::style::IntrinsicSize, avail: f32) -> Option<f32> {
     use fos_css::style::IntrinsicSize;
     if k == IntrinsicSize::None {
         return None;
@@ -806,6 +1177,12 @@ pub fn intrinsic_content(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
 }
 
 fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
+    // Size containment in the inline axis: contain-intrinsic-width
+    use fos_css::style::contain::{INLINE_SIZE, SIZE};
+    if b.style.containment() & (SIZE | INLINE_SIZE) != 0 && !matches!(b.kind, BoxKind::Replaced(_)) {
+        let w = b.style.box_.contain_intrinsic[0].unwrap_or(0.0);
+        return (w, w);
+    }
     match &b.kind {
         BoxKind::Inline(content) => inline::intrinsic_inline(ctx, content),
         BoxKind::Block(children) => {
@@ -841,12 +1218,31 @@ fn intrinsic_content_uncached(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) 
             }
             (min, max)
         }
-        BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items),
+        BoxKind::Flex(items) => super::flex::intrinsic_flex(ctx, &b.style, items, None),
         BoxKind::Table(t) => super::table::intrinsic_table(ctx, &b.style, t),
         BoxKind::Grid(items) => super::grid::intrinsic_grid(ctx, &b.style, items),
         BoxKind::Replaced(r) => {
-            let e = edges(&b.style, 0.0);
-            let (w, _) = replaced_content_size(ctx, &b.style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());
+            // Percentages are of a width not known yet: as auto, none and 0
+            // (CSS Sizing 3 §5.2.1). An image with only a ratio adds nothing
+            let mut style = std::borrow::Cow::Borrowed(&b.style);
+            let pct = |l: &fos_css::style::Lp| l.has_percent();
+            let bx = &b.style.box_;
+            if matches!(bx.width, LpAuto::Lp(l) if pct(&l)) || matches!(bx.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) || matches!(bx.min_width, LpAuto::Lp(l) if pct(&l)) {
+                let s = std::sync::Arc::make_mut(&mut style.to_mut().box_);
+                if matches!(s.width, LpAuto::Lp(l) if pct(&l)) {
+                    // Without a natural width, the default object size's
+                    // (as Chromium: an auto width adds nothing)
+                    s.width = if r.ratio_only { LpAuto::Lp(fos_css::style::Lp::px(300.0)) } else { LpAuto::Auto };
+                }
+                if matches!(s.max_width, fos_css::style::MaxSize::Lp(l) if pct(&l)) {
+                    s.max_width = fos_css::style::MaxSize::None;
+                }
+                if matches!(s.min_width, LpAuto::Lp(l) if pct(&l)) {
+                    s.min_width = LpAuto::Auto;
+                }
+            }
+            let e = edges(&style, 0.0);
+            let (w, _) = replaced_content_size(ctx, &style, r, 0.0, None, e.horizontal_bp(), e.vertical_bp());
             (w, w)
         }
     }
@@ -887,7 +1283,60 @@ pub fn intrinsic_outer(ctx: &mut LayoutCtx, b: &LayoutBox) -> (f32, f32) {
         };
         w.min(maxw).max(minw)
     };
-    (clamp(min) + hbp + margins, clamp(max) + hbp + margins)
+    // A replaced element whose width or max-width is a percentage can
+    // shrink to nothing: it adds nothing to a min-content size (CSS Sizing
+    // 3 §5.2.2, compressible replaced elements)
+    let percent = |l: &fos_css::style::Lp| l.has_percent();
+    let compressible = matches!(b.kind, BoxKind::Replaced(_))
+        && (matches!(style.box_.width, LpAuto::Lp(l) if percent(&l)) || matches!(style.box_.max_width, fos_css::style::MaxSize::Lp(l) if percent(&l)));
+    let min = if compressible { clamp(0.0) } else { clamp(min) };
+    (min + hbp + margins, clamp(max) + hbp + margins)
+}
+
+/// A flex or grid container's baseline: its first item's (in a grid, the
+/// first in row order), synthesized from the bottom of the item's border
+/// box when it has none (CSS Flexbox §8.5, CSS Grid §11.9). Chromium uses
+/// it as the last baseline too (an inline-block ending in a flex or grid
+/// container sits on its first item). wordpress.org's logo link is an
+/// inline-flex box whose one item is an <svg>: it sits on the svg's bottom
+fn item_baselines(children: &[Fragment], grid: bool) -> Option<(f32, f32)> {
+    let items = children.iter().filter_map(|c| match c {
+        Fragment::Box(b) if b.kind != BoxFragmentKind::Placeholder => Some(b),
+        _ => None,
+    });
+    let first = if grid {
+        items.min_by(|a, b| a.border_box.y.total_cmp(&b.border_box.y).then(a.border_box.x.total_cmp(&b.border_box.x)))
+    } else {
+        items.into_iter().next()
+    }?;
+    let baseline = first.first_baseline().unwrap_or(first.border_box.y + first.border_box.h);
+    Some((baseline, baseline))
+}
+
+/// How much `text-box-trim` takes off the top of the first line and the
+/// bottom of the last (CSS Inline 3 §5.1): down to the over edge of the
+/// container's font above the first baseline (cap height, x-height or
+/// ascent), up to its under edge below the last (the baseline or the
+/// descent). remix.run's headings are trimmed to cap and alphabetic
+fn text_box_trim(ctx: &mut LayoutCtx, style: &Style, height: f32, baselines: Option<(f32, f32)>) -> (f32, f32) {
+    use fos_css::style::text_box::*;
+    let trim = style.box_.text_box_trim;
+    let Some((first, last)) = baselines.filter(|_| trim != 0) else { return (0.0, 0.0) };
+    let font = ctx.fonts.resolve(style);
+    let size = font.size;
+    let (over, under) = style.inherited.text_box_edge;
+    let above = match over {
+        CAP => font.metrics.cap_height * size,
+        EX => font.metrics.x_height * size,
+        _ => font.ascent(),
+    };
+    let below = match under {
+        ALPHABETIC => 0.0,
+        _ => font.descent(),
+    };
+    let start = if trim & TRIM_START != 0 { first - above } else { 0.0 };
+    let end = if trim & TRIM_END != 0 { height - (last + below) } else { 0.0 };
+    (start, end)
 }
 
 /// Whether a box clips its overflow (an inline-block's baseline is then its

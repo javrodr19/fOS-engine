@@ -54,6 +54,14 @@ impl Item<'_> {
 }
 
 /// Horizontal and vertical border + padding
+/// A column item stretched across `avail` (its margin box), within its
+/// min- and max-width (CSS Box Alignment §6.1): bun.sh's max-w-[52ch]
+/// paragraphs in flex columns
+fn stretched_width(style: &Style, avail: f32, cb_w: f32) -> f32 {
+    let (hbp, _) = bp(style, cb_w);
+    super::block::clamp_width(style, (avail - hbp).max(0.0), cb_w, hbp) + hbp
+}
+
 fn bp(style: &Style, cb_w: f32) -> (f32, f32) {
     let b = &style.border.width;
     let p = style.box_.padding.map(|p| p.resolve(cb_w).max(0.0));
@@ -79,7 +87,7 @@ fn align_of(item: &Style, container: &Style) -> AlignItems {
 /// Lay out a flex container's items in its content box (`width` wide,
 /// `height` tall when definite)
 /// `height_bounds` are the container's min and max content heights, which
-/// bound a single row's cross size when its height is automatic
+/// bound an automatic height: a column's main size, a single row's cross size
 pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], width: f32, height: Option<f32>, height_bounds: (f32, f32)) -> FlexLayout {
     let bx = &style.box_;
     let row = bx.flex_direction.is_row();
@@ -101,8 +109,26 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for &i in &order {
         let b = &items[i];
         if b.style.is_out_of_flow() {
-            // Its static position is the container's content start
-            frags.push(Fragment::Box(super::block::placeholder(b, super::fragment::Rect::default())));
+            // Its static position is where it would be as the container's
+            // sole item (CSS Flexbox §4.1): aligned in the content box by
+            // justify-content and its align-self, once its size is known.
+            // nextjs.org centers its wordmark this way
+            let mut main = match bx.justify_content {
+                JustifyContent::Center | JustifyContent::SpaceAround | JustifyContent::SpaceEvenly => 0.5,
+                JustifyContent::FlexEnd | JustifyContent::End | JustifyContent::Right => 1.0,
+                _ => 0.0,
+            };
+            if reverse && !matches!(bx.justify_content, JustifyContent::Start | JustifyContent::End | JustifyContent::Left | JustifyContent::Right) {
+                main = 1.0 - main;
+            }
+            let cross = match align_of(&b.style, style) {
+                AlignItems::Center => 0.5,
+                AlignItems::FlexEnd | AlignItems::End | AlignItems::SelfEnd => 1.0,
+                _ => 0.0,
+            };
+            let mut p = super::block::placeholder(b, super::fragment::Rect::default());
+            p.static_align = Some(if row { (main, cross) } else { (cross, main) }).filter(|&a| a != (0.0, 0.0));
+            frags.push(Fragment::Box(p));
             continue;
         }
         let s = &b.style;
@@ -116,17 +142,42 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let definite = |v: LpAuto| v.resolve_definite(main_size).map(border_box);
         let mut content_laid: Option<Laid> = None;
         let align = align_of(s, style);
-        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal) && (if row { s.box_.height } else { s.box_.width }).is_auto();
+        // (auto margins across keep it from stretching: go.dev's logos)
+        let stretch_cross = matches!(align, AlignItems::Stretch | AlignItems::Normal)
+            && (if row { s.box_.height.is_auto() && !auto_margin[0] && !auto_margin[2] } else { s.box_.auto_width() && !auto_margin[1] && !auto_margin[3] });
+        // A replaced item with a definite height has its width through its
+        // ratio (CSS Flexbox §9.2 step 3B, and the transferred size of its
+        // automatic minimum): kit.svelte.dev's height: 100% logos. So has
+        // one whose natural height min/max-height constrains (CSS 2.1
+        // §10.4): kotlinlang.org's max-height: 30px logo
+        let ratio_width = match &b.kind {
+            super::box_tree::BoxKind::Replaced(r) if row && s.box_.width.is_auto() => {
+                let (_, vbp) = bp(s, width);
+                let constrained = r.natural.filter(|_| !r.ratio_only && !r.no_ratio).is_some_and(|n| super::block::clamp_height(s, n.1, height, vbp) != n.1);
+                (s.box_.height.resolve_definite(height).is_some() || constrained).then(|| super::block::replaced_content_size(ctx, s, r, width, height, hbp, vbp).0 + hbp)
+            }
+            _ => None,
+        };
+        // One with only a ratio (an <svg> with just a viewBox) starts as wide
+        // as the line, as it fills a block, and shrinks from there (as
+        // Chromium sizes remix.run's footer logo)
+        let fill_width = match &b.kind {
+            super::box_tree::BoxKind::Replaced(r) if row && r.ratio_only && s.box_.width.is_auto() && ratio_width.is_none() => Some((width - margin[1] - margin[3]).max(0.0)),
+            _ => None,
+        };
         let layout_column = |ctx: &mut LayoutCtx| -> Laid {
             // A column item's height at its cross size
-            let cross_w = if stretch_cross { Some((width - margin[1] - margin[3]).max(0.0)) } else { None };
+            let cross_w = if stretch_cross { Some(stretched_width(s, (width - margin[1] - margin[3]).max(0.0), width)) } else { None };
             layout_sized(ctx, b, width, height, Sizing::Shrink, false, Forced { width: cross_w, height: None, root: true })
         };
         let base = match (s.box_.flex_basis, definite(s.box_.flex_basis)) {
             (LpAuto::Lp(_), Some(v)) => v,
             _ => match definite(main_prop) {
                 Some(v) => v,
-                None if row => intrinsic_content(ctx, b).1 + bp_main,
+                None if ratio_width.is_some() => ratio_width.unwrap_or(0.0),
+                None if fill_width.is_some() => fill_width.unwrap_or(0.0),
+                // `width: min-content` and the like
+                None if row => super::block::intrinsic_size(ctx, b, s.box_.intrinsic_width[0], main_size.unwrap_or(f32::INFINITY) - bp_main).unwrap_or_else(|| intrinsic_content(ctx, b).1) + bp_main,
                 None => {
                     let laid = layout_column(ctx);
                     let h = laid.frag.border_box.h;
@@ -135,6 +186,12 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                 }
             },
         };
+        let max_prop = if row { s.box_.max_width } else { s.box_.max_height };
+        let max = match max_prop {
+            MaxSize::None => f32::INFINITY,
+            MaxSize::Lp(l) if l.has_percent() => main_size.map_or(f32::INFINITY, |m| border_box(l.resolve(m))),
+            MaxSize::Lp(l) => border_box(l.px),
+        };
         let clips = s.box_.overflow_x != Overflow::Visible || s.box_.overflow_y != Overflow::Visible;
         let min_prop = if row { s.box_.min_width } else { s.box_.min_height };
         let min = match min_prop.resolve_definite(main_size) {
@@ -142,7 +199,19 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
             None if min_prop.is_auto() && !clips => {
                 // Automatic minimum: the content size, capped by a specified
                 // size
-                let content = if row {
+                let natural_w = match &b.kind {
+                    // A replaced item's content size is its natural width,
+                    // whatever its own width (CSS Flexbox §4.5)
+                    // (form controls keep their intrinsic width)
+                    super::box_tree::BoxKind::Replaced(r) if r.ratio_only => Some(bp_main),
+                    super::box_tree::BoxKind::Replaced(r) => r.natural.map(|n| n.0 + bp_main),
+                    _ => None,
+                };
+                let content = if let Some(w) = ratio_width {
+                    w.min(natural_w.unwrap_or_else(|| intrinsic_content(ctx, b).0 + bp_main))
+                } else if let (true, Some(w)) = (row, natural_w) {
+                    w
+                } else if row {
                     intrinsic_content(ctx, b).0 + bp_main
                 } else {
                     match &content_laid {
@@ -155,15 +224,10 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
                         }
                     }
                 };
-                definite(main_prop).map_or(content, |v| v.min(content))
+                // ... and by the max main size (CSS Flexbox §4.5)
+                definite(main_prop).map_or(content, |v| v.min(content)).min(max)
             }
             None => 0.0,
-        };
-        let max_prop = if row { s.box_.max_width } else { s.box_.max_height };
-        let max = match max_prop {
-            MaxSize::None => f32::INFINITY,
-            MaxSize::Lp(l) if l.has_percent() => main_size.map_or(f32::INFINITY, |m| border_box(l.resolve(m))),
-            MaxSize::Lp(l) => border_box(l.px),
         };
         let hypo = base.min(max).max(min);
         let _ = content_laid;
@@ -189,6 +253,17 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     if start < flex.len() || lines.is_empty() {
         lines.push(start..flex.len());
     }
+    // An automatic column height is its content clamped by min-height and
+    // max-height, which flexible items then fill (§9.2 #4): vercel.com's
+    // hero is a min-h column whose flex-1 child takes the rest
+    let main_size = main_size.or_else(|| {
+        if row {
+            return None;
+        }
+        let content = lines.iter().map(|l| flex[l.clone()].iter().map(|it| it.hypo + it.main_margins(row)).sum::<f32>() + gap_main * l.len().saturating_sub(1) as f32).fold(0.0, f32::max);
+        let clamped = content.min(height_bounds.1).max(height_bounds.0);
+        (clamped != content).then_some(clamped)
+    });
 
     // Resolve flexible lengths (§9.7)
     for line in &lines {
@@ -257,8 +332,8 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
         let forced = if row {
             Forced { width: Some(it.target), height: None, root: true }
         } else {
-            let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.width.is_auto() && !it.auto_margin[1] && !it.auto_margin[3];
-            Forced { width: stretch.then(|| (width - it.margin[1] - it.margin[3]).max(0.0)), height: Some(it.target), root: true }
+            let stretch = matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) && s.box_.auto_width() && !it.auto_margin[1] && !it.auto_margin[3];
+            Forced { width: stretch.then(|| stretched_width(s, (width - it.margin[1] - it.margin[3]).max(0.0), width)), height: Some(it.target), root: true }
         };
         let laid = layout_sized(ctx, it.b, width, height, Sizing::Shrink, false, forced);
         it.cross = if row { laid.frag.border_box.h } else { laid.frag.border_box.w };
@@ -309,7 +384,7 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
     for (li, l) in lines.iter().enumerate() {
         for it in &mut flex[l.clone()] {
             let s = &it.b.style;
-            let auto_cross = if row { s.box_.height.is_auto() } else { s.box_.width.is_auto() };
+            let auto_cross = if row { s.box_.height.is_auto() } else { s.box_.auto_width() };
             let cross_auto_margins = if row { it.auto_margin[0] || it.auto_margin[2] } else { it.auto_margin[1] || it.auto_margin[3] };
             if row && auto_cross && !cross_auto_margins && matches!(align_of(s, style), AlignItems::Stretch | AlignItems::Normal) {
                 let mut target = (line_cross[li] - it.cross_margins(row)).max(0.0);
@@ -436,13 +511,26 @@ pub fn layout_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], widt
 }
 
 /// A flex container's min-content and max-content widths
-pub fn intrinsic_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox]) -> (f32, f32) {
+/// `cb_h`: the containing block's height, when known (what a percentage
+/// height of the container is of)
+pub fn intrinsic_flex(ctx: &mut LayoutCtx, style: &Style, items: &[LayoutBox], cb_h: Option<f32>) -> (f32, f32) {
     let row = style.box_.flex_direction.is_row();
     let gap = style.box_.column_gap.map_or(0.0, |g| g.resolve(0.0));
     let (mut min, mut max) = (0.0f32, 0.0f32);
     let mut n = 0;
+    // A definite row height sizes replaced items through their ratio here
+    // too
+    let cross = style.box_.height.resolve_definite(cb_h).filter(|_| row).map(|h| content_size(style, h, super::block::edges(style, 0.0).vertical_bp()));
     for b in items.iter().filter(|b| !b.style.is_out_of_flow()) {
-        let (bmin, bmax) = intrinsic_outer(ctx, b);
+        let (bmin, bmax) = match (&b.kind, cross) {
+            (super::box_tree::BoxKind::Replaced(r), Some(h)) if b.style.box_.width.is_auto() && b.style.box_.height.resolve_definite(Some(h)).is_some() => {
+                let e = super::block::edges(&b.style, 0.0);
+                let w = super::block::replaced_content_size(ctx, &b.style, r, 0.0, Some(h), e.horizontal_bp(), e.vertical_bp()).0;
+                let w = w + e.horizontal_bp() + e.margin[1].unwrap_or(0.0) + e.margin[3].unwrap_or(0.0);
+                (w, w)
+            }
+            _ => intrinsic_outer(ctx, b),
+        };
         if row {
             max += bmax;
             if style.box_.flex_wrap == FlexWrap::Nowrap {

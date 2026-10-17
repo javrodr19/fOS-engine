@@ -51,6 +51,14 @@ pub enum TemplateItem {
     /// `[name ...]`: names of the line at this point
     Names(Arc<[Arc<str>]>),
     Repeat(RepeatCount, Arc<[TemplateItem]>),
+    /// `subgrid` (first, before any line names): the axis takes the
+    /// parent grid's tracks the element spans
+    Subgrid,
+}
+
+/// Whether a track list is `subgrid`
+pub fn is_subgrid(list: &[TemplateItem]) -> bool {
+    matches!(list.first(), Some(TemplateItem::Subgrid))
 }
 
 /// `grid-template-areas`: each named area's rows and columns (end
@@ -153,6 +161,11 @@ fn tokens(v: &str) -> Vec<&str> {
                         _ => {}
                     }
                     i += 1;
+                    // A function ends its token: minified CSS runs them
+                    // together (`minmax(0,3fr)minmax(0,2fr)`)
+                    if depth == 0 && b[i - 1] == b')' {
+                        break;
+                    }
                 }
             }
         }
@@ -239,6 +252,14 @@ pub fn parse_track_list(v: &str, len: LengthFn) -> Option<Arc<[TemplateItem]>> {
     let v = v.trim();
     if v == "none" {
         return Some(Arc::from([]));
+    }
+    // subgrid [names]*: line names only
+    if let Some(rest) = v.strip_prefix("subgrid").filter(|r| r.is_empty() || r.starts_with(char::is_whitespace)) {
+        let mut out = vec![TemplateItem::Subgrid];
+        for t in tokens(rest.trim()) {
+            out.push(TemplateItem::Names(names(t)?));
+        }
+        return Some(Arc::from(out));
     }
     let items = track_items(v, len, true)?;
     items.iter().any(|i| !matches!(i, TemplateItem::Names(_))).then(|| Arc::from(items))
@@ -516,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn subgrid_track_lists() {
+        // mozilla.org's springboard rows are column subgrids
+        let l = parse_track_list("subgrid", &len).unwrap();
+        assert!(is_subgrid(&l));
+        let l = parse_track_list("subgrid [a] [b c]", &len).unwrap();
+        assert!(is_subgrid(&l) && l.len() == 3);
+        assert!(parse_track_list("subgrid 10px", &len).is_none());
+        assert!(!is_subgrid(&parse_track_list("10px", &len).unwrap()));
+        assert!(valid("grid-template-columns", "subgrid"));
+    }
+
+    #[test]
     fn track_lists() {
         let l = parse_track_list("[full-start] minmax(1em, 1fr) [main] repeat(3, 100px 2fr) fit-content(40%) auto", &len).unwrap();
         assert_eq!(l.len(), 6);
@@ -526,6 +559,9 @@ mod tests {
         assert!(parse_track_list("repeat(auto-fill, minmax(200px, 1fr))", &len).is_some());
         assert!(valid("grid-template-columns", "12.25rem minmax(0,1fr)"));
         assert!(expand_shorthand("grid-template", "min-content 1fr min-content / 12.25rem minmax(0,1fr)").unwrap().iter().all(|(n, v)| valid(n, v)));
+        // Minified: functions run together (deno.com's 3fr/2fr columns)
+        let l = parse_track_list("minmax(0,3fr)minmax(0,2fr)", &len).unwrap();
+        assert!(matches!((&l[0], &l[1]), (TemplateItem::Track(a), TemplateItem::Track(b)) if a.max == Breadth::Fr(3.0) && b.max == Breadth::Fr(2.0)));
         assert!(parse_track_list("minmax(1fr, 2fr)", &len).is_none());
         assert!(parse_track_list("-5px", &len).is_none());
     }

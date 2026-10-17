@@ -17,11 +17,27 @@ use crate::Declaration;
 
 // ---- values ----
 
-/// A length-percentage: `px` plus `pct` percent of a basis known at layout
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// A length-percentage: `px` plus `pct` percent of a basis known at layout.
+/// A zero percentage is kept as -0.0 so `0%` stays a percentage (a flex
+/// basis of 0% in a container of unknown height is the content's, where
+/// 0px is 0); it computes like 0.0 but is not equal to it, so styles
+/// shared as equal keep it
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Lp {
     pub px: f32,
     pub pct: f32,
+}
+
+/// A math function whose comparisons wait for the percentage basis
+/// (`min(1040px, 100%)`) is an `Lp` with a NaN `pct` carrying the index of
+/// its interned tree, and `px` its value with percentages as 0 (what code
+/// ignoring the percentage expects)
+const CALC_NAN: u32 = 0x7FC0_0000;
+
+impl PartialEq for Lp {
+    fn eq(&self, other: &Lp) -> bool {
+        self.px == other.px && (self.pct == other.pct || self.pct.to_bits() == other.pct.to_bits()) && self.has_percent() == other.has_percent()
+    }
 }
 
 impl Lp {
@@ -32,7 +48,16 @@ impl Lp {
     }
 
     pub const fn pct(pct: f32) -> Lp {
-        Lp { px: 0.0, pct }
+        Lp { px: 0.0, pct: if pct == 0.0 { -0.0 } else { pct } }
+    }
+
+    pub(crate) fn calc(index: u32, px: f32) -> Lp {
+        Lp { px, pct: f32::from_bits(CALC_NAN | index) }
+    }
+
+    /// The interned math function this is, if it is one
+    pub fn calc_index(self) -> Option<u32> {
+        self.pct.is_nan().then(|| self.pct.to_bits() & !CALC_NAN & 0x7FFF_FFFF)
     }
 
     /// Pixels, given what a percentage is of
@@ -40,9 +65,16 @@ impl Lp {
     pub fn resolve(self, basis: f32) -> f32 {
         if self.pct == 0.0 {
             self.px
+        } else if let Some(i) = self.calc_index() {
+            crate::values::eval_calc(i, basis)
         } else {
             self.px + self.pct * basis / 100.0
         }
+    }
+
+    /// The percentage alone, as a math function has none of its own
+    pub fn percent(self) -> f32 {
+        if self.pct.is_nan() { 0.0 } else { self.pct }
     }
 
     pub fn is_zero(self) -> bool {
@@ -50,7 +82,7 @@ impl Lp {
     }
 
     pub fn has_percent(self) -> bool {
-        self.pct != 0.0
+        self.pct != 0.0 || self.pct.is_sign_negative()
     }
 }
 
@@ -240,6 +272,7 @@ css_enum!(Position { Static = "static", Relative = "relative", Absolute = "absol
 css_enum!(Float { None = "none", Left = "left", Right = "right" });
 css_enum!(Clear { None = "none", Left = "left", Right = "right", Both = "both" });
 css_enum!(BoxSizing { ContentBox = "content-box", BorderBox = "border-box" });
+css_enum!(Appearance { None = "none", Auto = "auto" });
 css_enum!(Overflow { Visible = "visible", Hidden = "hidden", Clip = "clip", Scroll = "scroll", Auto = "auto" });
 css_enum!(Visibility { Visible = "visible", Hidden = "hidden", Collapse = "collapse" });
 css_enum!(TextAlign { Start = "start", End = "end", Left = "left", Right = "right", Center = "center", Justify = "justify", MatchParent = "match-parent", WebkitCenter = "-webkit-center" });
@@ -261,6 +294,12 @@ impl WhiteSpace {
     /// Lines may wrap at soft opportunities
     pub fn wraps(self) -> bool {
         !matches!(self, WhiteSpace::Pre | WhiteSpace::Nowrap)
+    }
+
+    /// Preserved spaces at the end of a line take room there rather than
+    /// hang (CSS Text 3 §4.1.3)
+    pub fn keeps_trailing_spaces(self) -> bool {
+        matches!(self, WhiteSpace::Pre | WhiteSpace::BreakSpaces)
     }
 }
 
@@ -361,6 +400,27 @@ css_enum!(WordBreak { Normal = "normal", BreakAll = "break-all", KeepAll = "keep
 css_enum!(OverflowWrap { Normal = "normal", Anywhere = "anywhere", BreakWord = "break-word" });
 css_enum!(TextOverflow { Clip = "clip", Ellipsis = "ellipsis" });
 css_enum!(ObjectFit { Fill = "fill", Contain = "contain", Cover = "cover", None = "none", ScaleDown = "scale-down" });
+css_enum!(ContentVisibility { Visible = "visible", Auto = "auto", Hidden = "hidden" });
+
+/// `text-box-trim` bits and `text-box-edge` keywords (CSS Inline 3)
+pub mod text_box {
+    pub const TRIM_START: u8 = 1;
+    pub const TRIM_END: u8 = 2;
+    pub const TEXT: u8 = 0;
+    pub const CAP: u8 = 1;
+    pub const EX: u8 = 2;
+    pub const ALPHABETIC: u8 = 3;
+    pub const IDEOGRAPHIC: u8 = 4;
+}
+
+/// `contain` bits (CSS Containment 2)
+pub mod contain {
+    pub const SIZE: u8 = 1;
+    pub const INLINE_SIZE: u8 = 2;
+    pub const LAYOUT: u8 = 4;
+    pub const STYLE: u8 = 8;
+    pub const PAINT: u8 = 16;
+}
 css_enum!(TextDecorationStyle { Solid = "solid", Double = "double", Dotted = "dotted", Dashed = "dashed", Wavy = "wavy" });
 css_enum!(BackgroundClip { BorderBox = "border-box", PaddingBox = "padding-box", ContentBox = "content-box", Text = "text" });
 css_enum!(BackgroundRepeat { Repeat = "repeat", RepeatX = "repeat-x", RepeatY = "repeat-y", NoRepeat = "no-repeat", Space = "space", Round = "round" });
@@ -420,6 +480,9 @@ pub enum Image {
     Url(Arc<str>),
     Linear { direction: GradientDirection, stops: Arc<[ColorStop]>, repeating: bool },
     Radial { circle: bool, size: RadialSize, center: (Lp, Lp), stops: Arc<[ColorStop]>, repeating: bool },
+    /// `conic-gradient()`: `from` in degrees clockwise from up; stop
+    /// positions are percentages of a turn
+    Conic { from: f32, center: (Lp, Lp), stops: Arc<[ColorStop]>, repeating: bool },
 }
 
 /// A `background-size` layer
@@ -443,6 +506,8 @@ pub struct InheritedStyle {
     pub font_size: f32,
     pub font_weight: u16,
     pub font_style: FontStyle,
+    /// `font-stretch`, as a percentage of the normal width
+    pub font_stretch: f32,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub text_indent: Lp,
@@ -450,6 +515,8 @@ pub struct InheritedStyle {
     pub white_space: WhiteSpace,
     /// `text-wrap-style` (`balance` evens out the lines)
     pub text_wrap: TextWrapStyle,
+    /// `text-box-edge`: the over and under edges ([`text_box`] keywords)
+    pub text_box_edge: (u8, u8),
     /// Where a table's captions go
     pub caption_side: CaptionSide,
     pub letter_spacing: f32,
@@ -472,6 +539,7 @@ impl Default for InheritedStyle {
             font_family: Arc::from([Arc::from("serif")]),
             font_size: 16.0,
             font_weight: 400,
+            font_stretch: 100.0,
             font_style: FontStyle::Normal,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
@@ -479,6 +547,7 @@ impl Default for InheritedStyle {
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             text_wrap: TextWrapStyle::Auto,
+            text_box_edge: (0, 0),
             caption_side: CaptionSide::Top,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -653,6 +722,8 @@ pub struct BoxStyle {
     pub float: Float,
     pub clear: Clear,
     pub box_sizing: BoxSizing,
+    /// `appearance`: form controls drawn natively (`auto`) or by CSS
+    pub appearance: Appearance,
     pub width: LpAuto,
     pub height: LpAuto,
     pub min_width: LpAuto,
@@ -680,7 +751,20 @@ pub struct BoxStyle {
     pub order: i32,
     pub row_gap: Option<Lp>,
     pub column_gap: Option<Lp>,
+    /// Multi-column layout: `column-count` and `column-width` (px), `None`
+    /// for auto
+    pub column_count: Option<u32>,
+    pub column_width: Option<f32>,
     pub object_fit: ObjectFit,
+    /// `contain` ([`contain`] bits)
+    pub contain: u8,
+    /// `container-type`, as the size [`contain`] bit it applies
+    pub container_type: u8,
+    /// `text-box-trim` ([`text_box`] trim bits)
+    pub text_box_trim: u8,
+    pub content_visibility: ContentVisibility,
+    /// `contain-intrinsic-width` and `-height` in pixels (`None`: none)
+    pub contain_intrinsic: [Option<f32>; 2],
     pub text_overflow: TextOverflow,
     pub table_layout: TableLayout,
     /// Grid container and item properties
@@ -759,6 +843,14 @@ impl IntrinsicSize {
     }
 }
 
+impl BoxStyle {
+    /// `width: auto`, with no intrinsic size keyword in its place (the box
+    /// may be stretched)
+    pub fn auto_width(&self) -> bool {
+        self.width.is_auto() && self.intrinsic_width[0] == IntrinsicSize::None
+    }
+}
+
 impl Default for BoxStyle {
     fn default() -> Self {
         BoxStyle {
@@ -767,6 +859,7 @@ impl Default for BoxStyle {
             float: Float::None,
             clear: Clear::None,
             box_sizing: BoxSizing::ContentBox,
+            appearance: Appearance::None,
             width: LpAuto::Auto,
             height: LpAuto::Auto,
             min_width: LpAuto::Auto,
@@ -793,7 +886,14 @@ impl Default for BoxStyle {
             order: 0,
             row_gap: None,
             column_gap: None,
+            column_count: None,
+            column_width: None,
             object_fit: ObjectFit::Fill,
+            contain: 0,
+            container_type: 0,
+            text_box_trim: 0,
+            content_visibility: ContentVisibility::Visible,
+            contain_intrinsic: [None, None],
             text_overflow: TextOverflow::Clip,
             table_layout: TableLayout::Auto,
             grid: Default::default(),
@@ -935,17 +1035,59 @@ impl PartialEq for Style {
 }
 
 /// What lengths are computed against
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StyleContext {
     /// The root element's font size (`rem`)
     pub root_font_size: f32,
     /// The viewport (`vw`, `vh`, `vmin`, `vmax`)
     pub viewport: (f32, f32),
+    /// Custom properties `@property` rules register
+    pub registered: Option<Arc<crate::values::PropertyRegistry>>,
+    /// The fonts' `ch` and `ex` (without it, half an em each)
+    pub font_units: Option<FontUnitsHook>,
 }
 
 impl Default for StyleContext {
     fn default() -> Self {
-        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0) }
+        StyleContext { root_font_size: 16.0, viewport: (1024.0, 768.0), registered: None, font_units: None }
+    }
+}
+
+impl StyleContext {
+    /// `ch` and `ex` in pixels for the font of `font` (an element's
+    /// inherited style) at `size`
+    pub fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32) {
+        self.font_units.as_ref().map_or((size * 0.5, size * 0.5), |u| u.0.ch_ex(font, size))
+    }
+
+    /// An element's line height in pixels (`lh`): `normal` is its font's
+    pub fn line_height(&self, font: &InheritedStyle) -> f32 {
+        match (font.line_height, &self.font_units) {
+            (LineHeight::Normal, Some(u)) => u.0.normal_line_height(font, font.font_size),
+            (lh, _) => lh.resolve(font.font_size),
+        }
+    }
+}
+
+/// Font metrics that styling needs: what `ch` and `ex` are
+pub trait FontUnits: Send + Sync {
+    /// The advance of "0" and the x-height, in pixels at `size`, of the
+    /// first available font for the family, weight and style of `font`
+    /// (CSS Values 4 §6.1.1)
+    fn ch_ex(&self, font: &InheritedStyle, size: f32) -> (f32, f32);
+    /// `line-height: normal` in pixels for that font at `size`
+    fn normal_line_height(&self, _font: &InheritedStyle, size: f32) -> f32 {
+        size * 1.2
+    }
+}
+
+/// A shared [`FontUnits`]
+#[derive(Clone)]
+pub struct FontUnitsHook(pub Arc<dyn FontUnits>);
+
+impl std::fmt::Debug for FontUnitsHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FontUnitsHook")
     }
 }
 
@@ -998,6 +1140,38 @@ impl Style {
 
     pub fn is_positioned(&self) -> bool {
         self.box_.position != Position::Static
+    }
+
+    /// The containment in effect ([`contain`] bits): `contain`'s, what
+    /// `content-visibility` turns on (layout, style and paint; size too
+    /// when hidden), and a size container's (style and its size
+    /// containment). Inline boxes are not contained
+    pub fn containment(&self) -> u8 {
+        use contain::*;
+        let b = &self.box_;
+        if b.display == Display::Inline || b.display == Display::Contents || b.display == Display::None {
+            return 0;
+        }
+        b.contain
+            | if b.container_type != 0 { b.container_type | STYLE } else { 0 }
+            | match b.content_visibility {
+                ContentVisibility::Visible => 0,
+                ContentVisibility::Auto => LAYOUT | STYLE | PAINT,
+                ContentVisibility::Hidden => SIZE | LAYOUT | STYLE | PAINT,
+            }
+    }
+
+    /// Layout or paint containment: an independent formatting context
+    /// and the containing block of its positioned descendants
+    pub fn contains_layout(&self) -> bool {
+        self.containment() & (contain::LAYOUT | contain::PAINT) != 0
+    }
+
+    /// An independent formatting context for containment: layout or paint
+    /// containment, or a size container (CSS Conditional 5 §2.1), which is
+    /// not the containing block of positioned descendants
+    pub fn contains_formatting(&self) -> bool {
+        self.contains_layout() || (self.box_.container_type != 0 && self.containment() != 0)
     }
 
     /// The element's transform for a border box at (x, y), w × h, in the
@@ -1097,9 +1271,10 @@ impl Style {
         out
     }
 
-    /// Clips its content (overflow other than visible)
+    /// Clips its content (overflow other than visible, or paint
+    /// containment)
     pub fn clips(&self) -> bool {
-        self.box_.overflow_x != Overflow::Visible || self.box_.overflow_y != Overflow::Visible
+        self.box_.overflow_x != Overflow::Visible || self.box_.overflow_y != Overflow::Visible || self.containment() & contain::PAINT != 0
     }
 
     /// Establishes a stacking context
@@ -1118,38 +1293,107 @@ impl Style {
                 _ => None,
             })
             .collect();
-        if !own.is_empty() {
-            let computed = crate::values::compute_custom_properties(self.custom.as_ref(), &own);
-            self.custom = Some(Arc::new(computed));
+        match ctx.registered.as_deref().filter(|r| !r.is_empty()) {
+            Some(registry) => self.custom = registry.compute(self.custom.as_ref(), &own),
+            None if !own.is_empty() => {
+                let computed = crate::values::compute_custom_properties(self.custom.as_ref(), &own);
+                self.custom = Some(Arc::new(computed));
+            }
+            None => {}
         }
         let parent_font_size = parent.inherited.font_size;
-        for font_pass in [true, false] {
+        // `ch` and `ex` of the parent's font (for font-size) and, once the
+        // font pass has set it, this element's
+        let parent_units = std::cell::OnceCell::new();
+        let mut units: Option<(f32, f32, f32)> = None;
+        // Border and outline sides given a width (the others' initial width
+        // is medium once they have a style)
+        let mut widths_set = 0u8;
+        let mut note = |id: PropertyId| {
+            widths_set |= match id {
+                PropertyId::BorderTopWidth => 1,
+                PropertyId::BorderRightWidth => 2,
+                PropertyId::BorderBottomWidth => 4,
+                PropertyId::BorderLeftWidth => 8,
+                PropertyId::OutlineWidth => 16,
+                _ => 0,
+            }
+        };
+        // The font first: other lengths are in its em, ch and ex; then the
+        // line height (lh)
+        for pass in 0..3 {
             for d in decls {
-                let is_font = match &d.value {
+                let of_pass = match &d.value {
                     PropertyValue::Custom(_) => continue,
-                    PropertyValue::Unresolved(b) => b.0 == "font-size" || b.0 == "font",
-                    _ => d.property == PropertyId::FontSize,
+                    PropertyValue::Unresolved(b) => match b.0.as_str() {
+                        "font-size" | "font" | "font-family" | "font-weight" | "font-style" | "font-stretch" | "font-width" => 0,
+                        "line-height" => 1,
+                        _ => 2,
+                    },
+                    _ => match d.property {
+                        PropertyId::FontSize | PropertyId::FontFamily | PropertyId::FontWeight | PropertyId::FontStyle | PropertyId::FontStretch => 0,
+                        PropertyId::LineHeight => 1,
+                        _ => 2,
+                    },
                 };
-                if is_font != font_pass {
+                if of_pass != pass {
                     continue;
                 }
                 match &d.value {
                     PropertyValue::Unresolved(b) => {
                         let custom = self.custom.clone();
+                        let (pch, pex, plh) = *parent_units.get_or_init(|| {
+                            let (ch, ex) = ctx.ch_ex(&parent.inherited, parent_font_size);
+                            (ch, ex, ctx.line_height(&parent.inherited))
+                        });
+                        let (ch, ex, lh) = match pass {
+                            0 => (pch, pex, plh),
+                            // Before this element's line height is known
+                            1 => {
+                                let (ch, ex) = ctx.ch_ex(&self.inherited, self.inherited.font_size);
+                                (ch, ex, plh)
+                            }
+                            _ => *units.get_or_insert_with(|| {
+                                let (ch, ex) = ctx.ch_ex(&self.inherited, self.inherited.font_size);
+                                (ch, ex, ctx.line_height(&self.inherited))
+                            }),
+                        };
                         let rctx = crate::values::ResolveContext {
                             custom: custom.as_deref().map(|c| c as &dyn crate::values::VarSource),
                             font_size: self.inherited.font_size,
                             parent_font_size,
                             root_font_size: ctx.root_font_size,
                             viewport: ctx.viewport,
+                            ch_ex: (ch, ex),
+                            parent_ch_ex: (pch, pex),
+                            lh: (lh, plh),
                         };
                         let resolved = cache.resolve(&b.0, &b.1, d.important, custom.as_ref(), &rctx).to_vec();
                         for r in &resolved {
+                            note(r.property);
                             self.apply(r.property, &r.value, parent, ctx);
                         }
                     }
-                    v => self.apply(d.property, v, parent, ctx),
+                    v => {
+                        note(d.property);
+                        self.apply(d.property, v, parent, ctx)
+                    }
                 }
+            }
+        }
+        // A side with a style but no width is medium (3px): mozilla.org's
+        // springboard links set border-bottom-width alone, so their sides
+        // are 3px
+        let b = &self.border;
+        let medium: Vec<usize> = (0..4).filter(|&i| widths_set & (1 << i) == 0 && !matches!(b.style[i], BorderStyle::None | BorderStyle::Hidden) && b.width[i] == 0.0).collect();
+        let outline_medium = widths_set & 16 == 0 && !matches!(b.outline_style, BorderStyle::None | BorderStyle::Hidden) && b.outline_width == 0.0;
+        if !medium.is_empty() || outline_medium {
+            let b = Arc::make_mut(&mut self.border);
+            for i in medium {
+                b.width[i] = 3.0;
+            }
+            if outline_medium {
+                b.outline_width = 3.0;
             }
         }
         self.finish();
@@ -1207,8 +1451,9 @@ impl Style {
             LengthUnit::Vh => l.value * h / 100.0,
             LengthUnit::Vmin => l.value * w.min(h) / 100.0,
             LengthUnit::Vmax => l.value * w.max(h) / 100.0,
-            LengthUnit::Ch => l.value * fs * 0.5,
-            LengthUnit::Ex => l.value * fs * 0.5,
+            LengthUnit::Ch => l.value * ctx.ch_ex(&self.inherited, fs).0,
+            LengthUnit::Ex => l.value * ctx.ch_ex(&self.inherited, fs).1,
+            LengthUnit::Lh => l.value * ctx.line_height(&self.inherited),
         };
         Lp::px(px)
     }
@@ -1260,6 +1505,9 @@ impl Style {
     /// A length-percentage in text (grid tracks), including resolved
     /// mixes (`-fos-mix(Xpx Y%)`)
     fn lp_text(&self, t: &str, ctx: &StyleContext) -> Option<Lp> {
+        if t.starts_with("-fos-calc(") {
+            return crate::values::calc_length(t);
+        }
         if let Some(inner) = t.strip_prefix("-fos-mix(").and_then(|r| r.strip_suffix(')')) {
             let mut lp = Lp::ZERO;
             for part in inner.split_whitespace() {
@@ -1332,6 +1580,7 @@ impl Style {
             PropertyId::Float => set!(box_, [float], enum_of!(Float)),
             PropertyId::Clear => set!(box_, [clear], enum_of!(Clear)),
             PropertyId::BoxSizing => set!(box_, [box_sizing], enum_of!(BoxSizing)),
+            PropertyId::Appearance => set!(box_, [appearance], enum_of!(Appearance)),
             PropertyId::Width | PropertyId::Height | PropertyId::MinWidth | PropertyId::MinHeight | PropertyId::FlexBasis => {
                 let intrinsic = IntrinsicSize::of(v);
                 match id {
@@ -1382,7 +1631,7 @@ impl Style {
             }
             PropertyId::PaddingTop | PropertyId::PaddingRight | PropertyId::PaddingBottom | PropertyId::PaddingLeft => {
                 let Some(val) = self.lp(v, ctx) else { return };
-                let val = Lp { px: val.px.max(0.0), pct: val.pct.max(0.0) };
+                let val = if val.calc_index().is_some() { val } else { Lp { px: val.px.max(0.0), pct: val.pct.max(0.0) } };
                 let i = match id {
                     PropertyId::PaddingTop => 0,
                     PropertyId::PaddingRight => 1,
@@ -1471,7 +1720,52 @@ impl Style {
                     set!(box_, [column_gap], val)
                 }
             }
+            PropertyId::ColumnCount => match v {
+                PropertyValue::Keyword(Keyword::Auto) => set!(box_, [column_count], None),
+                PropertyValue::Integer(n) if *n >= 1 => set!(box_, [column_count], Some(*n as u32)),
+                _ => {}
+            },
+            PropertyId::ColumnWidth => match v {
+                PropertyValue::Keyword(Keyword::Auto) => set!(box_, [column_width], None),
+                _ => {
+                    if let Some(l) = self.lp(v, ctx).filter(|l| !l.has_percent()) {
+                        set!(box_, [column_width], Some(l.px.max(0.0)));
+                    }
+                }
+            },
             PropertyId::ObjectFit => set!(box_, [object_fit], enum_of!(ObjectFit)),
+            PropertyId::ContainerType => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [container_type], *bits as u8);
+                }
+            }
+            PropertyId::Contain => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [contain], *bits as u8);
+                }
+            }
+            PropertyId::ContentVisibility => set!(box_, [content_visibility], enum_of!(ContentVisibility)),
+            PropertyId::TextBoxTrim => {
+                if let PropertyValue::Integer(bits) = v {
+                    set!(box_, [text_box_trim], *bits as u8);
+                }
+            }
+            PropertyId::TextBoxEdge => {
+                if let PropertyValue::Integer(e) = v {
+                    set!(inherited, [text_box_edge], ((*e / 8) as u8, (*e % 8) as u8));
+                }
+            }
+            PropertyId::ContainIntrinsicWidth | PropertyId::ContainIntrinsicHeight => {
+                let size = match v {
+                    PropertyValue::Keyword(Keyword::None) => None,
+                    _ => match self.lp(v, ctx) {
+                        Some(l) if !l.has_percent() => Some(l.px.max(0.0)),
+                        _ => return,
+                    },
+                };
+                let axis = (id == PropertyId::ContainIntrinsicHeight) as usize;
+                set!(box_, [contain_intrinsic[axis]], size);
+            }
             PropertyId::TextOverflow => set!(box_, [text_overflow], enum_of!(TextOverflow)),
             PropertyId::TableLayout => set!(box_, [table_layout], enum_of!(TableLayout)),
             PropertyId::GridTemplateColumns | PropertyId::GridTemplateRows | PropertyId::GridAutoColumns | PropertyId::GridAutoRows => {
@@ -1815,7 +2109,9 @@ impl Style {
                     PropertyValue::Length(l) => match l.unit {
                         LengthUnit::Em => l.value * parent_fs,
                         LengthUnit::Percent => l.value * parent_fs / 100.0,
-                        LengthUnit::Ch | LengthUnit::Ex => l.value * parent_fs * 0.5,
+                        LengthUnit::Ch => l.value * ctx.ch_ex(&parent.inherited, parent_fs).0,
+                        LengthUnit::Ex => l.value * ctx.ch_ex(&parent.inherited, parent_fs).1,
+                        LengthUnit::Lh => l.value * ctx.line_height(&parent.inherited),
                         _ => self.length(*l, ctx).px,
                     },
                     PropertyValue::Mix { px, pct } => px + pct * parent_fs / 100.0,
@@ -1845,6 +2141,11 @@ impl Style {
                 set!(inherited, [font_weight], w.clamp(1, 1000) as u16);
             }
             PropertyId::FontStyle => set!(inherited, [font_style], enum_of!(FontStyle)),
+            PropertyId::FontStretch => {
+                if let PropertyValue::Number(p) = v {
+                    set!(inherited, [font_stretch], *p);
+                }
+            }
             PropertyId::LineHeight => {
                 let fs = self.inherited.font_size;
                 let lh = match v {
@@ -1873,7 +2174,7 @@ impl Style {
                     PropertyValue::Keyword(Keyword::Normal) => 0.0,
                     _ => match self.lp(v, ctx) {
                         // Percentages of word-spacing are of the space width: approximate
-                        Some(l) => l.px + l.pct * self.inherited.font_size * 0.25 / 100.0,
+                        Some(l) => l.resolve(self.inherited.font_size * 0.25),
                         None => return,
                     },
                 };
@@ -1923,6 +2224,7 @@ impl Style {
             PropertyId::Float => copy!(box_, [float]),
             PropertyId::Clear => copy!(box_, [clear]),
             PropertyId::BoxSizing => copy!(box_, [box_sizing]),
+            PropertyId::Appearance => copy!(box_, [appearance]),
             PropertyId::Width => {
                 copy!(box_, [width]);
                 copy!(box_, [intrinsic_width[0]]);
@@ -1967,7 +2269,16 @@ impl Style {
             PropertyId::Order => copy!(box_, [order]),
             PropertyId::RowGap => copy!(box_, [row_gap]),
             PropertyId::ColumnGap => copy!(box_, [column_gap]),
+            PropertyId::ColumnCount => copy!(box_, [column_count]),
+            PropertyId::ColumnWidth => copy!(box_, [column_width]),
             PropertyId::ObjectFit => copy!(box_, [object_fit]),
+            PropertyId::Contain => copy!(box_, [contain]),
+            PropertyId::ContainerType => copy!(box_, [container_type]),
+            PropertyId::ContentVisibility => copy!(box_, [content_visibility]),
+            PropertyId::TextBoxTrim => copy!(box_, [text_box_trim]),
+            PropertyId::TextBoxEdge => copy!(inherited, [text_box_edge]),
+            PropertyId::ContainIntrinsicWidth => copy!(box_, [contain_intrinsic[0]]),
+            PropertyId::ContainIntrinsicHeight => copy!(box_, [contain_intrinsic[1]]),
             PropertyId::TextOverflow => copy!(box_, [text_overflow]),
             PropertyId::TableLayout => copy!(box_, [table_layout]),
             PropertyId::GridTemplateColumns => copy!(box_, [grid.template_columns]),
@@ -2047,6 +2358,7 @@ impl Style {
             PropertyId::FontSize => copy!(inherited, [font_size]),
             PropertyId::FontWeight => copy!(inherited, [font_weight]),
             PropertyId::FontStyle => copy!(inherited, [font_style]),
+            PropertyId::FontStretch => copy!(inherited, [font_stretch]),
             PropertyId::LineHeight => copy!(inherited, [line_height]),
             PropertyId::TextAlign => copy!(inherited, [text_align]),
             PropertyId::TextIndent => copy!(inherited, [text_indent]),

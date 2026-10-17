@@ -23,7 +23,7 @@ pub fn place_absolutes(ctx: &mut LayoutCtx, root: &mut BoxFragment, boxes: &Layo
         return;
     }
     let icb = Rect::new(0.0, 0.0, ctx.viewport.0, ctx.viewport.1);
-    walk(ctx, root, icb, icb, &map);
+    walk(ctx, root, icb, icb, &map, &HashMap::new());
 }
 
 /// Out-of-flow boxes by element
@@ -53,22 +53,34 @@ fn collect<'a>(b: &'a LayoutBox, map: &mut HashMap<NodeId, &'a LayoutBox>) {
     }
 }
 
-fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map: &HashMap<NodeId, &LayoutBox>) {
-    let cb = if f.style.is_positioned() && f.kind != BoxFragmentKind::Placeholder { f.padding_box() } else { cb };
+/// `spans`: the containing blocks of the positioned inline boxes on the
+/// lines `f` is in
+fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map: &HashMap<NodeId, &LayoutBox>, spans: &HashMap<NodeId, Rect>) {
+    let own = if f.kind == BoxFragmentKind::InlinePart { spans.get(&f.node).copied().unwrap_or_else(|| f.padding_box()) } else { f.padding_box() };
+    let cb = if f.style.is_positioned() && f.kind != BoxFragmentKind::Placeholder { own } else { cb };
+    let lines;
+    let spans = if f.kind == BoxFragmentKind::InlinePart {
+        spans
+    } else {
+        lines = inline_spans(&f.children);
+        &lines
+    };
+    // Layout and paint containment contain fixed descendants too
+    let (cb, viewport) = if f.style.contains_layout() && f.kind != BoxFragmentKind::Placeholder { (f.padding_box(), f.padding_box()) } else { (cb, viewport) };
     let mut changed = false;
     for c in f.children.iter_mut() {
         let Fragment::Box(child) = c else { continue };
         if child.kind == BoxFragmentKind::Placeholder {
             let Some(b) = map.get(&child.node) else { continue };
             let containing = if b.style.box_.position == Position::Fixed { viewport } else { cb };
-            let mut placed = layout_absolute(ctx, b, containing, (child.border_box.x, child.border_box.y));
+            let mut placed = layout_absolute(ctx, b, containing, child.border_box, child.static_align.unwrap_or((0.0, 0.0)));
             // Its own absolutely positioned descendants
-            walk(ctx, &mut placed, containing, viewport, map);
+            walk(ctx, &mut placed, containing, viewport, map, &HashMap::new());
             *child = placed;
             changed = true;
         } else {
             let before = child.ink;
-            walk(ctx, child, cb, viewport, map);
+            walk(ctx, child, cb, viewport, map, spans);
             changed |= child.ink != before;
         }
     }
@@ -77,9 +89,39 @@ fn walk(ctx: &mut LayoutCtx, f: &mut BoxFragment, cb: Rect, viewport: Rect, map:
     }
 }
 
+/// The containing blocks of the positioned inline boxes on lines `frags`:
+/// from the top left of the padding box of each one's first fragment to
+/// the bottom right of its last's (CSS 2.1 §10.1)
+fn inline_spans(frags: &[Fragment]) -> HashMap<NodeId, Rect> {
+    fn parts(frags: &[Fragment], out: &mut HashMap<NodeId, (Rect, Rect)>) {
+        for f in frags {
+            if let Fragment::Box(b) = f {
+                if b.kind == BoxFragmentKind::InlinePart {
+                    if b.style.is_positioned() {
+                        let p = b.padding_box();
+                        out.entry(b.node).and_modify(|e| e.1 = p).or_insert((p, p));
+                    }
+                    parts(&b.children, out);
+                }
+            }
+        }
+    }
+    let mut found = HashMap::new();
+    parts(frags, &mut found);
+    found
+        .into_iter()
+        .map(|(node, (first, last))| {
+            let (right, bottom) = (last.x + last.w, last.y + last.h);
+            (node, Rect::new(first.x, first.y, (right - first.x).max(0.0), (bottom - first.y).max(0.0)))
+        })
+        .collect()
+}
+
 /// Lay out an absolutely positioned box against containing block `cb`;
-/// `static_pos` is where its margin box would have started in flow
-pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos: (f32, f32)) -> BoxFragment {
+/// its static position is where its margin box would have started in
+/// flow: aligned in `static_area` by fractions `align` of the free space
+/// (an empty area at the start for block and inline layout)
+pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_area: Rect, align: (f32, f32)) -> BoxFragment {
     let s = &b.style;
     let e = edges(s, cb.w);
     let (hbp, vbp) = (e.horizontal_bp(), e.vertical_bp());
@@ -91,13 +133,28 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
 
     // Width
     let specified_w = s.box_.width.resolve(cb.w).map(|w| clamp_width(s, content_size(s, w, hbp), cb.w, hbp) + hbp);
+    // aspect-ratio with a definite height gives an automatic width (CSS
+    // Sizing 4 §5.1): vercel.com's hero art is h-full aspect-[3/2]
+    let ratio_w = s.box_.aspect_ratio.filter(|_| !replaced && specified_w.is_none()).and_then(|r| {
+        let h = s.box_.height.resolve_definite(Some(cb.h)).map(|h| content_size(s, h, vbp))?;
+        let h = clamp_height(s, h, Some(cb.h), vbp);
+        let border_box = s.box_.box_sizing == fos_css::style::BoxSizing::BorderBox;
+        let w = if border_box { ((h + vbp) * r - hbp).max(0.0) } else { h * r };
+        Some(clamp_width(s, w, cb.w, hbp) + hbp)
+    });
     let width = match (specified_w, left, right) {
         (Some(w), _, _) => Some(w),
         _ if replaced => None,
         (None, Some(l), Some(r)) => Some(clamp_width(s, (cb.w - l - r - ml - mr - hbp).max(0.0), cb.w, hbp) + hbp),
+        (None, _, _) if ratio_w.is_some() => ratio_w,
         (None, _, _) => {
             let avail = (cb.w - left.unwrap_or(0.0) - right.unwrap_or(0.0) - ml - mr - hbp).max(0.0);
-            let (min, max) = intrinsic_content(ctx, b);
+            // A flex row's percentage height is of the containing block,
+            // known here (kit.svelte.dev's logo marquee is height: 100%)
+            let (min, max) = match &b.kind {
+                BoxKind::Flex(items) if !s.box_.height.is_auto() => super::flex::intrinsic_flex(ctx, s, items, Some(cb.h)),
+                _ => intrinsic_content(ctx, b),
+            };
             Some(clamp_width(s, max.min(avail).max(min), cb.w, hbp) + hbp)
         }
     };
@@ -133,15 +190,16 @@ pub fn layout_absolute(ctx: &mut LayoutCtx, b: &LayoutBox, cb: Rect, static_pos:
         }
     }
     let _ = mr;
+    let (mr0, mb0) = (e.margin[1].unwrap_or(0.0), mb);
     let x = match (left, right) {
         (Some(l), _) => cb.x + l + ml,
-        (None, Some(r)) => cb.right() - r - e.margin[1].unwrap_or(0.0) - w,
-        (None, None) => static_pos.0 + ml,
+        (None, Some(r)) => cb.right() - r - mr0 - w,
+        (None, None) => static_area.x + ml + (static_area.w - ml - w - mr0) * align.0,
     };
     let y = match (top, bottom) {
         (Some(t), _) => cb.y + t + mt,
         (None, Some(bt)) => cb.bottom() - bt - mb - h,
-        (None, None) => static_pos.1 + mt,
+        (None, None) => static_area.y + mt + (static_area.h - mt - h - mb0) * align.1,
     };
     frag.translate(x - frag.border_box.x, y - frag.border_box.y);
     frag

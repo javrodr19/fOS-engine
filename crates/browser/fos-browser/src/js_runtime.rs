@@ -70,6 +70,10 @@ pub enum ScriptType {
     ImportMap,
 }
 
+/// How long one task (a script, a timer or event callback and its
+/// microtasks) may run before it is stopped
+const SCRIPT_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// JavaScript runtime for a page
 pub struct PageJsRuntime {
     vm: Option<Vm>,
@@ -136,6 +140,9 @@ impl PageJsRuntime {
             return Ok(());
         }
         let mut vm = Vm::new();
+        // A script, timer or event handler that runs this long is stopped
+        // (the page stays usable; browsers offer to stop such pages)
+        vm.script_time_limit = Some(SCRIPT_TIME_LIMIT);
         // FOS_GC_STRESS=1: collect garbage at every safepoint (debugging)
         if std::env::var_os("FOS_GC_STRESS").is_some() {
             vm.heap.set_stress(true);
@@ -1004,6 +1011,121 @@ mod tests {
             "true,3,0.5,true,0,0,,none,0,4,true"
         );
         assert_eq!(rt.eval("out.join()").unwrap(), "NotAllowedError");
+    }
+
+    #[test]
+    fn popovers_show_and_hide() {
+        // Shown popovers match :popover-open; toggling fires toggle events
+        let (mut rt, _doc) = page(
+            r#"<html><body><div id="p" popover="manual">menu</div><div id="q"></div><script>
+              var p = document.getElementById('p'), out = [];
+              p.addEventListener('toggle', function (e) { out.push(e.oldState + '>' + e.newState); });
+              out.push(p.popover, p.matches(':popover-open'));
+              p.showPopover(); out.push(p.matches(':popover-open'));
+              out.push(p.togglePopover()); out.push(p.matches(':popover-open'));
+              try { document.getElementById('q').showPopover(); } catch (e) { out.push(e.name); }
+              window.result = out.join();
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "manual,false,true,false,false,NotSupportedError");
+        // toggle events come in tasks of their own
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rt.process_timers(&mut |_: &str| None).unwrap();
+        }
+        assert_eq!(rt.eval("out.slice(6).join()").unwrap(), "closed>open,open>closed");
+    }
+
+    #[test]
+    fn xpath_queries() {
+        // htmx 2 builds an XPathExpression for hx-on attributes as it loads
+        let (mut rt, _doc) = page(
+            r#"<html><body><ul id="l"><li class="a">one</li><li hx-on:click="x()">two</li><li>three <b>3</b></li></ul><p lang="en-GB">p</p><script>
+              var out = [], T = XPathResult;
+              var q = new XPathEvaluator().createExpression('.//*[@*[ starts-with(name(), "hx-on:") or starts-with(name(), "data-hx-on:") ]]');
+              var it = q.evaluate(document.body), n;
+              while (n = it.iterateNext()) out.push(n.textContent);
+              var ev = function (x, t, c) { return document.evaluate(x, c || document, null, t, null); };
+              out.push(ev('count(//li)', T.NUMBER_TYPE).numberValue);
+              out.push(ev('//li[2]', T.FIRST_ORDERED_NODE_TYPE).singleNodeValue.textContent);
+              out.push(ev('//li[last()]/b', T.STRING_TYPE).stringValue);
+              out.push(ev('//LI[@class="a"]', T.ORDERED_NODE_SNAPSHOT_TYPE).snapshotLength);
+              out.push(ev('normalize-space(concat(" a ", "  b "))', T.STRING_TYPE).stringValue);
+              out.push(ev('//li[contains(., "th")] | //p', T.ORDERED_NODE_SNAPSHOT_TYPE).snapshotLength);
+              // lang() reads xml:lang, not lang
+              out.push(ev('boolean(//p[lang("en")])', T.BOOLEAN_TYPE).booleanValue);
+              out.push(ev('../li[1]/following-sibling::li[1]', T.STRING_TYPE, document.querySelector('li')).stringValue);
+              out.push(ev('ancestor::*[2]/@id', T.STRING_TYPE, document.querySelector('b')).stringValue);
+              out.push(ev('string(//li[1]/preceding-sibling::*)', T.STRING_TYPE).stringValue === '');
+              out.push(ev('(1 + 2 * 3) div 2 mod 3', T.ANY_TYPE).numberValue);
+              out.push(ev('//li', T.ANY_TYPE).resultType);
+              try { document.evaluate('//li[', document); } catch (e) { out.push(e.name); }
+              window.result = out.join('|');
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "two|3|two|3|1|a b|2|false|two|l|true|0.5|4|SyntaxError");
+    }
+
+    #[test]
+    fn svg_attribute_names_keep_their_case() {
+        // Names are lowercased on HTML elements only: viewBox on an <svg>
+        let (mut rt, _doc) = page(r#"<html><body><p ID="p" data-X="1"></p><svg id="s" viewBox="0 0 4 2"></svg></body></html>"#);
+        let out = rt
+            .eval(
+                r#"var s = document.getElementById('s'), p = document.getElementById('p');
+                s.setAttribute('preserveAspectRatio', 'none');
+                [s.getAttribute('viewBox'), s.getAttribute('viewbox'), s.getAttributeNode('viewBox').value, s.hasAttribute('preserveAspectRatio'),
+                 s.attributes[s.attributes.length - 1].name, p.getAttribute('DATA-x'), p.hasAttribute('id')].join('|')"#,
+            )
+            .unwrap();
+        assert_eq!(out, "0 0 4 2||0 0 4 2|true|preserveAspectRatio|1|true");
+        // And so are tag names: an SVG element's keeps its case
+        let names = rt.eval("[s.tagName, s.nodeName, p.tagName, document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject').tagName].join()").unwrap();
+        assert_eq!(names, "svg,svg,P,foreignObject");
+    }
+
+    #[test]
+    fn attributes_are_live() {
+        // React empties an element's attributes with
+        // while (attrs.length) el.removeAttributeNode(attrs[0])
+        let (mut rt, _doc) = page(
+            r#"<html><body a="1" c="2"><script>
+              var b = document.body, l = b.attributes, n = 0, out = [];
+              out.push(l.length);
+              b.setAttribute('d', '3'); out.push(l.length);
+              out.push(l[0] === b.getAttributeNode('a'), l.a === l[0], l === b.attributes, 'c' in l, '5' in l, Object.keys(l).join('|'));
+              var first = l[0];
+              while (l.length && n < 10) { out.push(b.removeAttributeNode(l[0]).name); n++; }
+              out.push(n, l.length, first.value, first.ownerElement);
+              window.result = out.join();
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("result").unwrap(), "2,3,true,true,true,true,false,0|1|2,a,c,d,3,0,1,");
+    }
+
+    #[test]
+    fn markup_set_in_connected_callback_connects_only_new_elements() {
+        // mdBook's sidebar fills itself from connectedCallback: that must
+        // not connect the element again
+        let (mut rt, _doc) = page(
+            r#"<html><body><x-box id="b"></x-box><div id="d"><x-item id="i"></x-item></div>
+            <script>
+              window.log = [];
+              customElements.define('x-item', class extends HTMLElement { connectedCallback() { log.push('item ' + (this.id || 'new')); } });
+              customElements.define('x-box', class extends HTMLElement {
+                connectedCallback() { log.push('box'); this.innerHTML = '<x-item></x-item>'; }
+              });
+              log.push('-');
+              document.getElementById('d').insertAdjacentHTML('beforeend', '<x-item></x-item>');
+              log.push('-');
+              document.getElementById('i').outerHTML = '<x-item></x-item>';
+            </script></body></html>"#,
+        );
+        rt.execute_scripts(&mut |_: &str| None).unwrap();
+        assert_eq!(rt.eval("log.join()").unwrap(), "item i,box,item new,-,item new,-,item new");
     }
 
     #[test]
@@ -2054,7 +2176,7 @@ mod tests {
         let (mut rt, doc) = page(r#"<html><body><img id=a src="logo.png"><img id=b src="missing.png"><img id=c></body></html>"#);
         let mut renderer = crate::renderer::PageRenderer::new(800, 600);
         let pixmap = fos_canvas::tiny_skia::Pixmap::new(4, 2).unwrap();
-        let image = Arc::new(crate::image_loader::LoadedImage { natural: (40.0, 20.0), pixmap, svg_source: None });
+        let image = Arc::new(crate::image_loader::LoadedImage { natural: (40.0, 20.0), pixmap, svg_source: None, svg_fit: None, ratio_only: false });
         let images: crate::image_loader::Images = Arc::new([("https://example.com/dir/logo.png".to_string(), image)].into_iter().collect());
         renderer.set_images(images);
         renderer.render_document(&doc.lock().unwrap(), 0.0).unwrap();
@@ -2110,7 +2232,7 @@ mod tests {
         let (mut rt, doc) = page(
             r#"<html><head><style>:root { --brand: #0a0 } h1 { color: red; display: flex; margin: 0 auto; width: 50%; padding: 10px }
             #hidden { display: none } #hidden span { color: blue; font-size: 2em } p::before { content: "hi"; color: green }</style></head>
-            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p></body></html>"#,
+            <body style="margin: 0"><h1 id=h>x</h1><div id=hidden><span id=s>s</span></div><div style="display: flex"><i id=i>i</i></div><p id=p>p</p><span id=m style="margin: 0 auto 0 .5em">m</span></body></html>"#,
         );
         rt.execute_scripts(&mut |_: &str| None).unwrap();
         let mut renderer = crate::renderer::PageRenderer::new(400, 600);
@@ -2123,6 +2245,8 @@ mod tests {
             // Inside display: none; a flex item; a pseudo-element; a variable
             ("[cs('s').color, cs('s').fontSize, cs('i').display, cs('p', '::before').content, cs('p', ':before').color].join()", "rgb(0, 0, 255),32px,block,\"hi\",rgb(0, 128, 0)"),
             ("getComputedStyle(document.documentElement).getPropertyValue('--brand')", "#0a0"),
+            // An inline box's margins: lengths as declared, auto as 0
+            ("[cs('m').marginLeft, cs('m').marginRight].join()", "8px,0px"),
             // Live: a style change shows at once
             ("document.getElementById('h').style.color = 'rgb(1, 2, 3)'; h.color", "rgb(1, 2, 3)"),
             // Detached elements have none; the declaration is read-only

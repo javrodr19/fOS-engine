@@ -48,20 +48,32 @@ pub fn requests(css: &str, media: &fos_css::MediaContext, base: &str) -> Vec<Fon
     if faces.is_empty() {
         return Vec::new();
     }
-    let lower = css.to_ascii_lowercase();
+    // Escaped spaces as spaces: a family is named `Font Awesome\ 5 Free`
+    // as often as "Font Awesome 5 Free"
+    let lower = css.to_ascii_lowercase().replace("\\ ", " ");
     // A family is used when it is named more often than its own
     // @font-face rules name it
     let mut declared: HashMap<String, usize> = HashMap::new();
     for face in &faces {
         *declared.entry(face.family.to_ascii_lowercase()).or_default() += 1;
     }
-    let mut used: HashMap<String, bool> = HashMap::new();
+    let mut uses: HashMap<String, usize> = HashMap::new();
+    let mut faces: Vec<(usize, fos_css::FontFace)> = faces
+        .into_iter()
+        .map(|face| {
+            let family = face.family.to_ascii_lowercase();
+            let n = *uses.entry(family.clone()).or_insert_with(|| lower.matches(family.as_str()).count().saturating_sub(declared[&family]));
+            (n, face)
+        })
+        .collect();
+    // The most named families first, so that the cap leaves out those only
+    // a :lang() rule or two names (typescriptlang.org declares Segoe UI for
+    // seven scripts before the one its text uses)
+    faces.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = Vec::new();
-    for face in faces {
-        let family = face.family.to_ascii_lowercase();
-        let is_used = *used.entry(family.clone()).or_insert_with(|| lower.matches(family.as_str()).count() > declared[&family]);
+    for (n, face) in faces {
         // Subsets for other scripts are left to the system's fonts
-        if !is_used || !face.covers('a') {
+        if n == 0 || !face.covers('a') {
             continue;
         }
         let Some(url) = pick_source(&face.src) else { continue };
@@ -134,5 +146,23 @@ mod tests {
         assert_eq!(reqs.len(), 2, "{reqs:?}");
         assert_eq!(reqs[0], FontRequest { url: "https://example.com/css/b.woff2".into(), family: "Brand".into(), weight: 400, weights: (300, 800), italic: false });
         assert!(reqs[1].italic && reqs[1].url.ends_with("/bi.woff"));
+    }
+
+    #[test]
+    fn the_most_named_families_come_first() {
+        // Faces declared first for a family only a :lang() rule names do
+        // not crowd out the one the text uses under the cap
+        let media = fos_css::MediaContext { width: 800.0, height: 600.0 };
+        let mut css = String::new();
+        for i in 0..MAX_FONTS {
+            css += &format!("@font-face {{ font-family: S{i}x; src: url(s{i}.woff2) }} :lang(x{i}) {{ font-family: S{i}x }}\n");
+        }
+        css += "@font-face { font-family: Text; src: url(t.woff2) } body { font-family: Text } h1, p { font-family: Text, sans-serif }";
+        css += r"@font-face { font-family: Icon\ 5 Font; src: url(i.woff2) } i { font-family: Icon\ 5 Font } b { font-family: 'Icon 5 Font' }";
+        let reqs = requests(&css, &media, "https://example.com/");
+        assert_eq!(reqs.len(), MAX_FONTS);
+        assert_eq!(reqs[0].family, "Text");
+        // A family named with escaped spaces counts its uses either way
+        assert_eq!(reqs[1].family, "Icon 5 Font");
     }
 }

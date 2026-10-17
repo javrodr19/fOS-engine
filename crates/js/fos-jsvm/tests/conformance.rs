@@ -554,6 +554,12 @@ fn control_flow() {
         ("let r = []; try { try { throw 'inner'; } finally { r.push('f1'); } } catch (e) { r.push(e); } r", "[ 'f1', 'inner' ]"),
         ("let r = []; try { try { throw 1; } catch (e) { throw 2; } finally { r.push('f'); } } catch (e) { r.push(e); } r", "[ 'f', 2 ]"),
         ("function f() { for (const x of [1, 2]) { try { return x; } finally { log.push('f' + x); } } } var log = []; [f(), log]", "[ 1, [ 'f1' ] ]"),
+        // A finally run by return or break sees the scopes around its try,
+        // not the try block's own lets (Jotai's store names both n)
+        ("const n = 'outer'; let seen; function f() { try { let n = 'inner'; return n; } finally { seen = n; } } [f(), seen]", "[ 'inner', 'outer' ]"),
+        ("const n = 'outer'; let seen; for (;;) { try { let n = 'inner'; break; } finally { seen = n; } } seen", "'outer'"),
+        ("const n = 'outer'; let seen; function f() { try { let n = 1; const g = () => n; return g(); } finally { seen = n; } } [f(), seen]", "[ 1, 'outer' ]"),
+        ("let seen; function f() { let a = 'a'; try { let b = 'b'; try { let a = 'shadow'; return 1; } finally { seen = a + b; } } finally { seen += a; } } f(); seen", "'aba'"),
         ("let n = 0; try { n = 1; } finally { n += 10; } n", "11"),
         ("function g() { try { throw new Error('x'); } catch { return 'no binding'; } } g()", "'no binding'"),
         ("try { null.x; } catch (e) { e instanceof TypeError }", "true"),
@@ -1190,6 +1196,8 @@ fn regex_unicode_properties() {
     check(&[
         ("/^\\p{ID_Start}\\p{ID_Continue}*$/u.test('ñame_1')", "true"),
         ("/^\\p{ID_Start}/u.test('1a')", "false"),
+        ("'a{b}c d→'.replace(/\\p{Pattern_Syntax}/gu, '_')", "'a_b_c d_'"),
+        ("/^\\p{Pattern_White_Space}+$/u.test(' \\t\\n\\u200e')", "true"),
         ("'a+b=$5 ©→😀'.match(/\\p{S}/gu).join('')", "'+=$©→😀'"),
         ("'a+b=$5'.match(/\\p{Sc}/gu).join('')", "'$'"),
         ("/\\p{Sm}/u.test('∑')", "true"),
@@ -1484,4 +1492,25 @@ fn proxy_prototype_chain() {
         ("var t = { a: 1, get g() { return 1; } }; var p = Object.freeze(new Proxy(t, {})); [Object.isFrozen(t), Object.isFrozen(p), Object.isSealed(p), Object.getOwnPropertyDescriptor(t, 'a').writable]", "[ true, true, true, false ]"),
         ("var t = { a: 1 }; Object.seal(new Proxy(t, {})); [Object.isSealed(t), Object.isFrozen(t), Object.isFrozen(new Proxy({}, {}))]", "[ true, false, false ]"),
     ]);
+}
+
+#[test]
+fn tasks_out_of_time_stop() {
+    // A task that never ends is stopped past every catch and finally, and
+    // the next task runs normally
+    let mut vm = Vm::new();
+    vm.script_time_limit = Some(std::time::Duration::from_millis(50));
+    let t = std::time::Instant::now();
+    let r = vm.eval("var caught = false; try { for (;;) {} } catch (e) { caught = true; } finally { caught = 'finally'; }");
+    assert!(r.is_err());
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    let msg = vm.display(r.unwrap_err());
+    assert!(msg.contains("Script stopped"), "{msg}");
+    // Recursion through calls stops too
+    let r = vm.eval("function f() { return f() + g(); } function g() { for (var i = 0; i < 1e3; i++); return 1; } try { while (true) { try { f(); } catch (e) {} } } catch (e) {}");
+    assert!(r.is_err());
+    let caught = vm.eval("caught").unwrap();
+    assert_eq!(vm.display(caught), "false");
+    let two = vm.eval("1 + 1").unwrap();
+    assert_eq!(vm.display(two), "2");
 }
